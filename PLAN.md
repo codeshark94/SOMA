@@ -23,8 +23,8 @@ interpretation of a sentence and cannot trigger speech or an external action.
 - Record monotonic timestamps at input, inference completion, event emission,
   command send, and actuator acknowledgement. Establish latency SLOs only
   after this baseline exists.
-- Do not infer speaker direction from the dual microphones until a calibrated
-  experiment establishes that the device exposes stable directional evidence.
+- Do not emit a speaker-direction cue from the dual microphones until a
+  three-position TDOA calibration establishes stable directional evidence.
 - A camera command always has exactly one owner. The valid owners are
   `manual`, `native_ai`, `external`, and `fault`.
 
@@ -124,8 +124,9 @@ No latency number is promised before P0 supplies the host-and-device baseline.
   available for direct control; OSC is an alternative integration boundary.
 - Wake word, ASR, speaker identification, and semantic intent: L1 work, not
   a prerequisite for subconscious v0.
-- Speaker direction from the dual microphone array: require a controlled
-  calibration before use.
+- Speaker direction from the dual microphone array: runtime code may emit only
+  calibrated, high-correlation left/center/right attention cues. It remains
+  separate from speaker identity and camera actuation.
 - Persistent memory, personality, dialogue, and outbound actions: L1/L2 work.
 
 ## P0 baseline captured
@@ -152,11 +153,12 @@ P1-P3 while leaving the camera owner as `manual`:
   active-sensing policy.
 - The video path updates the predictive state immediately and feeds a bounded
   latest-frame mailbox. The ANE-preferred person detector runs on every
-  dequeued latest frame; its full-body miss triggers an up-to-6Hz close-range
-  face fallback. A pending
-  fallback is not incorrectly treated as target-loss evidence.
-- The audio path uses a 96ms-confirmed local RMS/VAD gate only. It does not
-  perform learned speech classification, ASR, speaker ID, or direction estimation.
+  dequeued latest frame; its full-body miss triggers an up-to-6Hz ANE-preferred
+  BlazeFace inference. A pending face inference is not incorrectly treated as
+  target-loss evidence.
+- The audio path uses a 96ms-confirmed local RMS/VAD gate. It does not perform
+  learned speech classification, ASR, or speaker ID. After a three-position
+  calibration it can emit left/center/right TDOA attention cues only.
 - JSONL contains no raw audio/video. Source-health reports format-configuration
   fallback, runtime interruption/error, disconnect/reconnect, and clean stop.
 
@@ -174,12 +176,11 @@ target retention.
 
 ## P3 Neural Engine perception baseline
 
-The main person-detector path is now Apple Core ML YOLOv3Tiny FP16, bundled with
-the executable and configured on required macOS 13+ as `.cpuAndNeuralEngine`
-(GPU excluded). It evaluates the latest available frame rather than waiting
-behind a backlog. When it has no person candidate, a throttled up-to-6Hz generic
-Vision face detector supports close-up conversation distance while the
-ANE path remains the primary detector.
+The person-detector path is Apple Core ML YOLOv3Tiny FP16, bundled with the
+executable and configured on required macOS 13+ as `.cpuAndNeuralEngine` (GPU
+excluded). The close-range path is now a separate bundled Core ML BlazeFace
+model configured with the same policy; it replaces the generic Vision face
+detector and runs at up to 6 Hz after a person miss.
 
 On the Apple M5 host, `artifacts/subconscious/p3-ane-final.jsonl` recorded
 `neural_engine/configured` with `compute_units=cpu_and_neural_engine`, a 33.30
@@ -192,9 +193,9 @@ Use Instruments to obtain that hardware-level attribution.
 
 ## P3 sensory-fusion baseline
 
-`artifacts/subconscious/p3-fusion-continuity-final.jsonl` is a 30.66-second
-no-person capture-session run of the current fusion code. It records 832 Core
-ML inferences (27.1/s), 158 face fallback inferences (5.2/s), and
+`artifacts/subconscious/p3-fusion-continuity-final.jsonl` is a historical
+30.66-second no-person capture-session run before the face-model replacement.
+It records 832 Core ML inferences (27.1/s), 158 face fallback inferences (5.2/s), and
 `late_events_dropped=0`. Core ML averaged 17.05 ms and the maximum
 capture-to-belief latency was 390.98 ms. No person or face was visible, so it
 does not establish target retention, target loss, or speech detection quality.
@@ -229,10 +230,9 @@ also rules out any hard real-time end-to-end claim.
 
 ## Immediate next action
 
-Replace the variable-latency System Vision face fallback with a licensed Core
-ML face detector configured for `cpuAndNeuralEngine`, then measure its
-model-specific p50/p95 latency. Independently measure VAD precision/recall with
-labelled speech/noise clips before treating it as a speech cue. Separately,
-determine why macOS refuses the active 720p60 format; do not infer dual-
-microphone direction until a controlled TDOA calibration establishes stable
-left/right evidence.
+Run the consented 45-second three-position OBSBOT TDOA calibration and a
+speaker-present face scenario, then measure face-model p50/p95 and calibrated
+left/center/right stability. The small labelled VAD smoke corpus is a failure
+signal, not a threshold-selection result; replace it with a deployment-matched,
+consented corpus before relying on voice activity as a handoff cue. Separately,
+determine why macOS refuses the active 720p60 format.

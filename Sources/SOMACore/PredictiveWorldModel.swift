@@ -35,7 +35,7 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
 
 public enum VisualObservationSource: String, Codable, Sendable {
     case neuralDetector = "coreml_ane"
-    case faceDetector = "vision_face"
+    case neuralFaceDetector = "coreml_ane_face"
     case tracker
 }
 

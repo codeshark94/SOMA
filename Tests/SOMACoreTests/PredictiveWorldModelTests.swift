@@ -10,7 +10,7 @@ final class PredictiveWorldModelTests: XCTestCase {
             VisualObservation(
                 rect: NormalizedRect(x: 0.4, y: 0.3, width: 0.2, height: 0.3),
                 confidence: 0.95,
-                source: .detector
+                source: .neuralFaceDetector
             ),
             at: start
         )
@@ -28,7 +28,7 @@ final class PredictiveWorldModelTests: XCTestCase {
             VisualObservation(
                 rect: NormalizedRect(x: 0.2, y: 0.2, width: 0.2, height: 0.2),
                 confidence: 0.9,
-                source: .detector
+                source: .neuralFaceDetector
             ),
             at: start
         )

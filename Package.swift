@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "soma-probe", targets: ["SOMAProbe"]),
         .executable(name: "soma-subconscious", targets: ["SOMASubconscious"]),
         .executable(name: "soma-core-check", targets: ["SOMACoreChecks"]),
+        .executable(name: "soma-vad-eval", targets: ["SOMAVADEval"]),
     ],
     targets: [
         .target(name: "SOMACore"),
@@ -16,9 +17,13 @@ let package = Package(
         .executableTarget(
             name: "SOMASubconscious",
             dependencies: ["SOMACore"],
-            resources: [.process("Resources")]
+            resources: [
+                .process("Resources/YOLOv3TinyFP16.mlmodel"),
+                .copy("Resources/BlazeFaceShortRange.mlpackage")
+            ]
         ),
         .executableTarget(name: "SOMACoreChecks", dependencies: ["SOMACore"]),
+        .executableTarget(name: "SOMAVADEval", dependencies: ["SOMACore"]),
         .testTarget(name: "SOMACoreTests", dependencies: ["SOMACore"]),
     ]
 )

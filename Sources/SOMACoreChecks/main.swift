@@ -14,7 +14,7 @@ private func rect(_ x: Double) -> NormalizedRect {
 
 let model = PredictiveWorldModel()
 let start: UInt64 = 1_000_000_000
-_ = model.ingestVisual(VisualObservation(rect: rect(0.30), confidence: 0.95, source: .faceDetector), at: start)
+_ = model.ingestVisual(VisualObservation(rect: rect(0.30), confidence: 0.95, source: .neuralFaceDetector), at: start)
 _ = model.ingestVisual(VisualObservation(rect: rect(0.40), confidence: 0.95, source: .tracker), at: start + 100_000_000)
 let voiced = model.ingestVoice(active: true, confidence: 0.95, at: start + 120_000_000)
 require(voiced.targetStatus == .tracked, "visual target was not retained")
@@ -31,7 +31,7 @@ require(lost.targetStatus == .none, "stale target was not discarded")
 require(lost.policy == .hold, "loss did not return a safe hold policy")
 
 let reordered = PredictiveWorldModel()
-let first = reordered.ingestVisual(VisualObservation(rect: rect(0.25), confidence: 0.90, source: .faceDetector), at: start + 100_000_000)
+let first = reordered.ingestVisual(VisualObservation(rect: rect(0.25), confidence: 0.90, source: .neuralFaceDetector), at: start + 100_000_000)
 let delayed = reordered.ingestVisual(VisualObservation(rect: rect(0.20), confidence: 0.90, source: .tracker), at: start + 50_000_000)
 require(delayed.monotonicNS == start + 100_000_000, "out-of-order evidence reversed belief time")
 require(delayed.target?.rect == first.target?.rect, "out-of-order evidence changed belief content")
@@ -57,4 +57,34 @@ let discontinuousGate = VoiceActivityGate()
 require(!discontinuousGate.ingest(levelDB: -20, durationNS: 48_000_000, continuous: false, at: quiet).active, "voice gate opened before 96ms")
 require(!discontinuousGate.ingest(levelDB: -20, durationNS: 48_000_000, continuous: false, at: quiet + 80_000_000).active, "voice gate bridged an audio discontinuity")
 require(discontinuousGate.ingest(levelDB: -20, durationNS: 48_000_000, continuous: true, at: quiet + 128_000_000).active, "voice gate did not resume after continuous audio")
+
+var stereoSource: [Float] = []
+for index in 0..<512 {
+    let phase = Double(index)
+    let sample = sin(phase * 0.19) + cos(phase * 0.071) + Double((index * 17) % 13) / 20
+    stereoSource.append(Float(sample))
+}
+let rightDelayed = (0..<512).map { index in index >= 3 ? stereoSource[index - 3] : 0 }
+let rightAdvanced = (0..<512).map { index in index + 3 < stereoSource.count ? stereoSource[index + 3] : 0 }
+let leftMeasurement = StereoTDOAEstimator.measure(left: stereoSource, right: rightDelayed, sampleRateHz: 32_000)
+let centerMeasurement = StereoTDOAEstimator.measure(left: stereoSource, right: stereoSource, sampleRateHz: 32_000)
+let rightMeasurement = StereoTDOAEstimator.measure(left: stereoSource, right: rightAdvanced, sampleRateHz: 32_000)
+require(leftMeasurement?.lagSamples == 3, "TDOA did not recover a delayed right channel")
+require(centerMeasurement?.lagSamples == 0, "TDOA did not recover a centered source")
+require(rightMeasurement?.lagSamples == -3, "TDOA did not recover an advanced right channel")
+let periodicStereo = (0..<512).map { index in Float(index.isMultiple(of: 2) ? 1 : -1) }
+require(StereoTDOAEstimator.measure(left: periodicStereo, right: periodicStereo, sampleRateHz: 32_000) == nil, "ambiguous periodic stereo signal produced a direction")
+let calibration = StereoDirectionCalibration.make(
+    sampleRateHz: 32_000,
+    left: Array(repeating: leftMeasurement!, count: 3),
+    center: Array(repeating: centerMeasurement!, count: 3),
+    right: Array(repeating: rightMeasurement!, count: 3)
+)
+require(calibration != nil, "calibration rejected stable labelled TDOA measurements")
+let uncalibratedDirection = StereoTDOAEstimator(calibration: nil).estimate(left: stereoSource, right: rightDelayed, sampleRateHz: 32_000)
+require(uncalibratedDirection.direction == .unknown, "uncalibrated TDOA emitted a direction")
+let calibratedEstimator = StereoTDOAEstimator(calibration: calibration)
+require(calibratedEstimator.estimate(left: stereoSource, right: rightDelayed, sampleRateHz: 32_000).direction == AudioDirection.left, "calibrated TDOA did not identify left")
+require(calibratedEstimator.estimate(left: stereoSource, right: stereoSource, sampleRateHz: 32_000).direction == AudioDirection.center, "calibrated TDOA did not identify center")
+require(calibratedEstimator.estimate(left: stereoSource, right: rightAdvanced, sampleRateHz: 32_000).direction == AudioDirection.right, "calibrated TDOA did not identify right")
 print("soma-core-check: PASS")

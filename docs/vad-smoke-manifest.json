@@ -1,0 +1,8 @@
+[
+  {"id":"fsdd-0-jackson-0","path":"data/0_jackson_0.wav","label":"speech","source_url":"https://raw.githubusercontent.com/Jakobovski/free-spoken-digit-dataset/master/recordings/0_jackson_0.wav"},
+  {"id":"fsdd-4-jackson-12","path":"data/4_jackson_12.wav","label":"speech","source_url":"https://raw.githubusercontent.com/Jakobovski/free-spoken-digit-dataset/master/recordings/4_jackson_12.wav"},
+  {"id":"fsdd-7-nicolas-8","path":"data/7_nicolas_8.wav","label":"speech","source_url":"https://raw.githubusercontent.com/Jakobovski/free-spoken-digit-dataset/master/recordings/7_nicolas_8.wav"},
+  {"id":"fsdd-9-theo-4","path":"data/9_theo_4.wav","label":"speech","source_url":"https://raw.githubusercontent.com/Jakobovski/free-spoken-digit-dataset/master/recordings/9_theo_4.wav"},
+  {"id":"esc50-dog-cc0","path":"data/1-100032-A-0.wav","label":"noise","source_url":"https://raw.githubusercontent.com/karolpiczak/ESC-50/master/audio/1-100032-A-0.wav"},
+  {"id":"esc50-thunderstorm","path":"data/1-101296-A-19.wav","label":"noise","source_url":"https://raw.githubusercontent.com/karolpiczak/ESC-50/master/audio/1-101296-A-19.wav"}
+]

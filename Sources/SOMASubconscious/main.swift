@@ -30,6 +30,8 @@ private struct Options {
     let audioID: String
     let outputURL: URL
     let guidedScenario: Bool
+    let tdoaCalibrationURL: URL?
+    let tdoaCalibrationOutputURL: URL?
 
     static func parse(_ arguments: [String]) throws -> Options {
         var duration: TimeInterval = 60
@@ -37,6 +39,8 @@ private struct Options {
         var audioID: String?
         var outputURL = defaultOutputURL()
         var guidedScenario = false
+        var tdoaCalibrationURL: URL?
+        var tdoaCalibrationOutputURL: URL?
         var index = 0
 
         while index < arguments.count {
@@ -69,6 +73,18 @@ private struct Options {
                 outputURL = URL(fileURLWithPath: arguments[index])
             case "--guided-scenario":
                 guidedScenario = true
+            case "--tdoa-calibration":
+                index += 1
+                guard index < arguments.count else {
+                    throw RuntimeError.invalidArgument("--tdoa-calibration requires a calibration JSON path")
+                }
+                tdoaCalibrationURL = URL(fileURLWithPath: arguments[index])
+            case "--tdoa-calibrate":
+                index += 1
+                guard index < arguments.count else {
+                    throw RuntimeError.invalidArgument("--tdoa-calibrate requires an output JSON path")
+                }
+                tdoaCalibrationOutputURL = URL(fileURLWithPath: arguments[index])
             case "--help", "-h":
                 printUsage()
                 Foundation.exit(EXIT_SUCCESS)
@@ -84,7 +100,24 @@ private struct Options {
         if guidedScenario, duration != GuidedScenarioPhase.duration {
             throw RuntimeError.invalidArgument("--guided-scenario requires --duration 50")
         }
-        return Options(duration: duration, videoID: videoID, audioID: audioID, outputURL: outputURL, guidedScenario: guidedScenario)
+        if tdoaCalibrationOutputURL != nil, duration != TDOACalibrationPhase.duration {
+            throw RuntimeError.invalidArgument("--tdoa-calibrate requires --duration 45")
+        }
+        if guidedScenario, tdoaCalibrationOutputURL != nil {
+            throw RuntimeError.invalidArgument("--guided-scenario and --tdoa-calibrate cannot run together")
+        }
+        if tdoaCalibrationURL != nil, tdoaCalibrationOutputURL != nil {
+            throw RuntimeError.invalidArgument("Choose either --tdoa-calibration or --tdoa-calibrate")
+        }
+        return Options(
+            duration: duration,
+            videoID: videoID,
+            audioID: audioID,
+            outputURL: outputURL,
+            guidedScenario: guidedScenario,
+            tdoaCalibrationURL: tdoaCalibrationURL,
+            tdoaCalibrationOutputURL: tdoaCalibrationOutputURL
+        )
     }
 
     private static func defaultOutputURL() -> URL {
@@ -110,6 +143,26 @@ private struct GuidedScenarioPhase {
         GuidedScenarioPhase(startsAfterSeconds: 35, state: "exit_and_silence", instruction: "35-45s: leave the frame and remain silent"),
         GuidedScenarioPhase(startsAfterSeconds: 45, state: "settle", instruction: "45-50s: remain out of frame and silent")
     ]
+}
+
+private struct TDOACalibrationPhase {
+    static let duration: TimeInterval = 45
+
+    let startsAfterSeconds: TimeInterval
+    let position: TDOACalibrationPosition
+    let instruction: String
+
+    static let phases = [
+        TDOACalibrationPhase(startsAfterSeconds: 0, position: .left, instruction: "0-15s: stand left of camera, face it, and speak naturally"),
+        TDOACalibrationPhase(startsAfterSeconds: 15, position: .center, instruction: "15-30s: stand centered on camera, face it, and speak naturally"),
+        TDOACalibrationPhase(startsAfterSeconds: 30, position: .right, instruction: "30-45s: stand right of camera, face it, and speak naturally")
+    ]
+}
+
+private enum TDOACalibrationPosition: String, Sendable {
+    case left
+    case center
+    case right
 }
 
 private struct DeviceIdentity: Codable, Sendable {
@@ -147,6 +200,16 @@ private struct VoiceEvent: Encodable, Sendable {
     let levelDB: Double
 }
 
+private struct AudioDirectionEvent: Encodable, Sendable {
+    let event = "audio.direction"
+    let monotonicNS: UInt64
+    let direction: AudioDirection
+    let confidence: Double
+    let lagSamples: Int
+    let delayMilliseconds: Double
+    let correlation: Double
+}
+
 private struct VisionEvent: Encodable, Sendable {
     let event = "vision.observation"
     let monotonicNS: UInt64
@@ -165,7 +228,7 @@ private struct MetricsEvent: Encodable, Sendable {
     let visionFramesSkipped: Int
     let videoFramesSuperseded: Int
     let neuralEngineInferences: Int
-    let fallbackVisionInferences: Int
+    let neuralFaceInferences: Int
     let maximumVideoCallbackMS: Double
     let maximumAudioCallbackMS: Double
     let averageVideoCallbackMS: Double
@@ -185,6 +248,7 @@ private protocol TraceEvent: Encodable, Sendable {
 extension RuntimeEvent: TraceEvent {}
 extension BeliefEvent: TraceEvent {}
 extension VoiceEvent: TraceEvent {}
+extension AudioDirectionEvent: TraceEvent {}
 extension VisionEvent: TraceEvent {}
 extension MetricsEvent: TraceEvent {}
 
@@ -273,7 +337,7 @@ private final class LatencyCounters: @unchecked Sendable {
     private var visionFramesSkipped = 0
     private var supersededFrames = 0
     private var neuralEngineInferences = 0
-    private var fallbackVisionInferences = 0
+    private var neuralFaceInferences = 0
     private var previousVideoNS: UInt64?
     private var previousAudioNS: UInt64?
     private var maximumVideoCallbackMS = 0.0
@@ -337,9 +401,9 @@ private final class LatencyCounters: @unchecked Sendable {
         lock.unlock()
     }
 
-    func fallbackVisionInference() {
+    func neuralFaceInference() {
         lock.lock()
-        fallbackVisionInferences += 1
+        neuralFaceInferences += 1
         lock.unlock()
     }
 
@@ -361,7 +425,7 @@ private final class LatencyCounters: @unchecked Sendable {
             visionFramesSkipped: visionFramesSkipped,
             videoFramesSuperseded: supersededFrames,
             neuralEngineInferences: neuralEngineInferences,
-            fallbackVisionInferences: fallbackVisionInferences,
+            neuralFaceInferences: neuralFaceInferences,
             maximumVideoCallbackMS: maximumVideoCallbackMS,
             maximumAudioCallbackMS: maximumAudioCallbackMS,
             averageVideoCallbackMS: videoCallbacks == 0 ? 0 : totalVideoCallbackMS / Double(videoCallbacks),
@@ -444,16 +508,29 @@ private final class BeliefPublisher: @unchecked Sendable {
 private final class AudioAnalyzer: @unchecked Sendable {
     private let detector = VoiceActivityGate()
     private var previousAudioEndPTS: CMTime?
+    private var nextDirectionAnalysisNS: UInt64 = 0
+    private var lastDirection: AudioDirection = .unknown
     private let worldModel: PredictiveWorldModel
     private let publisher: BeliefPublisher
     private let writer: JSONLWriter
     private let counters: LatencyCounters
+    private let directionEstimator: StereoTDOAEstimator?
+    private let calibrationRecorder: TDOACalibrationRecorder?
 
-    init(worldModel: PredictiveWorldModel, publisher: BeliefPublisher, writer: JSONLWriter, counters: LatencyCounters) {
+    init(
+        worldModel: PredictiveWorldModel,
+        publisher: BeliefPublisher,
+        writer: JSONLWriter,
+        counters: LatencyCounters,
+        directionEstimator: StereoTDOAEstimator?,
+        calibrationRecorder: TDOACalibrationRecorder?
+    ) {
         self.worldModel = worldModel
         self.publisher = publisher
         self.writer = writer
         self.counters = counters
+        self.directionEstimator = directionEstimator
+        self.calibrationRecorder = calibrationRecorder
     }
 
     func ingest(_ sampleBuffer: CMSampleBuffer, at now: UInt64) {
@@ -481,6 +558,30 @@ private final class AudioAnalyzer: @unchecked Sendable {
             ))
             publisher.publish(belief, reason: activity.active ? "voice_onset" : "voice_offset", force: true)
         }
+        guard activity.active, now >= nextDirectionAnalysisNS else { return }
+        nextDirectionAnalysisNS = now + 125_000_000
+        guard let stereo = stereoSamples(from: sampleBuffer) else { return }
+        if let calibrationRecorder,
+           let measurement = StereoTDOAEstimator.measure(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz) {
+            calibrationRecorder.record(measurement)
+        }
+        guard let directionEstimator else { return }
+        let direction = directionEstimator.estimate(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz)
+        guard direction.direction != .unknown,
+              let lagSamples = direction.lagSamples,
+              let delayMilliseconds = direction.delayMilliseconds,
+              let correlation = direction.correlation else { return }
+        if direction.direction != lastDirection || activity.changed {
+            lastDirection = direction.direction
+            writer.write(AudioDirectionEvent(
+                monotonicNS: now,
+                direction: direction.direction,
+                confidence: direction.confidence,
+                lagSamples: lagSamples,
+                delayMilliseconds: delayMilliseconds,
+                correlation: correlation
+            ))
+        }
     }
 
     private func audioPacketIsContinuous(_ sampleBuffer: CMSampleBuffer, durationNS: UInt64) -> Bool {
@@ -499,6 +600,39 @@ private final class AudioAnalyzer: @unchecked Sendable {
         let delta = CMTimeGetSeconds(CMTimeSubtract(presentationTime, previousAudioEndPTS))
         let tolerance = max(0.004, Double(durationNS) / 1_000_000_000 * 0.25)
         return delta.isFinite && abs(delta) <= tolerance
+    }
+}
+
+private final class TDOACalibrationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var position: TDOACalibrationPosition = .left
+    private var measurements: [TDOACalibrationPosition: [StereoTDOAMeasurement]] = [:]
+
+    func setPosition(_ position: TDOACalibrationPosition) {
+        lock.lock()
+        self.position = position
+        lock.unlock()
+    }
+
+    func record(_ measurement: StereoTDOAMeasurement) {
+        lock.lock()
+        measurements[position, default: []].append(measurement)
+        lock.unlock()
+    }
+
+    func makeCalibration() -> StereoDirectionCalibration? {
+        lock.lock()
+        let snapshot = measurements
+        lock.unlock()
+        let sampleRates = snapshot.values.flatMap { $0 }.map(\.sampleRateHz).sorted()
+        guard !sampleRates.isEmpty else { return nil }
+        let sampleRateHz = sampleRates[sampleRates.count / 2]
+        return StereoDirectionCalibration.make(
+            sampleRateHz: sampleRateHz,
+            left: snapshot[.left] ?? [],
+            center: snapshot[.center] ?? [],
+            right: snapshot[.right] ?? []
+        )
     }
 }
 
@@ -570,6 +704,172 @@ private final class ANEPersonDetector: @unchecked Sendable {
     }
 }
 
+private final class ANEFaceDetector: @unchecked Sendable {
+    private struct Anchor {
+        let x: Double
+        let y: Double
+    }
+
+    let computeUnits: String
+    let warmupMS: Double
+    private let model: VNCoreMLModel
+    private let anchors: [Anchor]
+
+    init() throws {
+        guard let modelURL = Bundle.module.url(forResource: "BlazeFaceShortRange", withExtension: "mlpackage") else {
+            throw RuntimeError.configuration("Bundled Core ML face detector is missing")
+        }
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = .cpuAndNeuralEngine
+        computeUnits = "cpu_and_neural_engine"
+        let compiledURL = try MLModel.compileModel(at: modelURL)
+        let loadedModel = try MLModel(contentsOf: compiledURL, configuration: configuration)
+        model = try VNCoreMLModel(for: loadedModel)
+        anchors = Self.makeAnchors()
+        let startedNS = monotonicNanoseconds()
+        try Self.warmUp(model: model, anchors: anchors)
+        warmupMS = milliseconds(from: startedNS, to: monotonicNanoseconds())
+    }
+
+    func detect(in pixelBuffer: CVPixelBuffer) throws -> [VisualObservation] {
+        try Self.detect(in: pixelBuffer, model: model, anchors: anchors)
+    }
+
+    private static func warmUp(model: VNCoreMLModel, anchors: [Anchor]) throws {
+        var pixelBuffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            128,
+            128,
+            kCVPixelFormatType_32BGRA,
+            nil,
+            &pixelBuffer
+        ) == kCVReturnSuccess,
+              let pixelBuffer else {
+            throw RuntimeError.configuration("Cannot allocate Core ML face warmup frame")
+        }
+        _ = try detect(in: pixelBuffer, model: model, anchors: anchors)
+    }
+
+    private static func detect(in pixelBuffer: CVPixelBuffer, model: VNCoreMLModel, anchors: [Anchor]) throws -> [VisualObservation] {
+        let request = VNCoreMLRequest(model: model)
+        request.imageCropAndScaleOption = .centerCrop
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        try handler.perform([request])
+        let features = request.results?.compactMap { $0 as? VNCoreMLFeatureValueObservation } ?? []
+        let featureNames = features.map(\.featureName).joined(separator: ",")
+        guard let rawBoxes = features.first(where: { $0.featureName == "raw_boxes" })?.featureValue.multiArrayValue,
+              let rawScores = features.first(where: { $0.featureName == "raw_scores" })?.featureValue.multiArrayValue,
+              isFloatingPointArray(rawBoxes),
+              isFloatingPointArray(rawScores),
+              anchors.count == 896 else {
+            throw RuntimeError.configuration("Unexpected Core ML face detector output: \(featureNames)")
+        }
+
+        let boxStrides = rawBoxes.strides.map(\.intValue)
+        let scoreStrides = rawScores.strides.map(\.intValue)
+        guard boxStrides.count == 3, scoreStrides.count == 3 else {
+            throw RuntimeError.configuration("Unexpected Core ML face detector output layout")
+        }
+
+        let crop = cropTransform(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+        var candidates: [VisualObservation] = []
+        for index in anchors.indices {
+            let scoreOffset = index * scoreStrides[1]
+            let score = sigmoid(Double(value(in: rawScores, at: scoreOffset)))
+            guard score >= 0.75 else { continue }
+            let boxOffset = index * boxStrides[1]
+            let xCenter = Double(value(in: rawBoxes, at: boxOffset)) / 128 + anchors[index].x
+            let yCenter = Double(value(in: rawBoxes, at: boxOffset + boxStrides[2])) / 128 + anchors[index].y
+            let width = Double(value(in: rawBoxes, at: boxOffset + boxStrides[2] * 2)) / 128
+            let height = Double(value(in: rawBoxes, at: boxOffset + boxStrides[2] * 3)) / 128
+            guard width > 0, height > 0 else { continue }
+
+            let top = yCenter - height / 2
+            let left = xCenter - width / 2
+            let mappedLeft = crop.offsetX + left * crop.scaleX
+            let mappedTop = crop.offsetY + top * crop.scaleY
+            let mappedWidth = width * crop.scaleX
+            let mappedHeight = height * crop.scaleY
+            let rect = SOMACore.NormalizedRect(
+                x: max(0, mappedLeft),
+                y: max(0, 1 - mappedTop - mappedHeight),
+                width: min(mappedWidth, 1 - max(0, mappedLeft)),
+                height: min(mappedHeight, 1 - max(0, 1 - mappedTop - mappedHeight))
+            )
+            guard rect.width > 0.02, rect.height > 0.02 else { continue }
+            candidates.append(VisualObservation(rect: rect, confidence: score, source: .neuralFaceDetector))
+        }
+        return suppressOverlaps(candidates)
+    }
+
+    private static func makeAnchors() -> [Anchor] {
+        let strides = [8, 16, 16, 16]
+        var anchors: [Anchor] = []
+        var layer = 0
+        while layer < strides.count {
+            var sameStrideLayers = 0
+            while layer + sameStrideLayers < strides.count,
+                  strides[layer + sameStrideLayers] == strides[layer] {
+                sameStrideLayers += 1
+            }
+            let grid = 128 / strides[layer]
+            for y in 0..<grid {
+                for x in 0..<grid {
+                    for _ in 0..<(sameStrideLayers * 2) {
+                        anchors.append(Anchor(x: (Double(x) + 0.5) / Double(grid), y: (Double(y) + 0.5) / Double(grid)))
+                    }
+                }
+            }
+            layer += sameStrideLayers
+        }
+        return anchors
+    }
+
+    private static func isFloatingPointArray(_ array: MLMultiArray) -> Bool {
+        array.dataType == .float32 || array.dataType == .float16
+    }
+
+    private static func value(in array: MLMultiArray, at offset: Int) -> Float {
+        if array.dataType == .float16 {
+            return Float(array.dataPointer.bindMemory(to: Float16.self, capacity: offset + 1)[offset])
+        }
+        return array.dataPointer.bindMemory(to: Float.self, capacity: offset + 1)[offset]
+    }
+
+    private static func cropTransform(width: Int, height: Int) -> (offsetX: Double, offsetY: Double, scaleX: Double, scaleY: Double) {
+        guard width > 0, height > 0 else { return (0, 0, 1, 1) }
+        if width > height {
+            let scaleX = Double(height) / Double(width)
+            return ((1 - scaleX) / 2, 0, scaleX, 1)
+        }
+        let scaleY = Double(width) / Double(height)
+        return (0, (1 - scaleY) / 2, 1, scaleY)
+    }
+
+    private static func suppressOverlaps(_ candidates: [VisualObservation]) -> [VisualObservation] {
+        let sorted = candidates.sorted { $0.confidence > $1.confidence }
+        return sorted.reduce(into: []) { accepted, candidate in
+            guard !accepted.contains(where: { intersectionOverUnion($0.rect, candidate.rect) > 0.3 }) else { return }
+            accepted.append(candidate)
+        }
+    }
+
+    private static func intersectionOverUnion(_ lhs: SOMACore.NormalizedRect, _ rhs: SOMACore.NormalizedRect) -> Double {
+        let x1 = max(lhs.x, rhs.x)
+        let y1 = max(lhs.y, rhs.y)
+        let x2 = min(lhs.x + lhs.width, rhs.x + rhs.width)
+        let y2 = min(lhs.y + lhs.height, rhs.y + rhs.height)
+        let intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        let union = lhs.width * lhs.height + rhs.width * rhs.height - intersection
+        return union > 0 ? intersection / union : 0
+    }
+
+    private static func sigmoid(_ value: Double) -> Double {
+        1 / (1 + exp(-min(max(value, -100), 100)))
+    }
+}
+
 private final class VisionWorker: @unchecked Sendable {
     private enum DetectionOutcome {
         case observation(VisualObservation)
@@ -584,10 +884,11 @@ private final class VisionWorker: @unchecked Sendable {
     private let publisher: BeliefPublisher
     private let writer: JSONLWriter
     private let counters: LatencyCounters
-    private let neuralDetector: ANEPersonDetector?
+    private let neuralPersonDetector: ANEPersonDetector?
+    private let neuralFaceDetector: ANEFaceDetector?
     private let stateLock = NSLock()
     private var detectorCountdown = 0
-    private var nextFallbackNS: UInt64 = 0
+    private var nextFaceNS: UInt64 = 0
     private var trackerRect: CGRect?
     private var stopped = false
 
@@ -598,39 +899,41 @@ private final class VisionWorker: @unchecked Sendable {
         self.counters = counters
         do {
             let detector = try ANEPersonDetector()
-            neuralDetector = detector
+            neuralPersonDetector = detector
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
-                source: "neural_engine",
+                source: "person_neural_engine",
                 state: "configured",
                 message: "model=YOLOv3TinyFP16; compute_units=\(detector.computeUnits); prewarm_ms=\(detector.warmupMS)"
             ))
         } catch {
-            neuralDetector = nil
+            neuralPersonDetector = nil
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
-                source: "neural_engine",
-                state: "fallback_system_vision",
+                source: "person_neural_engine",
+                state: "unavailable",
                 message: error.localizedDescription
             ))
         }
         do {
-            let warmupMS = try Self.prewarmFallbackVision()
+            let detector = try ANEFaceDetector()
+            neuralFaceDetector = detector
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
-                source: "system_vision",
-                state: "prewarmed",
-                message: "close_range_fallback_ms=\(warmupMS)"
+                source: "face_neural_engine",
+                state: "configured",
+                message: "model=BlazeFaceShortRange; compute_units=\(detector.computeUnits); prewarm_ms=\(detector.warmupMS); max_hz=6"
             ))
         } catch {
+            neuralFaceDetector = nil
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
-                source: "system_vision",
-                state: "warmup_unavailable",
+                source: "face_neural_engine",
+                state: "unavailable",
                 message: error.localizedDescription
             ))
         }
@@ -675,7 +978,7 @@ private final class VisionWorker: @unchecked Sendable {
         detectorCountdown -= 1
         let outcome: DetectionOutcome
         do {
-            if neuralDetector != nil {
+            if neuralPersonDetector != nil {
                 outcome = try detect(in: frame.pixelBuffer)
             } else if let trackerRect, detectorCountdown > 0,
                let tracked = try track(trackerRect, in: frame.pixelBuffer) {
@@ -732,45 +1035,25 @@ private final class VisionWorker: @unchecked Sendable {
     }
 
     private func detect(in pixelBuffer: CVPixelBuffer) throws -> DetectionOutcome {
-        if let neuralDetector {
+        if let neuralPersonDetector {
             let startedNS = monotonicNanoseconds()
-            let candidates = try neuralDetector.detect(in: pixelBuffer)
+            let candidates = try neuralPersonDetector.detect(in: pixelBuffer)
             counters.neuralEngineInference(inferenceMS: milliseconds(from: startedNS, to: monotonicNanoseconds()))
             if let neuralCandidate = chooseAttentionCandidate(candidates) {
-                nextFallbackNS = 0
+                nextFaceNS = 0
                 return .observation(neuralCandidate)
             }
-            let now = monotonicNanoseconds()
-            guard now >= nextFallbackNS else { return .pendingFallback }
-            nextFallbackNS = now + 166_666_667
         }
-        counters.fallbackVisionInference()
-        let faceRequest = VNDetectFaceRectanglesRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        try handler.perform([faceRequest])
-        let faces = (faceRequest.results ?? []).map { VisualObservation(rect: SOMACore.NormalizedRect($0.boundingBox), confidence: Double($0.confidence), source: .faceDetector) }
+        guard let neuralFaceDetector else { return .miss }
+        let now = monotonicNanoseconds()
+        guard now >= nextFaceNS else { return .pendingFallback }
+        nextFaceNS = now + 166_666_667
+        let faces = try neuralFaceDetector.detect(in: pixelBuffer)
+        counters.neuralFaceInference()
         if let face = chooseAttentionCandidate(faces) {
             return .observation(face)
         }
         return .miss
-    }
-
-    private static func prewarmFallbackVision() throws -> Double {
-        var pixelBuffer: CVPixelBuffer?
-        guard CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            416,
-            416,
-            kCVPixelFormatType_32BGRA,
-            nil,
-            &pixelBuffer
-        ) == kCVReturnSuccess, let pixelBuffer else {
-            throw RuntimeError.configuration("Cannot allocate System Vision warmup frame")
-        }
-        let startedNS = monotonicNanoseconds()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        try handler.perform([VNDetectFaceRectanglesRequest()])
-        return milliseconds(from: startedNS, to: monotonicNanoseconds())
     }
 
     private func chooseAttentionCandidate(_ candidates: [VisualObservation]) -> VisualObservation? {
@@ -925,11 +1208,35 @@ private func run(_ options: Options) throws {
 
     let writer = try JSONLWriter(url: options.outputURL)
     defer { writer.close() }
+    let loadedDirectionCalibration: StereoDirectionCalibration?
+    if let calibrationURL = options.tdoaCalibrationURL {
+        do {
+            let calibration = try JSONDecoder().decode(StereoDirectionCalibration.self, from: Data(contentsOf: calibrationURL))
+            guard calibration.schemaVersion == 1 else {
+                throw RuntimeError.invalidArgument("Unsupported TDOA calibration schema: \(calibration.schemaVersion)")
+            }
+            loadedDirectionCalibration = calibration
+        } catch let error as RuntimeError {
+            throw error
+        } catch {
+            throw RuntimeError.invalidArgument("Cannot read TDOA calibration: \(error.localizedDescription)")
+        }
+    } else {
+        loadedDirectionCalibration = nil
+    }
+    let calibrationRecorder = options.tdoaCalibrationOutputURL.map { _ in TDOACalibrationRecorder() }
     let worldModel = PredictiveWorldModel()
     let counters = LatencyCounters()
     let publisher = BeliefPublisher(writer: writer)
     let visionWorker = VisionWorker(worldModel: worldModel, publisher: publisher, writer: writer, counters: counters)
-    let audioAnalyzer = AudioAnalyzer(worldModel: worldModel, publisher: publisher, writer: writer, counters: counters)
+    let audioAnalyzer = AudioAnalyzer(
+        worldModel: worldModel,
+        publisher: publisher,
+        writer: writer,
+        counters: counters,
+        directionEstimator: loadedDirectionCalibration.map { StereoTDOAEstimator(calibration: $0) },
+        calibrationRecorder: calibrationRecorder
+    )
     let session = AVCaptureSession()
 
     let selectedFormat = try requestLowLatencyFormat(on: videoDevice)
@@ -975,6 +1282,13 @@ private func run(_ options: Options) throws {
         message: "\(identity(videoDevice).name); requested=\(selectedFormat.requested); \(selectedFormat.detail)"
     ))
     writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio", state: "selected", message: "\(identity(audioDevice).name)"))
+    if loadedDirectionCalibration != nil {
+        writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "configured", message: "calibrated_stereo_tdoa"))
+    } else if calibrationRecorder != nil {
+        writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "calibrating", message: "three_positions=left,center,right"))
+    } else {
+        writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "calibration_required", message: "direction remains unknown until a three-position calibration is supplied"))
+    }
     visionWorker.start()
     session.startRunning()
     let startedNS = monotonicNanoseconds()
@@ -987,7 +1301,18 @@ private func run(_ options: Options) throws {
             message: firstPhase.instruction
         ))
     }
+    if let calibrationRecorder, let firstPhase = TDOACalibrationPhase.phases.first {
+        calibrationRecorder.setPosition(firstPhase.position)
+        writer.write(RuntimeEvent(
+            event: "scenario.phase",
+            monotonicNS: startedNS,
+            source: "tdoa_calibration",
+            state: firstPhase.position.rawValue,
+            message: firstPhase.instruction
+        ))
+    }
     var nextScenarioPhaseIndex = options.guidedScenario ? 1 : GuidedScenarioPhase.phases.count
+    var nextTDOAPhaseIndex = calibrationRecorder == nil ? TDOACalibrationPhase.phases.count : 1
     let complete = DispatchSemaphore(value: 0)
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "soma.subconscious.metrics"))
     timer.schedule(deadline: .now() + 1, repeating: 1)
@@ -1005,6 +1330,19 @@ private func run(_ options: Options) throws {
                 message: phase.instruction
             ))
             nextScenarioPhaseIndex += 1
+        }
+        while nextTDOAPhaseIndex < TDOACalibrationPhase.phases.count,
+              elapsed >= TDOACalibrationPhase.phases[nextTDOAPhaseIndex].startsAfterSeconds {
+            let phase = TDOACalibrationPhase.phases[nextTDOAPhaseIndex]
+            calibrationRecorder?.setPosition(phase.position)
+            writer.write(RuntimeEvent(
+                event: "scenario.phase",
+                monotonicNS: now,
+                source: "tdoa_calibration",
+                state: phase.position.rawValue,
+                message: phase.instruction
+            ))
+            nextTDOAPhaseIndex += 1
         }
         writer.write(counters.snapshot(at: now))
         publisher.publish(worldModel.snapshot(at: now), reason: "periodic")
@@ -1032,6 +1370,26 @@ private func run(_ options: Options) throws {
     visionWorker.stop()
     observer.stop()
     let stoppedNS = monotonicNanoseconds()
+    if let calibrationRecorder, let calibrationOutputURL = options.tdoaCalibrationOutputURL {
+        if let calibration = calibrationRecorder.makeCalibration() {
+            try write(calibration, to: calibrationOutputURL)
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: stoppedNS,
+                source: "audio_tdoa",
+                state: "calibration_written",
+                message: "\(calibrationOutputURL.path); sample_rate_hz=\(calibration.sampleRateHz)"
+            ))
+        } else {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: stoppedNS,
+                source: "audio_tdoa",
+                state: "calibration_failed",
+                message: "Need at least three high-correlation speech measurements at left, center, and right"
+            ))
+        }
+    }
     writer.write(counters.snapshot(at: stoppedNS))
     publisher.publish(worldModel.snapshot(at: stoppedNS), reason: "stopped", force: true)
     let lateEventsDropped = writer.drain()
@@ -1044,6 +1402,16 @@ private func run(_ options: Options) throws {
     ))
     withExtendedLifetime(observer) {}
     print("Wrote subconscious trace: \(options.outputURL.path)")
+}
+
+private func write(_ calibration: StereoDirectionCalibration, to url: URL) throws {
+    guard !FileManager.default.fileExists(atPath: url.path) else {
+        throw RuntimeError.invalidArgument("TDOA calibration output already exists: \(url.path)")
+    }
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(calibration).write(to: url, options: .atomic)
 }
 
 private func requestLowLatencyFormat(on device: AVCaptureDevice) throws -> VideoConfiguration {
@@ -1187,6 +1555,67 @@ private func audioMeasurement(from sampleBuffer: CMSampleBuffer) -> (rms: Double
     return (sqrt(sumSquares / Double(count)), durationNS)
 }
 
+private struct StereoSamples {
+    let left: [Float]
+    let right: [Float]
+    let sampleRateHz: Double
+}
+
+private func stereoSamples(from sampleBuffer: CMSampleBuffer) -> StereoSamples? {
+    guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+          let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+          asbd.mFormatID == kAudioFormatLinearPCM,
+          asbd.mChannelsPerFrame >= 2,
+          asbd.mSampleRate > 0,
+          let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+        return nil
+    }
+    var lengthAtOffset = 0
+    var totalLength = 0
+    var dataPointer: UnsafeMutablePointer<Int8>?
+    guard CMBlockBufferGetDataPointer(
+        blockBuffer,
+        atOffset: 0,
+        lengthAtOffsetOut: &lengthAtOffset,
+        totalLengthOut: &totalLength,
+        dataPointerOut: &dataPointer
+    ) == kCMBlockBufferNoErr,
+          let dataPointer else {
+        return nil
+    }
+    let bytesPerSample = Int(asbd.mBitsPerChannel / 8)
+    let bytesPerFrame = Int(asbd.mBytesPerFrame)
+    guard bytesPerSample > 0, bytesPerFrame >= bytesPerSample * 2 else { return nil }
+    let scalarStride = bytesPerFrame / bytesPerSample
+    let frameCount = totalLength / bytesPerFrame
+    guard scalarStride >= 2, frameCount >= 64 else { return nil }
+
+    var left: [Float] = []
+    var right: [Float] = []
+    left.reserveCapacity(frameCount)
+    right.reserveCapacity(frameCount)
+    let raw = UnsafeRawPointer(dataPointer)
+    let flags = asbd.mFormatFlags
+    if (flags & kAudioFormatFlagIsFloat) != 0, asbd.mBitsPerChannel == 32 {
+        let samples = raw.bindMemory(to: Float.self, capacity: totalLength / MemoryLayout<Float>.size)
+        for frame in 0..<frameCount {
+            let offset = frame * scalarStride
+            left.append(samples[offset])
+            right.append(samples[offset + 1])
+        }
+    } else if (flags & kAudioFormatFlagIsSignedInteger) != 0, asbd.mBitsPerChannel == 16 {
+        let samples = raw.bindMemory(to: Int16.self, capacity: totalLength / MemoryLayout<Int16>.size)
+        for frame in 0..<frameCount {
+            let offset = frame * scalarStride
+            left.append(Float(samples[offset]) / Float(Int16.max))
+            right.append(Float(samples[offset + 1]) / Float(Int16.max))
+        }
+    } else {
+        return nil
+    }
+    return StereoSamples(left: left, right: right, sampleRateHz: asbd.mSampleRate)
+}
+
 private extension SOMACore.NormalizedRect {
     init(_ rect: CGRect) {
         self.init(x: Double(rect.origin.x), y: Double(rect.origin.y), width: Double(rect.width), height: Double(rect.height))
@@ -1211,7 +1640,7 @@ private func milliseconds(from earlier: UInt64, to later: UInt64) -> Double {
 private func monotonicNanoseconds() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
 private func printUsage() {
-    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--guided-scenario] [--output trace.jsonl]")
+    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--guided-scenario] [--tdoa-calibration calibration.json | --tdoa-calibrate calibration.json --duration 45] [--output trace.jsonl]")
 }
 
 do {

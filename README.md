@@ -60,25 +60,23 @@ separate paths:
 - The video callback advances a persistent predictive belief and replaces the
   pending Vision frame rather than queueing it.
 - The Vision worker runs the ANE-preferred person model on each dequeued latest
-  frame.
-  On a full-body miss, it obtains a low-rate close-range face observation;
-  intermediate misses are absence of new evidence, not a target-loss claim.
+  frame. On a full-body miss it runs a separate ANE-preferred BlazeFace model
+  at up to 6 Hz; intermediate misses are absence of new evidence, not a
+  target-loss claim.
 - The audio callback uses a 96ms-confirmed local RMS/VAD gate only. It is
-  evidence for readiness, not a learned speech classifier, transcription, or
-  speaker direction.
+  evidence for readiness, not a learned speech classifier or transcription.
+  A calibrated two-channel TDOA estimator can additionally emit local
+  left/center/right attention cues; without calibration it emits `unknown`.
 
 It emits local JSONL belief, voice-activity, vision-observation, metrics, and
 source-health events. It never writes raw media, invokes an LLM/network,
 enables native tracking, or sends PTZ/OSC/SDK commands.
 
-SOMA requires macOS 13 or later. On Apple Silicon, person detection is a bundled
-Core ML YOLOv3Tiny FP16 model loaded with `cpuAndNeuralEngine`; GPU is excluded
-for that Core ML model.
-The model evaluates the latest available video frames and accepts only the
-`person` class. When that full-body detector has no candidate, a throttled
-up-to-6Hz System Vision face fallback supports close-up conversation distance;
-it does not replace the ANE primary path. The model source, hash, and hardware
-attribution boundary are recorded in [MODELS.md](MODELS.md).
+SOMA requires macOS 13 or later. On Apple Silicon, its bundled person and face
+models are both loaded with `cpuAndNeuralEngine`; GPU is excluded by that Core
+ML policy. Person observations are `coreml_ane`; close-range face observations
+are `coreml_ane_face`. The model source, hash, and hardware-attribution boundary
+are recorded in [MODELS.md](MODELS.md).
 
 Run it against explicit OBSBOT IDs:
 
@@ -92,9 +90,10 @@ swift run soma-subconscious --duration 30 \
 For an explicitly consented 50-second attention/VAD check, add
 `--guided-scenario`. The trace writes scheduled `scenario.phase` markers for
 five seconds to move out of frame, then quiet/out-of-frame, enter-and-move,
-speak-to-camera, exit-and-silence, and settle. Face-fallback observations are
-labeled `vision_face`. Markers record the protocol, not proof that an operator
-followed it.
+speak-to-camera, exit-and-silence, and settle. That historical trace predates
+the Core ML face replacement, so its face observations are labeled
+`vision_face`. Markers record the protocol, not proof that an operator followed
+it.
 
 ## P3 guided lifecycle evidence
 
@@ -151,7 +150,7 @@ per-frame or end-to-end latency SLO.
 
 ## P3 sensory-fusion baseline
 
-The current [p3-fusion-continuity-final.jsonl](artifacts/subconscious/p3-fusion-continuity-final.jsonl)
+The historical [p3-fusion-continuity-final.jsonl](artifacts/subconscious/p3-fusion-continuity-final.jsonl)
 is a 30.66-second capture-session OBSBOT run with no visible face or full body.
 It records 832 Core ML inferences (27.1/s), 158 throttled face-fallback
 inferences (5.2/s), and no raw media or late trace events. The Core ML model
@@ -164,3 +163,39 @@ after 96ms; a packet timestamp discontinuity resets the accumulation. The
 separate guided lifecycle trace above exercises the person-present, movement,
 speak, loss, and settle state transitions. It remains an activity gate, not a
 speech-quality classifier.
+
+## P4 ANE face, VAD, and direction baseline
+
+The 3.15-second [p4-ane-face-final-verified.jsonl](artifacts/subconscious/p4-ane-face-final-verified.jsonl)
+run on the connected OBSBOT configured both Core ML models with
+`cpu_and_neural_engine`: person prewarm 4.62 ms and BlazeFace prewarm 0.83 ms.
+It completed 91 person inferences and 16 face inferences; that scene contained
+no face observation. The pinned model's square reference face decodes to two
+candidates (top confidence 0.9998) in an offline, non-persisted check. The
+runtime has no `VNDetectFaceRectanglesRequest` path. This confirms loading,
+requested compute policy, and trace semantics—not a per-operation ANE
+attestation or face-detection accuracy benchmark.
+
+`soma-vad-eval` evaluates the exact local gate from a manifest of labelled WAV
+clips. The first ignored-local smoke corpus (four spoken-digit clips and two
+non-speech environmental clips) yielded block precision 0.646, recall 0.593,
+and F1 0.619. This small, mismatched corpus intentionally fails to qualify the
+gate as a reliable speech detector; see [VAD_EVALUATION.md](docs/VAD_EVALUATION.md)
+for the evaluator and its limits.
+
+For sound-origin attention only, collect a three-position calibration while
+speaking naturally at left, center, and right of the camera:
+
+```sh
+swift run soma-subconscious --duration 45 \
+  --video-id '<OBSBOT video unique ID>' \
+  --audio-id '<OBSBOT microphone unique ID>' \
+  --tdoa-calibrate artifacts/subconscious/tdoa-calibration.json \
+  --output artifacts/subconscious/tdoa-calibration-trace.jsonl
+```
+
+Then supply the scalar-only calibration file with `--tdoa-calibration`. The
+runtime emits `audio.direction` only for high-correlation, unambiguous,
+VAD-active audio; it writes no raw samples and still sends no pan/tilt command.
+This cue is for a future attention/actuator owner to consume, not speaker
+identity or exact angle.
