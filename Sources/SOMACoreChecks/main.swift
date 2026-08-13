@@ -88,12 +88,23 @@ for index in 0..<512 {
 }
 let rightDelayed = (0..<512).map { index in index >= 3 ? stereoSource[index - 3] : 0 }
 let rightAdvanced = (0..<512).map { index in index + 3 < stereoSource.count ? stereoSource[index + 3] : 0 }
+var rightFractionalDelayed: [Float] = []
+for index in 0..<512 {
+    if index >= 3 {
+        rightFractionalDelayed.append((stereoSource[index - 2] + stereoSource[index - 3]) / 2)
+    } else {
+        rightFractionalDelayed.append(0)
+    }
+}
 let leftMeasurement = StereoTDOAEstimator.measure(left: stereoSource, right: rightDelayed, sampleRateHz: 32_000)
 let centerMeasurement = StereoTDOAEstimator.measure(left: stereoSource, right: stereoSource, sampleRateHz: 32_000)
 let rightMeasurement = StereoTDOAEstimator.measure(left: stereoSource, right: rightAdvanced, sampleRateHz: 32_000)
+let fractionalMeasurement = StereoTDOAEstimator.measure(left: stereoSource, right: rightFractionalDelayed, sampleRateHz: 32_000)
 require(leftMeasurement?.lagSamples == 3, "TDOA did not recover a delayed right channel")
 require(centerMeasurement?.lagSamples == 0, "TDOA did not recover a centered source")
 require(rightMeasurement?.lagSamples == -3, "TDOA did not recover an advanced right channel")
+require(abs((fractionalMeasurement?.fractionalLagSamples ?? 0) - 2.5) < 0.20, "sub-sample TDOA did not recover a fractional delay")
+require((fractionalMeasurement?.zeroLagCorrelation ?? 1) < (fractionalMeasurement?.correlation ?? 0), "fractional delay did not distinguish zero-lag channel similarity")
 let periodicStereo = (0..<512).map { index in Float(index.isMultiple(of: 2) ? 1 : -1) }
 require(StereoTDOAEstimator.measure(left: periodicStereo, right: periodicStereo, sampleRateHz: 32_000) == nil, "ambiguous periodic stereo signal produced a direction")
 require(
@@ -128,6 +139,8 @@ let leftDiagnostic = calibrationDiagnostics.diagnostic(for: .left)
 require(leftDiagnostic.attempts == 7, "calibration diagnostic lost attempts")
 require(leftDiagnostic.accepted == 4 && leftDiagnostic.eligible == 3, "calibration diagnostic mixed accepted and eligible samples")
 require(leftDiagnostic.medianLagSamples == 3, "calibration diagnostic lost the eligible median lag")
+require(abs((leftDiagnostic.medianFractionalLagSamples ?? 0) - (leftMeasurement?.fractionalLagSamples ?? 0)) < 0.001, "calibration diagnostic lost the fractional median lag")
+require((leftDiagnostic.medianZeroLagCorrelation ?? 0) < 1, "calibration diagnostic lost zero-lag channel similarity")
 require(leftDiagnostic.ambiguous == 1 && leftDiagnostic.lowEnergy == 1 && leftDiagnostic.invalidInput == 1, "calibration diagnostic lost rejection reasons")
 require(calibrationDiagnostics.makeCalibration() != nil, "diagnostics could not produce a valid three-position calibration")
 let uncalibratedDirection = StereoTDOAEstimator(calibration: nil).estimate(left: stereoSource, right: rightDelayed, sampleRateHz: 32_000)

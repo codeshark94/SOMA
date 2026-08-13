@@ -270,6 +270,14 @@ state machine consider converting `reacquire` into motion.
 
 The calibration trace now records a scalar `calibration_summary` for each
 left/center/right phase: VAD-active analysis attempts, accepted measurements,
-those meeting the correlation threshold, and ambiguous/low-energy/invalid
+those meeting the correlation threshold, integer and fractional median lag,
+zero-lag absolute correlation magnitude, and ambiguous/low-energy/invalid
 rejections. A failed run is a diagnostic signal; do not lower the ambiguity or
 correlation gates merely to force a direction result.
+
+On 2026-08-13 the current OBSBOT macOS capture path produced zero fractional
+lag and a 1.000 rounded zero-lag absolute correlation magnitude at all three
+calibrated positions. This rules out this TDOA implementation as a source-direction input for the
+present configuration. Keep audio as non-directional `sound_present` evidence
+until a distinct microphone path is evaluated; do not convert it to a camera
+motion request.

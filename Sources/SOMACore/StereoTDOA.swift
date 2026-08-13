@@ -10,12 +10,22 @@ public enum AudioDirection: String, Codable, Sendable {
 public struct StereoTDOAMeasurement: Codable, Equatable, Sendable {
     public let sampleRateHz: Double
     public let lagSamples: Int
+    public let fractionalLagSamples: Double
     public let correlation: Double
+    public let zeroLagCorrelation: Double
 
-    public init(sampleRateHz: Double, lagSamples: Int, correlation: Double) {
+    public init(
+        sampleRateHz: Double,
+        lagSamples: Int,
+        fractionalLagSamples: Double? = nil,
+        correlation: Double,
+        zeroLagCorrelation: Double? = nil
+    ) {
         self.sampleRateHz = sampleRateHz
         self.lagSamples = lagSamples
+        self.fractionalLagSamples = fractionalLagSamples ?? Double(lagSamples)
         self.correlation = correlation
+        self.zeroLagCorrelation = zeroLagCorrelation ?? correlation
     }
 }
 
@@ -44,6 +54,8 @@ public struct TDOACalibrationDiagnostic: Equatable, Sendable {
     public let lowEnergy: Int
     public let invalidInput: Int
     public let medianLagSamples: Int?
+    public let medianFractionalLagSamples: Double?
+    public let medianZeroLagCorrelation: Double?
 
     public init(
         attempts: Int = 0,
@@ -52,7 +64,9 @@ public struct TDOACalibrationDiagnostic: Equatable, Sendable {
         ambiguous: Int = 0,
         lowEnergy: Int = 0,
         invalidInput: Int = 0,
-        medianLagSamples: Int? = nil
+        medianLagSamples: Int? = nil,
+        medianFractionalLagSamples: Double? = nil,
+        medianZeroLagCorrelation: Double? = nil
     ) {
         self.attempts = attempts
         self.accepted = accepted
@@ -61,6 +75,8 @@ public struct TDOACalibrationDiagnostic: Equatable, Sendable {
         self.lowEnergy = lowEnergy
         self.invalidInput = invalidInput
         self.medianLagSamples = medianLagSamples
+        self.medianFractionalLagSamples = medianFractionalLagSamples
+        self.medianZeroLagCorrelation = medianZeroLagCorrelation
     }
 }
 
@@ -79,18 +95,21 @@ public struct TDOACalibrationDiagnostics: Sendable {
             guard case let .measurement(measurement) = outcome else { return nil }
             return measurement
         }
-        let eligibleLags = accepted
+        let eligibleMeasurements = accepted
             .filter { $0.correlation >= StereoDirectionCalibration.minimumCorrelation }
-            .map(\.lagSamples)
-            .sorted()
+        let eligibleLags = eligibleMeasurements.map(\.lagSamples).sorted()
+        let eligibleFractionalLags = eligibleMeasurements.map(\.fractionalLagSamples).sorted()
+        let eligibleZeroLagCorrelations = eligibleMeasurements.map(\.zeroLagCorrelation).sorted()
         return TDOACalibrationDiagnostic(
             attempts: outcomes.count,
             accepted: accepted.count,
-            eligible: eligibleLags.count,
+            eligible: eligibleMeasurements.count,
             ambiguous: outcomes.count(where: { $0 == .rejected(.ambiguousPeak) }),
             lowEnergy: outcomes.count(where: { $0 == .rejected(.lowEnergy) }),
             invalidInput: outcomes.count(where: { $0 == .rejected(.invalidInput) }),
-            medianLagSamples: eligibleLags.isEmpty ? nil : eligibleLags[eligibleLags.count / 2]
+            medianLagSamples: eligibleLags.isEmpty ? nil : eligibleLags[eligibleLags.count / 2],
+            medianFractionalLagSamples: eligibleFractionalLags.isEmpty ? nil : eligibleFractionalLags[eligibleFractionalLags.count / 2],
+            medianZeroLagCorrelation: eligibleZeroLagCorrelations.isEmpty ? nil : eligibleZeroLagCorrelations[eligibleZeroLagCorrelations.count / 2]
         )
     }
 
@@ -161,7 +180,7 @@ public struct StereoDirectionCalibration: Codable, Equatable, Sendable {
     private static func medianLag(_ measurements: [StereoTDOAMeasurement], sampleRateHz: Double) -> Double? {
         let values = measurements
             .filter { abs($0.sampleRateHz - sampleRateHz) / sampleRateHz <= 0.05 && $0.correlation >= minimumCorrelation }
-            .map { Double($0.lagSamples) }
+            .map(\.fractionalLagSamples)
             .sorted()
         guard values.count >= 3 else { return nil }
         return values[values.count / 2]
@@ -172,6 +191,7 @@ public struct AudioDirectionEvidence: Codable, Equatable, Sendable {
     public let direction: AudioDirection
     public let confidence: Double
     public let lagSamples: Int?
+    public let fractionalLagSamples: Double?
     public let delayMilliseconds: Double?
     public let correlation: Double?
 
@@ -179,12 +199,14 @@ public struct AudioDirectionEvidence: Codable, Equatable, Sendable {
         direction: AudioDirection,
         confidence: Double,
         lagSamples: Int? = nil,
+        fractionalLagSamples: Double? = nil,
         delayMilliseconds: Double? = nil,
         correlation: Double? = nil
     ) {
         self.direction = direction
         self.confidence = min(max(confidence, 0), 1)
         self.lagSamples = lagSamples
+        self.fractionalLagSamples = fractionalLagSamples
         self.delayMilliseconds = delayMilliseconds
         self.correlation = correlation
     }
@@ -209,7 +231,7 @@ public struct StereoTDOAEstimator: Sendable {
         guard abs(halfSpan) >= 0.5 else {
             return AudioDirectionEvidence(direction: .unknown, confidence: 0)
         }
-        let position = min(max((Double(measurement.lagSamples) - calibration.centerLagSamples) / halfSpan, -1), 1)
+        let position = min(max((measurement.fractionalLagSamples - calibration.centerLagSamples) / halfSpan, -1), 1)
         let direction: AudioDirection
         if position <= -0.25 {
             direction = .left
@@ -223,7 +245,8 @@ public struct StereoTDOAEstimator: Sendable {
             direction: direction,
             confidence: confidence,
             lagSamples: measurement.lagSamples,
-            delayMilliseconds: Double(measurement.lagSamples) / sampleRateHz * 1_000,
+            fractionalLagSamples: measurement.fractionalLagSamples,
+            delayMilliseconds: measurement.fractionalLagSamples / sampleRateHz * 1_000,
             correlation: measurement.correlation
         )
     }
@@ -262,9 +285,10 @@ public struct StereoTDOAEstimator: Sendable {
             let correlation = abs(product / sqrt(leftEnergy * rightEnergy))
             candidates.append((lag: lag, correlation: correlation))
         }
-        guard let best = candidates.max(by: { $0.correlation < $1.correlation }) else {
+        guard let bestIndex = candidates.indices.max(by: { candidates[$0].correlation < candidates[$1].correlation }) else {
             return .rejected(.lowEnergy)
         }
+        let best = candidates[bestIndex]
         let competingCorrelation = candidates
             .filter { abs($0.lag - best.lag) > 1 }
             .map(\.correlation)
@@ -273,6 +297,26 @@ public struct StereoTDOAEstimator: Sendable {
         guard best.correlation - competingCorrelation >= 0.015 else {
             return .rejected(.ambiguousPeak)
         }
-        return .measurement(StereoTDOAMeasurement(sampleRateHz: sampleRateHz, lagSamples: best.lag, correlation: best.correlation))
+        let fractionalOffset: Double
+        if candidates.indices.contains(bestIndex - 1), candidates.indices.contains(bestIndex + 1) {
+            let before = candidates[bestIndex - 1].correlation
+            let after = candidates[bestIndex + 1].correlation
+            let denominator = before - 2 * best.correlation + after
+            if denominator < -Double.ulpOfOne {
+                fractionalOffset = min(max(0.5 * (before - after) / denominator, -0.5), 0.5)
+            } else {
+                fractionalOffset = 0
+            }
+        } else {
+            fractionalOffset = 0
+        }
+        let zeroLagCorrelation = candidates.first(where: { $0.lag == 0 })?.correlation ?? 0
+        return .measurement(StereoTDOAMeasurement(
+            sampleRateHz: sampleRateHz,
+            lagSamples: best.lag,
+            fractionalLagSamples: Double(best.lag) + fractionalOffset,
+            correlation: best.correlation,
+            zeroLagCorrelation: zeroLagCorrelation
+        ))
     }
 }

@@ -200,6 +200,7 @@ private struct AudioDirectionEvent: Encodable, Sendable {
     let direction: AudioDirection
     let confidence: Double
     let lagSamples: Int
+    let fractionalLagSamples: Double
     let delayMilliseconds: Double
     let correlation: Double
 }
@@ -573,6 +574,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
         let direction = directionEstimator.estimate(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz)
         guard direction.direction != .unknown,
               let lagSamples = direction.lagSamples,
+              let fractionalLagSamples = direction.fractionalLagSamples,
               let delayMilliseconds = direction.delayMilliseconds,
               let correlation = direction.correlation else { return }
         let directionalBelief = worldModel.ingestAudioDirection(
@@ -588,6 +590,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
                 direction: direction.direction,
                 confidence: direction.confidence,
                 lagSamples: lagSamples,
+                fractionalLagSamples: fractionalLagSamples,
                 delayMilliseconds: delayMilliseconds,
                 correlation: correlation
             ))
@@ -642,7 +645,9 @@ private final class TDOACalibrationRecorder: @unchecked Sendable {
         let summary = TDOACalibrationPosition.allCases.map { position in
             let diagnostic = diagnostics.diagnostic(for: position)
             let medianLag = diagnostic.medianLagSamples.map(String.init) ?? "none"
-            return "\(position.rawValue){attempts=\(diagnostic.attempts),accepted=\(diagnostic.accepted),eligible=\(diagnostic.eligible),lag_median=\(medianLag),ambiguous=\(diagnostic.ambiguous),low_energy=\(diagnostic.lowEnergy),invalid_input=\(diagnostic.invalidInput)}"
+            let fractionalLag = diagnostic.medianFractionalLagSamples.map { String(format: "%.3f", $0) } ?? "none"
+            let zeroLagCorrelation = diagnostic.medianZeroLagCorrelation.map { String(format: "%.3f", $0) } ?? "none"
+            return "\(position.rawValue){attempts=\(diagnostic.attempts),accepted=\(diagnostic.accepted),eligible=\(diagnostic.eligible),lag_median=\(medianLag),fractional_lag_median=\(fractionalLag),zero_lag_correlation_median=\(zeroLagCorrelation),ambiguous=\(diagnostic.ambiguous),low_energy=\(diagnostic.lowEnergy),invalid_input=\(diagnostic.invalidInput)}"
         }.joined(separator: ";")
         lock.unlock()
         return summary

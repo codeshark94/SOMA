@@ -202,9 +202,20 @@ identity or exact angle.
 
 Every calibration run writes a scalar-only `audio_tdoa=calibration_summary`
 health event for left, center, and right: VAD-active attempts, accepted and
-threshold-eligible measurements, median lag, and ambiguous/low-energy/invalid
-rejections. If calibration fails, use that summary to correct placement or
-speech coverage; do not relax the gates simply to produce a direction.
+threshold-eligible measurements, integer and fractional median lag, zero-lag
+absolute correlation magnitude, and ambiguous/low-energy/invalid rejections.
+Fractional lag is a local parabolic interpolation around one unambiguous
+correlation peak; it is not a direction result by itself. If calibration
+fails, use that summary to correct placement or speech coverage; do not relax
+the gates simply to produce a direction.
+
+The 2026-08-13 fractional OBSBOT check recorded 58/56/29 eligible speech
+measurements for left/center/right, respectively. All three phases had an
+integer median lag of 0, fractional median lag of 0.000 samples, and zero-lag
+absolute correlation magnitude rounded to 1.000. For this macOS capture path and placement, the
+two delivered channels contain no usable TDOA direction evidence. This does
+not make a general claim about every OBSBOT hardware/firmware mode, but it
+blocks audio-driven camera reaction in this configuration.
 
 ## Audiovisual attention field
 
