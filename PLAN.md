@@ -172,9 +172,11 @@ P1-P3 while leaving the camera owner as `manual`:
   dequeued latest frame; its full-body miss triggers an up-to-6Hz ANE-preferred
   BlazeFace inference. A pending face inference is not incorrectly treated as
   target-loss evidence.
-- The audio path uses a 96ms-confirmed local RMS/VAD gate. It does not perform
-  learned speech classification, ASR, or speaker ID. After a three-position
-  calibration it can emit left/center/right TDOA attention cues only.
+- The audio callback downmixes only ephemeral PCM and feeds a bounded
+  latest-audio worker. The worker runs local Core ML Silero VAD over 260 ms
+  windows with `cpuAndNeuralEngine` requested; it does not perform ASR or
+  speaker ID. After a three-position calibration it can emit left/center/right
+  TDOA attention cues only.
 - JSONL contains no raw audio/video. Source-health reports format-configuration
   fallback, runtime interruption/error, disconnect/reconnect, and clean stop.
 
@@ -215,9 +217,12 @@ It records 832 Core ML inferences (27.1/s), 158 face fallback inferences (5.2/s)
 `late_events_dropped=0`. Core ML averaged 17.05 ms and the maximum
 capture-to-belief latency was 390.98 ms. No person or face was visible, so it
 does not establish target retention, target loss, or speech detection quality.
-The VAD gate accumulates continuous PCM duration, resets on a packet timestamp
-discontinuity, opens after 96ms above threshold, and is deliberately non-learned
-until a separately evaluated on-device speech model replaces it.
+The former 96 ms RMS gate remains only as an evaluator baseline. Runtime voice
+evidence comes from local Core ML Silero VAD, which resets recurrent state on a
+packet discontinuity, evaluates 260 ms windows at a fixed 0.50 threshold, and
+uses a 520 ms inactive hangover. The model's source/hash and Core ML placement
+boundary are recorded in `MODELS.md`; requested compute units are not
+per-operation Neural Engine attestation.
 
 ## P3 guided lifecycle evidence
 
@@ -246,12 +251,12 @@ also rules out any hard real-time end-to-end claim.
 
 ## Immediate next action
 
-Run the consented 45-second three-position OBSBOT TDOA calibration and a
-speaker-present face scenario, then measure face-model p50/p95 and calibrated
-left/center/right stability. The small labelled VAD smoke corpus is a failure
-signal, not a threshold-selection result; replace it with a deployment-matched,
-consented corpus before relying on voice activity as a handoff cue. Separately,
-determine why macOS refuses the active 720p60 format.
+Collect a consented, deployment-matched multilingual VAD corpus with labelled
+speech, music, media playback, room noise, overlap, and distance conditions.
+Use held-out clips to set or reject the 0.50 threshold before relying on voice
+activity as a handoff cue. In parallel, run a speaker-present face scenario and
+measure face-model p50/p95; audio-driven camera reaction remains blocked by the
+failed OBSBOT TDOA calibration.
 
 ## P4 audiovisual attention field
 

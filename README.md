@@ -63,8 +63,10 @@ separate paths:
   frame. On a full-body miss it runs a separate ANE-preferred BlazeFace model
   at up to 6 Hz; intermediate misses are absence of new evidence, not a
   target-loss claim.
-- The audio callback uses a 96ms-confirmed local RMS/VAD gate only. It is
-  evidence for readiness, not a learned speech classifier or transcription.
+- The audio callback only downmixes ephemeral PCM and submits it to a bounded
+  mailbox. A local Core ML Silero VAD worker consumes 260 ms windows with
+  `cpuAndNeuralEngine` requested; it is evidence for readiness, not ASR or
+  transcription.
   A calibrated two-channel TDOA estimator can additionally emit local
   left/center/right attention cues; without calibration it emits `unknown`.
 
@@ -72,11 +74,12 @@ It emits local JSONL belief, voice-activity, vision-observation, metrics, and
 source-health events. It never writes raw media, invokes an LLM/network,
 enables native tracking, or sends PTZ/OSC/SDK commands.
 
-SOMA requires macOS 13 or later. On Apple Silicon, its bundled person and face
-models are both loaded with `cpuAndNeuralEngine`; GPU is excluded by that Core
-ML policy. Person observations are `coreml_ane`; close-range face observations
-are `coreml_ane_face`. The model source, hash, and hardware-attribution boundary
-are recorded in [MODELS.md](MODELS.md).
+SOMA requires macOS 13 or later. On Apple Silicon, its bundled person, face,
+and VAD models are loaded with `cpuAndNeuralEngine`; GPU is excluded by that
+Core ML policy. Person observations are `coreml_ane`; close-range face
+observations are `coreml_ane_face`; voice events are `coreml_vad`. The model
+source, hash, and hardware-attribution boundary are recorded in
+[MODELS.md](MODELS.md).
 
 Run it against explicit OBSBOT IDs:
 
@@ -176,12 +179,22 @@ runtime has no `VNDetectFaceRectanglesRequest` path. This confirms loading,
 requested compute policy, and trace semantics—not a per-operation ANE
 attestation or face-detection accuracy benchmark.
 
-`soma-vad-eval` evaluates the exact local gate from a manifest of labelled WAV
-clips. The first ignored-local smoke corpus (four spoken-digit clips and two
-non-speech environmental clips) yielded block precision 0.646, recall 0.593,
-and F1 0.619. This small, mismatched corpus intentionally fails to qualify the
-gate as a reliable speech detector; see [VAD_EVALUATION.md](docs/VAD_EVALUATION.md)
-for the evaluator and its limits.
+The runtime voice path now uses the bundled 16 kHz Core ML Silero VAD over
+260 ms windows, behind a latest-audio mailbox. Its voice events carry only
+`coreml_vad`, active state, probability, and RMS level; JSONL never stores PCM.
+The 6-second no-speech OBSBOT trace
+[p5-neural-vad-live.jsonl](artifacts/subconscious/p5-neural-vad-live.jsonl)
+completed 23 VAD inferences (mean 1.56 ms, maximum 2.43 ms; maximum
+window-end-to-evidence 3.02 ms) without superseding an audio VAD frame or
+writing a voice event. This proves bounded quiet-path operation, not speech
+quality or a human-onset latency below the model's 260 ms window.
+
+On the first ignored-local smoke corpus, the legacy RMS evaluator yielded
+precision 0.646, recall 0.593, and F1 0.619 on 16 ms blocks. The Core ML
+evaluator yielded F1 1.0 on only 43 independent 260 ms windows. Those scores
+are different units and this tiny, mismatched corpus does not qualify either
+model as a reliable field speech detector; see
+[VAD_EVALUATION.md](docs/VAD_EVALUATION.md) for the evaluator and limits.
 
 For sound-origin attention only, collect a three-position calibration while
 speaking naturally at left, center, and right of the camera:

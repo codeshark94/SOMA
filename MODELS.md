@@ -39,3 +39,29 @@ operations and has no public per-operation placement attestation. The trace
 therefore records requested compute policy and completed inference, not a claim
 that every operation ran on the Neural Engine. The exact conversion recipe is
 [`tools/convert_blazeface.py`](tools/convert_blazeface.py).
+
+## SileroVAD256ms
+
+- Package: `Sources/SOMAVADModel/Resources/SileroVAD256ms.mlmodelc`
+- Source package: [FluidInference/silero-vad-coreml](https://huggingface.co/FluidInference/silero-vad-coreml)
+  at `b419383c55c110e2c9271fa6ee0ea83d03c70d96`.
+- Upstream model: [snakers4/silero-vad](https://github.com/snakers4/silero-vad),
+  unified v6.2.1 VAD. The source package and upstream project declare MIT.
+- The bundled attribution and MIT notice are retained in
+  [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- Weight SHA-256: `53ecc8b5081146140ab654c89109cf001f2183abddd7a2411c5081feeffff063`.
+- Model SHA-256: `c6a9d1bf22d413265da0a07a1d14151c3ea2fad296b3aa5859275b33ef1c3270`
+  (`model.mil`); metadata SHA-256:
+  `2740be542c611e1ba358e1849b4e265c65cdf0b17192767e1e5de86a31ac94d6`.
+- Model: 16 kHz mono, recurrent 4,160-sample (260 ms) windows; scalar speech
+  probability plus 128-value hidden and cell states. SOMA uses a fixed 0.50
+  activation threshold and a 520 ms inactive hangover.
+
+SOMA loads this pre-converted Core ML package with
+`MLModelConfiguration.computeUnits = .cpuAndNeuralEngine`; no audio leaves the
+process and no model is downloaded at runtime. That setting excludes GPU and
+allows CPU fallback for unsupported operations. It is a requested execution
+policy—not proof that every layer, especially the recurrent layers, ran on the
+Neural Engine. The live trace separately records Core ML inference duration and
+window-end-to-evidence duration; a speech onset necessarily also waits for up
+to one 260 ms input window.

@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import Foundation
 import SOMACore
+import SOMAVADModel
 
 private enum EvaluationError: LocalizedError {
     case invalidArgument(String)
@@ -17,13 +18,41 @@ private enum EvaluationError: LocalizedError {
 
 private struct Options {
     let manifestURL: URL
+    let engine: Engine
 
     static func parse(_ arguments: [String]) throws -> Options {
-        guard arguments.count == 2, arguments[0] == "--manifest" else {
-            throw EvaluationError.invalidArgument("Usage: soma-vad-eval --manifest <labelled-audio.json>")
+        var manifestURL: URL?
+        var engine: Engine = .rms
+        var index = 0
+        while index < arguments.count {
+            switch arguments[index] {
+            case "--manifest":
+                index += 1
+                guard index < arguments.count else {
+                    throw EvaluationError.invalidArgument("--manifest requires a labelled-audio JSON path")
+                }
+                manifestURL = URL(fileURLWithPath: arguments[index])
+            case "--engine":
+                index += 1
+                guard index < arguments.count, let parsed = Engine(rawValue: arguments[index]) else {
+                    throw EvaluationError.invalidArgument("--engine must be rms or coreml")
+                }
+                engine = parsed
+            default:
+                throw EvaluationError.invalidArgument("Usage: soma-vad-eval --manifest <labelled-audio.json> [--engine rms|coreml]")
+            }
+            index += 1
         }
-        return Options(manifestURL: URL(fileURLWithPath: arguments[1]))
+        guard let manifestURL else {
+            throw EvaluationError.invalidArgument("Usage: soma-vad-eval --manifest <labelled-audio.json> [--engine rms|coreml]")
+        }
+        return Options(manifestURL: manifestURL, engine: engine)
     }
+}
+
+private enum Engine: String, Encodable {
+    case rms
+    case coreml
 }
 
 private enum Label: String, Codable {
@@ -89,13 +118,16 @@ private struct Counts: Encodable {
 }
 
 private struct EvaluationReport: Encodable {
-    let schemaVersion = 1
-    let blockMilliseconds = 16
+    let schemaVersion = 2
+    let engine: Engine
+    let unitMilliseconds: Int
+    let modelComputeUnits: String?
+    let modelWarmupMS: Double?
     let clips: [ClipReport]
     let counts: Counts
 }
 
-private func evaluate(_ clip: LabelledClip, baseURL: URL) throws -> (ClipReport, Counts) {
+private func openClip(_ clip: LabelledClip, baseURL: URL) throws -> (AVAudioPCMBuffer, AVAudioFormat) {
     let url = URL(fileURLWithPath: clip.path, relativeTo: baseURL).standardizedFileURL
     guard FileManager.default.fileExists(atPath: url.path) else {
         throw EvaluationError.invalidManifest("Missing labelled clip: \(url.path)")
@@ -116,10 +148,18 @@ private func evaluate(_ clip: LabelledClip, baseURL: URL) throws -> (ClipReport,
         throw EvaluationError.unreadableAudio("Unsupported PCM stream: \(url.path)")
     }
     try file.read(into: buffer)
-    guard let channelData = buffer.floatChannelData else {
+    guard buffer.floatChannelData != nil else {
         throw EvaluationError.unreadableAudio("No float PCM data: \(url.path)")
     }
 
+    return (buffer, format)
+}
+
+private func evaluateRMS(_ clip: LabelledClip, baseURL: URL) throws -> (ClipReport, Counts) {
+    let (buffer, format) = try openClip(clip, baseURL: baseURL)
+    guard let channelData = buffer.floatChannelData else {
+        throw EvaluationError.unreadableAudio("No float PCM data")
+    }
     let frameCount = Int(buffer.frameLength)
     let channelCount = Int(format.channelCount)
     let blockFrames = max(1, Int((format.sampleRate * 0.016).rounded()))
@@ -174,6 +214,84 @@ private func evaluate(_ clip: LabelledClip, baseURL: URL) throws -> (ClipReport,
     )
 }
 
+private func evaluateCoreML(_ clip: LabelledClip, baseURL: URL) throws -> (ClipReport, Counts, NeuralVoiceActivityDetector) {
+    let (buffer, format) = try openClip(clip, baseURL: baseURL)
+    guard let channelData = buffer.floatChannelData else {
+        throw EvaluationError.unreadableAudio("No float PCM data")
+    }
+    let frameCount = Int(buffer.frameLength)
+    let channelCount = Int(format.channelCount)
+    var mono: [Float] = []
+    mono.reserveCapacity(frameCount)
+    for frame in 0..<frameCount {
+        var sum: Float = 0
+        for channel in 0..<channelCount { sum += channelData[channel][frame] }
+        mono.append(sum / Float(channelCount))
+    }
+    let resampled = resample(mono, from: format.sampleRate, to: NeuralVoiceActivityDetector.targetSampleRateHz)
+    let detector = try NeuralVoiceActivityDetector()
+    var counts = Counts()
+    var activeWindows = 0
+    var onsetMS: Double?
+    var windowCount = 0
+    guard resampled.count >= NeuralVoiceActivityDetector.windowSampleCount else {
+        return (
+            ClipReport(id: clip.id, label: clip.label, sampleRateHz: format.sampleRate, blocks: 0, activeBlocks: 0, onsetMS: nil),
+            counts,
+            detector
+        )
+    }
+    for start in stride(from: 0, through: resampled.count - NeuralVoiceActivityDetector.windowSampleCount, by: NeuralVoiceActivityDetector.windowSampleCount) {
+        let end = start + NeuralVoiceActivityDetector.windowSampleCount
+        let endNS = UInt64((Double(end) / NeuralVoiceActivityDetector.targetSampleRateHz * 1_000_000_000).rounded())
+        let evidence = try detector.ingest(
+            samples: Array(resampled[start..<end]),
+            sampleRateHz: NeuralVoiceActivityDetector.targetSampleRateHz,
+            continuous: start > 0,
+            at: endNS
+        )
+        guard let result = evidence.last else { continue }
+        if result.active {
+            activeWindows += 1
+            if onsetMS == nil { onsetMS = Double(endNS) / 1_000_000 }
+        }
+        switch (clip.label, result.active) {
+        case (.speech, true): counts.truePositive += 1
+        case (.speech, false): counts.falseNegative += 1
+        case (.noise, true): counts.falsePositive += 1
+        case (.noise, false): counts.trueNegative += 1
+        }
+        windowCount += 1
+    }
+    return (
+        ClipReport(
+            id: clip.id,
+            label: clip.label,
+            sampleRateHz: format.sampleRate,
+            blocks: windowCount,
+            activeBlocks: activeWindows,
+            onsetMS: onsetMS
+        ),
+        counts,
+        detector
+    )
+}
+
+private func resample(_ samples: [Float], from sourceRateHz: Double, to targetRateHz: Double) -> [Float] {
+    guard sourceRateHz > 0, targetRateHz > 0, !samples.isEmpty else { return [] }
+    let outputCount = Int((Double(samples.count) * targetRateHz / sourceRateHz).rounded(.down))
+    var result: [Float] = []
+    result.reserveCapacity(outputCount)
+    for outputIndex in 0..<outputCount {
+        let sourcePosition = Double(outputIndex) * sourceRateHz / targetRateHz
+        let lower = min(Int(sourcePosition), samples.count - 1)
+        let upper = min(lower + 1, samples.count - 1)
+        let fraction = Float(sourcePosition - Double(lower))
+        result.append(samples[lower] + (samples[upper] - samples[lower]) * fraction)
+    }
+    return result
+}
+
 private func run(_ options: Options) throws {
     let data = try Data(contentsOf: options.manifestURL)
     let clips: [LabelledClip]
@@ -189,8 +307,21 @@ private func run(_ options: Options) throws {
     }
     var reports: [ClipReport] = []
     var totals = Counts()
+    var computeUnits: String?
+    var warmupMS: Double?
     for clip in clips {
-        let (report, counts) = try evaluate(clip, baseURL: options.manifestURL.deletingLastPathComponent())
+        let report: ClipReport
+        let counts: Counts
+        switch options.engine {
+        case .rms:
+            (report, counts) = try evaluateRMS(clip, baseURL: options.manifestURL.deletingLastPathComponent())
+        case .coreml:
+            let result = try evaluateCoreML(clip, baseURL: options.manifestURL.deletingLastPathComponent())
+            report = result.0
+            counts = result.1
+            computeUnits = result.2.computeUnits
+            warmupMS = result.2.warmupMS
+        }
         reports.append(report)
         totals.truePositive += counts.truePositive
         totals.falsePositive += counts.falsePositive
@@ -199,7 +330,15 @@ private func run(_ options: Options) throws {
     }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    print(String(decoding: try encoder.encode(EvaluationReport(clips: reports, counts: totals)), as: UTF8.self))
+    let unitMilliseconds = options.engine == .rms ? 16 : Int((Double(NeuralVoiceActivityDetector.windowSampleCount) / NeuralVoiceActivityDetector.targetSampleRateHz * 1_000).rounded())
+    print(String(decoding: try encoder.encode(EvaluationReport(
+        engine: options.engine,
+        unitMilliseconds: unitMilliseconds,
+        modelComputeUnits: computeUnits,
+        modelWarmupMS: warmupMS,
+        clips: reports,
+        counts: totals
+    )), as: UTF8.self))
 }
 
 do {

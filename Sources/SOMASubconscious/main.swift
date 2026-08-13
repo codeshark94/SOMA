@@ -5,6 +5,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import SOMACore
+import SOMAVADModel
 @preconcurrency import Vision
 
 private enum RuntimeError: LocalizedError {
@@ -189,6 +190,7 @@ private struct BeliefEvent: Encodable, Sendable {
 private struct VoiceEvent: Encodable, Sendable {
     let event = "voice.activity"
     let monotonicNS: UInt64
+    let source: String
     let active: Bool
     let confidence: Double
     let levelDB: Double
@@ -222,8 +224,10 @@ private struct MetricsEvent: Encodable, Sendable {
     let visionMisses: Int
     let visionFramesSkipped: Int
     let videoFramesSuperseded: Int
+    let audioVADFramesSuperseded: Int
     let neuralEngineInferences: Int
     let neuralFaceInferences: Int
+    let neuralVADInferences: Int
     let maximumVideoCallbackMS: Double
     let maximumAudioCallbackMS: Double
     let averageVideoCallbackMS: Double
@@ -234,6 +238,9 @@ private struct MetricsEvent: Encodable, Sendable {
     let maximumCaptureToBeliefMS: Double
     let averageNeuralEngineMS: Double
     let maximumNeuralEngineMS: Double
+    let averageNeuralVADMS: Double
+    let maximumNeuralVADMS: Double
+    let maximumVADWindowEndToEvidenceMS: Double
 }
 
 private protocol TraceEvent: Encodable, Sendable {
@@ -331,8 +338,10 @@ private final class LatencyCounters: @unchecked Sendable {
     private var visionMisses = 0
     private var visionFramesSkipped = 0
     private var supersededFrames = 0
+    private var supersededAudioVADFrames = 0
     private var neuralEngineInferences = 0
     private var neuralFaceInferences = 0
+    private var neuralVADInferences = 0
     private var previousVideoNS: UInt64?
     private var previousAudioNS: UInt64?
     private var maximumVideoCallbackMS = 0.0
@@ -345,6 +354,9 @@ private final class LatencyCounters: @unchecked Sendable {
     private var maximumCaptureToBeliefMS = 0.0
     private var totalNeuralEngineMS = 0.0
     private var maximumNeuralEngineMS = 0.0
+    private var totalNeuralVADMS = 0.0
+    private var maximumNeuralVADMS = 0.0
+    private var maximumVADWindowEndToEvidenceMS = 0.0
 
     func videoCallback(at now: UInt64, processingMS: Double) {
         lock.lock()
@@ -402,9 +414,24 @@ private final class LatencyCounters: @unchecked Sendable {
         lock.unlock()
     }
 
+    func neuralVADInference(inferenceMS: Double, windowEndToEvidenceMS: Double) {
+        lock.lock()
+        neuralVADInferences += 1
+        totalNeuralVADMS += inferenceMS
+        maximumNeuralVADMS = max(maximumNeuralVADMS, inferenceMS)
+        maximumVADWindowEndToEvidenceMS = max(maximumVADWindowEndToEvidenceMS, windowEndToEvidenceMS)
+        lock.unlock()
+    }
+
     func supersedeFrame() {
         lock.lock()
         supersededFrames += 1
+        lock.unlock()
+    }
+
+    func supersedeAudioVADFrame() {
+        lock.lock()
+        supersededAudioVADFrames += 1
         lock.unlock()
     }
 
@@ -419,8 +446,10 @@ private final class LatencyCounters: @unchecked Sendable {
             visionMisses: visionMisses,
             visionFramesSkipped: visionFramesSkipped,
             videoFramesSuperseded: supersededFrames,
+            audioVADFramesSuperseded: supersededAudioVADFrames,
             neuralEngineInferences: neuralEngineInferences,
             neuralFaceInferences: neuralFaceInferences,
+            neuralVADInferences: neuralVADInferences,
             maximumVideoCallbackMS: maximumVideoCallbackMS,
             maximumAudioCallbackMS: maximumAudioCallbackMS,
             averageVideoCallbackMS: videoCallbacks == 0 ? 0 : totalVideoCallbackMS / Double(videoCallbacks),
@@ -430,7 +459,10 @@ private final class LatencyCounters: @unchecked Sendable {
             maximumVisionMS: maximumVisionMS,
             maximumCaptureToBeliefMS: maximumCaptureToBeliefMS,
             averageNeuralEngineMS: neuralEngineInferences == 0 ? 0 : totalNeuralEngineMS / Double(neuralEngineInferences),
-            maximumNeuralEngineMS: maximumNeuralEngineMS
+            maximumNeuralEngineMS: maximumNeuralEngineMS,
+            averageNeuralVADMS: neuralVADInferences == 0 ? 0 : totalNeuralVADMS / Double(neuralVADInferences),
+            maximumNeuralVADMS: maximumNeuralVADMS,
+            maximumVADWindowEndToEvidenceMS: maximumVADWindowEndToEvidenceMS
         )
     }
 }
@@ -504,8 +536,128 @@ private final class BeliefPublisher: @unchecked Sendable {
     }
 }
 
+private final class AudioVADFrame: @unchecked Sendable {
+    let samples: [Float]
+    let sampleRateHz: Double
+    var continuous: Bool
+    let captureNS: UInt64
+    let levelDB: Double
+
+    init(samples: [Float], sampleRateHz: Double, continuous: Bool, captureNS: UInt64, levelDB: Double) {
+        self.samples = samples
+        self.sampleRateHz = sampleRateHz
+        self.continuous = continuous
+        self.captureNS = captureNS
+        self.levelDB = levelDB
+    }
+}
+
+private final class LatestAudioVADMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latest: AudioVADFrame?
+    private var signalPending = false
+    private var accepting = true
+
+    func publish(_ frame: AudioVADFrame) -> (shouldWake: Bool, superseded: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard accepting else { return (false, false) }
+        let superseded = latest != nil
+        if superseded { frame.continuous = false }
+        latest = frame
+        if signalPending { return (false, superseded) }
+        signalPending = true
+        return (true, superseded)
+    }
+
+    func take() -> AudioVADFrame? {
+        lock.lock()
+        defer { lock.unlock() }
+        signalPending = false
+        defer { latest = nil }
+        return latest
+    }
+
+    func stopAccepting() {
+        lock.lock()
+        accepting = false
+        latest = nil
+        lock.unlock()
+    }
+}
+
+private final class AudioVADWorker: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "soma.subconscious.audio-vad", qos: .userInitiated)
+    private let mailbox = LatestAudioVADMailbox()
+    private let detector: NeuralVoiceActivityDetector
+    private let stateLock = NSLock()
+    private let onEvidence: (NeuralVoiceActivityEvidence, AudioVADFrame, UInt64) -> Void
+    private let onError: (String) -> Void
+    private var active = false
+    private var errorReported = false
+
+    let computeUnits: String
+    let warmupMS: Double
+
+    init(
+        onEvidence: @escaping (NeuralVoiceActivityEvidence, AudioVADFrame, UInt64) -> Void,
+        onError: @escaping (String) -> Void
+    ) throws {
+        detector = try NeuralVoiceActivityDetector()
+        computeUnits = detector.computeUnits
+        warmupMS = detector.warmupMS
+        self.onEvidence = onEvidence
+        self.onError = onError
+    }
+
+    func submit(_ frame: AudioVADFrame) -> Bool {
+        let result = mailbox.publish(frame)
+        guard !result.superseded else { return true }
+        guard result.shouldWake else { return false }
+        queue.async { [weak self] in self?.processAvailable() }
+        return false
+    }
+
+    func currentActive() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return active
+    }
+
+    func stop() {
+        mailbox.stopAccepting()
+        queue.sync {}
+    }
+
+    private func processAvailable() {
+        while let frame = mailbox.take() {
+            do {
+                let evidence = try detector.ingest(
+                    samples: frame.samples,
+                    sampleRateHz: frame.sampleRateHz,
+                    continuous: frame.continuous,
+                    at: frame.captureNS
+                )
+                for result in evidence {
+                    stateLock.lock()
+                    active = result.active
+                    stateLock.unlock()
+                    onEvidence(result, frame, monotonicNanoseconds())
+                }
+            } catch {
+                detector.reset()
+                stateLock.lock()
+                active = false
+                let shouldReport = !errorReported
+                errorReported = true
+                stateLock.unlock()
+                if shouldReport { onError(error.localizedDescription) }
+            }
+        }
+    }
+}
+
 private final class AudioAnalyzer: @unchecked Sendable {
-    private let detector = VoiceActivityGate()
     private var previousAudioEndPTS: CMTime?
     private var nextDirectionAnalysisNS: UInt64 = 0
     private var lastDirection: AudioDirection = .unknown
@@ -515,12 +667,14 @@ private final class AudioAnalyzer: @unchecked Sendable {
     private let counters: LatencyCounters
     private let directionEstimator: StereoTDOAEstimator?
     private let calibrationRecorder: TDOACalibrationRecorder?
+    private let voiceWorker: AudioVADWorker
 
     init(
         worldModel: PredictiveWorldModel,
         publisher: BeliefPublisher,
         writer: JSONLWriter,
         counters: LatencyCounters,
+        voiceWorker: AudioVADWorker,
         directionEstimator: StereoTDOAEstimator?,
         calibrationRecorder: TDOACalibrationRecorder?
     ) {
@@ -528,6 +682,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
         self.publisher = publisher
         self.writer = writer
         self.counters = counters
+        self.voiceWorker = voiceWorker
         self.directionEstimator = directionEstimator
         self.calibrationRecorder = calibrationRecorder
     }
@@ -539,25 +694,18 @@ private final class AudioAnalyzer: @unchecked Sendable {
                 processingMS: milliseconds(from: now, to: monotonicNanoseconds())
             )
         }
-        guard let measurement = audioMeasurement(from: sampleBuffer) else { return }
-        let levelDB = 20 * log10(max(measurement.rms, 0.000_001))
-        let activity = detector.ingest(
-            levelDB: levelDB,
-            durationNS: measurement.durationNS,
-            continuous: audioPacketIsContinuous(sampleBuffer, durationNS: measurement.durationNS),
-            at: now
+        guard let audio = monoAudio(from: sampleBuffer) else { return }
+        let continuous = audioPacketIsContinuous(sampleBuffer, durationNS: audio.durationNS)
+        let frame = AudioVADFrame(
+            samples: audio.samples,
+            sampleRateHz: audio.sampleRateHz,
+            continuous: continuous,
+            captureNS: now,
+            levelDB: audio.levelDB
         )
-        let belief = worldModel.ingestVoice(active: activity.active, confidence: activity.confidence, at: now)
-        if activity.changed {
-            writer.write(VoiceEvent(
-                monotonicNS: now,
-                active: activity.active,
-                confidence: activity.confidence,
-                levelDB: levelDB
-            ))
-            publisher.publish(belief, reason: activity.active ? "voice_onset" : "voice_offset", force: true)
-        }
-        guard activity.active, now >= nextDirectionAnalysisNS else { return }
+        if voiceWorker.submit(frame) { counters.supersedeAudioVADFrame() }
+        if !continuous { lastDirection = .unknown }
+        guard voiceWorker.currentActive(), now >= nextDirectionAnalysisNS else { return }
         nextDirectionAnalysisNS = now + 125_000_000
         let stereoOutcome = stereoSamples(from: sampleBuffer)
         if let calibrationRecorder {
@@ -583,7 +731,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
             at: now
         )
         publisher.publish(directionalBelief, reason: "audio_direction")
-        if direction.direction != lastDirection || activity.changed {
+        if direction.direction != lastDirection {
             lastDirection = direction.direction
             writer.write(AudioDirectionEvent(
                 monotonicNS: now,
@@ -595,6 +743,10 @@ private final class AudioAnalyzer: @unchecked Sendable {
                 correlation: correlation
             ))
         }
+    }
+
+    func stop() {
+        voiceWorker.stop()
     }
 
     private func audioPacketIsContinuous(_ sampleBuffer: CMSampleBuffer, durationNS: UInt64) -> Bool {
@@ -1247,11 +1399,49 @@ private func run(_ options: Options) throws {
     let counters = LatencyCounters()
     let publisher = BeliefPublisher(writer: writer)
     let visionWorker = VisionWorker(worldModel: worldModel, publisher: publisher, writer: writer, counters: counters)
+    let voiceWorker = try AudioVADWorker(
+        onEvidence: { evidence, frame, completedNS in
+            if evidence.inferenceMS > 0 {
+                counters.neuralVADInference(
+                    inferenceMS: evidence.inferenceMS,
+                    windowEndToEvidenceMS: milliseconds(from: frame.captureNS, to: completedNS)
+                )
+            }
+            let belief = worldModel.ingestVoice(
+                active: evidence.active,
+                confidence: evidence.probability,
+                at: completedNS
+            )
+            guard evidence.changed else { return }
+            writer.write(VoiceEvent(
+                monotonicNS: completedNS,
+                source: "coreml_vad",
+                active: evidence.active,
+                confidence: evidence.probability,
+                levelDB: frame.levelDB
+            ))
+            publisher.publish(
+                belief,
+                reason: evidence.active ? "voice_onset" : "voice_offset",
+                force: true
+            )
+        },
+        onError: { message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "neural_vad",
+                state: "runtime_error",
+                message: message
+            ))
+        }
+    )
     let audioAnalyzer = AudioAnalyzer(
         worldModel: worldModel,
         publisher: publisher,
         writer: writer,
         counters: counters,
+        voiceWorker: voiceWorker,
         directionEstimator: loadedDirectionCalibration.map { StereoTDOAEstimator(calibration: $0) },
         calibrationRecorder: calibrationRecorder
     )
@@ -1300,6 +1490,18 @@ private func run(_ options: Options) throws {
         message: "\(identity(videoDevice).name); requested=\(selectedFormat.requested); \(selectedFormat.detail)"
     ))
     writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio", state: "selected", message: "\(identity(audioDevice).name)"))
+    let neuralVADConfiguration = String(
+        format: "model=silero_vad_unified_256ms_v6.2.1; compute_units=%@; warmup_ms=%.2f; window_ms=260; threshold=0.50",
+        voiceWorker.computeUnits,
+        voiceWorker.warmupMS
+    )
+    writer.write(RuntimeEvent(
+        event: "source.health",
+        monotonicNS: monotonicNanoseconds(),
+        source: "neural_vad",
+        state: "configured",
+        message: neuralVADConfiguration
+    ))
     if loadedDirectionCalibration != nil {
         writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "configured", message: "calibrated_stereo_tdoa"))
     } else if calibrationRecorder != nil {
@@ -1386,6 +1588,7 @@ private func run(_ options: Options) throws {
     videoQueue.sync {}
     audioQueue.sync {}
     visionWorker.stop()
+    audioAnalyzer.stop()
     observer.stop()
     let stoppedNS = monotonicNanoseconds()
     if let calibrationRecorder, let calibrationOutputURL = options.tdoaCalibrationOutputURL {
@@ -1455,7 +1658,9 @@ private func requestLowLatencyFormat(on device: AVCaptureDevice) throws -> Video
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
         device.activeFormat = selected.0
-        let frameDuration = CMTime(value: 1, timescale: 60)
+        let frameDuration = selected.0.videoSupportedFrameRateRanges
+            .min(by: { abs($0.maxFrameRate - 60) < abs($1.maxFrameRate - 60) })?
+            .minFrameDuration ?? CMTime(value: 1, timescale: 60)
         device.activeVideoMinFrameDuration = frameDuration
         device.activeVideoMaxFrameDuration = frameDuration
         return VideoConfiguration(requested: requested, applied: true, detail: "active_format_applied")
@@ -1516,7 +1721,14 @@ private final class AccessResult: @unchecked Sendable {
     var value: Bool { lock.lock(); defer { lock.unlock() }; return granted }
 }
 
-private func audioMeasurement(from sampleBuffer: CMSampleBuffer) -> (rms: Double, durationNS: UInt64)? {
+private struct MonoAudio {
+    let samples: [Float]
+    let sampleRateHz: Double
+    let durationNS: UInt64
+    let levelDB: Double
+}
+
+private func monoAudio(from sampleBuffer: CMSampleBuffer) -> MonoAudio? {
     guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
           asbd.mFormatID == kAudioFormatLinearPCM,
@@ -1552,33 +1764,39 @@ private func audioMeasurement(from sampleBuffer: CMSampleBuffer) -> (rms: Double
     let isFloat = (flags & kAudioFormatFlagIsFloat) != 0
     let isSignedInteger = (flags & kAudioFormatFlagIsSignedInteger) != 0
     let raw = UnsafeRawPointer(dataPointer)
-    var sumSquares = 0.0
-    var count = 0
+    var samples: [Float] = []
+    samples.reserveCapacity(frameCount)
     if isFloat, asbd.mBitsPerChannel == 32 {
-        let samples = raw.bindMemory(to: Float.self, capacity: totalLength / MemoryLayout<Float>.size)
+        let input = raw.bindMemory(to: Float.self, capacity: totalLength / MemoryLayout<Float>.size)
         for frame in 0..<frameCount {
             let base = frame * scalarStride
+            var sum: Float = 0
             for channel in 0..<valuesPerFrame {
-                let sample = Double(samples[base + channel])
-                sumSquares += sample * sample
-                count += 1
+                sum += input[base + channel]
             }
+            samples.append(sum / Float(valuesPerFrame))
         }
     } else if isSignedInteger, asbd.mBitsPerChannel == 16 {
-        let samples = raw.bindMemory(to: Int16.self, capacity: totalLength / MemoryLayout<Int16>.size)
+        let input = raw.bindMemory(to: Int16.self, capacity: totalLength / MemoryLayout<Int16>.size)
         for frame in 0..<frameCount {
             let base = frame * scalarStride
+            var sum: Float = 0
             for channel in 0..<valuesPerFrame {
-                let sample = Double(samples[base + channel]) / Double(Int16.max)
-                sumSquares += sample * sample
-                count += 1
+                sum += Float(input[base + channel]) / Float(Int16.max)
             }
+            samples.append(sum / Float(valuesPerFrame))
         }
     } else {
         return nil
     }
-    guard count > 0 else { return nil }
-    return (sqrt(sumSquares / Double(count)), durationNS)
+    guard !samples.isEmpty else { return nil }
+    let rms = sqrt(samples.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(samples.count))
+    return MonoAudio(
+        samples: samples,
+        sampleRateHz: asbd.mSampleRate,
+        durationNS: durationNS,
+        levelDB: 20 * log10(max(rms, 0.000_001))
+    )
 }
 
 private struct StereoSamples {

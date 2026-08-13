@@ -13,17 +13,21 @@ let package = Package(
     ],
     targets: [
         .target(name: "SOMACore"),
+        .target(
+            name: "SOMAVADModel",
+            resources: [.copy("Resources/SileroVAD256ms.mlmodelc")]
+        ),
         .executableTarget(name: "SOMAProbe"),
         .executableTarget(
             name: "SOMASubconscious",
-            dependencies: ["SOMACore"],
+            dependencies: ["SOMACore", "SOMAVADModel"],
             resources: [
                 .process("Resources/YOLOv3TinyFP16.mlmodel"),
                 .copy("Resources/BlazeFaceShortRange.mlpackage")
             ]
         ),
         .executableTarget(name: "SOMACoreChecks", dependencies: ["SOMACore"]),
-        .executableTarget(name: "SOMAVADEval", dependencies: ["SOMACore"]),
-        .testTarget(name: "SOMACoreTests", dependencies: ["SOMACore"]),
+        .executableTarget(name: "SOMAVADEval", dependencies: ["SOMACore", "SOMAVADModel"]),
+        .testTarget(name: "SOMACoreTests", dependencies: ["SOMACore", "SOMAVADModel"]),
     ]
 )
