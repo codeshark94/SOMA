@@ -14,7 +14,7 @@ private func rect(_ x: Double) -> NormalizedRect {
 
 let model = PredictiveWorldModel()
 let start: UInt64 = 1_000_000_000
-_ = model.ingestVisual(VisualObservation(rect: rect(0.30), confidence: 0.95, source: .detector), at: start)
+_ = model.ingestVisual(VisualObservation(rect: rect(0.30), confidence: 0.95, source: .faceDetector), at: start)
 _ = model.ingestVisual(VisualObservation(rect: rect(0.40), confidence: 0.95, source: .tracker), at: start + 100_000_000)
 let voiced = model.ingestVoice(active: true, confidence: 0.95, at: start + 120_000_000)
 require(voiced.targetStatus == .tracked, "visual target was not retained")
@@ -31,7 +31,7 @@ require(lost.targetStatus == .none, "stale target was not discarded")
 require(lost.policy == .hold, "loss did not return a safe hold policy")
 
 let reordered = PredictiveWorldModel()
-let first = reordered.ingestVisual(VisualObservation(rect: rect(0.25), confidence: 0.90, source: .detector), at: start + 100_000_000)
+let first = reordered.ingestVisual(VisualObservation(rect: rect(0.25), confidence: 0.90, source: .faceDetector), at: start + 100_000_000)
 let delayed = reordered.ingestVisual(VisualObservation(rect: rect(0.20), confidence: 0.90, source: .tracker), at: start + 50_000_000)
 require(delayed.monotonicNS == start + 100_000_000, "out-of-order evidence reversed belief time")
 require(delayed.target?.rect == first.target?.rect, "out-of-order evidence changed belief content")

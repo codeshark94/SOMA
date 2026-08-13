@@ -29,12 +29,14 @@ private struct Options {
     let videoID: String
     let audioID: String
     let outputURL: URL
+    let guidedScenario: Bool
 
     static func parse(_ arguments: [String]) throws -> Options {
         var duration: TimeInterval = 60
         var videoID: String?
         var audioID: String?
         var outputURL = defaultOutputURL()
+        var guidedScenario = false
         var index = 0
 
         while index < arguments.count {
@@ -65,6 +67,8 @@ private struct Options {
                     throw RuntimeError.invalidArgument("--output requires a trace path")
                 }
                 outputURL = URL(fileURLWithPath: arguments[index])
+            case "--guided-scenario":
+                guidedScenario = true
             case "--help", "-h":
                 printUsage()
                 Foundation.exit(EXIT_SUCCESS)
@@ -77,7 +81,10 @@ private struct Options {
         guard let videoID, let audioID else {
             throw RuntimeError.invalidArgument("--video-id and --audio-id are required. Use `swift run soma-probe --list-formats` first.")
         }
-        return Options(duration: duration, videoID: videoID, audioID: audioID, outputURL: outputURL)
+        if guidedScenario, duration != GuidedScenarioPhase.duration {
+            throw RuntimeError.invalidArgument("--guided-scenario requires --duration 50")
+        }
+        return Options(duration: duration, videoID: videoID, audioID: audioID, outputURL: outputURL, guidedScenario: guidedScenario)
     }
 
     private static func defaultOutputURL() -> URL {
@@ -86,6 +93,23 @@ private struct Options {
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("artifacts/subconscious/subconscious-\(stamp).jsonl")
     }
+}
+
+private struct GuidedScenarioPhase {
+    static let duration: TimeInterval = 50
+
+    let startsAfterSeconds: TimeInterval
+    let state: String
+    let instruction: String
+
+    static let phases = [
+        GuidedScenarioPhase(startsAfterSeconds: 0, state: "prepare_out_of_frame", instruction: "0-5s: move fully outside the frame and become silent"),
+        GuidedScenarioPhase(startsAfterSeconds: 5, state: "quiet_out_of_frame", instruction: "5-15s: remain outside the frame and silent"),
+        GuidedScenarioPhase(startsAfterSeconds: 15, state: "enter_and_move", instruction: "15-25s: enter the frame and move normally"),
+        GuidedScenarioPhase(startsAfterSeconds: 25, state: "speak_to_camera", instruction: "25-35s: face the camera and speak normally"),
+        GuidedScenarioPhase(startsAfterSeconds: 35, state: "exit_and_silence", instruction: "35-45s: leave the frame and remain silent"),
+        GuidedScenarioPhase(startsAfterSeconds: 45, state: "settle", instruction: "45-50s: remain out of frame and silent")
+    ]
 }
 
 private struct DeviceIdentity: Codable, Sendable {
@@ -724,7 +748,7 @@ private final class VisionWorker: @unchecked Sendable {
         let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         try handler.perform([faceRequest])
-        let faces = (faceRequest.results ?? []).map { VisualObservation(rect: SOMACore.NormalizedRect($0.boundingBox), confidence: Double($0.confidence), source: .detector) }
+        let faces = (faceRequest.results ?? []).map { VisualObservation(rect: SOMACore.NormalizedRect($0.boundingBox), confidence: Double($0.confidence), source: .faceDetector) }
         if let face = chooseAttentionCandidate(faces) {
             return .observation(face)
         }
@@ -954,14 +978,47 @@ private func run(_ options: Options) throws {
     visionWorker.start()
     session.startRunning()
     let startedNS = monotonicNanoseconds()
+    if options.guidedScenario, let firstPhase = GuidedScenarioPhase.phases.first {
+        writer.write(RuntimeEvent(
+            event: "scenario.phase",
+            monotonicNS: startedNS,
+            source: "guided_scenario",
+            state: firstPhase.state,
+            message: firstPhase.instruction
+        ))
+    }
+    var nextScenarioPhaseIndex = options.guidedScenario ? 1 : GuidedScenarioPhase.phases.count
     let complete = DispatchSemaphore(value: 0)
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "soma.subconscious.metrics"))
     timer.schedule(deadline: .now() + 1, repeating: 1)
     timer.setEventHandler {
         let now = monotonicNanoseconds()
+        let elapsed = Double(now - startedNS) / 1_000_000_000
+        while nextScenarioPhaseIndex < GuidedScenarioPhase.phases.count,
+              elapsed >= GuidedScenarioPhase.phases[nextScenarioPhaseIndex].startsAfterSeconds {
+            let phase = GuidedScenarioPhase.phases[nextScenarioPhaseIndex]
+            writer.write(RuntimeEvent(
+                event: "scenario.phase",
+                monotonicNS: now,
+                source: "guided_scenario",
+                state: phase.state,
+                message: phase.instruction
+            ))
+            nextScenarioPhaseIndex += 1
+        }
         writer.write(counters.snapshot(at: now))
         publisher.publish(worldModel.snapshot(at: now), reason: "periodic")
-        if Double(now - startedNS) / 1_000_000_000 >= options.duration {
+        if elapsed >= options.duration {
+            if options.guidedScenario {
+                writer.write(RuntimeEvent(
+                    event: "scenario.completed",
+                    monotonicNS: now,
+                    source: "guided_scenario",
+                    state: "capture_accepting_stopped",
+                    message: "scheduled_seconds=50"
+                ))
+            }
+            delegate.stopAccepting()
             timer.cancel()
             complete.signal()
         }
@@ -1154,7 +1211,7 @@ private func milliseconds(from earlier: UInt64, to later: UInt64) -> Double {
 private func monotonicNanoseconds() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
 private func printUsage() {
-    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--output trace.jsonl]")
+    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--guided-scenario] [--output trace.jsonl]")
 }
 
 do {

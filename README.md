@@ -89,6 +89,45 @@ swift run soma-subconscious --duration 30 \
   --output artifacts/subconscious/run.jsonl
 ```
 
+For an explicitly consented 50-second attention/VAD check, add
+`--guided-scenario`. The trace writes scheduled `scenario.phase` markers for
+five seconds to move out of frame, then quiet/out-of-frame, enter-and-move,
+speak-to-camera, exit-and-silence, and settle. Face-fallback observations are
+labeled `vision_face`. Markers record the protocol, not proof that an operator
+followed it.
+
+## P3 guided lifecycle evidence
+
+The [p3-guided-scenario-protocol-final.jsonl](artifacts/subconscious/p3-guided-scenario-protocol-final.jsonl)
+run records a 50.04-second capture acceptance interval, bounded by the
+`scenario.completed` event; later shutdown telemetry is not scored. Its first
+five seconds are an unscored move-out period and the final two seconds before
+entry are a transition buffer. In the scored 5–13 second quiet window there
+were zero visual observations and zero VAD transitions. The first ANE person
+observation followed the `enter_and_move` marker by 40 ms.
+
+During `speak_to_camera`, two local VAD onsets arrived 2.085 s and 4.663 s after
+the marker while a visual target was tracked; the first produced
+`handoff_candidate` with presence 0.74, voice 0.80, and readiness 0.61. The
+last visual observation preceded the `exit_and_silence` marker by 1.21 seconds;
+the predicted target became `none` 1.52 seconds after that last observation,
+matching the configured loss boundary. The final five-second settle window had
+zero visual observations and zero tracked beliefs.
+
+One local VAD onset also occurred 1.76 seconds before `speak_to_camera`; phase
+markers are scheduled protocol markers, not verified operator actions. At the
+acceptance cutoff the trace recorded 1,042 Core ML attempts. The final shutdown
+metric reports 1,043 because one in-flight Core ML inference completed during
+shutdown; it produced no post-cutoff visual or voice event.
+
+This is evidence that the local state machine responds coherently to the
+time-bounded protocol. It does not prove speaker identity, speech
+precision/recall, physical exit at the exact marker, or per-operation Neural
+Engine placement. The acceptance interval recorded 1,042 Core ML attempts
+(20.8/s), 191 visual observations (113 `coreml_ane`, 78 `vision_face`), and no
+raw media or late trace events; its maximum capture-to-belief latency was
+566.36 ms, so it is not an end-to-end real-time SLO.
+
 The latest 10-second trace is
 [p1-latency-final.jsonl](artifacts/subconscious/p1-latency-final.jsonl).
 Its callback averages were 0.37 ms (video) and 1.35 ms (audio). The connected
@@ -121,7 +160,7 @@ remained configured as `cpu_and_neural_engine`; its mean inference time was
 bounded latest-frame throughput result, not a hard end-to-end latency claim.
 
 The local VAD accumulates continuous PCM duration above threshold and opens only
-after 96ms; a packet timestamp discontinuity resets the accumulation. It emitted
-no activity onset in this trace. That is not a speech-quality result: a
-controlled person-present, ordinary-motion, leave-frame, and speak/silence
-scenario remains required before P2/P3 acceptance is claimed.
+after 96ms; a packet timestamp discontinuity resets the accumulation. The
+separate guided lifecycle trace above exercises the person-present, movement,
+speak, loss, and settle state transitions. It remains an activity gate, not a
+speech-quality classifier.

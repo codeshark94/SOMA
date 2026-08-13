@@ -202,14 +202,37 @@ The VAD gate accumulates continuous PCM duration, resets on a packet timestamp
 discontinuity, opens after 96ms above threshold, and is deliberately non-learned
 until a separately evaluated on-device speech model replaces it.
 
+## P3 guided lifecycle evidence
+
+`artifacts/subconscious/p3-guided-scenario-protocol-final.jsonl` provides a
+phase-marked 50.04-second capture acceptance interval. The five-second move-out
+period and two seconds before the entry marker are transition buffers. The
+scored quiet window (5–13 s) contains zero visual observations and zero VAD
+transitions. An ANE person observation arrived 40 ms after `enter_and_move`.
+
+In `speak_to_camera`, VAD opened at +2.085 s and +4.663 s while the visual target
+was tracked; the first onset produced `handoff_candidate` (presence 0.74,
+voice 0.80, readiness 0.61). After the final visual observation, target loss
+occurred at 1.52 seconds, consistent with the configured 1.5-second boundary;
+the settle window had zero visual observations and zero tracked beliefs. The
+acceptance cutoff records 1,042 Core ML attempts, 113 `coreml_ane` and 78
+`vision_face` observations, monotonic event timestamps, and
+`late_events_dropped=0`. One local VAD onset occurred 1.76 seconds before the
+speak marker; the markers describe the protocol, not verified human action.
+The final shutdown metric includes one in-flight Core ML inference (1,043 total)
+but no post-cutoff visual or voice event.
+
+This accepts the phase-bounded lifecycle behavior, not speaker identity,
+speech precision/recall, exact physical compliance with phase markers, or
+per-operation ANE attribution. Its 566.36 ms maximum capture-to-belief latency
+also rules out any hard real-time end-to-end claim.
+
 ## Immediate next action
 
-Run a consented person-present / ordinary-motion / target-loss / speak-silence
-scenario with phase markers and a visible operator. Verify ANE-person to
-close-range-face continuity, retained target ID, loss after the configured
-timeout, and VAD precision/recall. Only after that should P2/P3 be marked
-complete. Replace the variable-latency System Vision face fallback with a
-licensed Core ML face detector configured for `cpuAndNeuralEngine`, then measure
-its model-specific latency. Separately, determine why macOS refuses the active
-720p60 format; do not infer dual-microphone direction until a controlled TDOA
-calibration establishes stable left/right evidence.
+Replace the variable-latency System Vision face fallback with a licensed Core
+ML face detector configured for `cpuAndNeuralEngine`, then measure its
+model-specific p50/p95 latency. Independently measure VAD precision/recall with
+labelled speech/noise clips before treating it as a speech cue. Separately,
+determine why macOS refuses the active 720p60 format; do not infer dual-
+microphone direction until a controlled TDOA calibration establishes stable
+left/right evidence.

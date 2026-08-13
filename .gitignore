@@ -7,3 +7,4 @@ artifacts/*
 artifacts/subconscious/*
 !artifacts/subconscious/p3-ane-final.jsonl
 !artifacts/subconscious/p3-fusion-continuity-final.jsonl
+!artifacts/subconscious/p3-guided-scenario-protocol-final.jsonl
