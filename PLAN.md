@@ -236,3 +236,18 @@ left/center/right stability. The small labelled VAD smoke corpus is a failure
 signal, not a threshold-selection result; replace it with a deployment-matched,
 consented corpus before relying on voice activity as a handoff cue. Separately,
 determine why macOS refuses the active 720p60 format.
+
+## P4 audiovisual attention field
+
+The predictive model now records a version-2 `attention_cue` containing a
+route (`idle`, `visual`, `auditory`, or `audiovisual`), a left/center/right
+direction, and confidence. Visual target confidence and calibrated audio
+direction decay independently. Agreement fuses evidence; weak disagreement
+retains the visual target; only a substantially stronger audio cue emits the
+non-actuating `reacquire` policy. Audio alone never creates a visual identity.
+
+This is a hand-tuned continuous evidence field, not an LLM decision, random
+behavior, speaker identification, or a camera command. The next physical gate
+is still the three-position calibration plus a consented, deployment-matched
+VAD corpus. Only after those results are reviewed can a separate camera-owner
+state machine consider converting `reacquire` into motion.

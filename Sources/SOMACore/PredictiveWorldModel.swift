@@ -70,6 +70,25 @@ public enum TargetStatus: String, Codable, Sendable {
     case tracked
 }
 
+public enum AttentionRoute: String, Codable, Sendable {
+    case idle
+    case visual
+    case auditory
+    case audiovisual
+}
+
+public struct AttentionCue: Codable, Equatable, Sendable {
+    public let route: AttentionRoute
+    public let direction: AudioDirection
+    public let confidence: Double
+
+    public init(route: AttentionRoute, direction: AudioDirection, confidence: Double) {
+        self.route = route
+        self.direction = direction
+        self.confidence = clamp(confidence)
+    }
+}
+
 public struct AttentionTarget: Codable, Equatable, Sendable {
     public let id: String
     public let rect: NormalizedRect
@@ -91,6 +110,7 @@ public struct BeliefSnapshot: Codable, Equatable, Sendable {
     public let idleProbability: Double
     public let observingProbability: Double
     public let readyProbability: Double
+    public let attentionCue: AttentionCue
     public let policy: ActiveSensingPolicy
 }
 
@@ -104,8 +124,14 @@ public final class PredictiveWorldModel: @unchecked Sendable {
         var lastObservationNS: UInt64
     }
 
+    private struct AuditoryFocus {
+        var direction: AudioDirection
+        var confidence: Double
+    }
+
     private let lock = NSLock()
     private var target: TargetState?
+    private var auditoryFocus: AuditoryFocus?
     private var voiceProbability = 0.0
     private var uncertainty = 1.0
     private var surprise = 0.0
@@ -185,6 +211,38 @@ public final class PredictiveWorldModel: @unchecked Sendable {
     }
 
     @discardableResult
+    public func ingestAudioDirection(
+        _ direction: AudioDirection,
+        confidence: Double,
+        at monotonicNS: UInt64
+    ) -> BeliefSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        guard direction != .unknown, !isStale(monotonicNS) else { return currentSnapshot() }
+        let effectiveNS = orderedTimestamp(monotonicNS)
+        advance(to: effectiveNS)
+        let evidence = clamp(confidence)
+        guard evidence > 0 else { return makeSnapshot(at: effectiveNS) }
+
+        if let current = auditoryFocus, current.direction == direction {
+            auditoryFocus = AuditoryFocus(
+                direction: direction,
+                confidence: max(current.confidence * 0.70, evidence)
+            )
+        } else {
+            auditoryFocus = AuditoryFocus(direction: direction, confidence: evidence)
+        }
+
+        if let target, directionForVisual(target.rect) != direction {
+            surprise = max(surprise, evidence * 0.55)
+            uncertainty = min(1, uncertainty * 0.82 + evidence * 0.18)
+        } else {
+            uncertainty = max(0.03, uncertainty * 0.88 - evidence * 0.08)
+        }
+        return makeSnapshot(at: effectiveNS)
+    }
+
+    @discardableResult
     public func snapshot(at monotonicNS: UInt64) -> BeliefSnapshot {
         lock.lock()
         defer { lock.unlock() }
@@ -235,6 +293,10 @@ public final class PredictiveWorldModel: @unchecked Sendable {
         }
 
         voiceProbability *= exp(-elapsed / 0.42)
+        if var focus = auditoryFocus {
+            focus.confidence *= exp(-elapsed / 0.65)
+            auditoryFocus = focus.confidence < 0.08 ? nil : focus
+        }
         uncertainty = min(1, uncertainty + elapsed * 0.20)
         surprise *= exp(-elapsed / 0.30)
     }
@@ -242,16 +304,22 @@ public final class PredictiveWorldModel: @unchecked Sendable {
     private func makeSnapshot(at monotonicNS: UInt64) -> BeliefSnapshot {
         let presence = target?.confidence ?? 0
         let voice = voiceProbability
+        let attentionCue = makeAttentionCue()
         let idleScore = (1 - presence) * 2.2 + uncertainty * 0.30
         let observingScore = presence * 1.55 - voice * 0.35 - uncertainty * 0.15
-        let readyScore = presence * voice * 3.2 + surprise * 0.35 - uncertainty * 0.35
+        let readyEvidence = attentionCue.route == .audiovisual
+            ? max(voice, attentionCue.confidence)
+            : voice
+        let readyScore = presence * readyEvidence * 3.2 + surprise * 0.35 - uncertainty * 0.35
         let probabilities = softmax([idleScore, observingScore, readyScore])
         let informationGain = clamp(
-            uncertainty * presence * 0.75 + voice * presence * 0.45 + surprise * 0.35
+            uncertainty * presence * 0.75 + voice * presence * 0.45 + attentionCue.confidence * 0.25 + surprise * 0.35
         )
 
         let policy: ActiveSensingPolicy
-        if target == nil {
+        if attentionCue.route == .auditory {
+            policy = .reacquire
+        } else if target == nil {
             policy = .hold
         } else if uncertainty > 0.68 {
             policy = .reacquire
@@ -273,7 +341,7 @@ public final class PredictiveWorldModel: @unchecked Sendable {
             )
         }
         return BeliefSnapshot(
-            schemaVersion: 1,
+            schemaVersion: 2,
             monotonicNS: monotonicNS,
             targetStatus: attentionTarget == nil ? .none : .tracked,
             target: attentionTarget,
@@ -285,8 +353,43 @@ public final class PredictiveWorldModel: @unchecked Sendable {
             idleProbability: probabilities[0],
             observingProbability: probabilities[1],
             readyProbability: probabilities[2],
+            attentionCue: attentionCue,
             policy: policy
         )
+    }
+
+    private func makeAttentionCue() -> AttentionCue {
+        let visualDirection = target.map { directionForVisual($0.rect) }
+        let visualConfidence = target?.confidence ?? 0
+        let auditoryDirection = auditoryFocus?.direction ?? .unknown
+        let auditoryConfidence = auditoryFocus?.confidence ?? 0
+
+        guard auditoryDirection != .unknown, auditoryConfidence >= 0.20 else {
+            if let visualDirection {
+                return AttentionCue(route: .visual, direction: visualDirection, confidence: visualConfidence)
+            }
+            return AttentionCue(route: .idle, direction: .unknown, confidence: 0)
+        }
+        guard let visualDirection else {
+            return AttentionCue(route: .auditory, direction: auditoryDirection, confidence: auditoryConfidence)
+        }
+        if visualDirection == auditoryDirection {
+            return AttentionCue(
+                route: .audiovisual,
+                direction: visualDirection,
+                confidence: 1 - (1 - visualConfidence) * (1 - auditoryConfidence)
+            )
+        }
+        if auditoryConfidence > visualConfidence + 0.18 {
+            return AttentionCue(route: .auditory, direction: auditoryDirection, confidence: auditoryConfidence)
+        }
+        return AttentionCue(route: .visual, direction: visualDirection, confidence: visualConfidence)
+    }
+
+    private func directionForVisual(_ rect: NormalizedRect) -> AudioDirection {
+        if rect.centerX < 0.38 { return .left }
+        if rect.centerX > 0.62 { return .right }
+        return .center
     }
 }
 

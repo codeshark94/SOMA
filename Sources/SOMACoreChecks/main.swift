@@ -36,6 +36,28 @@ let delayed = reordered.ingestVisual(VisualObservation(rect: rect(0.20), confide
 require(delayed.monotonicNS == start + 100_000_000, "out-of-order evidence reversed belief time")
 require(delayed.target?.rect == first.target?.rect, "out-of-order evidence changed belief content")
 
+let audioOnly = PredictiveWorldModel()
+let auditoryCue = audioOnly.ingestAudioDirection(.right, confidence: 0.90, at: start)
+require(auditoryCue.attentionCue.route == .auditory, "audio-only evidence did not create an auditory cue")
+require(auditoryCue.attentionCue.direction == .right, "audio-only cue lost its direction")
+require(auditoryCue.policy == .reacquire, "audio-only cue did not request safe reacquisition")
+let expiredAuditoryCue = audioOnly.snapshot(at: start + 2_000_000_000)
+require(expiredAuditoryCue.attentionCue.route == .idle, "auditory cue did not decay to idle")
+
+let fusion = PredictiveWorldModel()
+_ = fusion.ingestVisual(VisualObservation(rect: rect(0.10), confidence: 0.75, source: .neuralFaceDetector), at: start)
+let fusedCue = fusion.ingestAudioDirection(.left, confidence: 0.80, at: start + 20_000_000)
+require(fusedCue.attentionCue.route == .audiovisual, "matching visual and audio evidence did not fuse")
+require(fusedCue.attentionCue.direction == .left, "fused cue lost its shared direction")
+let weakMismatch = fusion.ingestAudioDirection(.right, confidence: 0.80, at: start + 40_000_000)
+require(weakMismatch.attentionCue.route == .visual, "weak conflicting audio replaced a credible visual target")
+require(weakMismatch.targetStatus == .tracked, "conflicting audio discarded the visual target")
+let strongMismatch = fusion.ingestAudioDirection(.right, confidence: 1.0, at: start + 60_000_000)
+require(strongMismatch.attentionCue.route == .auditory, "strong conflicting audio did not become a reacquisition cue")
+require(strongMismatch.policy == .reacquire, "strong conflicting audio did not request safe reacquisition")
+require(strongMismatch.targetStatus == .tracked, "strong audio cue switched identity without visual evidence")
+require(strongMismatch.schemaVersion == 2, "audiovisual belief did not use the versioned schema")
+
 let voiceGate = VoiceActivityGate()
 let quiet: UInt64 = 4_000_000_000
 require(!voiceGate.ingest(levelDB: -45, durationNS: 16_000_000, continuous: false, at: quiet).active, "quiet room noise opened voice gate")

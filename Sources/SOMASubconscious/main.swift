@@ -480,6 +480,7 @@ private final class BeliefPublisher: @unchecked Sendable {
     private var lastPublishNS: UInt64 = 0
     private var lastPolicy: ActiveSensingPolicy?
     private var lastTargetStatus: TargetStatus?
+    private var lastAttentionCue: AttentionCue?
 
     init(writer: JSONLWriter) {
         self.writer = writer
@@ -491,7 +492,9 @@ private final class BeliefPublisher: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let changed = belief.policy != lastPolicy || belief.targetStatus != lastTargetStatus
+        let changed = belief.policy != lastPolicy
+            || belief.targetStatus != lastTargetStatus
+            || belief.attentionCue != lastAttentionCue
         let due = belief.monotonicNS - lastPublishNS >= 100_000_000
         guard force || changed || due else {
             lock.unlock()
@@ -500,6 +503,7 @@ private final class BeliefPublisher: @unchecked Sendable {
         lastPublishNS = belief.monotonicNS
         lastPolicy = belief.policy
         lastTargetStatus = belief.targetStatus
+        lastAttentionCue = belief.attentionCue
         lock.unlock()
         writer.write(BeliefEvent(monotonicNS: belief.monotonicNS, reason: reason, belief: belief))
     }
@@ -571,6 +575,12 @@ private final class AudioAnalyzer: @unchecked Sendable {
               let lagSamples = direction.lagSamples,
               let delayMilliseconds = direction.delayMilliseconds,
               let correlation = direction.correlation else { return }
+        let directionalBelief = worldModel.ingestAudioDirection(
+            direction.direction,
+            confidence: direction.confidence,
+            at: now
+        )
+        publisher.publish(directionalBelief, reason: "audio_direction")
         if direction.direction != lastDirection || activity.changed {
             lastDirection = direction.direction
             writer.write(AudioDirectionEvent(

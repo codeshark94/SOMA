@@ -59,5 +59,26 @@ final class PredictiveWorldModelTests: XCTestCase {
             accuracy: 0.000_001
         )
     }
+
+    func testAudiovisualCueFusesOnlyWhenDirectionsAgree() {
+        let model = PredictiveWorldModel()
+        let start: UInt64 = 4_000_000_000
+        _ = model.ingestVisual(
+            VisualObservation(
+                rect: NormalizedRect(x: 0.1, y: 0.3, width: 0.2, height: 0.3),
+                confidence: 0.75,
+                source: .neuralFaceDetector
+            ),
+            at: start
+        )
+
+        let fused = model.ingestAudioDirection(.left, confidence: 0.8, at: start + 20_000_000)
+        XCTAssertEqual(fused.attentionCue.route, .audiovisual)
+        XCTAssertEqual(fused.attentionCue.direction, .left)
+
+        let conflicting = model.ingestAudioDirection(.right, confidence: 0.8, at: start + 40_000_000)
+        XCTAssertEqual(conflicting.attentionCue.route, .visual)
+        XCTAssertEqual(conflicting.targetStatus, .tracked)
+    }
 }
 #endif

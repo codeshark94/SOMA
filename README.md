@@ -199,3 +199,32 @@ runtime emits `audio.direction` only for high-correlation, unambiguous,
 VAD-active audio; it writes no raw samples and still sends no pan/tilt command.
 This cue is for a future attention/actuator owner to consume, not speaker
 identity or exact angle.
+
+## Audiovisual attention field
+
+Belief schema version 2 adds an `attention_cue` with a route, direction, and
+confidence. It is a continuous, local evidence field rather than a random
+reaction or an LLM decision:
+
+- A credible visual target creates a decaying `visual` cue from its horizontal
+  screen position.
+- A calibrated, VAD-active TDOA estimate creates a decaying `auditory` cue.
+- Matching directions fuse into `audiovisual`, increasing confidence without
+  inventing a speaker identity.
+- Weak conflicting sound preserves the credible visual target. Only sound that
+  exceeds that target's confidence by 0.18 becomes an `auditory` `reacquire`
+  candidate; it never changes visual identity or moves the camera.
+- Auditory evidence fades with a 650 ms time constant and becomes `idle` below
+  0.08, so a single sound cannot hold attention indefinitely.
+
+The route is trace-only. Actual source-direction behavior remains blocked on
+the physical three-position TDOA calibration and a deployment-matched VAD
+evaluation; the current small VAD smoke corpus is not sufficient to authorize
+camera movement.
+
+The [p4-attention-field-idle.jsonl](artifacts/subconscious/p4-attention-field-idle.jsonl)
+four-second OBSBOT smoke run records 379 monotonic scalar events with belief
+schema version 2 and only `idle`/`visual` routes. Its health trace explicitly
+says `audio_tdoa=calibration_required`; it has zero `audio.direction` and zero
+camera-command events. It verifies the safe uncalibrated boundary, not sound
+localization or reaction quality.
