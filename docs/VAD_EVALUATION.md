@@ -35,3 +35,9 @@ Use a consented, deployment-matched corpus before selecting an operating
 threshold. The FSDD release is a small spoken-digit corpus, while ESC-50 is a
 manually extracted environmental-audio corpus; preserve each source's license
 and attribution when recreating or extending the corpus.
+
+The gate itself is language-neutral, but its operating quality is not assumed
+to be. A deployment corpus must label language or locale where known and report
+results by language and acoustic condition; Korean must not become an implicit
+default. Language identification, ASR, speaker identity, rapport, and personal
+memory are future L1 concerns and are intentionally outside this evaluator.

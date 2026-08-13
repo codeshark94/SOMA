@@ -96,6 +96,14 @@ require(centerMeasurement?.lagSamples == 0, "TDOA did not recover a centered sou
 require(rightMeasurement?.lagSamples == -3, "TDOA did not recover an advanced right channel")
 let periodicStereo = (0..<512).map { index in Float(index.isMultiple(of: 2) ? 1 : -1) }
 require(StereoTDOAEstimator.measure(left: periodicStereo, right: periodicStereo, sampleRateHz: 32_000) == nil, "ambiguous periodic stereo signal produced a direction")
+require(
+    StereoTDOAEstimator.assess(left: periodicStereo, right: periodicStereo, sampleRateHz: 32_000) == .rejected(.ambiguousPeak),
+    "ambiguous TDOA rejection was not diagnosable"
+)
+require(
+    StereoTDOAEstimator.assess(left: [], right: [], sampleRateHz: 32_000) == .rejected(.invalidInput),
+    "invalid TDOA input was not diagnosable"
+)
 let calibration = StereoDirectionCalibration.make(
     sampleRateHz: 32_000,
     left: Array(repeating: leftMeasurement!, count: 3),
@@ -103,6 +111,25 @@ let calibration = StereoDirectionCalibration.make(
     right: Array(repeating: rightMeasurement!, count: 3)
 )
 require(calibration != nil, "calibration rejected stable labelled TDOA measurements")
+var calibrationDiagnostics = TDOACalibrationDiagnostics()
+for _ in 0..<3 {
+    calibrationDiagnostics.record(position: .left, outcome: .measurement(leftMeasurement!))
+    calibrationDiagnostics.record(position: .center, outcome: .measurement(centerMeasurement!))
+    calibrationDiagnostics.record(position: .right, outcome: .measurement(rightMeasurement!))
+}
+calibrationDiagnostics.record(
+    position: .left,
+    outcome: .measurement(StereoTDOAMeasurement(sampleRateHz: 32_000, lagSamples: 2, correlation: 0.30))
+)
+calibrationDiagnostics.record(position: .left, outcome: .rejected(.ambiguousPeak))
+calibrationDiagnostics.record(position: .left, outcome: .rejected(.lowEnergy))
+calibrationDiagnostics.record(position: .left, outcome: .rejected(.invalidInput))
+let leftDiagnostic = calibrationDiagnostics.diagnostic(for: .left)
+require(leftDiagnostic.attempts == 7, "calibration diagnostic lost attempts")
+require(leftDiagnostic.accepted == 4 && leftDiagnostic.eligible == 3, "calibration diagnostic mixed accepted and eligible samples")
+require(leftDiagnostic.medianLagSamples == 3, "calibration diagnostic lost the eligible median lag")
+require(leftDiagnostic.ambiguous == 1 && leftDiagnostic.lowEnergy == 1 && leftDiagnostic.invalidInput == 1, "calibration diagnostic lost rejection reasons")
+require(calibrationDiagnostics.makeCalibration() != nil, "diagnostics could not produce a valid three-position calibration")
 let uncalibratedDirection = StereoTDOAEstimator(calibration: nil).estimate(left: stereoSource, right: rightDelayed, sampleRateHz: 32_000)
 require(uncalibratedDirection.direction == .unknown, "uncalibrated TDOA emitted a direction")
 let calibratedEstimator = StereoTDOAEstimator(calibration: calibration)

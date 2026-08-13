@@ -19,7 +19,110 @@ public struct StereoTDOAMeasurement: Codable, Equatable, Sendable {
     }
 }
 
+public enum StereoTDOARejection: String, Equatable, Sendable {
+    case invalidInput = "invalid_input"
+    case lowEnergy = "low_energy"
+    case ambiguousPeak = "ambiguous_peak"
+}
+
+public enum StereoTDOAMeasurementOutcome: Equatable, Sendable {
+    case measurement(StereoTDOAMeasurement)
+    case rejected(StereoTDOARejection)
+}
+
+public enum TDOACalibrationPosition: String, CaseIterable, Codable, Hashable, Sendable {
+    case left
+    case center
+    case right
+}
+
+public struct TDOACalibrationDiagnostic: Equatable, Sendable {
+    public let attempts: Int
+    public let accepted: Int
+    public let eligible: Int
+    public let ambiguous: Int
+    public let lowEnergy: Int
+    public let invalidInput: Int
+    public let medianLagSamples: Int?
+
+    public init(
+        attempts: Int = 0,
+        accepted: Int = 0,
+        eligible: Int = 0,
+        ambiguous: Int = 0,
+        lowEnergy: Int = 0,
+        invalidInput: Int = 0,
+        medianLagSamples: Int? = nil
+    ) {
+        self.attempts = attempts
+        self.accepted = accepted
+        self.eligible = eligible
+        self.ambiguous = ambiguous
+        self.lowEnergy = lowEnergy
+        self.invalidInput = invalidInput
+        self.medianLagSamples = medianLagSamples
+    }
+}
+
+public struct TDOACalibrationDiagnostics: Sendable {
+    private var outcomes: [TDOACalibrationPosition: [StereoTDOAMeasurementOutcome]] = [:]
+
+    public init() {}
+
+    public mutating func record(position: TDOACalibrationPosition, outcome: StereoTDOAMeasurementOutcome) {
+        outcomes[position, default: []].append(outcome)
+    }
+
+    public func diagnostic(for position: TDOACalibrationPosition) -> TDOACalibrationDiagnostic {
+        let outcomes = outcomes[position, default: []]
+        let accepted = outcomes.compactMap { outcome -> StereoTDOAMeasurement? in
+            guard case let .measurement(measurement) = outcome else { return nil }
+            return measurement
+        }
+        let eligibleLags = accepted
+            .filter { $0.correlation >= StereoDirectionCalibration.minimumCorrelation }
+            .map(\.lagSamples)
+            .sorted()
+        return TDOACalibrationDiagnostic(
+            attempts: outcomes.count,
+            accepted: accepted.count,
+            eligible: eligibleLags.count,
+            ambiguous: outcomes.count(where: { $0 == .rejected(.ambiguousPeak) }),
+            lowEnergy: outcomes.count(where: { $0 == .rejected(.lowEnergy) }),
+            invalidInput: outcomes.count(where: { $0 == .rejected(.invalidInput) }),
+            medianLagSamples: eligibleLags.isEmpty ? nil : eligibleLags[eligibleLags.count / 2]
+        )
+    }
+
+    public func makeCalibration() -> StereoDirectionCalibration? {
+        let allMeasurements = TDOACalibrationPosition.allCases.flatMap { position in
+            outcomes[position, default: []].compactMap { outcome -> StereoTDOAMeasurement? in
+                guard case let .measurement(measurement) = outcome else { return nil }
+                return measurement
+            }
+        }
+        let sampleRates = allMeasurements.map(\.sampleRateHz).sorted()
+        guard !sampleRates.isEmpty else { return nil }
+        let sampleRateHz = sampleRates[sampleRates.count / 2]
+        return StereoDirectionCalibration.make(
+            sampleRateHz: sampleRateHz,
+            left: measurements(for: .left),
+            center: measurements(for: .center),
+            right: measurements(for: .right)
+        )
+    }
+
+    private func measurements(for position: TDOACalibrationPosition) -> [StereoTDOAMeasurement] {
+        outcomes[position, default: []].compactMap { outcome in
+            guard case let .measurement(measurement) = outcome else { return nil }
+            return measurement
+        }
+    }
+}
+
 public struct StereoDirectionCalibration: Codable, Equatable, Sendable {
+    public static let minimumCorrelation = 0.45
+
     public let schemaVersion: Int
     public let sampleRateHz: Double
     public let leftLagSamples: Double
@@ -57,7 +160,7 @@ public struct StereoDirectionCalibration: Codable, Equatable, Sendable {
 
     private static func medianLag(_ measurements: [StereoTDOAMeasurement], sampleRateHz: Double) -> Double? {
         let values = measurements
-            .filter { abs($0.sampleRateHz - sampleRateHz) / sampleRateHz <= 0.05 && $0.correlation >= 0.45 }
+            .filter { abs($0.sampleRateHz - sampleRateHz) / sampleRateHz <= 0.05 && $0.correlation >= minimumCorrelation }
             .map { Double($0.lagSamples) }
             .sorted()
         guard values.count >= 3 else { return nil }
@@ -126,7 +229,16 @@ public struct StereoTDOAEstimator: Sendable {
     }
 
     public static func measure(left: [Float], right: [Float], sampleRateHz: Double) -> StereoTDOAMeasurement? {
-        guard sampleRateHz > 0, left.count == right.count, left.count >= 64 else { return nil }
+        switch assess(left: left, right: right, sampleRateHz: sampleRateHz) {
+        case let .measurement(measurement): return measurement
+        case .rejected: return nil
+        }
+    }
+
+    public static func assess(left: [Float], right: [Float], sampleRateHz: Double) -> StereoTDOAMeasurementOutcome {
+        guard sampleRateHz > 0, left.count == right.count, left.count >= 64 else {
+            return .rejected(.invalidInput)
+        }
         let count = left.count
         let meanLeft = left.reduce(0) { $0 + Double($1) } / Double(count)
         let meanRight = right.reduce(0) { $0 + Double($1) } / Double(count)
@@ -150,12 +262,17 @@ public struct StereoTDOAEstimator: Sendable {
             let correlation = abs(product / sqrt(leftEnergy * rightEnergy))
             candidates.append((lag: lag, correlation: correlation))
         }
-        guard let best = candidates.max(by: { $0.correlation < $1.correlation }) else { return nil }
+        guard let best = candidates.max(by: { $0.correlation < $1.correlation }) else {
+            return .rejected(.lowEnergy)
+        }
         let competingCorrelation = candidates
             .filter { abs($0.lag - best.lag) > 1 }
             .map(\.correlation)
             .max() ?? 0
-        guard best.correlation > 0, best.correlation - competingCorrelation >= 0.015 else { return nil }
-        return StereoTDOAMeasurement(sampleRateHz: sampleRateHz, lagSamples: best.lag, correlation: best.correlation)
+        guard best.correlation > 0 else { return .rejected(.lowEnergy) }
+        guard best.correlation - competingCorrelation >= 0.015 else {
+            return .rejected(.ambiguousPeak)
+        }
+        return .measurement(StereoTDOAMeasurement(sampleRateHz: sampleRateHz, lagSamples: best.lag, correlation: best.correlation))
     }
 }

@@ -159,12 +159,6 @@ private struct TDOACalibrationPhase {
     ]
 }
 
-private enum TDOACalibrationPosition: String, Sendable {
-    case left
-    case center
-    case right
-}
-
 private struct DeviceIdentity: Codable, Sendable {
     let name: String
     let uniqueID: String
@@ -564,11 +558,17 @@ private final class AudioAnalyzer: @unchecked Sendable {
         }
         guard activity.active, now >= nextDirectionAnalysisNS else { return }
         nextDirectionAnalysisNS = now + 125_000_000
-        guard let stereo = stereoSamples(from: sampleBuffer) else { return }
-        if let calibrationRecorder,
-           let measurement = StereoTDOAEstimator.measure(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz) {
-            calibrationRecorder.record(measurement)
+        let stereoOutcome = stereoSamples(from: sampleBuffer)
+        if let calibrationRecorder {
+            switch stereoOutcome {
+            case let .samples(stereo):
+                calibrationRecorder.record(
+                    StereoTDOAEstimator.assess(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz)
+                )
+            case let .rejected(reason): calibrationRecorder.record(.rejected(reason))
+            }
         }
+        guard case let .samples(stereo) = stereoOutcome else { return }
         guard let directionEstimator else { return }
         let direction = directionEstimator.estimate(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz)
         guard direction.direction != .unknown,
@@ -616,7 +616,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
 private final class TDOACalibrationRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var position: TDOACalibrationPosition = .left
-    private var measurements: [TDOACalibrationPosition: [StereoTDOAMeasurement]] = [:]
+    private var diagnostics = TDOACalibrationDiagnostics()
 
     func setPosition(_ position: TDOACalibrationPosition) {
         lock.lock()
@@ -624,25 +624,28 @@ private final class TDOACalibrationRecorder: @unchecked Sendable {
         lock.unlock()
     }
 
-    func record(_ measurement: StereoTDOAMeasurement) {
+    func record(_ outcome: StereoTDOAMeasurementOutcome) {
         lock.lock()
-        measurements[position, default: []].append(measurement)
+        diagnostics.record(position: position, outcome: outcome)
         lock.unlock()
     }
 
     func makeCalibration() -> StereoDirectionCalibration? {
         lock.lock()
-        let snapshot = measurements
+        let calibration = diagnostics.makeCalibration()
         lock.unlock()
-        let sampleRates = snapshot.values.flatMap { $0 }.map(\.sampleRateHz).sorted()
-        guard !sampleRates.isEmpty else { return nil }
-        let sampleRateHz = sampleRates[sampleRates.count / 2]
-        return StereoDirectionCalibration.make(
-            sampleRateHz: sampleRateHz,
-            left: snapshot[.left] ?? [],
-            center: snapshot[.center] ?? [],
-            right: snapshot[.right] ?? []
-        )
+        return calibration
+    }
+
+    func summary() -> String {
+        lock.lock()
+        let summary = TDOACalibrationPosition.allCases.map { position in
+            let diagnostic = diagnostics.diagnostic(for: position)
+            let medianLag = diagnostic.medianLagSamples.map(String.init) ?? "none"
+            return "\(position.rawValue){attempts=\(diagnostic.attempts),accepted=\(diagnostic.accepted),eligible=\(diagnostic.eligible),lag_median=\(medianLag),ambiguous=\(diagnostic.ambiguous),low_energy=\(diagnostic.lowEnergy),invalid_input=\(diagnostic.invalidInput)}"
+        }.joined(separator: ";")
+        lock.unlock()
+        return summary
     }
 }
 
@@ -1381,6 +1384,14 @@ private func run(_ options: Options) throws {
     observer.stop()
     let stoppedNS = monotonicNanoseconds()
     if let calibrationRecorder, let calibrationOutputURL = options.tdoaCalibrationOutputURL {
+        let diagnosticSummary = calibrationRecorder.summary()
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: stoppedNS,
+            source: "audio_tdoa",
+            state: "calibration_summary",
+            message: diagnosticSummary
+        ))
         if let calibration = calibrationRecorder.makeCalibration() {
             try write(calibration, to: calibrationOutputURL)
             writer.write(RuntimeEvent(
@@ -1396,7 +1407,7 @@ private func run(_ options: Options) throws {
                 monotonicNS: stoppedNS,
                 source: "audio_tdoa",
                 state: "calibration_failed",
-                message: "Need at least three high-correlation speech measurements at left, center, and right"
+                message: "Need at least three high-correlation speech measurements at left, center, and right; \(diagnosticSummary)"
             ))
         }
     }
@@ -1571,14 +1582,19 @@ private struct StereoSamples {
     let sampleRateHz: Double
 }
 
-private func stereoSamples(from sampleBuffer: CMSampleBuffer) -> StereoSamples? {
+private enum StereoSampleOutcome {
+    case samples(StereoSamples)
+    case rejected(StereoTDOARejection)
+}
+
+private func stereoSamples(from sampleBuffer: CMSampleBuffer) -> StereoSampleOutcome {
     guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
           asbd.mFormatID == kAudioFormatLinearPCM,
           asbd.mChannelsPerFrame >= 2,
           asbd.mSampleRate > 0,
           let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
-        return nil
+        return .rejected(.invalidInput)
     }
     var lengthAtOffset = 0
     var totalLength = 0
@@ -1587,18 +1603,18 @@ private func stereoSamples(from sampleBuffer: CMSampleBuffer) -> StereoSamples? 
         blockBuffer,
         atOffset: 0,
         lengthAtOffsetOut: &lengthAtOffset,
-        totalLengthOut: &totalLength,
-        dataPointerOut: &dataPointer
+          totalLengthOut: &totalLength,
+          dataPointerOut: &dataPointer
     ) == kCMBlockBufferNoErr,
           let dataPointer else {
-        return nil
+        return .rejected(.invalidInput)
     }
     let bytesPerSample = Int(asbd.mBitsPerChannel / 8)
     let bytesPerFrame = Int(asbd.mBytesPerFrame)
-    guard bytesPerSample > 0, bytesPerFrame >= bytesPerSample * 2 else { return nil }
+    guard bytesPerSample > 0, bytesPerFrame >= bytesPerSample * 2 else { return .rejected(.invalidInput) }
     let scalarStride = bytesPerFrame / bytesPerSample
     let frameCount = totalLength / bytesPerFrame
-    guard scalarStride >= 2, frameCount >= 64 else { return nil }
+    guard scalarStride >= 2, frameCount >= 64 else { return .rejected(.invalidInput) }
 
     var left: [Float] = []
     var right: [Float] = []
@@ -1621,9 +1637,9 @@ private func stereoSamples(from sampleBuffer: CMSampleBuffer) -> StereoSamples? 
             right.append(Float(samples[offset + 1]) / Float(Int16.max))
         }
     } else {
-        return nil
+        return .rejected(.invalidInput)
     }
-    return StereoSamples(left: left, right: right, sampleRateHz: asbd.mSampleRate)
+    return .samples(StereoSamples(left: left, right: right, sampleRateHz: asbd.mSampleRate))
 }
 
 private extension SOMACore.NormalizedRect {

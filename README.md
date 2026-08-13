@@ -200,6 +200,12 @@ VAD-active audio; it writes no raw samples and still sends no pan/tilt command.
 This cue is for a future attention/actuator owner to consume, not speaker
 identity or exact angle.
 
+Every calibration run writes a scalar-only `audio_tdoa=calibration_summary`
+health event for left, center, and right: VAD-active attempts, accepted and
+threshold-eligible measurements, median lag, and ambiguous/low-energy/invalid
+rejections. If calibration fails, use that summary to correct placement or
+speech coverage; do not relax the gates simply to produce a direction.
+
 ## Audiovisual attention field
 
 Belief schema version 2 adds an `attention_cue` with a route, direction, and
@@ -221,6 +227,11 @@ The route is trace-only. Actual source-direction behavior remains blocked on
 the physical three-position TDOA calibration and a deployment-matched VAD
 evaluation; the current small VAD smoke corpus is not sufficient to authorize
 camera movement.
+
+This L0 path is language-neutral. Future language identification, multilingual
+ASR, consented identity/session resolution, rapport, and scoped individual
+memory belong to L1. They may change response style or handoff priority, but
+cannot change L0 sensor permissions or authorize camera motion.
 
 The [p4-attention-field-idle.jsonl](artifacts/subconscious/p4-attention-field-idle.jsonl)
 four-second OBSBOT smoke run records 379 monotonic scalar events with belief

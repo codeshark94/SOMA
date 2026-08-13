@@ -129,6 +129,22 @@ No latency number is promised before P0 supplies the host-and-device baseline.
   separate from speaker identity and camera actuation.
 - Persistent memory, personality, dialogue, and outbound actions: L1/L2 work.
 
+## Language, identity, and memory boundary
+
+The subconscious is language-neutral: it may emit local evidence that a voice
+is active or comes from a calibrated direction, but it does not infer language,
+transcribe speech, identify a speaker, or retrieve a person record. VAD and
+TDOA evaluation must cover the deployment's expected languages and acoustic
+conditions; no Korean-only corpus may become the implicit production contract.
+
+L1 may later combine language evidence, a consented account/session identity
+candidate, and scoped memory retrieval. Identity remains `unknown` until an
+explicitly authorized signal establishes it; face or voice resemblance is not
+enough. Rapport and individual information may tune response timing and style,
+but cannot widen memory access, lower consent requirements, or authorize a
+camera/action command. The L0 attention field receives only bounded,
+non-semantic handoff evidence from that layer.
+
 ## P0 baseline captured
 
 P0 completed on 2026-08-13 with the connected OBSBOT Tiny 2 Lite. The
@@ -251,3 +267,9 @@ behavior, speaker identification, or a camera command. The next physical gate
 is still the three-position calibration plus a consented, deployment-matched
 VAD corpus. Only after those results are reviewed can a separate camera-owner
 state machine consider converting `reacquire` into motion.
+
+The calibration trace now records a scalar `calibration_summary` for each
+left/center/right phase: VAD-active analysis attempts, accepted measurements,
+those meeting the correlation threshold, and ambiguous/low-energy/invalid
+rejections. A failed run is a diagnostic signal; do not lower the ambiguity or
+correlation gates merely to force a direction result.
