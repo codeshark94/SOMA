@@ -141,6 +141,7 @@ private struct MetricsEvent: Encodable, Sendable {
     let visionFramesSkipped: Int
     let videoFramesSuperseded: Int
     let neuralEngineInferences: Int
+    let fallbackVisionInferences: Int
     let maximumVideoCallbackMS: Double
     let maximumAudioCallbackMS: Double
     let averageVideoCallbackMS: Double
@@ -248,6 +249,7 @@ private final class LatencyCounters: @unchecked Sendable {
     private var visionFramesSkipped = 0
     private var supersededFrames = 0
     private var neuralEngineInferences = 0
+    private var fallbackVisionInferences = 0
     private var previousVideoNS: UInt64?
     private var previousAudioNS: UInt64?
     private var maximumVideoCallbackMS = 0.0
@@ -311,6 +313,12 @@ private final class LatencyCounters: @unchecked Sendable {
         lock.unlock()
     }
 
+    func fallbackVisionInference() {
+        lock.lock()
+        fallbackVisionInferences += 1
+        lock.unlock()
+    }
+
     func supersedeFrame() {
         lock.lock()
         supersededFrames += 1
@@ -329,6 +337,7 @@ private final class LatencyCounters: @unchecked Sendable {
             visionFramesSkipped: visionFramesSkipped,
             videoFramesSuperseded: supersededFrames,
             neuralEngineInferences: neuralEngineInferences,
+            fallbackVisionInferences: fallbackVisionInferences,
             maximumVideoCallbackMS: maximumVideoCallbackMS,
             maximumAudioCallbackMS: maximumAudioCallbackMS,
             averageVideoCallbackMS: videoCallbacks == 0 ? 0 : totalVideoCallbackMS / Double(videoCallbacks),
@@ -408,34 +417,9 @@ private final class BeliefPublisher: @unchecked Sendable {
     }
 }
 
-private final class AdaptiveVoiceActivityDetector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var active = false
-    private var noiseFloorDB = -60.0
-    private var holdUntilNS: UInt64 = 0
-
-    func ingest(rms: Double, at now: UInt64) -> (active: Bool, confidence: Double, levelDB: Double, changed: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        let levelDB = 20 * log10(max(rms, 0.000_001))
-        if !active {
-            noiseFloorDB = noiseFloorDB * 0.985 + levelDB * 0.015
-        }
-        let threshold = max(noiseFloorDB + 11, -45)
-        let previous = active
-        if levelDB >= threshold {
-            active = true
-            holdUntilNS = now + 260_000_000
-        } else if now >= holdUntilNS {
-            active = false
-        }
-        let confidence = clamp((levelDB - threshold + 12) / 24)
-        return (active, confidence, levelDB, active != previous)
-    }
-}
-
 private final class AudioAnalyzer: @unchecked Sendable {
-    private let detector = AdaptiveVoiceActivityDetector()
+    private let detector = VoiceActivityGate()
+    private var previousAudioEndPTS: CMTime?
     private let worldModel: PredictiveWorldModel
     private let publisher: BeliefPublisher
     private let writer: JSONLWriter
@@ -455,18 +439,42 @@ private final class AudioAnalyzer: @unchecked Sendable {
                 processingMS: milliseconds(from: now, to: monotonicNanoseconds())
             )
         }
-        guard let rms = audioRMS(from: sampleBuffer) else { return }
-        let activity = detector.ingest(rms: rms, at: now)
+        guard let measurement = audioMeasurement(from: sampleBuffer) else { return }
+        let levelDB = 20 * log10(max(measurement.rms, 0.000_001))
+        let activity = detector.ingest(
+            levelDB: levelDB,
+            durationNS: measurement.durationNS,
+            continuous: audioPacketIsContinuous(sampleBuffer, durationNS: measurement.durationNS),
+            at: now
+        )
         let belief = worldModel.ingestVoice(active: activity.active, confidence: activity.confidence, at: now)
         if activity.changed {
             writer.write(VoiceEvent(
                 monotonicNS: now,
                 active: activity.active,
                 confidence: activity.confidence,
-                levelDB: activity.levelDB
+                levelDB: levelDB
             ))
             publisher.publish(belief, reason: activity.active ? "voice_onset" : "voice_offset", force: true)
         }
+    }
+
+    private func audioPacketIsContinuous(_ sampleBuffer: CMSampleBuffer, durationNS: UInt64) -> Bool {
+        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard presentationTime.isValid else {
+            previousAudioEndPTS = nil
+            return false
+        }
+        defer {
+            previousAudioEndPTS = CMTimeAdd(
+                presentationTime,
+                CMTime(value: Int64(durationNS), timescale: 1_000_000_000)
+            )
+        }
+        guard let previousAudioEndPTS else { return false }
+        let delta = CMTimeGetSeconds(CMTimeSubtract(presentationTime, previousAudioEndPTS))
+        let tolerance = max(0.004, Double(durationNS) / 1_000_000_000 * 0.25)
+        return delta.isFinite && abs(delta) <= tolerance
     }
 }
 
@@ -539,6 +547,12 @@ private final class ANEPersonDetector: @unchecked Sendable {
 }
 
 private final class VisionWorker: @unchecked Sendable {
+    private enum DetectionOutcome {
+        case observation(VisualObservation)
+        case miss
+        case pendingFallback
+    }
+
     private let mailbox = LatestFrameMailbox()
     private let wake = DispatchSemaphore(value: 0)
     private let queue = DispatchQueue(label: "soma.subconscious.vision", qos: .userInitiated)
@@ -549,6 +563,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let neuralDetector: ANEPersonDetector?
     private let stateLock = NSLock()
     private var detectorCountdown = 0
+    private var nextFallbackNS: UInt64 = 0
     private var trackerRect: CGRect?
     private var stopped = false
 
@@ -574,6 +589,24 @@ private final class VisionWorker: @unchecked Sendable {
                 monotonicNS: monotonicNanoseconds(),
                 source: "neural_engine",
                 state: "fallback_system_vision",
+                message: error.localizedDescription
+            ))
+        }
+        do {
+            let warmupMS = try Self.prewarmFallbackVision()
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "system_vision",
+                state: "prewarmed",
+                message: "close_range_fallback_ms=\(warmupMS)"
+            ))
+        } catch {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "system_vision",
+                state: "warmup_unavailable",
                 message: error.localizedDescription
             ))
         }
@@ -616,30 +649,33 @@ private final class VisionWorker: @unchecked Sendable {
     private func process(_ frame: VideoFrame) {
         let startedNS = monotonicNanoseconds()
         detectorCountdown -= 1
-        let observation: VisualObservation?
+        let outcome: DetectionOutcome
         do {
             if neuralDetector != nil {
-                observation = try detect(in: frame.pixelBuffer)
+                outcome = try detect(in: frame.pixelBuffer)
             } else if let trackerRect, detectorCountdown > 0,
                let tracked = try track(trackerRect, in: frame.pixelBuffer) {
                 self.trackerRect = tracked.rect.cgRect
-                observation = tracked
+                outcome = .observation(tracked)
             } else if detectorCountdown <= 0 {
                 detectorCountdown = 4
-                observation = try detect(in: frame.pixelBuffer)
-                trackerRect = observation?.rect.cgRect
+                outcome = try detect(in: frame.pixelBuffer)
+                if case let .observation(observation) = outcome {
+                    trackerRect = observation.rect.cgRect
+                }
             } else {
                 counters.visionFrameSkipped()
                 return
             }
         } catch {
-            observation = nil
+            outcome = .miss
         }
 
         let completedNS = monotonicNanoseconds()
         let inferenceMS = milliseconds(from: startedNS, to: completedNS)
         let captureToBeliefMS = milliseconds(from: frame.captureNS, to: completedNS)
-        if let observation {
+        switch outcome {
+        case let .observation(observation):
             let belief = worldModel.ingestVisual(observation, at: completedNS)
             counters.visionUpdate(inferenceMS: inferenceMS, captureToBeliefMS: captureToBeliefMS)
             writer.write(VisionEvent(
@@ -649,10 +685,12 @@ private final class VisionWorker: @unchecked Sendable {
                 captureToBeliefMS: captureToBeliefMS
             ))
             publisher.publish(belief, reason: observation.source.rawValue, force: true)
-        } else {
+        case .miss:
             let belief = worldModel.ingestVisionMiss(at: completedNS)
             counters.visionMiss(inferenceMS: inferenceMS, captureToBeliefMS: captureToBeliefMS)
             publisher.publish(belief, reason: "vision_miss")
+        case .pendingFallback:
+            counters.visionFrameSkipped()
         }
     }
 
@@ -669,21 +707,46 @@ private final class VisionWorker: @unchecked Sendable {
         return VisualObservation(rect: SOMACore.NormalizedRect(result.boundingBox), confidence: Double(result.confidence), source: .tracker)
     }
 
-    private func detect(in pixelBuffer: CVPixelBuffer) throws -> VisualObservation? {
+    private func detect(in pixelBuffer: CVPixelBuffer) throws -> DetectionOutcome {
         if let neuralDetector {
             let startedNS = monotonicNanoseconds()
             let candidates = try neuralDetector.detect(in: pixelBuffer)
             counters.neuralEngineInference(inferenceMS: milliseconds(from: startedNS, to: monotonicNanoseconds()))
-            return chooseAttentionCandidate(candidates)
+            if let neuralCandidate = chooseAttentionCandidate(candidates) {
+                nextFallbackNS = 0
+                return .observation(neuralCandidate)
+            }
+            let now = monotonicNanoseconds()
+            guard now >= nextFallbackNS else { return .pendingFallback }
+            nextFallbackNS = now + 166_666_667
         }
-        let humanRequest = VNDetectHumanRectanglesRequest()
+        counters.fallbackVisionInference()
         let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        try handler.perform([humanRequest, faceRequest])
-        let humans = (humanRequest.results ?? []).map { VisualObservation(rect: SOMACore.NormalizedRect($0.boundingBox), confidence: Double($0.confidence), source: .detector) }
+        try handler.perform([faceRequest])
         let faces = (faceRequest.results ?? []).map { VisualObservation(rect: SOMACore.NormalizedRect($0.boundingBox), confidence: Double($0.confidence), source: .detector) }
-        let candidates = !humans.isEmpty ? humans : faces
-        return chooseAttentionCandidate(candidates)
+        if let face = chooseAttentionCandidate(faces) {
+            return .observation(face)
+        }
+        return .miss
+    }
+
+    private static func prewarmFallbackVision() throws -> Double {
+        var pixelBuffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            416,
+            416,
+            kCVPixelFormatType_32BGRA,
+            nil,
+            &pixelBuffer
+        ) == kCVReturnSuccess, let pixelBuffer else {
+            throw RuntimeError.configuration("Cannot allocate System Vision warmup frame")
+        }
+        let startedNS = monotonicNanoseconds()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        try handler.perform([VNDetectFaceRectanglesRequest()])
+        return milliseconds(from: startedNS, to: monotonicNanoseconds())
     }
 
     private func chooseAttentionCandidate(_ candidates: [VisualObservation]) -> VisualObservation? {
@@ -1002,7 +1065,7 @@ private final class AccessResult: @unchecked Sendable {
     var value: Bool { lock.lock(); defer { lock.unlock() }; return granted }
 }
 
-private func audioRMS(from sampleBuffer: CMSampleBuffer) -> Double? {
+private func audioMeasurement(from sampleBuffer: CMSampleBuffer) -> (rms: Double, durationNS: UInt64)? {
     guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
           asbd.mFormatID == kAudioFormatLinearPCM,
@@ -1030,7 +1093,9 @@ private func audioRMS(from sampleBuffer: CMSampleBuffer) -> Double? {
     let scalarStride = max(1, bytesPerFrame / bytesPerSample)
     let valuesPerFrame = min(max(1, Int(asbd.mChannelsPerFrame)), scalarStride)
     let frameCount = totalLength / bytesPerFrame
-    guard frameCount > 0 else { return nil }
+    guard frameCount > 0, asbd.mSampleRate > 0 else { return nil }
+    let durationNS = UInt64((Double(frameCount) / asbd.mSampleRate * 1_000_000_000).rounded())
+    guard durationNS > 0 else { return nil }
 
     let flags = asbd.mFormatFlags
     let isFloat = (flags & kAudioFormatFlagIsFloat) != 0
@@ -1062,7 +1127,7 @@ private func audioRMS(from sampleBuffer: CMSampleBuffer) -> Double? {
         return nil
     }
     guard count > 0 else { return nil }
-    return sqrt(sumSquares / Double(count))
+    return (sqrt(sumSquares / Double(count)), durationNS)
 }
 
 private extension SOMACore.NormalizedRect {

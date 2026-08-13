@@ -59,20 +59,25 @@ separate paths:
 
 - The video callback advances a persistent predictive belief and replaces the
   pending Vision frame rather than queueing it.
-- The Vision worker re-detects at a low rate when no target exists, then uses a
-  fast tracker between periodic detector refreshes.
-- The audio callback computes local RMS/VAD only. It is evidence for readiness,
-  not transcription or speaker direction.
+- The Vision worker runs the ANE-preferred person model on each dequeued latest
+  frame.
+  On a full-body miss, it obtains a low-rate close-range face observation;
+  intermediate misses are absence of new evidence, not a target-loss claim.
+- The audio callback uses a 96ms-confirmed local RMS/VAD gate only. It is
+  evidence for readiness, not a learned speech classifier, transcription, or
+  speaker direction.
 
 It emits local JSONL belief, voice-activity, vision-observation, metrics, and
 source-health events. It never writes raw media, invokes an LLM/network,
 enables native tracking, or sends PTZ/OSC/SDK commands.
 
 SOMA requires macOS 13 or later. On Apple Silicon, person detection is a bundled
-Core ML YOLOv3Tiny FP16 model loaded with `cpuAndNeuralEngine`; GPU is excluded.
+Core ML YOLOv3Tiny FP16 model loaded with `cpuAndNeuralEngine`; GPU is excluded
+for that Core ML model.
 The model evaluates the latest available video frames and accepts only the
-`person` class. System Vision tracking is retained only as a compatibility
-fallback if the Core ML model cannot load. The model source, hash, and hardware
+`person` class. When that full-body detector has no candidate, a throttled
+up-to-6Hz System Vision face fallback supports close-up conversation distance;
+it does not replace the ANE primary path. The model source, hash, and hardware
 attribution boundary are recorded in [MODELS.md](MODELS.md).
 
 Run it against explicit OBSBOT IDs:
@@ -104,3 +109,19 @@ ML inferences (about 22.0/s), emitted 45 `coreml_ane` observations, and averaged
 30.68 ms per Core ML inference. The maximum was 415.67 ms, so this is evidence
 of ANE-preferred execution and bounded frame replacement, not a guaranteed
 per-frame or end-to-end latency SLO.
+
+## P3 sensory-fusion baseline
+
+The current [p3-fusion-continuity-final.jsonl](artifacts/subconscious/p3-fusion-continuity-final.jsonl)
+is a 30.66-second capture-session OBSBOT run with no visible face or full body.
+It records 832 Core ML inferences (27.1/s), 158 throttled face-fallback
+inferences (5.2/s), and no raw media or late trace events. The Core ML model
+remained configured as `cpu_and_neural_engine`; its mean inference time was
+17.05 ms. The worst capture-to-belief measurement was 390.98 ms, so this is a
+bounded latest-frame throughput result, not a hard end-to-end latency claim.
+
+The local VAD accumulates continuous PCM duration above threshold and opens only
+after 96ms; a packet timestamp discontinuity resets the accumulation. It emitted
+no activity onset in this trace. That is not a speech-quality result: a
+controlled person-present, ordinary-motion, leave-frame, and speak/silence
+scenario remains required before P2/P3 acceptance is claimed.

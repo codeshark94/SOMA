@@ -3,7 +3,7 @@ import SOMACore
 
 private func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     guard condition() else {
-        fputs("soma-core-check: \\(message)\\n", stderr)
+        fputs("soma-core-check: \(message)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }
@@ -35,4 +35,26 @@ let first = reordered.ingestVisual(VisualObservation(rect: rect(0.25), confidenc
 let delayed = reordered.ingestVisual(VisualObservation(rect: rect(0.20), confidence: 0.90, source: .tracker), at: start + 50_000_000)
 require(delayed.monotonicNS == start + 100_000_000, "out-of-order evidence reversed belief time")
 require(delayed.target?.rect == first.target?.rect, "out-of-order evidence changed belief content")
+
+let voiceGate = VoiceActivityGate()
+let quiet: UInt64 = 4_000_000_000
+require(!voiceGate.ingest(levelDB: -45, durationNS: 16_000_000, continuous: false, at: quiet).active, "quiet room noise opened voice gate")
+require(!voiceGate.ingest(levelDB: -20, durationNS: 16_000_000, continuous: true, at: quiet + 16_000_000).active, "voice gate opened without onset confirmation")
+require(!voiceGate.ingest(levelDB: -20, durationNS: 16_000_000, continuous: true, at: quiet + 32_000_000).active, "voice gate opened before 96ms")
+require(!voiceGate.ingest(levelDB: -20, durationNS: 16_000_000, continuous: true, at: quiet + 48_000_000).active, "voice gate opened before 96ms")
+require(!voiceGate.ingest(levelDB: -20, durationNS: 16_000_000, continuous: true, at: quiet + 64_000_000).active, "voice gate opened before 96ms")
+require(!voiceGate.ingest(levelDB: -20, durationNS: 16_000_000, continuous: true, at: quiet + 80_000_000).active, "voice gate opened before 96ms")
+require(voiceGate.ingest(levelDB: -20, durationNS: 16_000_000, continuous: true, at: quiet + 96_000_000).active, "sustained voice did not open gate")
+require(voiceGate.ingest(levelDB: -60, durationNS: 16_000_000, continuous: true, at: quiet + 400_000_000).active, "voice gate closed before hangover")
+require(!voiceGate.ingest(levelDB: -60, durationNS: 16_000_000, continuous: true, at: quiet + 700_000_000).active, "voice gate did not close after hangover")
+
+let durationGate = VoiceActivityGate()
+require(!durationGate.ingest(levelDB: -20, durationNS: 48_000_000, continuous: false, at: quiet).active, "voice gate opened before 96ms of audio")
+require(!durationGate.ingest(levelDB: -20, durationNS: 32_000_000, continuous: true, at: quiet + 48_000_000).active, "voice gate counted callbacks instead of audio duration")
+require(durationGate.ingest(levelDB: -20, durationNS: 16_000_000, continuous: true, at: quiet + 80_000_000).active, "voice gate did not accumulate audio duration")
+
+let discontinuousGate = VoiceActivityGate()
+require(!discontinuousGate.ingest(levelDB: -20, durationNS: 48_000_000, continuous: false, at: quiet).active, "voice gate opened before 96ms")
+require(!discontinuousGate.ingest(levelDB: -20, durationNS: 48_000_000, continuous: false, at: quiet + 80_000_000).active, "voice gate bridged an audio discontinuity")
+require(discontinuousGate.ingest(levelDB: -20, durationNS: 48_000_000, continuous: true, at: quiet + 128_000_000).active, "voice gate did not resume after continuous audio")
 print("soma-core-check: PASS")

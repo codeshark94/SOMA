@@ -151,10 +151,12 @@ P1-P3 while leaving the camera owner as `manual`:
   surprise, voice evidence, interaction probabilities, and a non-actuating
   active-sensing policy.
 - The video path updates the predictive state immediately and feeds a bounded
-  latest-frame mailbox. A Vision worker detects people/faces when untracked
-  and fast-tracks a selected target between detector refreshes.
-- The audio path provides local RMS/VAD evidence only. It does not perform ASR,
-  speaker ID, or direction estimation.
+  latest-frame mailbox. The ANE-preferred person detector runs on every
+  dequeued latest frame; its full-body miss triggers an up-to-6Hz close-range
+  face fallback. A pending
+  fallback is not incorrectly treated as target-loss evidence.
+- The audio path uses a 96ms-confirmed local RMS/VAD gate only. It does not
+  perform learned speech classification, ASR, speaker ID, or direction estimation.
 - JSONL contains no raw audio/video. Source-health reports format-configuration
   fallback, runtime interruption/error, disconnect/reconnect, and clean stop.
 
@@ -175,8 +177,9 @@ target retention.
 The main person-detector path is now Apple Core ML YOLOv3Tiny FP16, bundled with
 the executable and configured on required macOS 13+ as `.cpuAndNeuralEngine`
 (GPU excluded). It evaluates the latest available frame rather than waiting
-behind a backlog. The generic Vision person/face detector and tracker are a
-compatibility fallback only when the Core ML model cannot load.
+behind a backlog. When it has no person candidate, a throttled up-to-6Hz generic
+Vision face detector supports close-up conversation distance while the
+ANE path remains the primary detector.
 
 On the Apple M5 host, `artifacts/subconscious/p3-ane-final.jsonl` recorded
 `neural_engine/configured` with `compute_units=cpu_and_neural_engine`, a 33.30
@@ -187,11 +190,26 @@ hard real-time end-to-end SLO. Core ML's public API records the compute-unit
 policy but does not attest the hardware chosen for every individual operation.
 Use Instruments to obtain that hardware-level attribution.
 
+## P3 sensory-fusion baseline
+
+`artifacts/subconscious/p3-fusion-continuity-final.jsonl` is a 30.66-second
+no-person capture-session run of the current fusion code. It records 832 Core
+ML inferences (27.1/s), 158 face fallback inferences (5.2/s), and
+`late_events_dropped=0`. Core ML averaged 17.05 ms and the maximum
+capture-to-belief latency was 390.98 ms. No person or face was visible, so it
+does not establish target retention, target loss, or speech detection quality.
+The VAD gate accumulates continuous PCM duration, resets on a packet timestamp
+discontinuity, opens after 96ms above threshold, and is deliberately non-learned
+until a separately evaluated on-device speech model replaces it.
+
 ## Immediate next action
 
-Run a consented person-present / ordinary-motion / target-loss scenario with a
-visible operator. Verify detector-to-tracker transition, retained target ID,
-loss after the configured timeout, and voice-onset readiness. Only after that
-should P2/P3 be marked complete. Separately, determine why macOS refuses the
-active 720p60 format; do not infer dual-microphone direction until a controlled
-TDOA calibration establishes stable left/right evidence.
+Run a consented person-present / ordinary-motion / target-loss / speak-silence
+scenario with phase markers and a visible operator. Verify ANE-person to
+close-range-face continuity, retained target ID, loss after the configured
+timeout, and VAD precision/recall. Only after that should P2/P3 be marked
+complete. Replace the variable-latency System Vision face fallback with a
+licensed Core ML face detector configured for `cpuAndNeuralEngine`, then measure
+its model-specific latency. Separately, determine why macOS refuses the active
+720p60 format; do not infer dual-microphone direction until a controlled TDOA
+calibration establishes stable left/right evidence.
