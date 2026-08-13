@@ -1,0 +1,311 @@
+import Foundation
+
+public struct NormalizedRect: Codable, Equatable, Sendable {
+    public var x: Double
+    public var y: Double
+    public var width: Double
+    public var height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+
+    public var centerX: Double { x + width / 2 }
+    public var centerY: Double { y + height / 2 }
+
+    func blended(toward other: NormalizedRect, weight: Double) -> NormalizedRect {
+        let w = clamp(weight)
+        return NormalizedRect(
+            x: x + (other.x - x) * w,
+            y: y + (other.y - y) * w,
+            width: width + (other.width - width) * w,
+            height: height + (other.height - height) * w
+        )
+    }
+
+    func advanced(byX velocityX: Double, y velocityY: Double, seconds: Double) -> NormalizedRect {
+        let nextX = min(max(x + velocityX * seconds, 0), max(0, 1 - width))
+        let nextY = min(max(y + velocityY * seconds, 0), max(0, 1 - height))
+        return NormalizedRect(x: nextX, y: nextY, width: width, height: height)
+    }
+}
+
+public enum VisualObservationSource: String, Codable, Sendable {
+    case neuralDetector = "coreml_ane"
+    case detector
+    case tracker
+}
+
+public struct VisualObservation: Sendable {
+    public let rect: NormalizedRect
+    public let confidence: Double
+    public let source: VisualObservationSource
+
+    public init(rect: NormalizedRect, confidence: Double, source: VisualObservationSource) {
+        self.rect = rect
+        self.confidence = clamp(confidence)
+        self.source = source
+    }
+}
+
+public enum InteractionHypothesis: String, Codable, Sendable {
+    case idle
+    case observing
+    case ready
+}
+
+public enum ActiveSensingPolicy: String, Codable, Sendable {
+    case hold
+    case reacquire
+    case maintainTarget = "maintain_target"
+    case observeTarget = "observe_target"
+    case handoffCandidate = "handoff_candidate"
+}
+
+public enum TargetStatus: String, Codable, Sendable {
+    case none
+    case tracked
+}
+
+public struct AttentionTarget: Codable, Equatable, Sendable {
+    public let id: String
+    public let rect: NormalizedRect
+    public let confidence: Double
+    public let velocityX: Double
+    public let velocityY: Double
+}
+
+public struct BeliefSnapshot: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let monotonicNS: UInt64
+    public let targetStatus: TargetStatus
+    public let target: AttentionTarget?
+    public let presenceProbability: Double
+    public let voiceProbability: Double
+    public let uncertainty: Double
+    public let surprise: Double
+    public let informationGain: Double
+    public let idleProbability: Double
+    public let observingProbability: Double
+    public let readyProbability: Double
+    public let policy: ActiveSensingPolicy
+}
+
+public final class PredictiveWorldModel: @unchecked Sendable {
+    private struct TargetState {
+        var rect: NormalizedRect
+        var previousObservedRect: NormalizedRect
+        var confidence: Double
+        var velocityX: Double
+        var velocityY: Double
+        var lastObservationNS: UInt64
+    }
+
+    private let lock = NSLock()
+    private var target: TargetState?
+    private var voiceProbability = 0.0
+    private var uncertainty = 1.0
+    private var surprise = 0.0
+    private var lastUpdatedNS: UInt64?
+
+    public init() {}
+
+    @discardableResult
+    public func ingestVisual(_ observation: VisualObservation, at monotonicNS: UInt64) -> BeliefSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isStale(monotonicNS) else { return currentSnapshot() }
+        let effectiveNS = orderedTimestamp(monotonicNS)
+        advance(to: effectiveNS)
+
+        if var current = target {
+            let observationInterval = seconds(from: current.lastObservationNS, to: effectiveNS)
+            let predictionDistance = distance(
+                current.rect.centerX,
+                current.rect.centerY,
+                observation.rect.centerX,
+                observation.rect.centerY
+            )
+            surprise = clamp(predictionDistance / 0.16)
+
+            if observationInterval > 0.001 {
+                let measuredVelocityX = (observation.rect.centerX - current.previousObservedRect.centerX) / observationInterval
+                let measuredVelocityY = (observation.rect.centerY - current.previousObservedRect.centerY) / observationInterval
+                current.velocityX = current.velocityX * 0.55 + measuredVelocityX * 0.45
+                current.velocityY = current.velocityY * 0.55 + measuredVelocityY * 0.45
+            }
+            current.rect = current.rect.blended(toward: observation.rect, weight: 0.78)
+            current.previousObservedRect = observation.rect
+            current.confidence = clamp(current.confidence * 0.45 + observation.confidence * 0.55)
+            current.lastObservationNS = effectiveNS
+            target = current
+        } else {
+            target = TargetState(
+                rect: observation.rect,
+                previousObservedRect: observation.rect,
+                confidence: observation.confidence,
+                velocityX: 0,
+                velocityY: 0,
+                lastObservationNS: effectiveNS
+            )
+            surprise = 0.15
+        }
+
+        uncertainty = max(0.03, uncertainty * 0.45 + surprise * 0.25)
+        return makeSnapshot(at: effectiveNS)
+    }
+
+    @discardableResult
+    public func ingestVisionMiss(at monotonicNS: UInt64) -> BeliefSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isStale(monotonicNS) else { return currentSnapshot() }
+        let effectiveNS = orderedTimestamp(monotonicNS)
+        advance(to: effectiveNS)
+        uncertainty = min(1, uncertainty + 0.10)
+        surprise = max(surprise, 0.35)
+        return makeSnapshot(at: effectiveNS)
+    }
+
+    @discardableResult
+    public func ingestVoice(active: Bool, confidence: Double, at monotonicNS: UInt64) -> BeliefSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isStale(monotonicNS) else { return currentSnapshot() }
+        let effectiveNS = orderedTimestamp(monotonicNS)
+        advance(to: effectiveNS)
+        let evidence = clamp(confidence)
+        voiceProbability = active
+            ? max(voiceProbability * 0.65, evidence)
+            : voiceProbability * 0.70
+        return makeSnapshot(at: effectiveNS)
+    }
+
+    @discardableResult
+    public func snapshot(at monotonicNS: UInt64) -> BeliefSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isStale(monotonicNS) else { return currentSnapshot() }
+        let effectiveNS = orderedTimestamp(monotonicNS)
+        advance(to: effectiveNS)
+        return makeSnapshot(at: effectiveNS)
+    }
+
+    private func orderedTimestamp(_ candidate: UInt64) -> UInt64 {
+        guard let lastUpdatedNS else { return candidate }
+        return max(candidate, lastUpdatedNS)
+    }
+
+    private func isStale(_ candidate: UInt64) -> Bool {
+        guard let lastUpdatedNS else { return false }
+        return candidate < lastUpdatedNS
+    }
+
+    private func currentSnapshot() -> BeliefSnapshot {
+        makeSnapshot(at: lastUpdatedNS ?? 0)
+    }
+
+    private func advance(to monotonicNS: UInt64) {
+        guard let previous = lastUpdatedNS else {
+            lastUpdatedNS = monotonicNS
+            return
+        }
+        guard monotonicNS > previous else { return }
+        let elapsed = seconds(from: previous, to: monotonicNS)
+        let predictionSeconds = min(elapsed, 0.25)
+        lastUpdatedNS = monotonicNS
+
+        if var current = target {
+            current.rect = current.rect.advanced(
+                byX: current.velocityX,
+                y: current.velocityY,
+                seconds: predictionSeconds
+            )
+            current.confidence *= exp(-elapsed / 1.15)
+            let observationAge = seconds(from: current.lastObservationNS, to: monotonicNS)
+            if observationAge > 1.5 || current.confidence < 0.10 {
+                target = nil
+                uncertainty = min(1, uncertainty + 0.18)
+            } else {
+                target = current
+            }
+        }
+
+        voiceProbability *= exp(-elapsed / 0.42)
+        uncertainty = min(1, uncertainty + elapsed * 0.20)
+        surprise *= exp(-elapsed / 0.30)
+    }
+
+    private func makeSnapshot(at monotonicNS: UInt64) -> BeliefSnapshot {
+        let presence = target?.confidence ?? 0
+        let voice = voiceProbability
+        let idleScore = (1 - presence) * 2.2 + uncertainty * 0.30
+        let observingScore = presence * 1.55 - voice * 0.35 - uncertainty * 0.15
+        let readyScore = presence * voice * 3.2 + surprise * 0.35 - uncertainty * 0.35
+        let probabilities = softmax([idleScore, observingScore, readyScore])
+        let informationGain = clamp(
+            uncertainty * presence * 0.75 + voice * presence * 0.45 + surprise * 0.35
+        )
+
+        let policy: ActiveSensingPolicy
+        if target == nil {
+            policy = .hold
+        } else if uncertainty > 0.68 {
+            policy = .reacquire
+        } else if probabilities[2] >= 0.58 {
+            policy = .handoffCandidate
+        } else if voice >= 0.28 {
+            policy = .observeTarget
+        } else {
+            policy = .maintainTarget
+        }
+
+        let attentionTarget = target.map {
+            AttentionTarget(
+                id: "track-1",
+                rect: $0.rect,
+                confidence: $0.confidence,
+                velocityX: $0.velocityX,
+                velocityY: $0.velocityY
+            )
+        }
+        return BeliefSnapshot(
+            schemaVersion: 1,
+            monotonicNS: monotonicNS,
+            targetStatus: attentionTarget == nil ? .none : .tracked,
+            target: attentionTarget,
+            presenceProbability: presence,
+            voiceProbability: voice,
+            uncertainty: uncertainty,
+            surprise: surprise,
+            informationGain: informationGain,
+            idleProbability: probabilities[0],
+            observingProbability: probabilities[1],
+            readyProbability: probabilities[2],
+            policy: policy
+        )
+    }
+}
+
+private func seconds(from earlier: UInt64, to later: UInt64) -> Double {
+    guard later > earlier else { return 0 }
+    return Double(later - earlier) / 1_000_000_000
+}
+
+private func distance(_ x1: Double, _ y1: Double, _ x2: Double, _ y2: Double) -> Double {
+    hypot(x2 - x1, y2 - y1)
+}
+
+private func softmax(_ values: [Double]) -> [Double] {
+    let maximum = values.max() ?? 0
+    let exponentials = values.map { exp($0 - maximum) }
+    let total = exponentials.reduce(0, +)
+    return exponentials.map { $0 / total }
+}
+
+private func clamp(_ value: Double) -> Double {
+    min(max(value, 0), 1)
+}

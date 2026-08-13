@@ -1,0 +1,8 @@
+.build/
+.DS_Store
+tmp/
+Reference/
+artifacts/*
+!artifacts/subconscious/
+artifacts/subconscious/*
+!artifacts/subconscious/p3-ane-final.jsonl
