@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-15",
+  "host_memory_bytes": 25769803776,
+  "runtime": {
+    "python": "3.12.10",
+    "mlx": "0.32.0",
+    "mlx_vlm": "0.6.13",
+    "compute": "Apple GPU and unified memory; not ANE"
+  },
+  "model": {
+    "repository": "mlx-community/gemma-4-e4b-it-nvfp4",
+    "local_path": "/Users/seungyeop/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4",
+    "model_safetensors_bytes": 5146755012,
+    "model_safetensors_sha256": "42361d0a7d1af5c9cf6f42c2a46be0f39fa4e060cedf0dfc43b0b4d97e413c9e",
+    "revision": "769ca8889f89f8ec8c1ca59bf427332895eb1cb2"
+  },
+  "transport": {
+    "source_dimensions": [1920, 1080],
+    "jpeg_dimensions": [512, 288],
+    "persistent_worker": true,
+    "memory_limit_bytes": 8589934592,
+    "cache_limit_bytes": 268435456,
+    "resource_limit_smoke_passed": true,
+    "raw_media_persisted_by_l05": false
+  },
+  "latency_ms": {
+    "worker_load_observed_range": [2483.611458, 3817.912375],
+    "cold_image_observed_range": [3497.537083, 4765.327083],
+    "warm_image_observed_range": [2888.822458, 4246.439167],
+    "final_prompt_warm_samples": [4246.439167, 4101.930042]
+  },
+  "mlx_peak_memory_gb_max_observed": 5.752117426,
+  "semantic_checks": [
+    {
+      "fixture": "consented person-present diagnostic frame",
+      "attention_hint": "person",
+      "social_presence": 0.9,
+      "confidence": 0.9
+    },
+    {
+      "fixture": "consented face-absent diagnostic frame",
+      "attention_hint": "object",
+      "social_presence": 0.0,
+      "confidence": 0.9
+    }
+  ],
+  "concurrent_l0_interval": {
+    "start_monotonic_ns": 3057559387419041,
+    "end_monotonic_ns": 3057571387538500,
+    "video_callbacks": [1274, 1573],
+    "neural_engine_inferences": [509, 629],
+    "neural_face_inferences": [1272, 1571],
+    "vision_updates": [1219, 1519],
+    "vision_frames_skipped": [44, 44],
+    "maximum_video_callback_ms": [5.290792, 5.290792],
+    "maximum_neural_engine_ms": [20.081125, 20.081125],
+    "maximum_vision_ms": [76.521125, 76.521125],
+    "maximum_capture_to_belief_ms": [76.596042, 76.596042]
+  },
+  "soak_caveat": {
+    "status": "not_passed",
+    "observed_after_short_interval": "The pre-existing live L0 service later emitted IOSurface allocation failures, face/object VNCoreMLTransform runtime errors, and restarted after its 2000 ms inference-stall watchdog.",
+    "attribution": "The same roughly five-minute restart pattern predates this L0.5 benchmark, so this run does not attribute it to E4B; it also does not prove long-duration resource isolation."
+  },
+  "decision": "E4B is viable only as an opt-in 0.2-0.35 Hz advisory L0.5 loop; persistent enablement is blocked on closing the existing L0 IOSurface restart and passing a longer resource soak."
+}

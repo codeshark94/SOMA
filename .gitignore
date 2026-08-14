@@ -1,5 +1,6 @@
 .build/
 .DS_Store
+__pycache__/
 tmp/
 Reference/
 artifacts/*
@@ -11,3 +12,5 @@ artifacts/subconscious/*
 !artifacts/subconscious/p4-ane-face-final-verified.jsonl
 !artifacts/subconscious/p4-attention-field-idle.jsonl
 !artifacts/subconscious/p5-neural-vad-live.jsonl
+!artifacts/subconscious/l05-e4b-mlx-benchmark-20260815.json
+!artifacts/subconscious/l0-lifetime-l05-coexistence-20260815.json

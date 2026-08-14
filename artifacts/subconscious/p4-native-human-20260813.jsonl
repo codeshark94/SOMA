@@ -1,0 +1,2 @@
+{"event":"camera.owner","monotonic_ns":2970464432685000,"owner":"native_ai","state":"discovering","result_code":0,"message":"native_human_tracking_requested"}
+{"event":"camera.ack","monotonic_ns":2970469517604375,"owner":"fault","state":"device_unavailable","result_code":-1,"message":"Tiny 2 Lite was not discovered within 5 seconds"}

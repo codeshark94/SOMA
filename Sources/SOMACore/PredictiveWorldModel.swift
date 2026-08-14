@@ -33,21 +33,59 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
     }
 }
 
-public enum VisualObservationSource: String, Codable, Sendable {
+public enum VisualObservationSource: String, Codable, Hashable, Sendable {
     case neuralDetector = "coreml_ane"
     case neuralFaceDetector = "coreml_ane_face"
+    case systemFaceDetector = "system_vision_face"
+    case systemSaliency = "system_saliency"
     case tracker
+}
+
+public enum AttentionTargetKind: String, Codable, Equatable, Sendable {
+    case human
+    case object
+    case unknown
 }
 
 public struct VisualObservation: Sendable {
     public let rect: NormalizedRect
     public let confidence: Double
     public let source: VisualObservationSource
+    public let kind: AttentionTargetKind
+    public let label: String?
+    public let attentionWeight: Double
+    public let posteriorProbability: Double
+    public let sceneID: String?
+    public let stabilityMilliseconds: Double
+    public let isActionEligible: Bool
+    /// Independent System Vision confirmation for a face candidate. It is
+    /// transient L0 validation, not identity data.
+    public let isFaceVerified: Bool
 
-    public init(rect: NormalizedRect, confidence: Double, source: VisualObservationSource) {
+    public init(
+        rect: NormalizedRect,
+        confidence: Double,
+        source: VisualObservationSource,
+        kind: AttentionTargetKind? = nil,
+        label: String? = nil,
+        attentionWeight: Double = 0,
+        posteriorProbability: Double = 0,
+        sceneID: String? = nil,
+        stabilityMilliseconds: Double = 0,
+        isActionEligible: Bool = false,
+        isFaceVerified: Bool = false
+    ) {
         self.rect = rect
         self.confidence = clamp(confidence)
         self.source = source
+        self.kind = kind ?? ((source == .neuralFaceDetector || source == .systemFaceDetector) ? .human : .unknown)
+        self.label = label
+        self.attentionWeight = clamp(attentionWeight)
+        self.posteriorProbability = clamp(posteriorProbability)
+        self.sceneID = sceneID
+        self.stabilityMilliseconds = max(0, stabilityMilliseconds)
+        self.isActionEligible = isActionEligible
+        self.isFaceVerified = isFaceVerified
     }
 }
 
@@ -95,6 +133,22 @@ public struct AttentionTarget: Codable, Equatable, Sendable {
     public let confidence: Double
     public let velocityX: Double
     public let velocityY: Double
+    public let kind: AttentionTargetKind
+    public let label: String?
+    public let attentionWeight: Double
+    public let posteriorProbability: Double
+    public let stabilityMilliseconds: Double
+    public let isActionEligible: Bool
+
+    /// L0 has no identity or task-level intent. It may physically fixate only
+    /// on current face evidence. Attention weights remain reasoning evidence.
+    public var isFaceMotorTarget: Bool {
+        isActionEligible && kind == .human && label == "face"
+    }
+
+    public var permitsL0MotorControl: Bool {
+        isFaceMotorTarget
+    }
 }
 
 public struct BeliefSnapshot: Codable, Equatable, Sendable {
@@ -122,6 +176,13 @@ public final class PredictiveWorldModel: @unchecked Sendable {
         var velocityX: Double
         var velocityY: Double
         var lastObservationNS: UInt64
+        var kind: AttentionTargetKind
+        var label: String?
+        var attentionWeight: Double
+        var posteriorProbability: Double
+        var sceneID: String?
+        var stabilityMilliseconds: Double
+        var isActionEligible: Bool
     }
 
     private struct AuditoryFocus {
@@ -167,6 +228,15 @@ public final class PredictiveWorldModel: @unchecked Sendable {
             current.previousObservedRect = observation.rect
             current.confidence = clamp(current.confidence * 0.45 + observation.confidence * 0.55)
             current.lastObservationNS = effectiveNS
+            if observation.kind != .unknown {
+                current.kind = observation.kind
+                current.label = observation.label
+            }
+            current.attentionWeight = observation.attentionWeight
+            current.posteriorProbability = clamp(current.posteriorProbability * 0.35 + observation.posteriorProbability * 0.65)
+            current.sceneID = observation.sceneID ?? current.sceneID
+            current.stabilityMilliseconds = observation.stabilityMilliseconds
+            current.isActionEligible = observation.isActionEligible
             target = current
         } else {
             target = TargetState(
@@ -175,7 +245,14 @@ public final class PredictiveWorldModel: @unchecked Sendable {
                 confidence: observation.confidence,
                 velocityX: 0,
                 velocityY: 0,
-                lastObservationNS: effectiveNS
+                lastObservationNS: effectiveNS,
+                kind: observation.kind,
+                label: observation.label,
+                attentionWeight: observation.attentionWeight,
+                posteriorProbability: observation.posteriorProbability,
+                sceneID: observation.sceneID,
+                stabilityMilliseconds: observation.stabilityMilliseconds,
+                isActionEligible: observation.isActionEligible
             )
             surprise = 0.15
         }
@@ -333,11 +410,17 @@ public final class PredictiveWorldModel: @unchecked Sendable {
 
         let attentionTarget = target.map {
             AttentionTarget(
-                id: "track-1",
+                id: $0.sceneID ?? "track-1",
                 rect: $0.rect,
                 confidence: $0.confidence,
                 velocityX: $0.velocityX,
-                velocityY: $0.velocityY
+                velocityY: $0.velocityY,
+                kind: $0.kind,
+                label: $0.label,
+                attentionWeight: $0.attentionWeight,
+                posteriorProbability: $0.posteriorProbability,
+                stabilityMilliseconds: $0.stabilityMilliseconds,
+                isActionEligible: $0.isActionEligible
             )
         }
         return BeliefSnapshot(

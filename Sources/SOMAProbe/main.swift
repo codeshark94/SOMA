@@ -472,6 +472,8 @@ private final class JSONLWriter {
 }
 
 private func run(options: ProbeOptions) throws {
+    try requestAccess(for: .video, label: "camera")
+    try requestAccess(for: .audio, label: "microphone")
     let videoDevices = AVCaptureDevice.devices(for: .video)
     let audioDevices = AVCaptureDevice.devices(for: .audio)
 
@@ -492,9 +494,6 @@ private func run(options: ProbeOptions) throws {
     guard let audioDevice = obsbotDevice(in: audioDevices, matching: audioID) else {
         throw ProbeError.deviceUnavailable("No OBSBOT audio device is available")
     }
-
-    try requestAccess(for: .video, label: "camera")
-    try requestAccess(for: .audio, label: "microphone")
 
     let writer = try JSONLWriter(url: options.outputURL)
     defer { writer.close() }

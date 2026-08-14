@@ -65,3 +65,23 @@ policy—not proof that every layer, especially the recurrent layers, ran on the
 Neural Engine. The live trace separately records Core ML inference duration and
 window-end-to-evidence duration; a speech onset necessarily also waits for up
 to one 260 ms input window.
+
+## Optional local Gemma 4 E4B MLX-VLM
+
+- Local directory: `~/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4`
+  (downloaded runtime asset; not bundled in the Swift package or Git repository).
+- Repository: [mlx-community/gemma-4-e4b-it-nvfp4](https://huggingface.co/mlx-community/gemma-4-e4b-it-nvfp4)
+  at revision `769ca8889f89f8ec8c1ca59bf427332895eb1cb2`.
+- Upstream: `google/gemma-4-E4B-it` source revision
+  `fee6332c1abaafb77f6f9624236c63aa2f1d0187`, according to the conversion card.
+- Variant: NVFP4; `model.safetensors` size 5,146,755,012 bytes and SHA-256
+  `42361d0a7d1af5c9cf6f42c2a46be0f39fa4e060cedf0dfc43b0b4d97e413c9e`.
+- License: Gemma terms, as declared by the conversion model card. The operator
+  is responsible for accepting and complying with those terms for the local
+  downloaded checkpoint.
+
+This model is used only by the optional `mlx-vlm` L0.5 side process. MLX runs
+it on the Apple GPU and unified memory, not the Neural Engine. The real-time L0
+path never waits for it, and its scalar advisory output has no target-selection
+or actuator authority. The command line requires an existing local directory;
+there is no runtime network fallback.

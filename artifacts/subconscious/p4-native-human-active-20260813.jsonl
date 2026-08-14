@@ -1,0 +1,5 @@
+{"event":"camera.owner","monotonic_ns":2973553581304208,"owner":"native_ai","state":"discovering","result_code":0,"message":"native_human_tracking_requested"}
+{"event":"camera.command","monotonic_ns":2973557729916916,"owner":"native_ai","state":"human_normal_sent","result_code":0,"message":"Tiny 2 Lite"}
+{"event":"camera.ack","monotonic_ns":2973557732975500,"owner":"native_ai","state":"human_normal_active","result_code":0,"message":"camera_status_ai_mode=2"}
+{"event":"camera.command","monotonic_ns":2973567805331083,"owner":"native_ai","state":"manual_sent","result_code":0,"message":"duration_elapsed"}
+{"event":"camera.ack","monotonic_ns":2973568051243666,"owner":"manual","state":"manual_active","result_code":0,"message":"camera_status_ai_mode=0; gimbal_stop_result=0"}
