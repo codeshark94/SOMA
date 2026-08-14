@@ -1721,4 +1721,48 @@ require(l05Admission.admit(l05Context(at: l05Start + 1_000_000_000, label: "face
 require(!l05Admission.admit(l05Context(at: l05Start + 5_999_000_000, label: "face")), "L0.5 refreshed an unchanged scene before five seconds")
 require(l05Admission.admit(l05Context(at: l05Start + 6_000_000_000, label: "face")), "L0.5 did not refresh an unchanged scene at five seconds")
 require(l05Admission.admit(l05Context(at: l05Start + 7_000_000_000, label: "face", surprise: 0.7)), "L0.5 did not admit a salient event at one second")
+func l05Cue(
+    at monotonicNS: UInt64,
+    situation: L05Situation,
+    reason: L05WakeReason,
+    score: Double = 0.9,
+    confidence: Double = 0.9
+) -> L05SemanticCue {
+    L05SemanticCue(
+        requestID: monotonicNS,
+        captureNS: monotonicNS,
+        completedNS: monotonicNS,
+        source: "test",
+        summary: "bounded visible evidence",
+        novelty: 0.8,
+        socialPresence: situation == .socialBid ? 0.9 : 0,
+        attentionHint: situation == .socialBid ? .person : .none,
+        situation: situation,
+        wakeReason: reason,
+        wakeScore: score,
+        confidence: confidence,
+        inferenceMS: 100
+    )
+}
+var l05InterruptGate = L05SemanticInterruptGate()
+require(
+    l05InterruptGate.recommend(l05Cue(at: l05Start, situation: .ambient, reason: .none)) == nil,
+    "ambient L0.5 evidence emitted a conscious interrupt"
+)
+require(
+    l05InterruptGate.recommend(l05Cue(at: l05Start, situation: .socialBid, reason: .presentedObject)) == nil,
+    "inconsistent L0.5 situation and wake reason emitted an interrupt"
+)
+require(
+    l05InterruptGate.recommend(l05Cue(at: l05Start, situation: .socialBid, reason: .directSocialBid)) != nil,
+    "credible direct social bid did not emit an L0.5 interrupt recommendation"
+)
+require(
+    l05InterruptGate.recommend(l05Cue(at: l05Start + 4_999_000_000, situation: .socialBid, reason: .directSocialBid)) == nil,
+    "L0.5 repeated the same interrupt inside its debounce interval"
+)
+require(
+    l05InterruptGate.recommend(l05Cue(at: l05Start + 5_000_000_000, situation: .socialBid, reason: .directSocialBid)) != nil,
+    "L0.5 did not re-admit a persistent interrupt after its debounce interval"
+)
 print("soma-core-check: PASS")

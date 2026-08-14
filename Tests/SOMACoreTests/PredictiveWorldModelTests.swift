@@ -1812,5 +1812,47 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertTrue(gate.admit(context(at: start + 6_000_000_000, label: "face")))
         XCTAssertTrue(gate.admit(context(at: start + 7_000_000_000, label: "face", surprise: 0.7)))
     }
+
+    func testL05SemanticInterruptRequiresConsistentCredibleEvidenceAndDebounces() {
+        func cue(
+            at monotonicNS: UInt64,
+            situation: L05Situation,
+            reason: L05WakeReason,
+            score: Double = 0.9,
+            confidence: Double = 0.9
+        ) -> L05SemanticCue {
+            L05SemanticCue(
+                requestID: monotonicNS,
+                captureNS: monotonicNS,
+                completedNS: monotonicNS,
+                source: "test",
+                summary: "bounded visible evidence",
+                novelty: 0.8,
+                socialPresence: situation == .socialBid ? 0.9 : 0,
+                attentionHint: situation == .socialBid ? .person : .none,
+                situation: situation,
+                wakeReason: reason,
+                wakeScore: score,
+                confidence: confidence,
+                inferenceMS: 100
+            )
+        }
+
+        let start: UInt64 = 40_000_000_000
+        var gate = L05SemanticInterruptGate()
+        XCTAssertNil(gate.recommend(cue(at: start, situation: .ambient, reason: .none)))
+        XCTAssertNil(gate.recommend(cue(at: start, situation: .socialBid, reason: .presentedObject)))
+        XCTAssertNotNil(gate.recommend(cue(at: start, situation: .socialBid, reason: .directSocialBid)))
+        XCTAssertNil(gate.recommend(cue(
+            at: start + 4_999_000_000,
+            situation: .socialBid,
+            reason: .directSocialBid
+        )))
+        XCTAssertNotNil(gate.recommend(cue(
+            at: start + 5_000_000_000,
+            situation: .socialBid,
+            reason: .directSocialBid
+        )))
+    }
 }
 #endif

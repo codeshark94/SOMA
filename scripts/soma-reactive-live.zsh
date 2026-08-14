@@ -4,6 +4,8 @@ set -eu
 soma_root=/Users/seungyeop/workspace/Research/SOMA
 soma_binary="$soma_root/.build/soma-live/arm64-apple-macosx/debug/soma-subconscious"
 soma_codesign_identity='SOMA Local Persistent Code Signing'
+soma_l05_python='/Users/seungyeop/Library/Application Support/SOMA/venvs/l05/bin/python'
+soma_l05_model='/Users/seungyeop/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4'
 run_id="$(date +%Y%m%dT%H%M%S)-$$"
 
 # SwiftPM replaces a signature after a rebuild. Keep the camera client bound to
@@ -25,6 +27,9 @@ exec "$soma_binary" \
   --audio-id 'AppleUSBAudioEngine:Remo Tech Co., Ltd.:OBSBOT Tiny 2 Lite:3100000:3' \
   --output "$soma_root/artifacts/subconscious/p7-reactive-live-$run_id.jsonl" \
   --face-lock-diagnostics "$soma_root/artifacts/subconscious/face-lock-diagnostics-$run_id" \
+  --l05-vlm-python "$soma_l05_python" \
+  --l05-vlm-worker "$soma_root/scripts/soma_l05_vlm_worker.py" \
+  --l05-vlm-model "$soma_l05_model" \
   --allow-camera-motion \
   --native-gimbal-helper "$soma_root/.build/soma-live/native/soma-native-track" \
   --gimbal-output "$soma_root/artifacts/subconscious/p7-reactive-live-actuator-$run_id.jsonl" \

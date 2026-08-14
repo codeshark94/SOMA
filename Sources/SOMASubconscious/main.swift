@@ -400,6 +400,7 @@ private struct VisionEvent: Encodable, Sendable {
 
 private struct L05SemanticTraceEvent: Encodable, Sendable {
     let event = "l05.semantic"
+    let requestID: UInt64
     let monotonicNS: UInt64
     let captureNS: UInt64
     let source: String
@@ -407,11 +408,15 @@ private struct L05SemanticTraceEvent: Encodable, Sendable {
     let novelty: Double
     let socialPresence: Double
     let attentionHint: L05AttentionHint
+    let situation: L05Situation
+    let wakeReason: L05WakeReason
+    let wakeScore: Double
     let confidence: Double
     let inferenceMS: Double
     let captureToCueMS: Double
 
     init(_ cue: L05SemanticCue) {
+        requestID = cue.requestID
         monotonicNS = cue.completedNS
         captureNS = cue.captureNS
         source = cue.source
@@ -419,9 +424,35 @@ private struct L05SemanticTraceEvent: Encodable, Sendable {
         novelty = cue.novelty
         socialPresence = cue.socialPresence
         attentionHint = cue.attentionHint
+        situation = cue.situation
+        wakeReason = cue.wakeReason
+        wakeScore = cue.wakeScore
         confidence = cue.confidence
         inferenceMS = cue.inferenceMS
         captureToCueMS = milliseconds(from: cue.captureNS, to: cue.completedNS)
+    }
+}
+
+private struct L05SemanticInterruptTraceEvent: Encodable, Sendable {
+    let event = "l05.interrupt"
+    let requestID: UInt64
+    let monotonicNS: UInt64
+    let captureNS: UInt64
+    let situation: L05Situation
+    let reason: L05WakeReason
+    let score: Double
+    let confidence: Double
+    let evidence: String
+
+    init(_ interrupt: L05SemanticInterrupt) {
+        requestID = interrupt.requestID
+        monotonicNS = interrupt.completedNS
+        captureNS = interrupt.captureNS
+        situation = interrupt.situation
+        reason = interrupt.reason
+        score = interrupt.score
+        confidence = interrupt.confidence
+        evidence = interrupt.evidence
     }
 }
 
@@ -527,6 +558,7 @@ extension VoiceEvent: TraceEvent {}
 extension AudioDirectionEvent: TraceEvent {}
 extension VisionEvent: TraceEvent {}
 extension L05SemanticTraceEvent: TraceEvent {}
+extension L05SemanticInterruptTraceEvent: TraceEvent {}
 extension SceneEvent: TraceEvent {}
 extension CameraIntentEvent: TraceEvent {}
 extension MetricsEvent: TraceEvent {}
@@ -4256,6 +4288,9 @@ private func run(_ options: Options) throws {
             },
             onCue: { cue in
                 writer.write(L05SemanticTraceEvent(cue))
+            },
+            onInterrupt: { interrupt in
+                writer.write(L05SemanticInterruptTraceEvent(interrupt))
             }
         )
     } else {

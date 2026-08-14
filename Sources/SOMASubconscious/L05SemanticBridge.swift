@@ -40,6 +40,9 @@ private struct L05WorkerEnvelope: Decodable {
     let novelty: Double?
     let socialPresence: Double?
     let attentionHint: L05AttentionHint?
+    let situation: L05Situation?
+    let wakeReason: L05WakeReason?
+    let wakeScore: Double?
     let confidence: Double?
     let inferenceMS: Double?
 }
@@ -61,7 +64,9 @@ final class L05SemanticBridge: @unchecked Sendable {
     private let errorOutput: FileHandle
     private let onHealth: @Sendable (String, String) -> Void
     private let onCue: @Sendable (L05SemanticCue) -> Void
+    private let onInterrupt: @Sendable (L05SemanticInterrupt) -> Void
     private var admission = L05SemanticAdmissionGate()
+    private var interruptGate = L05SemanticInterruptGate()
     private var pending: Pending?
     private var inFlight = false
     private var ready = false
@@ -77,10 +82,12 @@ final class L05SemanticBridge: @unchecked Sendable {
         workerURL: URL,
         model: String,
         onHealth: @escaping @Sendable (String, String) -> Void,
-        onCue: @escaping @Sendable (L05SemanticCue) -> Void
+        onCue: @escaping @Sendable (L05SemanticCue) -> Void,
+        onInterrupt: @escaping @Sendable (L05SemanticInterrupt) -> Void
     ) throws {
         self.onHealth = onHealth
         self.onCue = onCue
+        self.onInterrupt = onInterrupt
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -238,12 +245,15 @@ final class L05SemanticBridge: @unchecked Sendable {
                   let novelty = envelope.novelty,
                   let socialPresence = envelope.socialPresence,
                   let attentionHint = envelope.attentionHint,
+                  let situation = envelope.situation,
+                  let wakeReason = envelope.wakeReason,
+                  let wakeScore = envelope.wakeScore,
                   let confidence = envelope.confidence,
                   let inferenceMS = envelope.inferenceMS else {
                 onHealth("protocol_error", "incomplete_result")
                 return
             }
-            onCue(L05SemanticCue(
+            let cue = L05SemanticCue(
                 requestID: requestID,
                 captureNS: captureNS,
                 completedNS: DispatchTime.now().uptimeNanoseconds,
@@ -252,9 +262,16 @@ final class L05SemanticBridge: @unchecked Sendable {
                 novelty: novelty,
                 socialPresence: socialPresence,
                 attentionHint: attentionHint,
+                situation: situation,
+                wakeReason: wakeReason,
+                wakeScore: wakeScore,
                 confidence: confidence,
                 inferenceMS: inferenceMS
-            ))
+            )
+            onCue(cue)
+            if let recommendation = interruptGate.recommend(cue) {
+                onInterrupt(recommendation)
+            }
         case "error":
             inFlight = false
             onHealth("runtime_error", envelope.message ?? "worker_error")

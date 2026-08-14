@@ -8,6 +8,22 @@ public enum L05AttentionHint: String, Codable, CaseIterable, Sendable {
     case none
 }
 
+public enum L05Situation: String, Codable, CaseIterable, Sendable {
+    case socialBid = "social_bid"
+    case objectPresentation = "object_presentation"
+    case sceneTransition = "scene_transition"
+    case ambient
+    case uncertain
+}
+
+public enum L05WakeReason: String, Codable, CaseIterable, Sendable {
+    case directSocialBid = "direct_social_bid"
+    case presentedObject = "presented_object"
+    case unexpectedChange = "unexpected_change"
+    case ambiguity
+    case none
+}
+
 /// Scalar context accompanying one in-memory L0.5 keyframe. It deliberately
 /// excludes pixels; the transport owns the ephemeral image payload.
 public struct L05FrameContext: Codable, Equatable, Sendable {
@@ -73,6 +89,9 @@ public struct L05SemanticCue: Codable, Equatable, Sendable {
     public let novelty: Double
     public let socialPresence: Double
     public let attentionHint: L05AttentionHint
+    public let situation: L05Situation
+    public let wakeReason: L05WakeReason
+    public let wakeScore: Double
     public let confidence: Double
     public let inferenceMS: Double
 
@@ -85,6 +104,9 @@ public struct L05SemanticCue: Codable, Equatable, Sendable {
         novelty: Double,
         socialPresence: Double,
         attentionHint: L05AttentionHint,
+        situation: L05Situation,
+        wakeReason: L05WakeReason,
+        wakeScore: Double,
         confidence: Double,
         inferenceMS: Double
     ) {
@@ -96,8 +118,81 @@ public struct L05SemanticCue: Codable, Equatable, Sendable {
         self.novelty = min(max(novelty, 0), 1)
         self.socialPresence = min(max(socialPresence, 0), 1)
         self.attentionHint = attentionHint
+        self.situation = situation
+        self.wakeReason = wakeReason
+        self.wakeScore = min(max(wakeScore, 0), 1)
         self.confidence = min(max(confidence, 0), 1)
         self.inferenceMS = max(0, inferenceMS)
+    }
+}
+
+/// Scalar proposal to wake a future conscious layer. It has no motor,
+/// dialogue, memory, or task-execution authority.
+public struct L05SemanticInterrupt: Codable, Equatable, Sendable {
+    public let requestID: UInt64
+    public let captureNS: UInt64
+    public let completedNS: UInt64
+    public let situation: L05Situation
+    public let reason: L05WakeReason
+    public let score: Double
+    public let confidence: Double
+    public let evidence: String
+}
+
+public struct L05SemanticInterruptGate: Sendable {
+    private let minimumWakeScore: Double
+    private let minimumConfidence: Double
+    private let repeatIntervalNS: UInt64
+    private var lastSignature: String?
+    private var lastEmittedNS: UInt64?
+
+    public init(
+        minimumWakeScore: Double = 0.65,
+        minimumConfidence: Double = 0.55,
+        repeatIntervalMilliseconds: UInt64 = 5_000
+    ) {
+        self.minimumWakeScore = min(max(minimumWakeScore, 0), 1)
+        self.minimumConfidence = min(max(minimumConfidence, 0), 1)
+        repeatIntervalNS = repeatIntervalMilliseconds * 1_000_000
+    }
+
+    public mutating func recommend(_ cue: L05SemanticCue) -> L05SemanticInterrupt? {
+        guard cue.wakeScore >= minimumWakeScore,
+              cue.confidence >= minimumConfidence,
+              isConsistent(situation: cue.situation, reason: cue.wakeReason) else {
+            return nil
+        }
+        let signature = "\(cue.situation.rawValue)|\(cue.wakeReason.rawValue)"
+        if signature == lastSignature,
+           let lastEmittedNS,
+           cue.completedNS >= lastEmittedNS,
+           cue.completedNS - lastEmittedNS < repeatIntervalNS {
+            return nil
+        }
+        lastSignature = signature
+        lastEmittedNS = cue.completedNS
+        return L05SemanticInterrupt(
+            requestID: cue.requestID,
+            captureNS: cue.captureNS,
+            completedNS: cue.completedNS,
+            situation: cue.situation,
+            reason: cue.wakeReason,
+            score: cue.wakeScore,
+            confidence: cue.confidence,
+            evidence: cue.summary
+        )
+    }
+
+    private func isConsistent(situation: L05Situation, reason: L05WakeReason) -> Bool {
+        switch (situation, reason) {
+        case (.socialBid, .directSocialBid),
+             (.objectPresentation, .presentedObject),
+             (.sceneTransition, .unexpectedChange),
+             (.uncertain, .ambiguity):
+            return true
+        default:
+            return false
+        }
     }
 }
 

@@ -118,8 +118,12 @@ swift run soma-subconscious --duration 30 \
 `gemma-4-e4b-it-nvfp4` can run directly through `mlx-vlm`, without Ollama, as
 an explicitly enabled low-rate semantic side loop. It is not part of the L0
 control path and it is not L1: it produces a bounded scene summary, novelty,
-social-presence probability, and an advisory attention hint. Those values are
-written as scalar `l05.semantic` events only. They never enter target
+social-presence probability, an advisory attention hint, a bounded situation
+hypothesis, and a semantic wake score. Every result is written as a scalar
+`l05.semantic` event. A deterministic consistency/confidence gate may also
+emit `l05.interrupt` for `social_bid`, `object_presentation`,
+`scene_transition`, or high-confidence ambiguity. This is only a recommendation
+for a future conscious layer; neither event enters target
 selection, face lock, camera ownership, or a gimbal command.
 
 The video callback never waits for the model. An event gate admits a changed
@@ -132,6 +136,11 @@ so enabling the bridge cannot silently download a model or call a remote API.
 The worker also sets an 8 GB MLX evaluation limit and a 256 MB free-cache limit;
 an over-limit inference fails in the advisory process instead of consuming
 unbounded unified memory.
+
+The live implementation invokes `mlx-vlm` directly. It does not use Ollama and
+has no Ollama fallback. `scripts/soma_l05_ollama_probe.py` is a benchmark-only
+tool for an explicitly named comparison model; it is not imported or launched
+by `soma-subconscious`.
 
 The installed reference environment is:
 
@@ -180,18 +189,32 @@ error or stall. The worker loaded in 2.79 s and its 20-request run measured a
 3.41 s cold inference and 2.79 s warm median. This is a bounded coexistence
 stress result, not permission to put semantic output in the motor path.
 
+With the semantic-interrupt schema, a fresh three-request direct-MLX run loaded
+in 2.22 s, took 3.27 s cold and 2.65 s warm median, and consistently classified
+the person-free fixture as `ambient / none / 0.1`. The benchmark-only
+`gemma4:31b-cloud` comparison took 0.79 s cold and 0.89 s warm median on the
+same fixture. It was faster, but it is remote and is not a runtime candidate.
+The Ollama `gemma4:e4b-mlx` and `gemma4:12b-mlx` packages both returned HTTP 400
+for image input; loading them for that capability check also increased L0's
+cumulative Vision maximum, so both were unloaded and excluded.
+
 The earlier roughly five-minute `IOSurface` failure came from running every
 Vision request inside one long-lived GCD work item without a per-frame
 autorelease boundary. The worker now drains temporary Vision/IOSurface objects
 after every processed frame. A same-PID L0-only run then lasted 898.43 seconds,
 advanced from 23 to 22,422 video callbacks, recorded zero Vision runtime
 error/stall events, and showed no linear RSS growth. The persistent LaunchAgent
-still leaves L0.5 disabled until the integrated side-loop configuration itself
-receives a longer thermal soak.
+now enables the direct-MLX side loop. Its first 234.34-second integrated smoke
+produced 48 semantic events, zero interrupt false positives, and zero L0.5
+runtime errors; semantic inference ranged from 2.70 to 3.25 seconds. This is
+enough for continuous development use, but it is not a multi-hour thermal
+qualification.
 The original latency run is recorded in
 [l05-e4b-mlx-benchmark-20260815.json](artifacts/subconscious/l05-e4b-mlx-benchmark-20260815.json);
 the repaired L0 soak and 20-request coexistence window are recorded in
 [l0-lifetime-l05-coexistence-20260815.json](artifacts/subconscious/l0-lifetime-l05-coexistence-20260815.json).
+The interrupt feature, Ollama comparison, and integrated smoke are recorded in
+[l05-semantic-interrupt-benchmark-20260815.json](artifacts/subconscious/l05-semantic-interrupt-benchmark-20260815.json).
 MLX uses the Apple GPU/unified memory for this model; it does not move this VLM
 onto the Neural Engine. L0's Core ML person, face, and VAD models retain their
 separate ANE-preferred policy.

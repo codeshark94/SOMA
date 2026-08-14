@@ -84,4 +84,5 @@ This model is used only by the optional `mlx-vlm` L0.5 side process. MLX runs
 it on the Apple GPU and unified memory, not the Neural Engine. The real-time L0
 path never waits for it, and its scalar advisory output has no target-selection
 or actuator authority. The command line requires an existing local directory;
-there is no runtime network fallback.
+there is no runtime network fallback. The persistent worker calls `mlx-vlm`
+directly and never routes the local checkpoint through Ollama.

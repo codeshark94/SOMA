@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "recorded_at_local_date": "2026-08-15",
+  "feature": {
+    "name": "preconscious semantic interrupt recommendation",
+    "semantic_event": "l05.semantic",
+    "interrupt_event": "l05.interrupt",
+    "situations": [
+      "social_bid",
+      "object_presentation",
+      "scene_transition",
+      "ambient",
+      "uncertain"
+    ],
+    "minimum_wake_score": 0.65,
+    "minimum_confidence": 0.55,
+    "duplicate_suppression_seconds": 5,
+    "authority": "scalar recommendation only; no motor, dialogue, memory, task, or L1 authority"
+  },
+  "runtime_boundary": {
+    "persistent_implementation": "direct mlx-vlm worker",
+    "ollama_used_by_runtime": false,
+    "network_fallback": false,
+    "model": "mlx-community/gemma-4-e4b-it-nvfp4",
+    "raw_media_persisted_by_l05": false
+  },
+  "same_fixture_comparison": {
+    "fixture_sha256": "6aba778ccce9861276b45777c6ff387b77a5edf6e970f4424829a5908900921c",
+    "fixture_contains_person": false,
+    "transport_dimensions": [512, 288],
+    "direct_mlx_e4b": {
+      "requests": 3,
+      "worker_load_ms": 2215.009458363056,
+      "cold_inference_ms": 3272.694209124893,
+      "warm_inference_median_ms": 2653.4880835097283,
+      "peak_memory_gb_max": 5.752122638,
+      "stable_result": {
+        "situation": "ambient",
+        "wake_reason": "none",
+        "wake_score": 0.1,
+        "confidence": 0.9
+      }
+    },
+    "ollama_gemma4_31b_cloud": {
+      "requests": 3,
+      "cold_wall_ms": 792.1046246774495,
+      "warm_wall_median_ms": 892.5996250472963,
+      "wall_ms": [
+        792.1046246774495,
+        1146.4140000753105,
+        638.7852500192821
+      ],
+      "stable_result": {
+        "situation": "ambient",
+        "wake_reason": "none",
+        "wake_score": 0.1,
+        "confidence": 0.95
+      },
+      "decision": "faster comparison model, but remote and benchmark-only"
+    },
+    "ollama_local_models": [
+      {
+        "model": "gemma4:e4b-mlx",
+        "image_request": "HTTP 400: this model does not support image input"
+      },
+      {
+        "model": "gemma4:12b-mlx",
+        "image_request": "HTTP 400: this model does not support image input"
+      }
+    ]
+  },
+  "resource_observations": {
+    "ollama_local_capability_probe": {
+      "models_unloaded_after_probe": true,
+      "l0_maximum_vision_ms_before_after": [71.008792, 231.281292],
+      "l0_maximum_video_frame_interval_ms_after": 707.543541,
+      "decision": "do not use local Ollama models beside L0"
+    },
+    "direct_mlx_three_request_probe": {
+      "l0_video_callbacks_delta": 475,
+      "l0_face_inferences_delta": 475,
+      "l0_vision_frames_skipped_delta": 2,
+      "new_cumulative_latency_maximum": false
+    }
+  },
+  "integrated_live_smoke": {
+    "trace": "artifacts/subconscious/p7-reactive-live-20260815T015442-83742.jsonl",
+    "l0_pid": 83742,
+    "worker_pid_at_measurement": 83749,
+    "span_seconds": 234.338978583,
+    "semantic_events": 48,
+    "interrupt_events": 0,
+    "l05_runtime_errors": 0,
+    "l05_inference_ms": {
+      "minimum": 2702.432374935597,
+      "median": 2921.8660830520093,
+      "maximum": 3246.3349578902125
+    },
+    "l0_last_metrics": {
+      "video_callbacks": 5649,
+      "neural_face_inferences": 5639,
+      "neural_engine_inferences": 2255,
+      "neural_vad_inferences": 869,
+      "vision_frames_skipped": 14,
+      "video_frames_superseded": 7,
+      "maximum_video_callback_ms": 0.397708,
+      "maximum_neural_engine_ms": 11.835,
+      "maximum_neural_vad_ms": 3.7805,
+      "maximum_capture_to_belief_ms": 137.393292
+    },
+    "ambient_false_interrupts": 0,
+    "caveat": "short integrated smoke, not a multi-hour thermal qualification"
+  }
+}

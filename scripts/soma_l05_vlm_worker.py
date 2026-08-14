@@ -85,13 +85,19 @@ def main() -> int:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             context_text = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
             instruction = (
-                "You are SOMA's low-rate L0.5 visual interpretation layer. "
+                "You are SOMA's low-rate preconscious visual interpretation layer. "
                 "Describe only currently visible evidence. Do not identify a person, infer private traits, "
                 "or issue motor commands. Return exactly one JSON object with keys: "
                 "summary (max 120 characters), novelty (0..1), social_presence (0..1), "
-                "attention_hint (person|object|sound_source|explore|none), confidence (0..1). "
+                "attention_hint (person|object|sound_source|explore|none), "
+                "situation (social_bid|object_presentation|scene_transition|ambient|uncertain), "
+                "wake_reason (direct_social_bid|presented_object|unexpected_change|ambiguity|none), "
+                "wake_score (0..1), confidence (0..1). "
                 "Use attention_hint=person whenever any human, face, or body is visible; use object only "
                 "when no human is visible. social_presence is the probability that a human is visible. "
+                "A quiet static background is ambient with wake_reason=none and low wake_score. "
+                "A social bid requires visible evidence that a person is addressing the camera; merely "
+                "being visible is not enough. Do not use markdown. "
                 f"Fast sensor context: {context_text}"
             )
             prompt = apply_chat_template(
@@ -108,7 +114,7 @@ def main() -> int:
                     processor=processor,
                     prompt=prompt,
                     image=[image],
-                    max_tokens=96,
+                    max_tokens=128,
                     temperature=0.0,
                     enable_thinking=False,
                     verbose=False,
@@ -119,6 +125,12 @@ def main() -> int:
             hint = str(parsed.get("attention_hint", "none"))
             if hint not in {"person", "object", "sound_source", "explore", "none"}:
                 hint = "none"
+            situation = str(parsed.get("situation", "uncertain"))
+            if situation not in {"social_bid", "object_presentation", "scene_transition", "ambient", "uncertain"}:
+                situation = "uncertain"
+            wake_reason = str(parsed.get("wake_reason", "none"))
+            if wake_reason not in {"direct_social_bid", "presented_object", "unexpected_change", "ambiguity", "none"}:
+                wake_reason = "none"
             emit({
                 "type": "result",
                 "requestID": request_id,
@@ -128,6 +140,9 @@ def main() -> int:
                 "novelty": bounded_probability(parsed.get("novelty")),
                 "socialPresence": bounded_probability(parsed.get("social_presence")),
                 "attentionHint": hint,
+                "situation": situation,
+                "wakeReason": wake_reason,
+                "wakeScore": bounded_probability(parsed.get("wake_score")),
                 "confidence": bounded_probability(parsed.get("confidence")),
                 "inferenceMS": inference_ms,
                 "promptTokens": getattr(generated, "prompt_tokens", 0),

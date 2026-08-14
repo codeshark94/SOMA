@@ -133,25 +133,29 @@ for it. A changed or salient scene may submit at most one keyframe per second;
 an unchanged scene refreshes at five seconds. One persistent worker accepts one
 inference plus one replaceable pending 512x288 in-memory JPEG. Its strict result
 contains only a scene summary, novelty, social-presence probability, advisory
-attention hint, confidence, and timing.
+attention hint, bounded situation/wake hypotheses, confidence, and timing. A
+deterministic gate emits a scalar `l05.interrupt` recommendation only when the
+situation and wake reason agree, wake score is at least 0.65, and confidence is
+at least 0.55; identical recommendations are suppressed for five seconds.
 
 The result is trace evidence, not authority. It cannot select or suppress a
 target, change a face lock, claim the camera owner, move the gimbal, speak,
 identify a person, retrieve memory, or invoke L1. The model path must already
-exist locally; no network fallback is permitted. Direct MLX uses the Apple GPU
+exist locally; no network or Ollama fallback is permitted. Direct MLX uses the Apple GPU
 and unified memory, while L0 Core ML remains independently ANE-preferred. The
 worker has an 8 GB MLX evaluation limit and a 256 MB free-cache limit.
 
-The 2026-08-15 24 GB host benchmark found 3.50–4.77 s first-image latency,
-2.89–4.25 s warm latency, and a 5.75 GB MLX-reported peak. E4B is therefore a
-roughly 0.2–0.35 Hz semantic observer, not a reflex or tracking component. It
-remains opt-in and is not added to the persistent launch configuration. The L0
+The 2026-08-15 24 GB host benchmark found about 3.27 s cold and 2.65 s warm
+median direct-MLX latency with a 5.75 GB MLX-reported peak. E4B is therefore a
+roughly 0.3 Hz semantic observer, not a reflex or tracking component. The L0
 Vision worker's missing per-frame autorelease boundary was fixed and a same-PID
 898.43-second L0-only run reached 22,422 video callbacks with zero runtime
 error/stall events and bounded RSS. A following 20-request E4B stress window
 advanced L0 by 1,749 video callbacks with no new skipped frames or cumulative
-latency maxima, but a longer integrated thermal soak is still required before
-enabling the side loop in the LaunchAgent.
+latency maxima. The persistent LaunchAgent now enables direct MLX and a first
+234.34-second integrated smoke produced 48 semantic events, no interrupt false
+positive, and no L0.5 runtime error. A longer thermal qualification remains an
+operational follow-up. Ollama is benchmark-only and never part of this runtime.
 
 ## P8 gimbal-relative spatial scene field
 
