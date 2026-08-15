@@ -13,7 +13,7 @@ not imply that a language model is part of the real-time control loop.
 | --- | --- | --- | --- |
 | L0 subconscious | Local Core ML, temporal fusion, and deterministic control | Continuous perception, target continuity, VAD, spatial coverage, immediate motor control, and interaction-readiness evidence | Sole executor of hard real-time SDK commands and physical vetoes; supplies autonomous behaviour when no cognitive lease is active |
 | L1 conscious stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Active situational context, memory-conditioned interpretation, curiosity, social hypotheses, and goal-level attention | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends SDK velocity directly |
-| L2 human interaction and executive reasoning | Codex account session plus local speech transport | Conversation, high-order reasoning, tool use, coding, and user-requested work | May be opened directly by authorized L0 contact evidence without waiting for L1; receives final transcripts and scoped context and uses leased embodiment goals when observation or expression is needed |
+| L2 human interaction and executive reasoning | Codex account session with app-server GPT-Live WebRTC; explicit local fallback | Conversation, high-order reasoning, tool use, coding, and user-requested work | Opens directly from authorized L0 contact evidence, or from an L1-approved proactive opening; neither route waits on the other. It receives scoped text context, may pull image context through Codex/MCP, and uses leased embodiment goals when observation or expression is needed |
 
 The fast 31B cloud route is the primary L1 stream and may run frequently while
 human or task context is active. E2B is a local visual helper within that same
@@ -22,23 +22,32 @@ when remote image disclosure is disallowed or a provisional local sketch is
 useful. E2B results remain provisional until the primary L1 cycle accepts or
 revises them.
 
-The initial `gemma4:31b-cloud` adapter crosses a network boundary. It receives
-only the minimum context projection allowed for that cycle. Raw biometric
-templates, unrestricted memory rows, and continuous camera media remain local
-by default.
+The running `gemma4:31b-cloud` adapter uses Ollama's local `/api/generate`
+transport to reach the selected cloud route. It accepts one in-flight cycle and
+one replaceable pending cycle, has an eight-second situation deadline, and
+receives only the minimum context projection allowed for that cycle. Raw
+biometric templates, unrestricted memory rows, and continuous camera media
+remain local by default.
+
+An ordinary L1 cycle carries no image. It starts from scalar scene, spatial,
+memory, task, and social evidence. A current-view crop or change overlay is
+attached only for an admitted active-view request. The rolling spherical atlas
+remains local by default and may expose one expiring low-resolution sector only
+for a place-level discrepancy or route-planning question; the full panorama is
+not routine conversational context.
 
 ```mermaid
 flowchart LR
     Sensors["Camera and microphone"] --> L0["L0 perception and motor control"]
     L0 --> Router["Event-importance router"]
     Router --> L1["L1 31B conscious stream"]
-    Router -->|"explicit human contact"| Speech["Local speech turn transport"]
+    Router -->|"eye contact plus speech onset"| Speech["Codex app-server GPT-Live WebRTC"]
     L1 --> Helper["Local E2B visual helper"]
     Helper --> L1
     Memory["Short, medium, and long-term memory"] <--> L1
     L1 -->|"accepted curiosity"| Speech
-    Speech -->|"final transcript and scoped context"| Codex["L2 Codex interaction and task worker"]
-    Codex -->|"response and task result"| Speech
+    Speech -->|"live conversation"| Codex["L2 Codex interaction and task worker"]
+    Codex -->|"live spoken response"| Speech
     L1 --> MCP["SOMA embodiment MCP"]
     Codex --> MCP
     MCP --> Arbiter["L0 owner arbiter and intent executor"]
@@ -74,14 +83,23 @@ SituationFrame
   interaction_recommendation, natural_language_summary
 ```
 
-Human presence raises the allowed L1 sampling cadence because social context
-changes quickly. Presence alone does not start speech. An L2 interaction needs
-one of two causes:
+Human presence and a recognized identity raise the allowed L1 sampling cadence
+because social context changes quickly. They create a social-deliberation
+opportunity, not a speech trigger. Every such L1 cycle may conclude
+`remain_silent`, `nonverbal_invitation`, or `spoken_opening`; only an explicit,
+grounded L1 decision can take the latter two paths. A human's first spoken
+turn requires fresh directed eye contact plus voice. The only exception is one
+response inside the bounded invitation window after SOMA initiates a greeting
+pulse. Once an L2 handoff opens a conversation, follow-up turns use the active
+conversation lease instead of repeatedly demanding gaze. An L2 interaction
+therefore needs one of two causes:
 
-1. an explicit human contact signal, such as directed speech, an accepted wake
-   gesture, or a deliberate interaction request; or
-2. a memory-grounded curiosity proposal that passes relevance, confidence,
-   cooldown, interruption-cost, and social-appropriateness policy.
+1. an explicit human contact signal satisfying that first-turn rule, or SOMA's
+   own still-active greeting invitation; or
+2. a grounded L1 social decision that passes relevance, confidence, cooldown,
+   interruption-cost, and social-appropriateness policy. A useful open question
+   may supply its content, but curiosity is not mandatory: L1 may conclude that
+   a plain greeting is appropriate, or that silence is preferable.
 
 Because the selected 31B route is remote, L1 is not treated as a scarce local
 compute task. While a human, active task, unresolved change, or accepted
@@ -95,6 +113,32 @@ and evidence. It is not an unconstrained instruction to ask questions. Repeated
 or rejected questions receive a cooldown, and a quiet or do-not-disturb state
 suppresses proactive contact.
 
+### Current social thought path
+
+A stable local person identity—an enrolled face profile or an encrypted
+pseudonymous repeat-visitor cluster—is an event source for the running L1
+adapter. It must first remain stable through the local identity scheduler; it
+then opens at most one 31B deliberation per person every 12 seconds while the
+person remains current. Gemma emits a strict JSON `L1SituationFrame`, which is
+checked against the current cycle's evidence and social opportunity. Its bounded
+rolling thought state carries social availability, curiosity pressure,
+interruption cost, relationship uncertainty, active grounded motives, and a
+short working hypothesis into the next cycle; current evidence always takes
+precedence. A late frame is discarded if the person is no longer current.
+`remain_silent` has no side effect. A nonverbal invitation uses a bounded L0
+greeting overlay: a small down-and-return bow that releases its lease as soon
+as it completes, rather than a side-to-side sweep or a timeout-held pose. The
+face-lock state survives the overlay and resumes fixation immediately after the
+return. A spoken opening transfers directly
+from L1 to the account-backed Live session only when it is a question bound to
+one current information motive; the same packet carries the motive's explicit
+completion condition. The motive is private L2 orientation, not an opening
+script: L2 begins with one question and advances the exchange responsively,
+without narrating its plan or stacking its questions. A bare greeting, generic
+offer of help, or unbound question cannot open Live voice. The L0 greeting expression is an asynchronous
+social mirror, never a serial speech gate. L0 remains free to reject all
+physical motion.
+
 ## Memory layer
 
 Memory is an application-owned service. Models retrieve typed projections and
@@ -105,7 +149,7 @@ canonical database.
 
 | Horizon | Typical contents | Storage and lifecycle |
 | --- | --- | --- |
-| Short-term | Current scene graph, active tracks, recent utterance turns, current goal, transient hypotheses, unresolved cues | In-memory working set plus a bounded recovery journal; expires or is summarized when the situation closes |
+| Short-term | Current scene graph, active tracks, exact recent L2 transcript turns, current goal, transient hypotheses, unresolved cues | Encrypted bounded recovery journal; raw transcript turns stay local until L1 consolidation and then expire by retention policy |
 | Medium-term | Session episodes, recent visits, interaction episodes, task checkpoints, unresolved questions, rapport observations | Local episode store; retained by policy and periodically consolidated |
 | Long-term | Consented identities, familiar-space models, stable person facts and preferences, relationship history, completed task history, durable semantic knowledge | Local durable store with provenance, confidence, revision history, export, correction, and deletion |
 
@@ -134,6 +178,9 @@ silently overwriting history.
 - `open_question`: the information gap, expected value, evidence, target person,
   social cost, cooldown, and resolution.
 - `memory_link`: typed relationship among canonical records.
+- `conversation_turn`: exact user or assistant transcript text, Codex thread and
+  interaction IDs, ordered turn sequence, and pending/consolidated state. It is
+  local-only short-term evidence, not a remotely projectable person fact.
 
 Face presence, person presence, and human identity are separate variables. A
 face or voice resemblance may create an identity hypothesis, but identity stays
@@ -142,15 +189,40 @@ supports it. Recognition embeddings remain local by default and are not sent
 to the 31B route. A remote prompt uses scoped aliases and summarized facts
 instead.
 
+`unknown` does not require forgetting every encounter. Repeated local ArcFace
+matches may form an encrypted anonymous cluster whose only projected identity
+is a per-install `anon_*` HMAC pseudonym. It deterministically maps to a
+local-only person entity, allowing L1 to build continuity and relationship
+context without projecting the pseudonym, name, face vector, or pixels to the
+remote model. It carries no name or consent claim, expires under a rolling
+retention policy, and can be forgotten. An anonymous cluster can become a
+known identity only through a separate, explicit enrollment transition that
+preserves the same person entity and its existing local memory.
+
+Face recognition retains a compact multi-view reference set rather than a
+single high-quality portrait. A local diversity selector rejects near-identical
+frames and prefers a set with greater minimum embedding-space separation, so a
+turn, partial profile, or changed height can contribute a representative local
+view. The anonymous cluster cap is eight references and the explicit persistent
+profile cap is twenty-four. This is appearance-space coverage, not a claim that
+SOMA has a calibrated semantic head-pose measurement. Biometric templates stay
+encrypted locally and never enter L1 or L2 prompts.
+
 ### Write path
 
 1. L0 emits timestamped observations; it never creates semantic person facts.
-2. L1 proposes a typed memory mutation with evidence IDs and confidence.
-3. A deterministic validator checks schema, provenance, consent, sensitivity,
+2. L2 appends exact finalized user and assistant transcript turns to the
+   encrypted short-term journal. It may flag explicit user facts, corrections,
+   and memory requests as high-confidence proposals.
+3. L1 is the default curator: it reads raw turns with situation context,
+   resolves them against existing memory, and proposes typed episode, person,
+   relationship, task, and open-question mutations.
+4. A deterministic validator checks schema, provenance, consent, sensitivity,
    contradictions, and retention policy.
-4. Accepted mutations enter the episode store.
-5. A separate consolidation job promotes stable material to long-term memory.
-6. Corrections and deletions propagate to derived summaries and retrieval
+5. Accepted mutations enter the episode store and the contributing raw turns
+   are linked to the derived memory IDs as consolidated.
+6. A separate consolidation job promotes stable material to long-term memory.
+7. Corrections and deletions propagate to derived summaries and retrieval
    indexes.
 
 This path prevents a model hallucination from becoming an untraceable personal
@@ -159,7 +231,7 @@ memory.
 ### C2 implementation boundary
 
 `SOMACore/CognitiveMemory.swift` implements the model-independent memory core.
-It provides versioned typed payloads for entities, identity hypotheses,
+It provides versioned typed payloads for raw conversation turns, entities, identity hypotheses,
 relationships and rapport, person facts, spaces, episodes, tasks, situations,
 open questions, and typed memory links. Short- and medium-term records require
 policy-bounded expiry; long-term records require explicit, enrolled,
@@ -173,7 +245,10 @@ recognition reference requires consent, biometric sensitivity, and local-only
 disclosure. Remote projection contains only the record's approved summary and
 minimal metadata; it never serializes the typed biometric payload. The 256-bit
 encryption key is supplied by the caller and is never stored beside the journal;
-Keychain provisioning belongs to the future runtime integration.
+Keychain provisioning belongs to the future runtime integration. The
+`ConversationTranscriptArchiver` already enforces exact-text preservation,
+short-term/local-only policy, L2 provenance, ordered turns, and links from a
+consolidated turn to its derived memories.
 
 ## Event importance and cognitive transition
 
@@ -206,7 +281,7 @@ policy reason so false wakes and missed wakes can be labelled later.
 | Capability | Purpose | Recommended placement |
 | --- | --- | --- |
 | Visual embedding and change encoder | Object re-identification, familiar-space matching, panorama-tile comparison, and semantic retrieval | Small Core ML or MLX encoder outside the camera callback; ANE preferred when the converted model supports it |
-| Consented face verification | Distinguish a known person hypothesis from generic face presence | Local-only identity service with enrollment, confidence calibration, and an `unknown` outcome |
+| Local face re-identification | Separate known profiles, anonymous repeat visitors, and genuinely unmatched evidence | ArcFace R50 Core ML worker with explicit enrollment, encrypted references, per-install pseudonyms, calibration, and a reject outcome |
 | Speaker embedding and diarization | Associate speech turns without pretending that VAD or TDOA identifies a person | Local audio worker; separate from speech recognition and directional attention |
 | Head pose, gaze, and gesture cues | Estimate directed social contact and nonverbal bids | Low-rate temporal model feeding the event router; avoid unsupported emotion labels |
 | Audio-event classifier | Distinguish directed speech, alarm-like events, impact, and ambient noise | Small local model beside VAD; it does not infer meaning from speech |
@@ -235,7 +310,20 @@ deployment-measured in-memory pre-roll duration. A `CodexInteractionTurn`
 carries the accepted final transcript, interaction/turn IDs, timing, bounded
 evidence IDs, and a scoped context reference. It has no raw-audio field. These
 types make direct L0-to-L2 wake and transcript delivery independently testable
-before live speech recognition is connected.
+without putting audio in the cognitive contract. `SpeechTurnSegmenter` now
+closes the runtime boundary: voice without an authorized C3 wake cannot open a
+turn, VAD analysis lookback is accounted for, utterances are duration-bounded,
+and a refractory interval prevents one offset from immediately reopening the
+same turn.
+
+`ConversationContactGate` supplies the missing social-entry state. System
+Vision landmarks provide a transient, non-identifying estimate from bilateral
+eyes and pupils, frontal yaw, and social-fovea alignment. The estimate is fresh
+for 450 ms. A greeting expression grants one response attempt for eight seconds.
+Only a confirmed app-server realtime session or a successful fallback handoff opens
+the conversation; 60 seconds without confirmed user activity closes the Live
+session. This separates ambient speech near a detected face from
+speech addressed to SOMA without turning face detection into identity.
 
 `soma-event-eval` fits temperature on one partition and reports held-out
 accuracy, negative log likelihood, Brier score, expected calibration error,
@@ -332,6 +420,28 @@ The wire contract follows the MCP 2025-11-25
 and [tool](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 specifications; stdout contains JSON-RPC messages only.
 
+### Person-context tools
+
+L2 needs more than a camera lease: it must be able to retrieve and maintain
+the explicitly shared social context of the person it is speaking with. The
+same current-user MCP endpoint therefore provides `get_person_context`,
+`set_preferred_language`, `clear_preferred_language`,
+`set_contact_preference`, `set_person_rapport`, `set_person_fact`, and
+`remove_person_fact`. A person-context request reaches the L0-owned encrypted
+journal through the current-user socket; an MCP child never opens a competing
+journal writer. Every MCP mutation requires an explicit user confirmation flag,
+becomes a revisioned explicit-user record, and is projected to L1/L2 only when
+its disclosure policy permits it. The returned reference is an opaque local
+person UUID for tool routing, never a name or biometric template. Face vectors,
+raw media, raw transcripts, and local-only identity records are unavailable to
+these tools.
+
+When a person has an explicit language preference, L1 receives only the
+normalized BCP-47 tag and creates a compact native-language Live-session
+directive. L0 caches and relays that directive without translating it or
+sending biometric material; L2 treats it as the default response language
+until the person explicitly changes language.
+
 Image tools return transient resource handles. Persistence is a separate,
 explicit operation with retention and consent policy; raw images never enter
 the scalar operational trace.
@@ -367,7 +477,8 @@ The resulting capability contract is `rgb_palette=true`,
 `arbitrary_rgb=false`, four brightness levels, firmware patterns enabled, and
 Tally unavailable.
 
-The MCP contract uses semantic states rather than assuming colours:
+The MCP contract uses human-facing interaction meanings rather than assuming
+colours or exposing raw implementation status:
 
 - `available`
 - `attention_requested`
@@ -377,16 +488,27 @@ The MCP contract uses semantic states rather than assuming colours:
 - `do_not_disturb`
 - `fault`
 
-The initial MCP/native boundary exposes `setIndicatorState(state_id)`,
+The native boundary now exposes `setIndicatorState(state_id)`,
 `clearIndicatorState(state_id)`, `setLedBrightness(0...3)`, and
 `setLedEnabled(bool)`. It does not expose RGB triplets. Social state names map to
-an allowlist of physically validated firmware state IDs. Every indicator state
-is a lease: the helper records the previous enabled/brightness state, clears the
-same `state_id` on expiry or cancellation, and restores any changed global LED
-setting. A crash watchdog performs the same clear/restore operation. The first
-physical validation sets one allowlisted state for at most two seconds and then
-clears it. Existing firmware status priority remains authoritative; SOMA must
-not clear an unrelated system state or leave a stale social state active.
+the allowlisted non-error firmware IDs `16` target-lost, `17` target-lock,
+`18` gesture-recognizing, `54` normal-work, and `57` tracking-work. The L0
+priority is `speaking > working > listening > contact_ready > human_detected > exploring`.
+Firmware colour and SOMA cadence jointly encode what a nearby person can do:
+the exploration beacon means SOMA is not engaged, steady presence means it has
+noticed someone, the double invitation means "make eye contact and speak", calm
+long-on listening means "keep speaking", the slow work heartbeat means "please
+wait", and steady speaking means "listen to the response". The cadence
+scheduler is generation-bound, so a stale timer cannot revive a previous state.
+On every transition the bridge sets the new state and clears the previous
+SOMA-owned state. Its native session remembers the prior enabled/brightness
+values, clears all SOMA-owned IDs, and restores any changed global setting on
+normal shutdown, signal, input closure, or exceptional return. Existing
+firmware status priority remains authoritative; SOMA never clears an unrelated
+system state. The connected camera reports its baseline LED setting as disabled,
+so the persistent L0 session enables it after native bridge readiness and the
+helper restores disabled on exit. Exact hue is firmware-defined until the allowlist is visually
+characterized on the connected camera.
 
 LED signals are secondary and redundant with speech and gimbal behaviour. They
 must respect quiet/privacy preferences and must not override firmware status or
@@ -466,15 +588,18 @@ frame.
 
 ## L2 voice and Codex account integration
 
-Human interaction is an L2 capability, not a separate cognitive layer. An
-authorized explicit-contact event opens an L2 turn directly from L0 and never
+Human interaction is an L2 capability, not a separate cognitive layer. The
+first explicit-contact event requires directed eye contact and voice, except for
+the bounded response to a greeting pulse initiated by SOMA. An authorized event
+opens an L2 turn directly from L0 and never
 waits for the 31B L1 stream. L1 prepares richer situation and memory context in
-parallel. A bounded in-memory audio pre-roll, sized from measured wake latency,
-belongs to the local speech transport so opening words are not lost. An
-accepted L1 social-curiosity transition may also open a turn. Automatic speech
-remains disabled until SOMA authorizes the turn. L0/L1 context is injected as a bounded
-`ContextPacket` through session instructions, prompt variables, or conversation
-items:
+parallel. An accepted L1 social decision may also open a turn; recognized
+identity alone never does.
+Automatic speech remains disabled until SOMA authorizes the turn. The local
+fallback retains a bounded in-memory pre-roll; the Live route reuses the same
+L0 PCM stream and schedules a one-second memory-only pre-roll. L0/L1
+context is represented by a bounded `ContextPacket` for prompt, conversation,
+or MCP-tool projection:
 
 ```text
 ContextPacket
@@ -485,55 +610,79 @@ ContextPacket
   source_evidence_ids[], freshness, contradictions[]
 ```
 
-`soma-codex-bridge` sends every accepted final transcript to the installed
-Codex CLI with interaction/turn IDs, contact evidence IDs, the scoped context,
-transcript timing, and privacy scope. It requires `Logged in using ChatGPT`, so
-it reuses the owner's Codex subscription authentication rather than storing an
-OpenAI API key. The transcript is written to the child's standard input, not
-its command line. The bridge parses Codex JSONL, retains the returned thread ID
-per interaction, and can resume an explicitly supplied thread after a restart.
-It runs outside L0 with a timeout, bounded pipes, an isolated owner-only working
-directory, ignored user rules/config, and a read-only initial sandbox. A Codex
-failure therefore cannot block capture or motor control.
+The primary route is `--l2-live-voice`, using the installed app-server's
+`maple` voice. L0 authorizes an opening only when a
+Core ML voice onset coincides with fresh directed eye contact, or when a human
+answers one recent SOMA social pulse. A dedicated helper starts the installed
+Codex app-server with `realtime_conversation`, creates an ephemeral
+`realtime_voice` thread that is not materialized in the Codex desktop task
+list, and negotiates V3 WebRTC under the existing ChatGPT account. L0 batches its
+already captured OBSBOT PCM into 60 ms packets and feeds a persistent Web Audio
+worklet on that peer connection, including a bounded one-second memory-only
+pre-roll. There is no Accessibility shortcut and no second microphone capture.
+The remote WebRTC audio track is played directly. GPT-Live owns multilingual recognition,
+interruption handling, spoken output, and Codex response handoff. SOMA does not
+persist raw audio. The encrypted short-term transcript journal and its exact
+turn contract are implemented, but Live transcript ingestion is not yet wired;
+no transcript is claimed persisted until that adapter reports it.
+The installed realtime start path currently selects the `maple` voice and does
+not send a model override; the Codex app-server therefore owns the realtime
+model choice. `maple` is a voice, not a reasoning-model identifier.
 
-Codex CLI is a text/tool boundary, not an embeddable audio stream. Raw audio is
-not sent to Codex. A local ASR/turn transport must produce the final transcript;
-TTS and interruption handling remain separate output work. The first account
-smoke on this host completed in 9.36 seconds, so it proves authentication and
-content delivery but does not satisfy a conversational latency target. Closing
-an interaction releases embodiment leases, finalizes the episode, and submits
-only validated memory proposals.
+`soma-codex-bridge` plus Apple Speech recognition and local speech synthesis is
+retained only as a separately enabled diagnostic/fallback path. Its 5.45-second
+account smoke and 1.73-second local synthesis smoke do not measure GPT-Live and
+are not conversational-latency acceptance evidence.
+
+Text and image context use distinct contracts. V3 `initialItems` injects the
+opening role-bearing text context. Changed, ephemeral E2B camera summaries are
+forwarded through `thread/realtime/appendText`, so the conversation receives
+current visual meaning without retaining or transmitting raw camera frames.
+The realtime append API does not accept images. `capture_view`
+therefore returns its bounded settled JPEG as an MCP image block and 60-second
+resource link to a Codex tool turn; the grounded result can be appended back to
+Live as text. Direct image injection into the realtime session remains
+unclaimed.
+Closing an interaction releases embodiment leases and finalizes the interaction
+state. Once the pending Live transcript adapter is wired, its raw turns will be
+queued for the same `gemma4:31b-cloud` consolidation stream. Structured output
+will remain a proposal: L1 reconciles it with current memory and the
+deterministic validator owns the commit.
 
 Official implementation references:
 
 - [Codex authentication](https://learn.chatgpt.com/docs/auth)
+- [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
+- [ChatGPT Voice](https://learn.chatgpt.com/docs/features/voice)
 - [Codex CLI developer commands](https://learn.chatgpt.com/docs/developer-commands?surface=cli)
 - [Voice agents](https://developers.openai.com/api/docs/guides/voice-agents)
+- [Apple SpeechAnalyzer](https://developer.apple.com/documentation/speech/speechanalyzer)
+- [Apple SpeechAnalyzer and SpeechTranscriber session](https://developer.apple.com/videos/play/wwdc2025/277/)
 
 ## Development roadmap
 
 | Milestone | Status | Acceptance evidence |
 | --- | --- | --- |
 | C0 L0 embodied baseline | Implemented; physical behaviour tuning continues | Bounded local perception/control traces, owner arbitration, and existing core checks |
-| C1 E2B L1 visual helper | Worker implemented and selected over E4B; primary L1 orchestration pending | Direct-MLX bounded worker is advisory and has no independent layer or motor lease |
-| C2 Memory contracts and store | Core implemented; runtime wiring planned | Versioned schemas, provenance/consent validator, encrypted short/medium/long store, correction, deletion, projection, and replay checks |
+| C1 E2B L1 visual helper | Worker implemented; opt-in for visual audit | Direct-MLX bounded worker is advisory, consumes substantial unified memory, and has no independent layer or motor lease |
+| C2 Memory contracts and store | Core, encrypted runtime store, and L1 read projection implemented; Live transcript ingestion and consolidation wiring planned | Versioned schemas, exact encrypted local L2 turns, L1 consolidation links, provenance/consent validator, encrypted short/medium/long store, correction, deletion, policy-filtered remote projection, and replay checks |
 | C3 Event-importance router | Core implemented; deployment labels and shadow integration pending | Versioned route probabilities, direct L2 interaction dispatch plus parallel L1 context, interaction/safety policy masks, 32-row bootstrap contract, calibration and false/missed-wake report; real labelled corpus still required |
-| C4 31B L1 conscious stream | Planned | Structured `SituationFrame`, main/detour routing, memory retrieval/write proposals, human-presence cadence evaluation |
+| C4 31B L1 conscious stream | Event-driven local-person situation runtime and policy-filtered memory retrieval implemented; consolidation remains pending | One Gemma 31B stream, structured `SituationFrame`, bounded current-presence check, explicit silence/nonverbal/speech decisions, allowed memory summaries, rapport, and information motives naturalized at decision time, then asynchronous memory consolidation |
 | C5 Local embodiment MCP | Shadow transport implemented and deployed | MCP lifecycle plus thirteen schema-described tools; stdio to owner-only Unix socket; live L0 scene/atlas/state reply and scalar audit trace; no actuator writes |
 | C6 Leased embodiment actions | Implemented and physically validated | Target ownership, registration-before-tracking, priority preemption, independently scheduled expiry, owner release, explicit-scene permanence, probabilistic descriptor ambiguity, orient/grounded-track/policy-explore/active-view/social-expression execution, transient image return, labelled target reacquisition, and native stop/watchdog pass |
 | C7 Panoramic spatial memory | Learned fixed-base place memory and active mapping implemented; robustness evaluation pending | Capture-aligned spherical projection, bounded image registration, best-observation pixels, versioned Feature Print revisits, bounded cross-session persistence, information-gain reachable view planning, MCP map projection, static/dynamic separation and familiar-space evaluation |
-| C8 L0-to-L2 interaction bridge | Codex account bridge implemented; live ASR/contact wiring pending | ChatGPT-authenticated Codex CLI invocation, bounded transcript/context contract, resumable interaction thread, timeout/isolation, direct explicit-contact wake without L1 admission; local ASR, pre-roll, TTS, interruption, and live release tests remain |
-| C9 LED signalling | Palette/pattern ABI confirmed; MCP/native wiring and physical state map planned | `rgb_palette=true`, `arbitrary_rgb=false`, brightness/enabled access, leased set/clear/restore, and a consented physical test of every allowlisted state |
+| C8 L0-to-L2 interaction bridge | Account-authenticated app-server GPT-Live WebRTC handshake implemented; physical conversation validation pending | Directed eye-contact plus VAD opening, bot-pulse exception, V3 WebRTC session, one-second PCM pre-roll, text context injection, duplicate-launch suppression, scalar audit, and an explicit local CLI/ASR/TTS fallback |
+| C9 LED signalling | Firmware ABI, native L0 state wiring, and semantic cadence engine implemented; MCP tool and visual hue characterization pending | `rgb_palette=true`, `arbitrary_rgb=false`, allowlisted state set/clear, six distinct steady/blink signatures, brightness/enabled access, shutdown restore, semantic priority trace, and physical SDK acknowledgements |
 | C10 End-to-end social evaluation | Planned | Labelled explicit-contact, curiosity, dialogue, task, opt-out, memory-correction, and embodiment scenarios |
 
 The physical intent adapter and its end-to-end target/view gates are complete.
-The next integration gate is C4: the primary 31B L1 stream must consume typed
-situation frames, retrieve bounded C2 memory projections, submit validated
-memory proposals, and use the C6 MCP surface for active observation. Place
+The next integration gate is C4 consolidation: the primary 31B L1 stream must
+turn raw L2 transcript turns into validated memory proposals and use the C6 MCP
+surface for active observation. Place
 re-identification remains deliberately ambiguity-aware and needs a
 labelled viewpoint, lighting, and change-evaluation corpus before its
 familiarity can influence anything beyond no-target exploration. C3 still needs
-deployment labels before it schedules L1 or opens L2 interaction. C8 speech wiring, C9, and C10 remain subsequent
+deployment labels before it schedules L1 or opens L2 interaction automatically. C8 barge-in, the C9 semantic MCP surface, and C10 remain subsequent
 work. Every cognitive layer
 receives the same semantic surface, while SDK calls stay behind the L0 arbiter
 and each stage remains independently disableable.

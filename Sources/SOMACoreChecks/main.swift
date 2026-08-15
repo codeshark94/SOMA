@@ -14,6 +14,88 @@ private func rect(_ x: Double) -> NormalizedRect {
 
 let model = PredictiveWorldModel()
 let start: UInt64 = 1_000_000_000
+var contactGate = ConversationContactGate()
+require(
+    contactGate.authorizeSpeechOnset(at: start) == nil,
+    "ambient speech opened a first conversation without eye contact"
+)
+contactGate.observeEyeContact(at: start)
+require(
+    contactGate.authorizeSpeechOnset(at: start + 450_000_000) == .eyeContact,
+    "fresh eye contact did not authorize the first spoken turn"
+)
+require(
+    contactGate.authorizeSpeechOnset(at: start + 451_000_000) == nil,
+    "stale eye contact authorized a first spoken turn"
+)
+contactGate.issueSocialPulse(at: start + 1_000_000_000)
+require(
+    contactGate.authorizeSpeechOnset(at: start + 1_100_000_000) == .botInitiatedPulseResponse,
+    "bot-initiated social pulse did not authorize its response"
+)
+require(
+    contactGate.authorizeSpeechOnset(at: start + 1_200_000_000) == nil,
+    "one social pulse authorized more than one first-turn attempt"
+)
+contactGate.markConversationOpened(at: start + 2_000_000_000)
+require(
+    contactGate.authorizeSpeechOnset(at: start + 61_999_000_000) == .activeConversation,
+    "opened conversation required repeated eye contact"
+)
+require(
+    contactGate.authorizeSpeechOnset(at: start + 62_000_000_000) == nil,
+    "inactive conversation lease did not close"
+)
+var liveSessionInactivity = LiveVoiceSessionInactivityGate()
+let firstLiveDeadline = liveSessionInactivity.activate(at: start)
+require(
+    !liveSessionInactivity.shouldClose(at: firstLiveDeadline - 1),
+    "Live voice session closed before one minute of user silence"
+)
+require(
+    liveSessionInactivity.shouldClose(at: firstLiveDeadline),
+    "Live voice session did not close after one minute of user silence"
+)
+let renewedLiveDeadline = liveSessionInactivity.recordUserActivity(at: firstLiveDeadline - 1)
+require(
+    renewedLiveDeadline == firstLiveDeadline + 59_999_999_999,
+    "user activity did not renew the Live voice silence deadline"
+)
+var indicatorInputs = SubconsciousIndicatorInputs(
+    visualState: .eyeContact,
+    interactionState: .idle
+)
+require(indicatorInputs.resolvedState == .contactReady, "contact-ready LED priority is wrong")
+indicatorInputs.interactionState = .conversation
+require(indicatorInputs.resolvedState == .conversation, "conversation LED priority is wrong")
+indicatorInputs.interactionState = .preparingReply
+require(indicatorInputs.resolvedState == .working, "working LED priority is wrong")
+require(
+    SOMALEDHardwareTransition.commands(previousStateID: 18, nextStateID: 57)
+        == [.clear(stateID: 18), .set(stateID: 57)],
+    "LED state transition did not release the prior firmware state first"
+)
+require(
+    SubconsciousIndicatorState.contactReady.humanMeaning == "ready_speak_now"
+        && SubconsciousIndicatorState.working.humanMeaning == "please_wait_preparing_reply",
+    "LED state does not expose a human-readable interaction affordance"
+)
+var liveVoiceGate = LiveVoiceLaunchGate()
+require(liveVoiceGate.beginLaunch(at: start), "app-server Live launch did not arm")
+require(!liveVoiceGate.beginLaunch(at: start + 1), "app-server Live launch was not debounced")
+liveVoiceGate.fail(at: start, retryMilliseconds: 5_000)
+require(
+    !liveVoiceGate.beginLaunch(at: start + 4_999_999_999),
+    "app-server Live retry cooldown ended early"
+)
+require(
+    liveVoiceGate.beginLaunch(at: start + 5_000_000_000),
+    "Live voice retry did not rearm at its deadline"
+)
+liveVoiceGate.observeActive()
+require(!liveVoiceGate.beginLaunch(at: start + 6_000_000_000), "active Voice relaunched")
+liveVoiceGate.observeEnded()
+require(liveVoiceGate.beginLaunch(at: start + 6_000_000_000), "ended Voice did not rearm")
 let wideHorizontalFOV = CameraFieldOfView.horizontalDegrees(
     diagonalDegrees: 86,
     aspectRatio: 16.0 / 9.0
@@ -2253,6 +2335,32 @@ do {
     let codexResult = try CodexCLIJSONLParser.parse(codexFixture)
     require(codexResult.threadID == "core-thread", "Codex account parser lost the thread ID")
     require(codexResult.assistantText == "hello back", "Codex account parser lost the reply")
+
+    var speechSegmenter = SpeechTurnSegmenter(configuration: .init(
+        analysisLookbackMilliseconds: 260,
+        maximumTurnMilliseconds: 1_000,
+        rearmMilliseconds: 500
+    ))
+    require(
+        speechSegmenter.observe(voiceActive: true, at: 1_000_000_000) == nil,
+        "speech segmenter admitted voice without an authorized contact wake"
+    )
+    let speechStart = speechSegmenter.observe(
+        voiceActive: true,
+        at: 2_000_000_000,
+        authorizedWake: interactionWake
+    )
+    if case .started(let start) = speechStart {
+        require(start.speechStartedAtNS == 1_740_000_000, "speech analysis lookback changed")
+    } else {
+        require(false, "authorized contact failed to start a speech turn")
+    }
+    let speechFinish = speechSegmenter.observe(voiceActive: false, at: 2_700_000_000)
+    if case .finished(let finish) = speechFinish {
+        require(finish.reason == .voiceOffset, "speech turn closed for the wrong reason")
+    } else {
+        require(false, "voice offset failed to close the speech turn")
+    }
 } catch {
     require(false, "explicit contact interaction handoff failed: \(error)")
 }

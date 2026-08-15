@@ -149,7 +149,8 @@ move the gimbal, speak, identify a person, retrieve memory, or invoke L1. The
 shared MCP transport and running L0 arbiter accept the same leased semantic
 embodiment goals from L1 and L2—labels, attention priors, tracking, orientation,
 exploration, view alignment, and expression. The separately enabled motor
-adapter is active in the authorized persistent launcher; E2B still cannot claim
+adapter is active in the authorized persistent launcher; E2B is disabled there
+by default and is enabled only with `SOMA_ENABLE_L05_VLM=1`. It still cannot claim
 that lease or invoke the MCP by itself. The model path
 must already exist locally; no network or Ollama fallback is permitted. Direct MLX uses the Apple GPU
 and unified memory, while L0 Core ML remains independently ANE-preferred. The
@@ -158,7 +159,7 @@ worker has an 8 GB MLX evaluation limit and a 256 MB free-cache limit.
 The 2026-08-15 same-image direct-MLX comparison found E2B at 1.47 s cold and
 1.39 s warm median, versus E4B at 3.00 s cold and 2.75 s warm median. E2B's
 MLX-reported peak was 4.20 GB versus 5.75 GB, and its local checkpoint was
-3.3 GiB versus 4.8 GiB. E2B is therefore the persistent helper; E4B remains a
+3.3 GiB versus 4.8 GiB. E2B is therefore the preferred explicit helper; E4B remains a
 comparison fallback. Process RSS moved in the opposite direction in this short
 probe (3.33 GB E2B versus 2.31 GB E4B), so the decision is based on latency,
 MLX peak, disk footprint, and the bounded-worker isolation—not a claim that
@@ -168,7 +169,7 @@ Vision worker's missing per-frame autorelease boundary was fixed and a same-PID
 898.43-second L0-only run reached 22,422 video callbacks with zero runtime
 error/stall events and bounded RSS. A following 20-request E4B stress window
 advanced L0 by 1,749 video callbacks with no new skipped frames or cumulative
-latency maxima. The persistent LaunchAgent now enables direct MLX and a first
+latency maxima. The persistent LaunchAgent keeps direct MLX opt-in and a first
 234.34-second integrated smoke produced 48 semantic events, no interrupt false
 positive, and no auxiliary-worker runtime error. A longer thermal qualification remains an
 operational follow-up. The E2B/E4B semantic comparison used one person-free
@@ -324,10 +325,11 @@ transcribe speech, identify a speaker, or retrieve a person record. VAD and
 TDOA evaluation must cover the deployment's expected languages and acoustic
 conditions; no Korean-only corpus may become the implicit production contract.
 
-L1 may later combine language evidence, a consented account/session identity
-candidate, and scoped memory retrieval. Identity remains `unknown` until an
-explicitly authorized signal establishes it; face or voice resemblance is not
-enough. Rapport and individual information may tune response timing and style,
+L1 may combine language evidence, a consented account/session identity
+candidate, and scoped memory retrieval. Face resemblance can recover an
+encrypted local anonymous pseudonym, but it does not establish a name,
+relationship, or consent state. Those remain `unknown` until an explicitly
+authorized enrollment. Rapport and individual information may tune response timing and style,
 but cannot widen memory access, lower consent requirements, or authorize a
 camera/action command. The L0 attention field receives only bounded,
 non-semantic handoff evidence from that layer.
@@ -447,12 +449,25 @@ also rules out any hard real-time end-to-end claim.
 
 ## Immediate next action
 
-Implement the direct interaction path and C4 without coupling their latency.
-L0 first publishes C3 contact dispatch in shadow mode; a local speech transport
-then consumes its bounded in-memory audio pre-roll and live stream, forwards
-every accepted final transcript plus scoped context to the ChatGPT-authenticated
-L2 Codex account bridge, and records wake-to-audio, speech-start-to-transcript,
-Codex, and speech-output latency.
+The direct interaction transport now has an end-to-end synthetic validation:
+the installed helper accepted OBSBOT-format PCM, produced an input transcript,
+created a response turn, and played a detected remote audio track. The deployed
+default is the app-server's `maple` voice. Physical field validation with a
+human still has to measure microphone, echo, and barge-in behaviour. Build C4
+without coupling its latency to this route. L0 now permits the first spoken turn
+only when fresh directed
+eye-contact evidence and voice coincide, except for one response after a
+SOMA-initiated greeting pulse. A successful L2 handoff opens a bounded follow-up
+conversation lease. The authorized C3 wake becomes a bounded
+utterance and consumes one second of memory-only PCM pre-roll. The primary path
+starts an account-authenticated Codex app-server V3 WebRTC session, supplies the
+opening context through `initialItems`, batches PCM into a continuous Web Audio
+worklet, and admits changed ephemeral E2B camera summaries through `appendText`.
+The local CLI/Apple-ASR/AVSpeechSynthesizer bridge remains a
+diagnostic fallback only. A labelled directed/non-directed speech set must
+still measure false wakes, missed wakes, speech-start-to-transcript latency,
+multilingual accuracy, account-to-audio latency, echo, and barge-in without
+weakening the eye-contact opening gate or immediate L0 acknowledgement.
 Meanwhile the primary 31B situational stream consumes a bounded
 `SituationFrame`, C2 memory projection, and C6 embodiment MCP and prepares the
 richer interaction context in parallel. It requests transient views only for
@@ -464,8 +479,16 @@ missed contacts remain measurable.
 
 The C2 core is now implemented as a typed, encrypted local journal with
 provenance, consent, tier retention, promotion, correction, deletion, and
-remote-summary projection boundaries. Keychain provisioning and L1 integration
-remain runtime work. The C3 core now supplies a versioned probabilistic router,
+remote-summary projection boundaries. It now includes exact local-only L2
+conversation turns, ordered pending/consolidated state, and links to the typed
+memories derived by L1. The L1 read path now provisions an owner-only local key
+and retrieves only policy-approved summaries, rapport context, and information
+motives, which it may naturalize into a context-appropriate opening. Live
+transcript ingestion and consolidation remain runtime work. The default curator is L1; L2 may explicitly flag direct
+user facts, corrections, and memory requests, but cannot bypass validation.
+The same `gemma4:31b-cloud` L1 stream is the intended consolidation route; no
+second L1 model or shadow route participates in memory decisions. The C3 core
+now supplies a versioned probabilistic router,
 direct L2 interaction dispatch, parallel L1 context preparation, interaction
 authorization and local-safety policy masks, deterministic replay sampling,
 temperature calibration, and false-wake/missed-wake metrics. Its 32-row
@@ -488,9 +511,9 @@ MCP image resource, and releases only its one-shot motor goal. Live checks
 returned a sharp 640x360 frame in 1.6 s at -0.35/-0.05 degrees for a 0/0-degree
 request. A registered `bicycle` bound to `scene-10`, reacquired fresh visual
 evidence, physically tracked to hold, and released at the 20-second deadline.
-The next implementation gate is C4: wire the primary 31B situational stream to
-the typed C2 memory projection and calibrated C3 event router, using C6 tools
-for active observation rather than adding another actuator path.
+The next implementation gate is C4: ingest Live transcript turns and consolidate
+them through the primary 31B stream, using C6 tools for active observation
+rather than adding another actuator path.
 
 ## P4 audiovisual attention field
 

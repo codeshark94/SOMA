@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cmath>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <set>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -642,6 +644,10 @@ bool requestNativeHumanTracking(
     try { trackingModeResult = device->aiSetTrackingModeR(Device::AiVTrackMotion); } catch (...) {}
     bool activated = false;
     try { activated = waitForMode(device, Device::AiWorkModeHuman, 2'000); } catch (...) {}
+    int nativeLedPatternResult = RM_RET_ERR;
+    if (activated) {
+        try { nativeLedPatternResult = device->cameraSetLedCtrlU(false); } catch (...) {}
+    }
     const int confirmedTrackingMode = verticalTrackingMode(device).value_or(-1);
     trace.event(
         "camera.ack",
@@ -650,6 +656,7 @@ bool requestNativeHumanTracking(
         activated ? RM_RET_OK : RM_RET_ERR,
         "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device))
             + "; tracking_mode_set_result=" + std::to_string(trackingModeResult)
+            + "; native_led_pattern_disable_result=" + std::to_string(nativeLedPatternResult)
             + "; camera_status_vertical_tracking_mode=" + std::to_string(confirmedTrackingMode),
         commandID
     );
@@ -662,7 +669,24 @@ bool requestNativeHumanTracking(
     return activated;
 }
 
-enum class BridgeCommandType { nativeStart, heartbeat, externalVelocity, externalPosition, externalPulse, externalVelocityOutOfRange, externalPositionOutOfRange, externalStop, manualStop, recenter, shutdown, invalid };
+enum class BridgeCommandType {
+    nativeStart,
+    heartbeat,
+    externalVelocity,
+    externalPosition,
+    externalPulse,
+    externalVelocityOutOfRange,
+    externalPositionOutOfRange,
+    externalStop,
+    manualStop,
+    recenter,
+    indicatorSet,
+    indicatorClear,
+    indicatorBrightness,
+    indicatorEnabled,
+    shutdown,
+    invalid
+};
 
 struct BridgeCommand {
     BridgeCommandType type = BridgeCommandType::invalid;
@@ -670,6 +694,7 @@ struct BridgeCommand {
     double pitch = 0;
     double pan = 0;
     int durationMilliseconds = 0;
+    int value = 0;
 };
 
 bool validCommandID(const std::string &value) {
@@ -710,6 +735,40 @@ BridgeCommand parseBridgeCommand(const std::string &line) {
             || durationMilliseconds < 1 || durationMilliseconds > 180) return {};
         return {BridgeCommandType::externalPulse, commandID, pitch, pan, durationMilliseconds};
     }
+    if (verb == "indicator_set" || verb == "indicator_clear") {
+        int stateID = -1;
+        if (!(input >> stateID) || (input >> extra)) return {};
+        // These are non-error firmware palette entries verified on Tiny 2
+        // Lite. Raw state IDs are deliberately not a general command surface.
+        const bool allowed = stateID == 16 || stateID == 17 || stateID == 18
+            || stateID == 54 || stateID == 57;
+        if (!allowed) return {};
+        BridgeCommand command;
+        command.type = verb == "indicator_set"
+            ? BridgeCommandType::indicatorSet
+            : BridgeCommandType::indicatorClear;
+        command.commandID = commandID;
+        command.value = stateID;
+        return command;
+    }
+    if (verb == "indicator_brightness") {
+        int brightness = -1;
+        if (!(input >> brightness) || (input >> extra) || brightness < 0 || brightness > 3) return {};
+        BridgeCommand command;
+        command.type = BridgeCommandType::indicatorBrightness;
+        command.commandID = commandID;
+        command.value = brightness;
+        return command;
+    }
+    if (verb == "indicator_enabled") {
+        int enabled = -1;
+        if (!(input >> enabled) || (input >> extra) || (enabled != 0 && enabled != 1)) return {};
+        BridgeCommand command;
+        command.type = BridgeCommandType::indicatorEnabled;
+        command.commandID = commandID;
+        command.value = enabled;
+        return command;
+    }
     if (input >> extra) return {};
     if (verb == "native_start") return {BridgeCommandType::nativeStart, commandID};
     if (verb == "heartbeat") return {BridgeCommandType::heartbeat, commandID};
@@ -719,6 +778,163 @@ BridgeCommand parseBridgeCommand(const std::string &line) {
     if (verb == "shutdown") return {BridgeCommandType::shutdown, commandID};
     return {};
 }
+
+class IndicatorSession {
+public:
+    IndicatorSession(std::shared_ptr<Device> device, Trace &trace)
+        : device_(std::move(device)), trace_(trace) {
+        readBaseline();
+    }
+
+    ~IndicatorSession() {
+        restore();
+    }
+
+    void set(int stateID, const std::string &commandID) noexcept {
+        trace_.event("indicator.command", "soma", "set_state", 0, "state_id=" + std::to_string(stateID), commandID);
+        int result = RM_RET_ERR;
+        try { result = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+        if (result == RM_RET_OK) activeStates_.insert(stateID);
+        trace_.event(
+            "indicator.ack",
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "state_active" : "state_rejected",
+            result,
+            "state_id=" + std::to_string(stateID),
+            commandID
+        );
+    }
+
+    void clear(int stateID, const std::string &commandID) noexcept {
+        trace_.event("indicator.command", "soma", "clear_state", 0, "state_id=" + std::to_string(stateID), commandID);
+        int result = RM_RET_ERR;
+        try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+        if (result == RM_RET_OK) activeStates_.erase(stateID);
+        trace_.event(
+            "indicator.ack",
+            result == RM_RET_OK ? "firmware" : "fault",
+            result == RM_RET_OK ? "state_cleared" : "clear_rejected",
+            result,
+            "state_id=" + std::to_string(stateID),
+            commandID
+        );
+    }
+
+    void setBrightness(int brightness, const std::string &commandID) noexcept {
+        trace_.event("indicator.command", "soma", "set_brightness", 0, "brightness=" + std::to_string(brightness), commandID);
+        const int result = callSetBrightness(static_cast<uint8_t>(brightness));
+        if (result == RM_RET_OK) brightnessChanged_ = true;
+        trace_.event(
+            "indicator.ack",
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "brightness_active" : "brightness_rejected",
+            result,
+            "brightness=" + std::to_string(brightness),
+            commandID
+        );
+    }
+
+    void setEnabled(bool enabled, const std::string &commandID) noexcept {
+        trace_.event(
+            "indicator.command",
+            "soma",
+            "set_enabled",
+            0,
+            std::string("enabled=") + (enabled ? "true" : "false"),
+            commandID
+        );
+        const int result = callSetEnabled(enabled);
+        if (result == RM_RET_OK) enabledChanged_ = true;
+        trace_.event(
+            "indicator.ack",
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "enabled_active" : "enabled_rejected",
+            result,
+            std::string("enabled=") + (enabled ? "true" : "false"),
+            commandID
+        );
+    }
+
+    void restore() noexcept {
+        if (restored_) return;
+        restored_ = true;
+        bool clearSucceeded = true;
+        for (const int stateID : activeStates_) {
+            int result = RM_RET_ERR;
+            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+            clearSucceeded = clearSucceeded && result == RM_RET_OK;
+        }
+        activeStates_.clear();
+        bool globalsSucceeded = true;
+        if (brightnessChanged_ && baselineBrightness_) {
+            globalsSucceeded = callSetBrightness(*baselineBrightness_) == RM_RET_OK && globalsSucceeded;
+        }
+        if (enabledChanged_ && baselineEnabled_) {
+            globalsSucceeded = callSetEnabled(*baselineEnabled_) == RM_RET_OK && globalsSucceeded;
+        }
+        trace_.event(
+            "indicator.ack",
+            clearSucceeded && globalsSucceeded ? "firmware" : "fault",
+            clearSucceeded && globalsSucceeded ? "restored" : "restore_incomplete",
+            clearSucceeded && globalsSucceeded ? RM_RET_OK : RM_RET_ERR,
+            std::string("soma_states_cleared=") + (clearSucceeded ? "true" : "false")
+                + "; globals_restored=" + (globalsSucceeded ? "true" : "false")
+        );
+    }
+
+private:
+    using GetEnabled = int (*)(Device *, bool &);
+    using SetEnabled = int (*)(Device *, bool);
+    using GetBrightness = int (*)(Device *, uint8_t &);
+    using SetBrightness = int (*)(Device *, uint8_t);
+
+    template <typename Function>
+    static Function symbol(const char *name) noexcept {
+        return reinterpret_cast<Function>(dlsym(RTLD_DEFAULT, name));
+    }
+
+    void readBaseline() noexcept {
+        bool enabled = false;
+        uint8_t brightness = 0;
+        const auto getEnabled = symbol<GetEnabled>("_ZN6Device19sysMgGetLedEnabledRERb");
+        const auto getBrightness = symbol<GetBrightness>("_ZN6Device22sysMgGetLedBrightnessRERh");
+        const int enabledResult = getEnabled ? getEnabled(device_.get(), enabled) : RM_RET_ERR;
+        const int brightnessResult = getBrightness ? getBrightness(device_.get(), brightness) : RM_RET_ERR;
+        if (enabledResult == RM_RET_OK) baselineEnabled_ = enabled;
+        if (brightnessResult == RM_RET_OK) baselineBrightness_ = brightness;
+        trace_.event(
+            "indicator.capability",
+            "firmware",
+            "rgb_palette_available",
+            enabledResult == RM_RET_OK && brightnessResult == RM_RET_OK ? RM_RET_OK : RM_RET_ERR,
+            "arbitrary_rgb=false; enabled="
+                + (baselineEnabled_ ? (*baselineEnabled_ ? std::string("true") : std::string("false")) : std::string("unavailable"))
+                + "; brightness="
+                + (baselineBrightness_ ? std::to_string(*baselineBrightness_) : std::string("unavailable"))
+        );
+    }
+
+    int callSetEnabled(bool enabled) noexcept {
+        const auto function = symbol<SetEnabled>("_ZN6Device19sysMgSetLedEnabledREb");
+        if (!function) return RM_RET_ERR;
+        try { return function(device_.get(), enabled); } catch (...) { return RM_RET_ERR; }
+    }
+
+    int callSetBrightness(uint8_t brightness) noexcept {
+        const auto function = symbol<SetBrightness>("_ZN6Device22sysMgSetLedBrightnessREh");
+        if (!function) return RM_RET_ERR;
+        try { return function(device_.get(), brightness); } catch (...) { return RM_RET_ERR; }
+    }
+
+    std::shared_ptr<Device> device_;
+    Trace &trace_;
+    std::set<int> activeStates_;
+    std::optional<bool> baselineEnabled_;
+    std::optional<uint8_t> baselineBrightness_;
+    bool brightnessChanged_ = false;
+    bool enabledChanged_ = false;
+    bool restored_ = false;
+};
 
 std::optional<std::string> readBridgeLine() noexcept {
     std::string line;
@@ -746,6 +962,7 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
     if (!configureFixedCameraZoom(device, trace)) return 5;
     if (const auto fieldOfView = cameraHorizontalFieldOfViewDegrees(device)) emitHorizontalFieldOfView(*fieldOfView);
     if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
+    IndicatorSession indicator(device, trace);
     trace.event("camera.owner", "manual", "bridge_ready", RM_RET_OK, "awaiting_local_attention_commands");
     std::cerr << "SOMA_NATIVE_BRIDGE_READY\n" << std::flush;
     bool nativeTracking = false;
@@ -921,6 +1138,18 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                     if (!stopped) return 4;
                 }
                 if (!requestCenter(device, trace, command.commandID)) return 4;
+                break;
+            case BridgeCommandType::indicatorSet:
+                indicator.set(command.value, command.commandID);
+                break;
+            case BridgeCommandType::indicatorClear:
+                indicator.clear(command.value, command.commandID);
+                break;
+            case BridgeCommandType::indicatorBrightness:
+                indicator.setBrightness(command.value, command.commandID);
+                break;
+            case BridgeCommandType::indicatorEnabled:
+                indicator.setEnabled(command.value == 1, command.commandID);
                 break;
             case BridgeCommandType::shutdown:
                 if (nativeTracking || externalControl) {

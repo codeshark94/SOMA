@@ -59,6 +59,10 @@ private struct Options {
     let cameraGeometryCalibrationURL: URL?
     let cameraGeometryCaptureDirectoryURL: URL?
     let panoramaStripScan: Bool
+    let localSpeechLocaleIdentifier: String?
+    let l2CodexBridgeURL: URL?
+    let l2LiveVoice: Bool
+    let controlSettingsURL: URL
 
     static func parse(_ arguments: [String]) throws -> Options {
         var duration: TimeInterval = 60
@@ -96,6 +100,10 @@ private struct Options {
         var cameraGeometryCalibrationURL: URL?
         var cameraGeometryCaptureDirectoryURL: URL?
         var panoramaStripScan = false
+        var localSpeechLocaleIdentifier: String?
+        var l2CodexBridgeURL: URL?
+        var l2LiveVoice = false
+        var controlSettingsURL = SOMAControlSettingsStore.defaultURL()
         var index = 0
 
         while index < arguments.count {
@@ -290,6 +298,26 @@ private struct Options {
                 cameraGeometryCaptureDirectoryURL = URL(fileURLWithPath: arguments[index])
             case "--panorama-strip-scan":
                 panoramaStripScan = true
+            case "--local-speech-recognition":
+                index += 1
+                guard index < arguments.count else {
+                    throw RuntimeError.invalidArgument("--local-speech-recognition requires a locale such as ko-KR or en-US")
+                }
+                localSpeechLocaleIdentifier = arguments[index]
+            case "--l2-codex-bridge":
+                index += 1
+                guard index < arguments.count, arguments[index].hasPrefix("/") else {
+                    throw RuntimeError.invalidArgument("--l2-codex-bridge requires an absolute executable path")
+                }
+                l2CodexBridgeURL = URL(fileURLWithPath: arguments[index])
+            case "--l2-live-voice":
+                l2LiveVoice = true
+            case "--soma-settings":
+                index += 1
+                guard index < arguments.count, arguments[index].hasPrefix("/") else {
+                    throw RuntimeError.invalidArgument("--soma-settings requires an absolute JSON path")
+                }
+                controlSettingsURL = URL(fileURLWithPath: arguments[index])
             case "--help", "-h":
                 printUsage()
                 Foundation.exit(EXIT_SUCCESS)
@@ -423,6 +451,23 @@ private struct Options {
                 throw RuntimeError.invalidArgument("--capture-camera-geometry requires --panorama-output, duration 0 or at least 30 seconds, and a new directory")
             }
         }
+        if let localSpeechLocaleIdentifier {
+            guard !localSpeechLocaleIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  localSpeechLocaleIdentifier.count <= 32 else {
+                throw RuntimeError.invalidArgument("--local-speech-recognition requires a valid bounded locale identifier")
+            }
+        }
+        if let l2CodexBridgeURL {
+            guard localSpeechLocaleIdentifier != nil else {
+                throw RuntimeError.invalidArgument("--l2-codex-bridge requires --local-speech-recognition")
+            }
+            guard FileManager.default.isExecutableFile(atPath: l2CodexBridgeURL.path) else {
+                throw RuntimeError.invalidArgument("L2 Codex bridge is not executable: \(l2CodexBridgeURL.path)")
+            }
+        }
+        if l2LiveVoice, l2CodexBridgeURL != nil {
+            throw RuntimeError.invalidArgument("Choose either --l2-live-voice or --l2-codex-bridge")
+        }
         let l1AuxiliaryValuesPresent = [
             l1AuxiliaryVLMPythonURL != nil,
             l1AuxiliaryVLMWorkerURL != nil,
@@ -480,7 +525,11 @@ private struct Options {
             panoramaPlaceMemoryURL: panoramaPlaceMemoryURL,
             cameraGeometryCalibrationURL: cameraGeometryCalibrationURL,
             cameraGeometryCaptureDirectoryURL: cameraGeometryCaptureDirectoryURL,
-            panoramaStripScan: panoramaStripScan
+            panoramaStripScan: panoramaStripScan,
+            localSpeechLocaleIdentifier: localSpeechLocaleIdentifier,
+            l2CodexBridgeURL: l2CodexBridgeURL,
+            l2LiveVoice: l2LiveVoice,
+            controlSettingsURL: controlSettingsURL
         )
     }
 
@@ -578,6 +627,206 @@ private struct VoiceEvent: Encodable, Sendable {
     let levelDB: Double
 }
 
+private struct SpeechInteractionTraceEvent: Encodable, Sendable {
+    let event = "speech.interaction"
+    let monotonicNS: UInt64
+    let state: String
+    let speechStartedAtNS: UInt64?
+    let speechEndedAtNS: UInt64?
+    let preRollMilliseconds: UInt64?
+    let audioChunkCount: Int?
+    let transcriptCharacters: Int?
+    let localeIdentifier: String?
+    let confidence: Double?
+    let latencyMilliseconds: Double?
+    let handedToL2: Bool?
+    let turnID: String?
+    let responseCharacters: Int?
+    let reason: String?
+
+    init(_ value: LocalSpeechInteractionState, at monotonicNS: UInt64) {
+        self.monotonicNS = monotonicNS
+        switch value {
+        case let .turnStarted(startedNS, preRollMS, chunkCount, authorization):
+            state = "turn_started"
+            speechStartedAtNS = startedNS
+            speechEndedAtNS = nil
+            preRollMilliseconds = preRollMS
+            audioChunkCount = chunkCount
+            transcriptCharacters = nil
+            localeIdentifier = nil
+            confidence = nil
+            latencyMilliseconds = nil
+            handedToL2 = nil
+            turnID = nil
+            responseCharacters = nil
+            reason = authorization
+        case let .turnCancelled(value):
+            state = "turn_cancelled"
+            speechStartedAtNS = nil
+            speechEndedAtNS = nil
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = nil
+            localeIdentifier = nil
+            confidence = nil
+            latencyMilliseconds = nil
+            handedToL2 = nil
+            turnID = nil
+            responseCharacters = nil
+            reason = value
+        case let .recognitionCompleted(startedNS, endedNS, characters, locale, score, latencyMS, handedOff):
+            state = "recognition_completed"
+            speechStartedAtNS = startedNS
+            speechEndedAtNS = endedNS
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = characters
+            localeIdentifier = locale
+            confidence = score
+            latencyMilliseconds = latencyMS
+            handedToL2 = handedOff
+            turnID = nil
+            responseCharacters = nil
+            reason = nil
+        case let .recognitionFailed(value):
+            state = "recognition_failed"
+            speechStartedAtNS = nil
+            speechEndedAtNS = nil
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = nil
+            localeIdentifier = nil
+            confidence = nil
+            latencyMilliseconds = nil
+            handedToL2 = nil
+            turnID = nil
+            responseCharacters = nil
+            reason = value
+        case let .l2Completed(value, characters, latencyMS):
+            state = "l2_completed"
+            speechStartedAtNS = nil
+            speechEndedAtNS = nil
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = nil
+            localeIdentifier = nil
+            confidence = nil
+            latencyMilliseconds = latencyMS
+            handedToL2 = true
+            turnID = value
+            responseCharacters = characters
+            reason = nil
+        case let .l2Failed(value, failure):
+            state = "l2_failed"
+            speechStartedAtNS = nil
+            speechEndedAtNS = nil
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = nil
+            localeIdentifier = nil
+            confidence = nil
+            latencyMilliseconds = nil
+            handedToL2 = false
+            turnID = value
+            responseCharacters = nil
+            reason = failure
+        case let .speechStarted(value, characters, locale):
+            state = "speech_started"
+            speechStartedAtNS = nil
+            speechEndedAtNS = nil
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = nil
+            localeIdentifier = locale
+            confidence = nil
+            latencyMilliseconds = nil
+            handedToL2 = true
+            turnID = value
+            responseCharacters = characters
+            reason = nil
+        case let .speechCompleted(value, durationMS):
+            state = "speech_completed"
+            speechStartedAtNS = nil
+            speechEndedAtNS = nil
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = nil
+            localeIdentifier = nil
+            confidence = nil
+            latencyMilliseconds = durationMS
+            handedToL2 = true
+            turnID = value
+            responseCharacters = nil
+            reason = nil
+        case let .speechCancelled(value, cancellation):
+            state = "speech_cancelled"
+            speechStartedAtNS = nil
+            speechEndedAtNS = nil
+            preRollMilliseconds = nil
+            audioChunkCount = nil
+            transcriptCharacters = nil
+            localeIdentifier = nil
+            confidence = nil
+            latencyMilliseconds = nil
+            handedToL2 = true
+            turnID = value
+            responseCharacters = nil
+            reason = cancellation
+        }
+    }
+}
+
+private final class ConversationContactRuntime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var gate = ConversationContactGate()
+
+    func observe(_ candidates: [SceneCandidate], at monotonicNS: UInt64) {
+        let hasEyeContact = candidates.contains { candidate in
+            candidate.observedThisFrame
+                && candidate.observation.kind == .human
+                && candidate.observation.label == "face"
+                && candidate.isActionEligible
+                && candidate.faceVerificationEligible
+                && candidate.eyeContactEligible
+        }
+        guard hasEyeContact else { return }
+        lock.lock()
+        gate.observeEyeContact(at: monotonicNS)
+        lock.unlock()
+    }
+
+    func issueSocialPulse(at monotonicNS: UInt64) {
+        lock.lock()
+        gate.issueSocialPulse(at: monotonicNS)
+        lock.unlock()
+    }
+
+    func authorizeSpeechOnset(at monotonicNS: UInt64) -> ConversationOpeningAuthorization? {
+        lock.lock()
+        defer { lock.unlock() }
+        return gate.authorizeSpeechOnset(at: monotonicNS)
+    }
+
+    func markConversationOpened(at monotonicNS: UInt64) {
+        lock.lock()
+        gate.markConversationOpened(at: monotonicNS)
+        lock.unlock()
+    }
+
+    func recordConversationActivity(at monotonicNS: UInt64) {
+        lock.lock()
+        gate.recordConversationActivity(at: monotonicNS)
+        lock.unlock()
+    }
+
+    func closeConversation() {
+        lock.lock()
+        gate.closeConversation()
+        lock.unlock()
+    }
+}
+
 private struct AudioDirectionEvent: Encodable, Sendable {
     let event = "audio.direction"
     let monotonicNS: UInt64
@@ -600,6 +849,66 @@ private struct VisionEvent: Encodable, Sendable {
     let attentionProbability: Double
     let attentionEntropy: Double
     let captureToBeliefMS: Double
+}
+
+private struct FaceIdentityEvent: Encodable, Sendable {
+    let schemaVersion = 1
+    let event = "identity.observation"
+    let monotonicNS: UInt64
+    let state: String
+    let subject: String
+    let confidence: Double
+    let inferenceMS: Double
+}
+
+/// Face recognition remains a local, probabilistic signal. This tracker only
+/// applies an administrator label after the encrypted profile matcher has
+/// emitted its repeated-confirmation result, and it expires quickly when the
+/// matching face is no longer observed.
+private final class AdministratorRecognitionTracker: @unchecked Sendable {
+    private let administrator: SOMAAdministratorIdentity?
+    private let lock = NSLock()
+    private var lastRecognizedNS: UInt64?
+
+    init(administrator: SOMAAdministratorIdentity?) {
+        self.administrator = administrator
+    }
+
+    @discardableResult
+    func observe(_ decision: FaceIdentityRuntimeDecision, at monotonicNS: UInt64) -> Bool {
+        guard case let .known(entityID, _, _) = decision,
+              entityID == administrator?.entityID else {
+            return false
+        }
+        lock.lock()
+        lastRecognizedNS = monotonicNS
+        lock.unlock()
+        return true
+    }
+
+    func interactionReference(at monotonicNS: UInt64) -> String? {
+        guard let administrator else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let lastRecognizedNS,
+              monotonicNS >= lastRecognizedNS,
+              monotonicNS - lastRecognizedNS <= 2_000_000_000 else {
+            return nil
+        }
+        return "verified_local_administrator; person-context MCP reference: \(administrator.entityID.uuidString.lowercased()). Use it only with person-context tools; do not speak or expose it."
+    }
+
+    func recognizedPersonEntityID(at monotonicNS: UInt64) -> UUID? {
+        guard let administrator else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let lastRecognizedNS,
+              monotonicNS >= lastRecognizedNS,
+              monotonicNS - lastRecognizedNS <= 2_000_000_000 else {
+            return nil
+        }
+        return administrator.entityID
+    }
 }
 
 private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
@@ -955,12 +1264,17 @@ extension VoiceEvent: TraceEvent {
     var longTermDisposition: LongTermDisposition { .always }
 }
 
+extension SpeechInteractionTraceEvent: TraceEvent {
+    var longTermDisposition: LongTermDisposition { .always }
+}
+
 extension AudioDirectionEvent: TraceEvent {
     var longTermDisposition: LongTermDisposition {
         .onChange(key: "audio.direction", fingerprint: direction.rawValue)
     }
 }
 extension VisionEvent: TraceEvent {}
+extension FaceIdentityEvent: TraceEvent {}
 extension L1AuxiliarySemanticTraceEvent: TraceEvent {}
 extension L1AuxiliarySemanticInterruptTraceEvent: TraceEvent {
     var longTermDisposition: LongTermDisposition { .always }
@@ -1641,6 +1955,14 @@ private final class CognitiveEmbodimentMotorAdapter: @unchecked Sendable {
     }
 }
 
+private enum LiveVoicePresentationState: String, Sendable {
+    case inactive
+    case ready
+    case hearingUser = "hearing_user"
+    case preparingResponse = "preparing_response"
+    case responding
+}
+
 private final class AttentionGimbalBridge: @unchecked Sendable {
     private enum State {
         case running
@@ -1696,12 +2018,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private let readyInput: FileHandle
     private let exited = DispatchSemaphore(value: 0)
     private let nativeHumanTrackingEnabled: Bool
+    private let ledSettings: SOMALEDSettings
     private let calibrationOutputURL: URL?
     private let poseStore: GimbalPoseStore
     private let spatialAtlas: SphericalSceneAtlasStore
     private let faceLockDiagnosticRecorder: FaceLockDiagnosticRecorder?
     private let embodimentViewCaptureStore: EmbodimentViewCaptureStore?
     private let externalCalibration: ExternalGimbalCalibration?
+    private let onOutgoingSocialPulse: @Sendable (UInt64) -> Void
     private var state: State = .running
     private var gate = NativeHumanTrackingGate()
     private var nativeCommandID: String?
@@ -1772,6 +2096,23 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var cognitiveDynamics = SmoothExplorationDynamics()
     private var cognitiveExplorationWaypoint: SpatialCoverageDirection?
     private var cognitiveExplorationWaypointStartedNS: UInt64?
+    private var socialPulseIssuedForRequestID: String?
+    private var indicatorInputs = SubconsciousIndicatorInputs()
+    private var localSpeechListening = false
+    private var localSpeechWorking = false
+    private var localSpeechSpeaking = false
+    private var liveVoicePresentation: LiveVoicePresentationState = .inactive
+    private var liveVoiceUserSpeaking = false
+    private var liveVoiceResponsePending = false
+    private var activeIndicatorState: SubconsciousIndicatorState?
+    private var indicatorIlluminated = false
+    private var indicatorCalibrationPreset: SOMALEDFirmwarePreset?
+    private var indicatorCalibrationStateID: Int?
+    private var lastEyeContactNS: UInt64?
+    /// Landmark gaze can miss individual frames. This debounce applies only
+    /// while L0 still has a current face lock; confirmed visual loss clears it
+    /// immediately before any re-acquisition motion begins.
+    private let eyeContactDebounceNS: UInt64 = 500_000_000
 
     init(
         helperURL: URL,
@@ -1782,6 +2123,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         autonomousScanEnabled: Bool,
         idleExplorationEnabled: Bool,
         nativeHumanTrackingEnabled: Bool,
+        ledSettings: SOMALEDSettings,
         calibrationOutputURL: URL?,
         cameraGeometryCalibrationMode: Bool,
         panoramaStripScanMode: Bool,
@@ -1789,10 +2131,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         spatialAtlas: SphericalSceneAtlasStore,
         faceLockDiagnosticRecorder: FaceLockDiagnosticRecorder?,
         embodimentViewCaptureStore: EmbodimentViewCaptureStore?,
+        onOutgoingSocialPulse: @escaping @Sendable (UInt64) -> Void,
         writer: JSONLWriter
     ) throws {
         self.writer = writer
         self.nativeHumanTrackingEnabled = nativeHumanTrackingEnabled
+        self.ledSettings = ledSettings
         self.calibrationOutputURL = calibrationOutputURL
         self.cameraGeometryCalibrationMode = cameraGeometryCalibrationMode
         self.panoramaStripScanMode = panoramaStripScanMode
@@ -1800,6 +2144,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         self.spatialAtlas = spatialAtlas
         self.faceLockDiagnosticRecorder = faceLockDiagnosticRecorder
         self.embodimentViewCaptureStore = embodimentViewCaptureStore
+        self.onOutgoingSocialPulse = onOutgoingSocialPulse
         self.externalCalibration = externalCalibration
         calibrationMode = calibrationOutputURL != nil
         externalGate = externalCalibration.map {
@@ -1876,6 +2221,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             guard !helperReady else { return }
             helperReady = true
             explorationEligibleAfterNS = monotonicNanoseconds() + 3_000_000_000
+            let indicatorEnableCommandID = nextCommandID(prefix: "indicator-enable")
+            send("indicator_enabled \(indicatorEnableCommandID) \(ledSettings.responseMode == .off ? 0 : 1)")
+            let indicatorBrightnessCommandID = nextCommandID(prefix: "indicator-brightness")
+            send("indicator_brightness \(indicatorBrightnessCommandID) \(ledSettings.brightness)")
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
@@ -1886,6 +2235,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             if cameraGeometryCalibrationMode || panoramaStripScanMode {
                 startSmoothExploration(initialPan: 0)
             }
+            refreshIndicator(at: monotonicNanoseconds())
             return
         }
         if line.hasPrefix("SOMA_NATIVE_TRACKING ") {
@@ -1962,6 +2312,80 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             self?.spatialAtlas.updateScene(candidates.map(EmbodimentSceneEntity.init))
             self?.applySceneCandidates(candidates, at: monotonicNS)
         }
+    }
+
+    func ingestSpeechInteractionState(_ speechState: LocalSpeechInteractionState) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            switch speechState {
+            case .turnStarted:
+                localSpeechListening = true
+                localSpeechWorking = false
+                localSpeechSpeaking = false
+            case let .recognitionCompleted(_, _, _, _, _, _, handedToL2):
+                localSpeechListening = false
+                localSpeechWorking = handedToL2
+            case .speechStarted:
+                localSpeechListening = false
+                localSpeechWorking = false
+                localSpeechSpeaking = true
+            case .speechCompleted, .speechCancelled:
+                localSpeechSpeaking = false
+            case .l2Completed:
+                localSpeechListening = false
+                localSpeechWorking = false
+            case .l2Failed, .recognitionFailed, .turnCancelled:
+                localSpeechListening = false
+                localSpeechWorking = false
+                localSpeechSpeaking = false
+            }
+            refreshCommunicationIndicatorInputs()
+            refreshIndicator(at: monotonicNanoseconds())
+        }
+    }
+
+    func ingestLiveVoicePresentation(_ presentation: LiveVoicePresentationState) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard presentation != .preparingResponse || liveVoiceResponsePending else { return }
+            liveVoicePresentation = presentation
+            if presentation == .inactive {
+                liveVoiceUserSpeaking = false
+                liveVoiceResponsePending = false
+            } else if presentation == .responding || presentation == .ready {
+                liveVoiceResponsePending = false
+            }
+            refreshCommunicationIndicatorInputs()
+            refreshIndicator(at: monotonicNanoseconds())
+        }
+    }
+
+    func ingestLiveVoiceTurnAccepted() {
+        queue.async { [weak self] in
+            guard let self, liveVoicePresentation != .inactive else { return }
+            liveVoiceResponsePending = true
+        }
+    }
+
+    func ingestLiveVoiceUserActivity(active: Bool) {
+        queue.async { [weak self] in
+            guard let self, liveVoicePresentation != .inactive else { return }
+            liveVoiceUserSpeaking = active
+            refreshCommunicationIndicatorInputs()
+            refreshIndicator(at: monotonicNanoseconds())
+        }
+    }
+
+    private func refreshCommunicationIndicatorInputs() {
+        let conversationActive = liveVoicePresentation == .hearingUser
+            || liveVoicePresentation == .responding
+            || liveVoiceUserSpeaking
+            || localSpeechListening
+            || localSpeechSpeaking
+        let preparingReply = liveVoicePresentation == .preparingResponse || localSpeechWorking
+        indicatorInputs.interactionState = preparingReply
+            ? .preparingReply
+            : (conversationActive ? .conversation : .idle)
     }
 
     func ingestCoverage(
@@ -2318,6 +2742,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         // selector publishes its matching belief. A miss in that interval is
         // not permission to restart exploration and look away from the face.
         guard !hasRecentObservedFace(at: now) else { return }
+        if indicatorInputs.visualState != .none {
+            indicatorInputs.visualState = .none
+            lastEyeContactNS = nil
+            refreshIndicator(at: now)
+        }
         // Keep the first confirmed-loss time. Replacing it on every empty
         // detector frame makes every recovery grace period recede forever.
         if confirmedVisualLossNS == nil {
@@ -2679,6 +3108,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 let preemptedExploration = scanRunning || activeSpatialFaceReacquisition != nil
                 lastObservedFaceNS = monotonicNS
                 if faceLock.permitsMotor(at: monotonicNS) {
+                    if observedFace.eyeContactEligible {
+                        lastEyeContactNS = monotonicNS
+                        indicatorInputs.visualState = .eyeContact
+                    } else if !hasRecentEyeContact(at: monotonicNS) {
+                        indicatorInputs.visualState = .humanDetected
+                    }
+                    refreshIndicator(at: monotonicNS)
                     socialTrackingContinuity.recordObservation(at: monotonicNS)
                 }
                 // Invalidate any absence callback that was queued before this
@@ -3457,8 +3893,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let base = basePose ?? pose
         let offsets = cognitiveExpressionOffsets(kind, currentPan: base.panDegrees)
         guard waypointIndex < offsets.count else {
-            stopCognitiveMotion(state: "cognitive_expression_completed", at: monotonicNS, retainLease: true)
-            cognitiveMotionMode = .suspended(reason: "expression_completed")
+            // An expression is a bounded overlay. Holding its lease after the
+            // return waypoint would suppress face fixation until timeout.
+            releaseCognitiveMotor(state: "cognitive_expression_completed", at: monotonicNS)
             return
         }
         let offset = offsets[waypointIndex]
@@ -3466,9 +3903,17 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             azimuthDegrees: base.panDegrees + offset.pan,
             elevationDegrees: base.pitchDegrees + offset.pitch
         )
+        if kind == .greeting,
+           let requestID = activeCognitiveMotorRequestID,
+           socialPulseIssuedForRequestID != requestID {
+            socialPulseIssuedForRequestID = requestID
+            onOutgoingSocialPulse(monotonicNS)
+        }
         let distance = hypot(target.azimuthDegrees - pose.panDegrees, target.elevationDegrees - pose.pitchDegrees)
         let startedNS = waypointStartedNS ?? monotonicNS
-        if distance <= 1.8 && monotonicNS >= startedNS + 120_000_000 {
+        let minimumWaypointNS: UInt64 = kind == .greeting ? 70_000_000 : 120_000_000
+        let arrivalToleranceDegrees = kind == .greeting ? 0.75 : 1.8
+        if distance <= arrivalToleranceDegrees && monotonicNS >= startedNS + minimumWaypointNS {
             cognitiveMotionMode = .expression(
                 kind: kind,
                 basePose: base,
@@ -3485,7 +3930,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         )
         driveCognitiveWaypoint(
             target,
-            toleranceDegrees: 1.2,
+            toleranceDegrees: kind == .greeting ? 0.75 : 1.2,
             motionStyle: kind == .greeting ? .playful : .attentive,
             state: "cognitive_expression_\(kind.rawValue)",
             calibration: calibration,
@@ -3509,7 +3954,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         case .thinkingGlance:
             return [(pitch: 4, pan: 10 * inward), (pitch: 0, pan: 0)]
         case .greeting:
-            return [(pitch: 0, pan: 9 * inward), (pitch: 0, pan: -9 * inward), (pitch: 0, pan: 0)]
+            // Explicit greetings are a brief bow and return, never a
+            // side-to-side sweep that can dislodge the social target.
+            return [(pitch: -3, pan: 0), (pitch: 0, pan: 0)]
         }
     }
 
@@ -3779,9 +4226,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func hasRecentObservedFace(at monotonicNS: UInt64) -> Bool {
-        guard let lastObservedFaceNS,
-              monotonicNS >= lastObservedFaceNS else { return false }
+        guard let lastObservedFaceNS else { return false }
+        guard monotonicNS >= lastObservedFaceNS else { return true }
         return monotonicNS - lastObservedFaceNS <= 600_000_000
+    }
+
+    private func hasRecentEyeContact(at monotonicNS: UInt64) -> Bool {
+        guard let lastEyeContactNS else { return false }
+        guard monotonicNS >= lastEyeContactNS else { return true }
+        return monotonicNS - lastEyeContactNS <= eyeContactDebounceNS
     }
 
     private func scheduleScanControlTick(
@@ -4391,6 +4844,110 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         return "\(prefix)-\(commandSequence)"
     }
 
+    private func refreshIndicator(at monotonicNS: UInt64) {
+        guard indicatorCalibrationPreset == nil else { return }
+        let next = indicatorInputs.resolvedState
+        guard ledSettings.responseMode.permits(next) else {
+            guard helperReady, process.isRunning, next != activeIndicatorState || indicatorIlluminated else { return }
+            if indicatorIlluminated, let previous = activeIndicatorState {
+                let commandID = nextCommandID(prefix: "indicator-policy-clear")
+                send("indicator_clear \(commandID) \(indicatorFirmwareStateID(previous))")
+            }
+            activeIndicatorState = next
+            indicatorIlluminated = false
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNS,
+                source: "social_indicator",
+                state: "suppressed",
+                message: "policy=\(ledSettings.responseMode.rawValue); requested_state=\(next.rawValue); brightness=\(ledSettings.brightness)"
+            ))
+            return
+        }
+        guard helperReady, process.isRunning, next != activeIndicatorState else { return }
+        let previous = activeIndicatorState
+        let previousWasIlluminated = indicatorIlluminated
+        activeIndicatorState = next
+        let nextSignal = ledSettings.signal(for: next)
+        let nextStateID = indicatorFirmwareStateID(next)
+        let previousStateID = previousWasIlluminated
+            ? previous.map(indicatorFirmwareStateID)
+            : nil
+        for command in SOMALEDHardwareTransition.commands(
+            previousStateID: previousStateID,
+            nextStateID: nextStateID
+        ) {
+            switch command {
+            case let .clear(stateID):
+                let commandID = nextCommandID(prefix: "indicator-clear")
+                send("indicator_clear \(commandID) \(stateID)")
+            case let .set(stateID):
+                let commandID = nextCommandID(prefix: "indicator-set")
+                send("indicator_set \(commandID) \(stateID)")
+            }
+        }
+        indicatorIlluminated = true
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "social_indicator",
+            state: next.rawValue,
+            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextStateID); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); rgb_palette=true; arbitrary_rgb=false"
+        ))
+    }
+
+    private func indicatorFirmwareStateID(_ state: SubconsciousIndicatorState) -> Int {
+        ledSettings.signal(for: state).firmwareStateID
+    }
+
+    func calibrateIndicator(
+        preset: SOMALEDFirmwarePreset?
+    ) -> Result<Void, Error> {
+        queue.sync {
+            guard case .running = state, helperReady, process.isRunning else {
+                return .failure(RuntimeError.unavailable("The local LED bridge is not ready"))
+            }
+            let commandID = nextCommandID(prefix: "indicator-calibration")
+            let nextStateID = preset?.firmwareStateID
+
+            if indicatorIlluminated,
+               let activeIndicatorState,
+               indicatorFirmwareStateID(activeIndicatorState) != nextStateID {
+                send("indicator_clear \(commandID)-normal \(indicatorFirmwareStateID(activeIndicatorState))")
+            }
+            if let indicatorCalibrationStateID,
+               indicatorCalibrationStateID != nextStateID {
+                send("indicator_clear \(commandID)-previous \(indicatorCalibrationStateID)")
+            }
+
+            indicatorCalibrationPreset = preset
+            indicatorCalibrationStateID = nextStateID
+            activeIndicatorState = nil
+            indicatorIlluminated = nextStateID != nil
+
+            if let preset, let nextStateID {
+                send("indicator_set \(commandID) \(nextStateID)")
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "social_indicator",
+                    state: "calibration_active",
+                    message: "preset=\(preset.rawValue); firmware_state_id=\(nextStateID); local_owner_only=true"
+                ))
+            } else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "social_indicator",
+                    state: "calibration_ended",
+                    message: "normal_state_signalling_resumed"
+                ))
+                refreshIndicator(at: monotonicNanoseconds())
+            }
+            return .success(())
+        }
+    }
+
     private func send(_ command: String) {
         guard let data = (command + "\n").data(using: .utf8) else { return }
         try? input.write(contentsOf: data)
@@ -4529,6 +5086,8 @@ private final class AudioAnalyzer: @unchecked Sendable {
     private let directionEstimator: StereoTDOAEstimator?
     private let calibrationRecorder: TDOACalibrationRecorder?
     private let voiceWorker: AudioVADWorker
+    private let speechInteraction: LocalSpeechInteractionCoordinator?
+    private let liveVoiceLauncher: AppServerLiveVoiceLauncher?
 
     init(
         worldModel: PredictiveWorldModel,
@@ -4537,7 +5096,9 @@ private final class AudioAnalyzer: @unchecked Sendable {
         counters: LatencyCounters,
         voiceWorker: AudioVADWorker,
         directionEstimator: StereoTDOAEstimator?,
-        calibrationRecorder: TDOACalibrationRecorder?
+        calibrationRecorder: TDOACalibrationRecorder?,
+        speechInteraction: LocalSpeechInteractionCoordinator?,
+        liveVoiceLauncher: AppServerLiveVoiceLauncher?
     ) {
         self.worldModel = worldModel
         self.publisher = publisher
@@ -4546,6 +5107,8 @@ private final class AudioAnalyzer: @unchecked Sendable {
         self.voiceWorker = voiceWorker
         self.directionEstimator = directionEstimator
         self.calibrationRecorder = calibrationRecorder
+        self.speechInteraction = speechInteraction
+        self.liveVoiceLauncher = liveVoiceLauncher
     }
 
     func ingest(_ sampleBuffer: CMSampleBuffer, at now: UInt64) {
@@ -4563,6 +5126,18 @@ private final class AudioAnalyzer: @unchecked Sendable {
             continuous: continuous,
             captureNS: now,
             levelDB: audio.levelDB
+        )
+        speechInteraction?.ingestAudio(SpeechAudioChunk(
+            samples: audio.samples,
+            sampleRateHz: audio.sampleRateHz,
+            captureNS: now,
+            durationNS: audio.durationNS,
+            continuous: continuous
+        ))
+        liveVoiceLauncher?.ingestAudio(
+            samples: audio.samples,
+            sampleRateHz: audio.sampleRateHz,
+            durationNS: audio.durationNS
         )
         if voiceWorker.submit(frame) { counters.supersedeAudioVADFrame() }
         if !continuous { lastDirection = .unknown }
@@ -4987,8 +5562,14 @@ private final class SystemSaliencyDetector: @unchecked Sendable {
 /// landmark result must contain actual facial feature points before it can
 /// promote a face candidate. They are transient observations only; no pixels
 /// or landmark data are written.
+private struct SystemFaceEvidence: Sendable {
+    let rect: SOMACore.NormalizedRect
+    let directedEyeContact: Bool
+    let alignment: FaceAlignmentEvidence
+}
+
 private final class SystemFaceVerifier: @unchecked Sendable {
-    func detect(in pixelBuffer: CVPixelBuffer) -> [SOMACore.NormalizedRect] {
+    func detect(in pixelBuffer: CVPixelBuffer) -> [SystemFaceEvidence] {
         let faceRequest = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         guard (try? handler.perform([faceRequest])) != nil else { return [] }
@@ -4997,8 +5578,67 @@ private final class SystemFaceVerifier: @unchecked Sendable {
                   hasFacialFeatureSet(landmarks) else {
                 return nil
             }
-            return SOMACore.NormalizedRect(observation.boundingBox)
+            let rect = SOMACore.NormalizedRect(observation.boundingBox)
+            guard let alignment = alignmentEvidence(landmarks: landmarks, rect: rect) else {
+                return nil
+            }
+            return SystemFaceEvidence(
+                rect: rect,
+                directedEyeContact: hasDirectedEyeContact(
+                    observation: observation,
+                    landmarks: landmarks,
+                    rect: rect
+                ),
+                alignment: alignment
+            )
         }
+    }
+
+    private func alignmentEvidence(
+        landmarks: VNFaceLandmarks2D,
+        rect: SOMACore.NormalizedRect
+    ) -> FaceAlignmentEvidence? {
+        guard let visionLeftEye = landmarks.leftEye,
+              let visionRightEye = landmarks.rightEye,
+              let nose = landmarks.nose,
+              let firstEye = center(of: visionLeftEye, in: rect),
+              let secondEye = center(of: visionRightEye, in: rect),
+              let noseCenter = center(of: nose, in: rect) else {
+            return nil
+        }
+        // Vision names eyes anatomically. ArcFace's template is ordered by
+        // image position, so normalize the pair explicitly for an unmirrored
+        // camera frame.
+        let imageLeftEye = firstEye.x <= secondEye.x ? firstEye : secondEye
+        let imageRightEye = firstEye.x <= secondEye.x ? secondEye : firstEye
+        guard imageRightEye.x - imageLeftEye.x >= rect.width * 0.12,
+              noseCenter.y < max(imageLeftEye.y, imageRightEye.y) else {
+            return nil
+        }
+        return FaceAlignmentEvidence(
+            rect: rect,
+            leftEye: imageLeftEye,
+            rightEye: imageRightEye,
+            nose: noseCenter
+        )
+    }
+
+    private func center(
+        of region: VNFaceLandmarkRegion2D,
+        in rect: SOMACore.NormalizedRect
+    ) -> CGPoint? {
+        guard region.pointCount > 0 else { return nil }
+        var x = 0.0
+        var y = 0.0
+        for index in 0..<region.pointCount {
+            x += Double(region.normalizedPoints[index].x)
+            y += Double(region.normalizedPoints[index].y)
+        }
+        let divisor = Double(region.pointCount)
+        return CGPoint(
+            x: rect.x + (x / divisor) * rect.width,
+            y: rect.y + (y / divisor) * rect.height
+        )
     }
 
     private func hasFacialFeatureSet(_ landmarks: VNFaceLandmarks2D) -> Bool {
@@ -5011,6 +5651,54 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         let nose = (landmarks.nose?.pointCount ?? 0) >= 2
         let mouth = (landmarks.outerLips?.pointCount ?? 0) >= 3
         return eyes && nose && mouth
+    }
+
+    private func hasDirectedEyeContact(
+        observation: VNFaceObservation,
+        landmarks: VNFaceLandmarks2D,
+        rect: SOMACore.NormalizedRect
+    ) -> Bool {
+        guard rect.centerX >= 0.27, rect.centerX <= 0.73,
+              rect.centerY >= 0.14, rect.centerY <= 0.90,
+              rect.width * rect.height >= 0.008,
+              let yaw = observation.yaw?.doubleValue,
+              abs(yaw) <= 0.42,
+              let leftEye = landmarks.leftEye,
+              let rightEye = landmarks.rightEye,
+              let leftPupil = landmarks.leftPupil,
+              let rightPupil = landmarks.rightPupil else {
+            return false
+        }
+        return pupilIsCentered(leftPupil, in: leftEye)
+            && pupilIsCentered(rightPupil, in: rightEye)
+    }
+
+    private func pupilIsCentered(
+        _ pupil: VNFaceLandmarkRegion2D,
+        in eye: VNFaceLandmarkRegion2D
+    ) -> Bool {
+        guard pupil.pointCount > 0, eye.pointCount >= 2 else { return false }
+        let pupilPoint = pupil.normalizedPoints[0]
+        var minimumX = Double.greatestFiniteMagnitude
+        var maximumX = -Double.greatestFiniteMagnitude
+        var minimumY = Double.greatestFiniteMagnitude
+        var maximumY = -Double.greatestFiniteMagnitude
+        for index in 0..<eye.pointCount {
+            let point = eye.normalizedPoints[index]
+            minimumX = min(minimumX, Double(point.x))
+            maximumX = max(maximumX, Double(point.x))
+            minimumY = min(minimumY, Double(point.y))
+            maximumY = max(maximumY, Double(point.y))
+        }
+        let width = maximumX - minimumX
+        let height = maximumY - minimumY
+        guard width > 0.001, height > 0.001 else { return false }
+        let normalizedX = abs(Double(pupilPoint.x) - (minimumX + maximumX) / 2) / (width / 2)
+        let normalizedY = abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2)
+        // Vision documents pupil points as approximate. This is intentionally
+        // tolerant: it rejects a clearly averted gaze without demanding that
+        // the user stare at one exact pixel.
+        return normalizedX <= 0.72 && normalizedY <= 0.90
     }
 }
 
@@ -5184,6 +5872,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let externalGimbalCalibration: ExternalGimbalCalibration?
     private let neuralObjectDetector: ANEObjectDetector?
     private let neuralFaceDetector: ANEFaceDetector?
+    private let faceIdentityRuntime: FaceIdentityRuntime?
     private let systemSaliencyDetector = SystemSaliencyDetector()
     private let systemFaceVerifier = SystemFaceVerifier()
     private let stateLock = NSLock()
@@ -5192,6 +5881,8 @@ private final class VisionWorker: @unchecked Sendable {
     private var nextObjectNS: UInt64 = 0
     private var nextFaceNS: UInt64 = 0
     private var nextFaceVerificationNS: UInt64 = 0
+    private var directedContactEvidence: [(rect: SOMACore.NormalizedRect, observedNS: UInt64)] = []
+    private var identityAlignmentEvidence: [(evidence: SystemFaceEvidence, observedNS: UInt64)] = []
     private var nextSaliencyNS: UInt64 = 0
     private var nextSceneSnapshotNS: UInt64 = 0
     private var nextObjectErrorReportNS: UInt64 = 0
@@ -5209,6 +5900,20 @@ private final class VisionWorker: @unchecked Sendable {
     private var faceInferenceStallReported = false
     private var stopped = false
 
+    private static func faceEvidenceMatches(
+        _ lhs: SOMACore.NormalizedRect,
+        _ rhs: SOMACore.NormalizedRect
+    ) -> Bool {
+        let x1 = max(lhs.x, rhs.x)
+        let y1 = max(lhs.y, rhs.y)
+        let x2 = min(lhs.x + lhs.width, rhs.x + rhs.width)
+        let y2 = min(lhs.y + lhs.height, rhs.y + rhs.height)
+        let intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        let union = lhs.width * lhs.height + rhs.width * rhs.height - intersection
+        if union > 0, intersection / union >= 0.10 { return true }
+        return hypot(lhs.centerX - rhs.centerX, lhs.centerY - rhs.centerY) <= 0.14
+    }
+
     init(
         worldModel: PredictiveWorldModel,
         publisher: BeliefPublisher,
@@ -5220,6 +5925,7 @@ private final class VisionWorker: @unchecked Sendable {
         panoramaCompositor: RollingPanoramaCompositor? = nil,
         onSceneCandidates: (([SceneCandidate], UInt64) -> Void)? = nil,
         onCoverage: ((GimbalPose, Double, GimbalPoseProjection, CameraProjectionModel, UInt64) -> Void)? = nil,
+        onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, UInt64) -> Void)? = nil,
         onFatalVisionFailure: (() -> Void)? = nil
     ) {
         self.worldModel = worldModel
@@ -5274,6 +5980,38 @@ private final class VisionWorker: @unchecked Sendable {
                 message: error.localizedDescription
             ))
         }
+        do {
+            faceIdentityRuntime = try FaceIdentityRuntime(
+                onHealth: { state, message in
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "face_identity",
+                        state: state,
+                        message: message
+                    ))
+                },
+                onDecision: { decision, observedNS, inferenceMS in
+                    writer.write(FaceIdentityEvent(
+                        monotonicNS: observedNS,
+                        state: decision.state,
+                        subject: decision.opaqueSubject,
+                        confidence: decision.confidence,
+                        inferenceMS: inferenceMS
+                    ))
+                    onIdentityDecision?(decision, observedNS)
+                }
+            )
+        } catch {
+            faceIdentityRuntime = nil
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "face_identity",
+                state: "unavailable",
+                message: error.localizedDescription
+            ))
+        }
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNanoseconds(),
@@ -5311,6 +6049,7 @@ private final class VisionWorker: @unchecked Sendable {
         stateLock.unlock()
         wake.signal()
         queue.sync {}
+        faceIdentityRuntime?.stop()
     }
 
     private func workLoop() {
@@ -5580,7 +6319,11 @@ private final class VisionWorker: @unchecked Sendable {
         if faceVerificationNow >= nextFaceVerificationNS {
             nextFaceVerificationNS = faceVerificationNow + 50_000_000
             let systemFaces = systemFaceVerifier.detect(in: pixelBuffer)
-            faceConfirmationLease.record(systemFaces, at: faceVerificationNow)
+            faceConfirmationLease.record(systemFaces.map(\.rect), at: faceVerificationNow)
+            directedContactEvidence = systemFaces
+                .filter(\.directedEyeContact)
+                .map { ($0.rect, faceVerificationNow) }
+            identityAlignmentEvidence = systemFaces.map { ($0, faceVerificationNow) }
             // System Vision is an independent confirmation signal, never a
             // steering measurement. Its face box has a different crop and
             // cadence from BlazeFace; alternating the two boxes made the
@@ -5594,6 +6337,12 @@ private final class VisionWorker: @unchecked Sendable {
             // confirmation; never promote a System-Vision rectangle by itself.
             let independentlyVerified = candidate.isFaceVerified
                 || faceConfirmationLease.permits(candidate.rect, at: faceVerificationNow)
+            let directedEyeContact = independentlyVerified
+                && directedContactEvidence.contains { evidence in
+                    faceVerificationNow >= evidence.observedNS
+                        && faceVerificationNow - evidence.observedNS <= 450_000_000
+                        && Self.faceEvidenceMatches(evidence.rect, candidate.rect)
+                }
             if independentlyVerified {
                 faceMotorContinuityLease.record(candidate.rect, at: faceVerificationNow)
             }
@@ -5609,7 +6358,8 @@ private final class VisionWorker: @unchecked Sendable {
                 stabilityMilliseconds: candidate.stabilityMilliseconds,
                 isActionEligible: candidate.isActionEligible
                     || (candidate.source == .neuralFaceDetector && independentlyVerified),
-                isFaceVerified: independentlyVerified
+                isFaceVerified: independentlyVerified,
+                isEyeContactEligible: directedEyeContact
             )
         }
         for candidate in candidates where isFaceCandidate(candidate) && candidate.isFaceVerified {
@@ -5647,11 +6397,28 @@ private final class VisionWorker: @unchecked Sendable {
                 sceneID: candidate.sceneID,
                 stabilityMilliseconds: candidate.stabilityMilliseconds,
                 isActionEligible: candidate.isActionEligible,
-                isFaceVerified: true
+                isFaceVerified: true,
+                isEyeContactEligible: candidate.isEyeContactEligible
             )
         }
         sceneField.invalidateUnverifiedFaceTracks(matching: rejectedFaceRects)
         let verifiedFaceCount = candidates.filter { isFaceCandidate($0) && $0.isFaceVerified }.count
+        if let identityFace = candidates
+            .filter({ isFaceCandidate($0) && $0.isFaceVerified })
+            .max(by: { $0.confidence < $1.confidence }),
+           let evidence = identityAlignmentEvidence
+            .filter({ evidence in
+                faceVerificationNow >= evidence.observedNS
+                    && faceVerificationNow - evidence.observedNS <= 250_000_000
+                    && Self.faceEvidenceMatches(evidence.evidence.rect, identityFace.rect)
+            })
+            .max(by: { $0.observedNS < $1.observedNS }) {
+            faceIdentityRuntime?.submit(
+                pixelBuffer: pixelBuffer,
+                alignment: evidence.evidence.alignment,
+                at: faceVerificationNow
+            )
+        }
         let faceLockDiagnosticState: String
         if verifiedFaceCount > 0 {
             faceLockDiagnosticState = "face_verified"
@@ -6070,6 +6837,29 @@ private func run(_ options: Options) throws {
         importantRotationPolicy: options.importantRotationPolicy
     )
     defer { writer.close() }
+    let controlSettings: SOMAControlSettings
+    do {
+        controlSettings = try SOMAControlSettingsStore(fileURL: options.controlSettingsURL).load()
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "control_settings",
+            state: "loaded",
+            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
+        ))
+    } catch {
+        controlSettings = .init()
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "control_settings",
+            state: "rejected",
+            message: String(error.localizedDescription.prefix(192))
+        ))
+    }
+    let administratorTracker = AdministratorRecognitionTracker(
+        administrator: controlSettings.administrator
+    )
     let spatialAtlas = SphericalSceneAtlasStore()
     let placeEmbeddingEncoder = PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder
     let placeEmbeddingRevision = VNGenerateImageFeaturePrintRequest().revision
@@ -6092,6 +6882,7 @@ private func run(_ options: Options) throws {
     }
     placeMemoryPersistence?.restore()
     let panoramaStatus = PanoramaMapStatusStore()
+    let liveVisualContextRelay = LiveVisualContextRelay()
     let embodimentArbiter = options.embodimentShadowSocketURL.map { _ in
         ShadowEmbodimentArbiter(
             spatialAtlas: spatialAtlas,
@@ -6117,6 +6908,7 @@ private func run(_ options: Options) throws {
                 ))
             },
             onCue: { cue in
+                liveVisualContextRelay.record(cue)
                 writer.write(L1AuxiliarySemanticTraceEvent(cue))
             },
             onInterrupt: { interrupt in
@@ -6257,6 +7049,7 @@ private func run(_ options: Options) throws {
         ))
     }
     let complete = DispatchSemaphore(value: 0)
+    let conversationContact = ConversationContactRuntime()
     let faceLockDiagnosticRecorder = try options.faceLockDiagnosticDirectoryURL.map {
         try FaceLockDiagnosticRecorder(directoryURL: $0)
     }
@@ -6280,6 +7073,7 @@ private func run(_ options: Options) throws {
         // coverage controller available for the genuine no-human state.
         let autonomousExplorationEnabled = options.allowAutonomousScan
             && options.allowCameraMotion
+            && controlSettings.autonomousExplorationEnabled
         attentionGimbalBridge = try AttentionGimbalBridge(
             helperURL: helperURL,
             outputURL: gimbalOutputURL,
@@ -6288,7 +7082,9 @@ private func run(_ options: Options) throws {
             externalCalibration: externalGimbalCalibration,
             autonomousScanEnabled: autonomousExplorationEnabled,
             idleExplorationEnabled: autonomousExplorationEnabled,
-            nativeHumanTrackingEnabled: options.allowNativeHumanTracking,
+            nativeHumanTrackingEnabled: options.allowNativeHumanTracking
+                && controlSettings.nativeHumanTrackingEnabled,
+            ledSettings: controlSettings.led,
             calibrationOutputURL: options.externalGimbalCalibrationOutputURL,
             cameraGeometryCalibrationMode: options.cameraGeometryCaptureDirectoryURL != nil,
             panoramaStripScanMode: options.panoramaStripScan,
@@ -6296,12 +7092,264 @@ private func run(_ options: Options) throws {
             spatialAtlas: spatialAtlas,
             faceLockDiagnosticRecorder: faceLockDiagnosticRecorder,
             embodimentViewCaptureStore: embodimentViewCaptureStore,
+            onOutgoingSocialPulse: { monotonicNS in
+                conversationContact.issueSocialPulse(at: monotonicNS)
+            },
             writer: writer
         )
     } else {
         attentionGimbalBridge = nil
     }
     defer { attentionGimbalBridge?.stop() }
+    let liveVoiceLauncher: AppServerLiveVoiceLauncher?
+    if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
+        let launcher = AppServerLiveVoiceLauncher(voice: controlSettings.realtimeVoice) { event in
+            let eventNS = monotonicNanoseconds()
+            switch event {
+            case let .launchRequested(authorization):
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "launch_requested",
+                    message: "authorization=\(authorization)"
+                ))
+            case let .active(threadID):
+                conversationContact.markConversationOpened(at: eventNS)
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "active",
+                    message: threadID.map { "thread_id=\(String($0.prefix(96)))" }
+                ))
+            case .inputTransportStarted:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "input_streaming",
+                    message: "audio_worklet_to_webrtc"
+                ))
+            case .outputPlaybackReady:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "output_ready",
+                    message: "webrtc_audio_to_system_output"
+                ))
+            case .hearingUser:
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.hearingUser)
+            case .contextAppended:
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "context_appended",
+                    message: nil
+                ))
+            case let .contextRejected(reason):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "context_rejected",
+                    message: String(reason.prefix(192))
+                ))
+            case let .inputAccepted(characters):
+                conversationContact.recordConversationActivity(at: eventNS)
+                attentionGimbalBridge?.ingestLiveVoiceTurnAccepted()
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "input_transcript_ready",
+                    message: "characters=\(min(characters, 65_535)); transcript_persisted=false"
+                ))
+            case .preparingResponse:
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.preparingResponse)
+            case .responding:
+                conversationContact.recordConversationActivity(at: eventNS)
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.responding)
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "responding",
+                    message: "output_audio=true"
+                ))
+            case .responseCompleted:
+                conversationContact.recordConversationActivity(at: eventNS)
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
+            case let .ended(reason):
+                conversationContact.closeConversation()
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "ended",
+                    message: reason
+                ))
+            case let .failed(reason):
+                conversationContact.closeConversation()
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "failed",
+                    message: String(reason.prefix(192))
+                ))
+            }
+        }
+        liveVisualContextRelay.attach(to: launcher)
+        liveVoiceLauncher = launcher
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "l2_live_voice",
+            state: "configured",
+            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=eye_contact_plus_voice_or_social_pulse; user_silence_timeout_seconds=60; visual_context=l1_ephemeral_summary; text_context=initial_items_plus_append_text"
+        ))
+    } else {
+        liveVoiceLauncher = nil
+    }
+    defer { liveVoiceLauncher?.stop() }
+    let l1ThoughtRelay = L1ThoughtStreamRelay()
+    let l1LanguageInstructions = L1LanguageInstructionCache(
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_language_instruction",
+                state: state,
+                message: message
+            ))
+        },
+        onReady: { _, directive in
+            liveVoiceLauncher?.appendActiveContext(directive)
+        }
+    )
+    let l1MemoryContext = L1MemoryContextProvider(
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_memory",
+                state: state,
+                message: message
+            ))
+        },
+        onPreferredLanguageChanged: { _, languageTag in
+            l1LanguageInstructions.prepare(for: languageTag)
+        }
+    )
+    if let administratorID = controlSettings.administrator?.entityID {
+        l1MemoryContext.warmContext(for: administratorID)
+    }
+    do {
+        let l1ThoughtStream = try L1PresenceThoughtStream(
+            memoryContext: l1MemoryContext,
+            onHealth: { state, message in
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "l1_situation",
+                    state: state,
+                    message: message
+                ))
+            },
+            onFrame: { request, frame, presence, completedNS in
+                let action = frame.socialDecision?.action.rawValue ?? "no_social_action"
+                writer.write(RuntimeEvent(
+                    event: "l1.situation",
+                    monotonicNS: completedNS,
+                    source: "gemma4_31b_cloud",
+                    state: "frame",
+                    message: "cycle=\(request.cycleID.uuidString.lowercased()); action=\(action); uncertainty=\(String(format: "%.2f", frame.uncertainty))"
+                ))
+                guard let opportunity = request.socialOpportunity,
+                      let decision = frame.socialDecision else { return }
+                do {
+                    try L1SocialDecisionValidator().validate(
+                        decision,
+                        for: opportunity,
+                        currentPresence: presence,
+                        at: completedNS
+                    )
+                } catch {
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: completedNS,
+                        source: "l1_situation",
+                        state: "decision_rejected",
+                        message: String(error.localizedDescription.prefix(192))
+                    ))
+                    return
+                }
+                guard decision.action != .remainSilent else { return }
+                if decision.action == .spokenOpening {
+                    guard let opening = L1PurposefulOpeningGate.resolve(
+                        decision: decision,
+                        informationNeeds: request.informationNeeds
+                    ) else {
+                        writer.write(RuntimeEvent(
+                            event: "source.health",
+                            monotonicNS: completedNS,
+                            source: "l1_situation",
+                            state: "opening_suppressed",
+                            message: "closed_purpose_required"
+                        ))
+                        return
+                    }
+                    let context = l1ProactiveInteractionContext(
+                        request: request,
+                        frame: frame,
+                        decision: decision,
+                        purpose: opening,
+                        languageStartInstruction: l1LanguageInstructions.directive(
+                            for: request.preferredLanguageTag
+                        )
+                    )
+                    // L1 owns social initiation and transfers directly to the
+                    // conversation runtime. L0 may mirror the outcome through
+                    // embodiment, but cannot become a serial gate for speech.
+                    liveVoiceLauncher?.startProactiveOpening(
+                        text: opening.question,
+                        context: context,
+                        at: completedNS
+                    )
+                    conversationContact.issueSocialPulse(at: completedNS)
+                    l1ThoughtRelay.recordInteraction(with: decision.entityID, at: completedNS)
+                }
+                let requestID = "l1-social-\(decision.opportunityID.uuidString.lowercased())"
+                // A greeting is a short physical overlay, not a long-lived
+                // attention claim. Completion releases this lease sooner; the
+                // deadline only guarantees recovery if an attitude sample is
+                // unavailable while the gesture starts.
+                let expiration = completedNS + 600_000_000
+                attentionGimbalBridge?.ingestEmbodimentIntent(.express(
+                    requestID: requestID,
+                    expression: .greeting,
+                    expiresAtNS: expiration
+                ))
+            }
+        )
+        l1ThoughtRelay.install(l1ThoughtStream)
+    } catch {
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "l1_situation",
+            state: "unavailable",
+            message: String(error.localizedDescription.prefix(192))
+        ))
+    }
+    defer { l1ThoughtRelay.stop() }
     let embodimentMotorAdapter: CognitiveEmbodimentMotorAdapter?
     if options.allowEmbodimentMotorControl {
         guard let attentionGimbalBridge else {
@@ -6344,6 +7392,51 @@ private func run(_ options: Options) throws {
             captureResultProvider: { requestID, monotonicNS in
                 embodimentViewCaptureStore?.result(requestID: requestID, at: monotonicNS)
             },
+            personContextProvider: { request in
+                let semaphore = DispatchSemaphore(value: 0)
+                let resultBox = SynchronousResultBox<PersonContextSnapshot>()
+                Task {
+                    do {
+                        resultBox.set(.success(try await l1MemoryContext.applyPersonContext(request)))
+                    } catch {
+                        resultBox.set(.failure(error))
+                    }
+                    semaphore.signal()
+                }
+                semaphore.wait()
+                let result = resultBox.get() ?? .failure(EmbodimentIPCError.timeout)
+                if request.operation != .get, case let .success(snapshot) = result {
+                    writer.write(RuntimeEvent(
+                        event: "person_context.updated",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "person_context_mcp",
+                        state: request.operation.rawValue,
+                        message: "storage=encrypted_local; disclosure=remote_summary_allowed; explicit_confirmation=true"
+                    ))
+                    switch request.operation {
+                    case .setPreferredLanguage, .clearPreferredLanguage:
+                        if let languageTag = snapshot.preferredLanguageTag {
+                            l1LanguageInstructions.prepare(for: languageTag)
+                            if let directive = l1LanguageInstructions.directive(for: languageTag) {
+                                liveVoiceLauncher?.appendActiveContext(directive)
+                            }
+                        } else {
+                            liveVoiceLauncher?.appendActiveContext(
+                                "The participant has cleared their explicit language preference. Follow the language they use in the conversation."
+                            )
+                        }
+                    default:
+                        break
+                    }
+                }
+                return result
+            },
+            indicatorCalibrationHandler: { preset in
+                guard let attentionGimbalBridge else {
+                    return .failure(RuntimeError.unavailable("The local LED bridge is unavailable"))
+                }
+                return attentionGimbalBridge.calibrateIndicator(preset: preset)
+            },
             onHealth: { state, message in
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -6381,6 +7474,7 @@ private func run(_ options: Options) throws {
         faceLockDiagnosticRecorder: faceLockDiagnosticRecorder,
         panoramaCompositor: panoramaCompositor,
         onSceneCandidates: { candidates, monotonicNS in
+            conversationContact.observe(candidates, at: monotonicNS)
             embodimentSceneBridge?.submit(candidates, at: monotonicNS)
             attentionGimbalBridge?.ingestSceneCandidates(candidates, at: monotonicNS)
         },
@@ -6393,10 +7487,63 @@ private func run(_ options: Options) throws {
                 at: monotonicNS
             )
         },
+        onIdentityDecision: { decision, monotonicNS in
+            if administratorTracker.observe(decision, at: monotonicNS) {
+                writer.write(RuntimeEvent(
+                    event: "administrator.identity",
+                    monotonicNS: monotonicNS,
+                    source: "administrator_identity",
+                    state: "verified",
+                    message: "recognized_local_profile; metadata_disclosure=local_only"
+                ))
+            }
+            l1ThoughtRelay.observe(decision, at: monotonicNS)
+        },
         onFatalVisionFailure: {
             complete.signal()
         }
     )
+    let eventImportanceModel = EventImportanceModel()
+    let speechInteraction: LocalSpeechInteractionCoordinator?
+    if let localeIdentifier = options.localSpeechLocaleIdentifier {
+        speechInteraction = try LocalSpeechInteractionCoordinator(
+            localeIdentifier: localeIdentifier,
+            codexBridgeURL: options.l2CodexBridgeURL,
+            codexWorkingDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/SOMA/L2Codex", isDirectory: true),
+            onState: { state in
+                let stateNS = monotonicNanoseconds()
+                switch state {
+                case let .recognitionCompleted(_, _, _, _, _, _, handedToL2):
+                    if handedToL2 {
+                        conversationContact.markConversationOpened(at: stateNS)
+                    }
+                case .l2Completed:
+                    conversationContact.recordConversationActivity(at: stateNS)
+                case .l2Failed:
+                    conversationContact.closeConversation()
+                case .turnStarted, .turnCancelled, .recognitionFailed,
+                     .speechStarted, .speechCompleted, .speechCancelled:
+                    break
+                }
+                attentionGimbalBridge?.ingestSpeechInteractionState(state)
+                writer.write(SpeechInteractionTraceEvent(
+                    state,
+                    at: stateNS
+                ))
+            }
+        )
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "local_speech_recognition",
+            state: "configured",
+            message: "engine=speech_analyzer; locale=\(String(localeIdentifier.prefix(32))); on_device=true; audio_persistence=false; pre_roll_ms=900; l2_handoff=\(options.l2CodexBridgeURL != nil)"
+        ))
+    } else {
+        speechInteraction = nil
+    }
+    defer { speechInteraction?.stop() }
     let voiceWorker = try AudioVADWorker(
         onEvidence: { evidence, frame, completedNS in
             if evidence.inferenceMS > 0 {
@@ -6410,6 +7557,58 @@ private func run(_ options: Options) throws {
                 confidence: evidence.probability,
                 at: completedNS
             )
+            if evidence.active, evidence.changed {
+                conversationContact.recordConversationActivity(at: completedNS)
+            }
+            let openingAuthorization = evidence.active && evidence.changed
+                ? conversationContact.authorizeSpeechOnset(at: completedNS)
+                : nil
+            if evidence.changed, options.l2LiveVoice {
+                attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
+            }
+            let recognizedPersonEntityID = administratorTracker.recognizedPersonEntityID(at: completedNS)
+            let preferredLanguageTag = recognizedPersonEntityID.flatMap {
+                l1MemoryContext.cachedPreferredLanguage(for: $0)
+            }
+            let languageStartInstruction = l1LanguageInstructions.directive(for: preferredLanguageTag)
+            if let openingAuthorization {
+                let context = speechInteractionContext(
+                    from: belief,
+                    visualSummary: liveVisualContextRelay.latestSummary,
+                    identityReference: administratorTracker.interactionReference(at: completedNS),
+                    preferredLanguageTag: preferredLanguageTag,
+                    languageStartInstruction: languageStartInstruction
+                )
+                liveVoiceLauncher?.startIfNeeded(
+                    authorization: openingAuthorization.rawValue,
+                    context: context,
+                    at: completedNS
+                )
+            }
+            if let speechInteraction,
+               let context = speechInteractionContext(
+                   from: belief,
+                   visualSummary: liveVisualContextRelay.latestSummary,
+                   identityReference: administratorTracker.interactionReference(at: completedNS),
+                   preferredLanguageTag: preferredLanguageTag,
+                   languageStartInstruction: languageStartInstruction
+               ) {
+                let wake = openingAuthorization.flatMap {
+                    speechInteractionWake(
+                        model: eventImportanceModel,
+                        belief: belief,
+                        voiceConfidence: evidence.probability,
+                        authorization: $0,
+                        at: completedNS
+                    )
+                }
+                speechInteraction.observeVAD(
+                    active: evidence.active,
+                    at: completedNS,
+                    authorizedWake: wake,
+                    context: context
+                )
+            }
             guard evidence.changed else { return }
             writer.write(VoiceEvent(
                 monotonicNS: completedNS,
@@ -6441,7 +7640,9 @@ private func run(_ options: Options) throws {
         counters: counters,
         voiceWorker: voiceWorker,
         directionEstimator: loadedDirectionCalibration.map { StereoTDOAEstimator(calibration: $0) },
-        calibrationRecorder: calibrationRecorder
+        calibrationRecorder: calibrationRecorder,
+        speechInteraction: speechInteraction,
+        liveVoiceLauncher: liveVoiceLauncher
     )
     let session = AVCaptureSession()
 
@@ -6724,11 +7925,143 @@ private func requestAccess(for mediaType: AVMediaType, label: String) throws {
     }
 }
 
+private func speechInteractionWake(
+    model: EventImportanceModel,
+    belief: BeliefSnapshot,
+    voiceConfidence: Double,
+    authorization: ConversationOpeningAuthorization,
+    at monotonicNS: UInt64
+) -> HumanInteractionWakeRequest? {
+    let target = belief.targetStatus == .tracked ? belief.target : nil
+    if authorization == .eyeContact {
+        guard let target, target.isFaceMotorTarget else { return nil }
+    }
+    let eventID = "voice-contact-\(monotonicNS)"
+    let visualConfidence = target?.confidence ?? belief.presenceProbability
+    let decision = model.evaluate(EventImportanceInput(
+        eventID: eventID,
+        monotonicNS: monotonicNS,
+        evidenceIDs: [
+            "voice:\(monotonicNS)",
+            "contact:\(authorization.rawValue)",
+            target.map { "vision:\(String($0.id.prefix(96)))" } ?? "vision:not_required_for_active_contact",
+        ],
+        features: EventImportanceFeatures(
+            explicitContact: max(0.80, min(visualConfidence, voiceConfidence)),
+            socialSalience: visualConfidence,
+            persistence: min((target?.stabilityMilliseconds ?? 1_000) / 1_000, 1),
+            crossModalCorroboration: min(visualConfidence, voiceConfidence),
+            humanPresence: belief.presenceProbability
+        )
+    ))
+    return try? HumanInteractionWakeRequest(
+        decision: decision,
+        audioPreRollMilliseconds: 900
+    )
+}
+
+private func speechInteractionContext(
+    from belief: BeliefSnapshot,
+    visualSummary: String? = nil,
+    identityReference: String? = nil,
+    preferredLanguageTag: String? = nil,
+    languageStartInstruction: String? = nil
+) -> CodexInteractionContext? {
+    let targetSummary: String
+    if let target = belief.target {
+        targetSummary = "L0 tracks a \(target.kind.rawValue) hypothesis labelled \(target.label ?? "unlabelled") with confidence \(String(format: "%.2f", target.confidence))."
+    } else {
+        targetSummary = "L0 has no current visual target."
+    }
+    let situationSummary = [targetSummary, visualSummary]
+        .compactMap { $0 }
+        .joined(separator: " ")
+    return try? CodexInteractionContext(
+        situationSummary: situationSummary,
+        identityReference: identityReference,
+        preferredLanguageTag: preferredLanguageTag,
+        languageStartInstruction: languageStartInstruction,
+        embodimentSummary: "Camera policy is \(belief.policy.rawValue); interaction readiness is \(String(format: "%.2f", belief.readyProbability))."
+    )
+}
+
+private func l1ProactiveInteractionContext(
+    request: L1SituationRequest,
+    frame: L1SituationFrame,
+    decision: L1SocialDecision,
+    purpose: L1PurposefulOpening,
+    languageStartInstruction: String?
+) -> CodexInteractionContext? {
+    let objective = "Conversation objective: \(purpose.objective)"
+    let completion = "Conversation completion condition: \(purpose.completionCondition)"
+    let thought = frame.thoughtState ?? request.priorThoughtState
+    let hypothesis = thought.map { state in
+        "L1 working hypothesis: \(state.workingHypothesis)"
+    }
+    let rationale = String(decision.rationale.prefix(512))
+    let situation = [
+        "L1 situation: \(frame.summary)",
+        hypothesis,
+        "Why L1 opened now: \(rationale)",
+    ].compactMap { $0 }.joined(separator: " ")
+    let identityScope = request.beliefSummary.localizedCaseInsensitiveContains("pseudonymous")
+        ? "locally pseudonymous recurring person; no name or biometric material is available"
+        : "locally recognized person; do not infer an identity beyond supplied context"
+    let identity: String
+    if let personEntityID = request.presentEntityIDs.first {
+        identity = "\(identityScope). Person-context MCP reference: \(personEntityID.uuidString.lowercased()). Use it only with person-context tools; do not speak or expose it."
+    } else {
+        identity = identityScope
+    }
+    let rapport: String
+    if let value = request.rapport {
+        rapport = String(
+            format: "L1 rapport estimate: familiarity %.2f; interaction comfort %.2f; communication alignment %.2f; proactive-contact preference %@.",
+            value.familiarity,
+            value.interactionComfort,
+            value.communicationAlignment,
+            value.proactiveContact.rawValue
+        )
+    } else {
+        rapport = "L1 has no established rapport record; keep the first exchange light, reciprocal, and easy to decline."
+    }
+    let language = request.preferredLanguageTag.map {
+        "The person's explicitly stated preferred language is \($0); use it when naturally appropriate."
+    }
+    return try? CodexInteractionContext(
+        situationSummary: situation,
+        identityReference: identity,
+        preferredLanguageTag: request.preferredLanguageTag,
+        languageStartInstruction: languageStartInstruction,
+        rapportSummary: rapport,
+        activeTaskSummaries: [objective, completion] + (language.map { [$0] } ?? []),
+        memorySummaries: request.memory.map(\.summary),
+        embodimentSummary: "L0 is maintaining visual attention while L2 leads the interaction. Do not issue camera-control instructions as part of ordinary conversation."
+    )
+}
+
 private final class AccessResult: @unchecked Sendable {
     private let lock = NSLock()
     private var granted = false
     func set(_ granted: Bool) { lock.lock(); self.granted = granted; lock.unlock() }
     var value: Bool { lock.lock(); defer { lock.unlock() }; return granted }
+}
+
+private final class SynchronousResultBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Result<Value, Error>?
+
+    func set(_ value: Result<Value, Error>) {
+        lock.lock()
+        storage = value
+        lock.unlock()
+    }
+
+    func get() -> Result<Value, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
 }
 
 private struct MonoAudio {
@@ -6921,12 +8254,126 @@ private func hostAlignedPresentationTimestamp(
 private func monotonicNanoseconds() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
 private func printUsage() {
-    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--guided-scenario] [--tdoa-calibration calibration.json | --tdoa-calibrate calibration.json --duration 45] [--output trace.jsonl [--trace-max-megabytes MB --trace-retained-files count] [--important-output important.jsonl --important-max-megabytes MB --important-retained-files count]] [--diagnostic-snapshot frame.jpg | --face-lock-diagnostics jpeg-directory] [--panorama-output /absolute/panorama.jpg [--panorama-place-memory /absolute/place-memory.json] [--camera-geometry-calibration /absolute/calibration.json] [--capture-camera-geometry /absolute/new-directory | --panorama-strip-scan]] [--l1-auxiliary-vlm-python python --l1-auxiliary-vlm-worker worker.py --l1-auxiliary-vlm-model local-model-directory] [--embodiment-shadow-socket /absolute/path.sock [--allow-embodiment-motor-control --embodiment-view-directory /absolute/private-directory]] [--allow-camera-motion --native-gimbal-helper /path/to/soma-native-track --gimbal-output actuator.jsonl [--gimbal-trace-max-megabytes MB --gimbal-trace-retained-files count] --duration 0=continuous|positive-seconds] [--allow-external-gimbal-control --external-gimbal-calibration calibration.json [--allow-autonomous-scan] | --calibrate-external-gimbal calibration.json --duration 12..30] [--allow-native-human-tracking]")
+    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--soma-settings /absolute/settings.json] [--guided-scenario] [--tdoa-calibration calibration.json | --tdoa-calibrate calibration.json --duration 45] [--output trace.jsonl [--trace-max-megabytes MB --trace-retained-files count] [--important-output important.jsonl --important-max-megabytes MB --important-retained-files count]] [--diagnostic-snapshot frame.jpg | --face-lock-diagnostics jpeg-directory] [--panorama-output /absolute/panorama.jpg [--panorama-place-memory /absolute/place-memory.json] [--camera-geometry-calibration /absolute/calibration.json] [--capture-camera-geometry /absolute/new-directory | --panorama-strip-scan]] [--l2-live-voice | --local-speech-recognition locale [--l2-codex-bridge /absolute/soma-codex-bridge]] [--l1-auxiliary-vlm-python python --l1-auxiliary-vlm-worker worker.py --l1-auxiliary-vlm-model local-model-directory] [--embodiment-shadow-socket /absolute/path.sock [--allow-embodiment-motor-control --embodiment-view-directory /absolute/private-directory]] [--allow-camera-motion --native-gimbal-helper /path/to/soma-native-track --gimbal-output actuator.jsonl [--gimbal-trace-max-megabytes MB --gimbal-trace-retained-files count] --duration 0=continuous|positive-seconds] [--allow-external-gimbal-control --external-gimbal-calibration calibration.json [--allow-autonomous-scan] | --calibrate-external-gimbal calibration.json --duration 12..30] [--allow-native-human-tracking]")
+    print("       soma-subconscious --speech-recognition-status [locale]")
+    print("       soma-subconscious --speech-recognition-file <locale> <absolute-audio-path>")
+    print("       soma-subconscious --speech-synthesis-test <locale> <text>")
+    print("       soma-subconscious --live-voice-test")
+    print("       soma-subconscious --face-identity-status")
+    print("       soma-subconscious --promote-anonymous-face <anon_handle>")
+    print("       soma-subconscious --remove-face-identity <entity_uuid>")
 }
 
-do {
-    try run(Options.parse(Array(CommandLine.arguments.dropFirst())))
-} catch {
-    fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
-    Foundation.exit(EXIT_FAILURE)
+let somaArguments = Array(CommandLine.arguments.dropFirst())
+if somaArguments.first == "--speech-recognition-status" {
+    let localeIdentifier = somaArguments.count > 1
+        ? somaArguments[1]
+        : Locale.current.identifier.replacingOccurrences(of: "_", with: "-")
+    let capability = localSpeechCapability(localeIdentifier: localeIdentifier)
+    print("engine=speech_analyzer")
+    print("locale=\(capability.localeIdentifier)")
+    print("supported=\(capability.supported)")
+    print("installed=\(capability.installed)")
+    print("on_device=true")
+    Foundation.exit(capability.supported && capability.installed ? EXIT_SUCCESS : EXIT_FAILURE)
+} else if somaArguments.first == "--speech-recognition-file" {
+    guard somaArguments.count == 3, somaArguments[2].hasPrefix("/") else {
+        fputs("soma-subconscious: --speech-recognition-file requires a locale and absolute audio path\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        let startedNS = monotonicNanoseconds()
+        let result = try transcribeLocalSpeechFile(
+            at: URL(fileURLWithPath: somaArguments[2]),
+            localeIdentifier: somaArguments[1]
+        )
+        print("engine=speech_analyzer")
+        print("locale=\(result.localeIdentifier)")
+        print("latency_ms=\(milliseconds(from: startedNS, to: result.completedNS))")
+        print("transcript=\(result.transcript)")
+        Foundation.exit(result.transcript.isEmpty ? EXIT_FAILURE : EXIT_SUCCESS)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+} else if somaArguments.first == "--speech-synthesis-test" {
+    guard somaArguments.count == 3 else {
+        fputs("soma-subconscious: --speech-synthesis-test requires a locale and text\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        let durationMilliseconds = try testLocalSpeechOutput(
+            text: somaArguments[2],
+            localeIdentifier: somaArguments[1]
+        )
+        print("engine=av_speech_synthesizer")
+        print("locale=\(somaArguments[1])")
+        print("duration_ms=\(durationMilliseconds)")
+        Foundation.exit(EXIT_SUCCESS)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+} else if somaArguments.first == "--live-voice-test" {
+    guard somaArguments.count == 1 else {
+        fputs("soma-subconscious: --live-voice-test takes no additional arguments\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    let result = testAppServerLiveVoiceLauncher()
+    print("live_voice=\(result)")
+        Foundation.exit(result == "active" ? EXIT_SUCCESS : EXIT_FAILURE)
+} else if somaArguments.first == "--face-identity-status" {
+    guard somaArguments.count == 1 else {
+        fputs("soma-subconscious: --face-identity-status takes no additional arguments\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        let counts = try await FaceIdentityRuntime.referenceCounts()
+        print("known_profiles=\(counts.knownProfileReferenceCounts.count)")
+        print("known_references_per_profile=\(counts.knownProfileReferenceCounts.map(String.init).joined(separator: ","))")
+        print("anonymous_clusters=\(counts.anonymousClusterReferenceCounts.count)")
+        print("anonymous_references_per_cluster=\(counts.anonymousClusterReferenceCounts.map(String.init).joined(separator: ","))")
+        Foundation.exit(EXIT_SUCCESS)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+} else if somaArguments.first == "--promote-anonymous-face" {
+    guard somaArguments.count == 2,
+          let handle = try? AnonymousFaceHandle(rawValue: somaArguments[1]) else {
+        fputs("soma-subconscious: --promote-anonymous-face requires an anon handle\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        let result = try await FaceIdentityRuntime.promoteAnonymousIdentity(handle: handle)
+        print("entity_id=\(result.entityID.uuidString.lowercased())")
+        print("references=\(result.referenceCount)")
+        print("profile=encrypted_local_v2")
+        Foundation.exit(EXIT_SUCCESS)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+} else if somaArguments.first == "--remove-face-identity" {
+    guard somaArguments.count == 2,
+          let entityID = UUID(uuidString: somaArguments[1]) else {
+        fputs("soma-subconscious: --remove-face-identity requires a profile UUID\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        try await FaceIdentityRuntime.removeKnownIdentity(entityID: entityID)
+        print("entity_id=\(entityID.uuidString.lowercased())")
+        print("profile=removed")
+        Foundation.exit(EXIT_SUCCESS)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+} else {
+    do {
+        try run(Options.parse(somaArguments))
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
 }

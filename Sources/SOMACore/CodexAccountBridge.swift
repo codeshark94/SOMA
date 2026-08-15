@@ -5,6 +5,8 @@ import Foundation
 public struct CodexInteractionContext: Codable, Equatable, Sendable {
     public let situationSummary: String?
     public let identityReference: String?
+    public let preferredLanguageTag: String?
+    public let languageStartInstruction: String?
     public let rapportSummary: String?
     public let activeTaskSummaries: [String]
     public let memorySummaries: [String]
@@ -14,6 +16,8 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
     public init(
         situationSummary: String? = nil,
         identityReference: String? = nil,
+        preferredLanguageTag: String? = nil,
+        languageStartInstruction: String? = nil,
         rapportSummary: String? = nil,
         activeTaskSummaries: [String] = [],
         memorySummaries: [String] = [],
@@ -22,6 +26,8 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
     ) throws {
         self.situationSummary = try Self.optional(situationSummary, maximumCount: 8_192)
         self.identityReference = try Self.optional(identityReference, maximumCount: 128)
+        self.preferredLanguageTag = try Self.optional(preferredLanguageTag, maximumCount: 35)
+        self.languageStartInstruction = try Self.optional(languageStartInstruction, maximumCount: 1_024)
         self.rapportSummary = try Self.optional(rapportSummary, maximumCount: 2_048)
         self.activeTaskSummaries = try Self.list(activeTaskSummaries, maximumItems: 16, maximumCount: 1_024)
         self.memorySummaries = try Self.list(memorySummaries, maximumItems: 24, maximumCount: 1_024)
@@ -100,6 +106,8 @@ public struct CodexAccountTurnRequest: Codable, Equatable, Sendable {
         _ = try CodexInteractionContext(
             situationSummary: context.situationSummary,
             identityReference: context.identityReference,
+            preferredLanguageTag: context.preferredLanguageTag,
+            languageStartInstruction: context.languageStartInstruction,
             rapportSummary: context.rapportSummary,
             activeTaskSummaries: context.activeTaskSummaries,
             memorySummaries: context.memorySummaries,
@@ -183,7 +191,7 @@ public enum CodexAccountPromptBuilder {
 
         return """
         You are SOMA L2, the human-interaction, executive-reasoning, and task layer.
-        Treat the transcript as the user's current utterance. Answer naturally in the user's language unless they ask otherwise. You may use preceding turns in this same interaction as conversational context. Use only the supplied scoped context for sensor observations, identity, canonical memory, tasks, and embodiment state; state uncertainty instead of inventing them. Do not perform file, shell, network, or embodiment actions unless the utterance explicitly requests that action. Return only the response intended for the user.
+        Treat the transcript as the user's current utterance. When an explicit preferred response language is supplied, use it unless the user clearly switches language or asks otherwise; otherwise answer naturally in the user's language. This response will normally be spoken aloud, so prefer one or two concise sentences unless the user requests detail. You may use preceding turns in this same interaction as conversational context. Use only the supplied scoped context for sensor observations, identity, canonical memory, tasks, and embodiment state; state uncertainty instead of inventing them. Do not perform file, shell, network, or embodiment actions unless the utterance explicitly requests that action. Return only the response intended for the user.
 
         Interaction ID: \(turn.interactionID)
         Turn ID: \(turn.turnID)
@@ -191,6 +199,8 @@ public enum CodexAccountPromptBuilder {
         Evidence IDs: \(evidence)
         Privacy scope: \(context.privacyScope)
         Identity reference: \(context.identityReference ?? "unknown")
+        Preferred response language: \(context.preferredLanguageTag ?? "unspecified")
+        L1 language instruction: \(context.languageStartInstruction ?? "unavailable")
         Situation: \(context.situationSummary ?? "unavailable")
         Rapport: \(context.rapportSummary ?? "unavailable")
         Embodiment: \(context.embodimentSummary ?? "unavailable")

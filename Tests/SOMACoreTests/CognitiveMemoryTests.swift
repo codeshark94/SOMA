@@ -266,6 +266,58 @@ final class CognitiveMemoryTests: XCTestCase {
         try await store.close()
     }
 
+    func testExplicitPersonContextUpdatesLanguageRapportAndFactsWithoutBiometrics() async throws {
+        let directory = temporaryDirectory("person-context")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let personID = UUID()
+        let start = Date(timeIntervalSince1970: 4_500)
+
+        let first = try await store.setExplicitPersonFact(
+            personEntityID: personID,
+            key: "preferred_language",
+            value: "zh-Hans",
+            at: start
+        )
+        XCTAssertEqual(first.preferredLanguageTag, "zh-Hans")
+        XCTAssertEqual(first.facts["preferred_language"], "zh-Hans")
+
+        let revised = try await store.setExplicitPersonFact(
+            personEntityID: personID,
+            key: "preferred_language",
+            value: "en-US",
+            at: start.addingTimeInterval(1)
+        )
+        XCTAssertEqual(revised.preferredLanguageTag, "en-US")
+        XCTAssertEqual(revised.facts.count, 1)
+
+        let rapport = try await store.setExplicitPersonRapport(
+            personEntityID: personID,
+            rapport: RapportProfile(
+                familiarity: 0.7,
+                interactionComfort: 0.8,
+                communicationAlignment: 0.9,
+                proactiveContact: .allowed
+            ),
+            at: start.addingTimeInterval(2)
+        )
+        XCTAssertEqual(rapport.proactiveContactPreference, .allowed)
+        XCTAssertEqual(rapport.rapport?.communicationAlignment, 0.9)
+
+        let removed = try await store.clearExplicitPersonFact(
+            personEntityID: personID,
+            key: "preferred_language",
+            at: start.addingTimeInterval(3)
+        )
+        XCTAssertNil(removed.preferredLanguageTag)
+        XCTAssertEqual(removed.proactiveContactPreference, .allowed)
+        let projection = try await store.remoteProjection(.init(relatedTo: [personID]), at: start.addingTimeInterval(3))
+        XCTAssertEqual(projection.count, 1)
+        XCTAssertEqual(projection.first?.kind, .relationship)
+        try await store.close()
+    }
+
     func testWrongKeyAndSecondWriterAreRejected() async throws {
         let directory = temporaryDirectory("locking")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -293,6 +345,96 @@ final class CognitiveMemoryTests: XCTestCase {
                 return XCTFail("wrong key did not fail authentication: \(error)")
             }
         }
+    }
+
+    func testRawL2TurnsRemainEncryptedUntilL1Consolidation() async throws {
+        let directory = temporaryDirectory("conversation")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let interactionID = UUID()
+        let threadID = "codex-live-thread-1"
+        let start = Date(timeIntervalSince1970: 6_000)
+        let archiver = ConversationTranscriptArchiver(
+            store: store,
+            interactionID: interactionID,
+            threadID: threadID
+        )
+        let exactText = "Please remember that I prefer status updates after lunch."
+        let raw = try await archiver.append(
+            role: .user,
+            rawText: exactText,
+            sourceEventID: "realtime-transcript:1",
+            at: start
+        )
+        guard case let .conversationTurn(turn) = raw.payload else {
+            return XCTFail("raw transcript did not retain its typed payload")
+        }
+        XCTAssertEqual(turn.rawText, exactText)
+        XCTAssertEqual(turn.consolidationState, .pending)
+        let pendingBeforeConsolidation = try await archiver.pending(at: start)
+        XCTAssertEqual(pendingBeforeConsolidation.map(\.id), [raw.id])
+
+        let journal = try Data(contentsOf: directory.appendingPathComponent(CognitiveMemoryStore.journalFilename))
+        XCTAssertFalse(String(decoding: journal, as: UTF8.self).contains(exactText))
+
+        let derived = UUID()
+        let consolidated = try await archiver.markConsolidated(
+            recordID: raw.id,
+            derivedMemoryIDs: [derived],
+            at: start.addingTimeInterval(1)
+        )
+        guard case let .conversationTurn(consolidatedTurn) = consolidated.payload else {
+            return XCTFail("consolidated transcript changed kind")
+        }
+        XCTAssertEqual(consolidatedTurn.rawText, exactText)
+        XCTAssertEqual(consolidatedTurn.consolidationState, .consolidated)
+        XCTAssertEqual(consolidatedTurn.derivedMemoryIDs, [derived])
+        let pendingAfterConsolidation = try await archiver.pending(at: start.addingTimeInterval(1))
+        XCTAssertTrue(pendingAfterConsolidation.isEmpty)
+        try await store.close()
+    }
+
+    func testRawConversationCannotBecomeRemoteOrLongTermMemory() async throws {
+        let directory = temporaryDirectory("conversation-policy")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let start = Date(timeIntervalSince1970: 7_000)
+        let turn = ConversationTurnMemory(
+            interactionID: UUID(),
+            threadID: "thread-policy",
+            turnSequence: 1,
+            role: .assistant,
+            rawText: "A complete response transcript.",
+            finalizedAt: start
+        )
+        do {
+            _ = try await store.insert(
+                CognitiveMemoryDraft(
+                    tier: .longTerm,
+                    summary: "Invalid raw transcript promotion",
+                    payload: .conversationTurn(turn),
+                    confidence: 1,
+                    provenance: [
+                        MemoryProvenance(
+                            source: .l2Interaction,
+                            sourceID: "codex-thread:thread-policy",
+                            observedAt: start,
+                            evidenceIDs: ["turn:1"]
+                        ),
+                        explicitProvenance(at: start),
+                    ],
+                    sensitivity: .personal,
+                    disclosure: .remoteSummaryAllowed
+                ),
+                at: start
+            )
+            XCTFail("raw transcript escaped short-term local retention")
+        } catch let error as CognitiveMemoryError {
+            guard case .validationFailed = error else { return XCTFail("unexpected error: \(error)") }
+        }
+        try await store.close()
     }
 
     private func temporaryDirectory(_ suffix: String) -> URL {

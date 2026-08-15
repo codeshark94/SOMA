@@ -13,6 +13,8 @@ let package = Package(
         .executable(name: "soma-event-eval", targets: ["SOMAEventEval"]),
         .executable(name: "soma-embodiment", targets: ["SOMAEmbodimentMCP"]),
         .executable(name: "soma-codex-bridge", targets: ["SOMACodexBridge"]),
+        .executable(name: "soma-live-voice", targets: ["SOMALiveVoice"]),
+        .executable(name: "soma-menu-bar", targets: ["SOMAMenuBar"]),
     ],
     targets: [
         .target(name: "SOMACore"),
@@ -38,9 +40,19 @@ let package = Package(
         .executableTarget(
             name: "SOMASubconscious",
             dependencies: ["SOMACore", "SOMAVADModel", "SOMAOpenCV"],
+            exclude: ["Info.plist"],
             resources: [
                 .process("Resources/YOLOv3TinyFP16.mlmodel"),
                 .copy("Resources/BlazeFaceShortRange.mlpackage")
+            ],
+            linkerSettings: [
+                .linkedFramework("Speech"),
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/SOMASubconscious/Info.plist",
+                ]),
             ]
         ),
         .executableTarget(name: "SOMACoreChecks", dependencies: ["SOMACore"]),
@@ -52,6 +64,21 @@ let package = Package(
         ),
         .executableTarget(name: "SOMAEmbodimentMCP", dependencies: ["SOMACore"]),
         .executableTarget(name: "SOMACodexBridge", dependencies: ["SOMACore"]),
+        .executableTarget(
+            name: "SOMALiveVoice",
+            dependencies: ["SOMACore"],
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .linkedFramework("WebKit"),
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/SOMALiveVoice/Info.plist",
+                ]),
+            ]
+        ),
+        .executableTarget(name: "SOMAMenuBar", dependencies: ["SOMACore"]),
         .testTarget(name: "SOMACoreTests", dependencies: ["SOMACore", "SOMAVADModel"]),
     ]
 )

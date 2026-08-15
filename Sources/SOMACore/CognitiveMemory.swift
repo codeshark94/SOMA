@@ -17,6 +17,7 @@ public enum MemoryTier: String, Codable, CaseIterable, Hashable, Sendable {
 }
 
 public enum MemoryKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case conversationTurn = "conversation_turn"
     case entity
     case identity
     case relationship
@@ -27,6 +28,50 @@ public enum MemoryKind: String, Codable, CaseIterable, Hashable, Sendable {
     case situation
     case openQuestion = "open_question"
     case memoryLink = "memory_link"
+}
+
+public enum ConversationParticipantRole: String, Codable, CaseIterable, Hashable, Sendable {
+    case user
+    case assistant
+}
+
+public enum ConversationTurnConsolidationState: String, Codable, CaseIterable, Hashable, Sendable {
+    case pending
+    case consolidated
+}
+
+/// Exact L2 transcript text retained locally until L1 has converted the turn
+/// into typed episode, person, task, relationship, or open-question memory.
+/// Audio is intentionally a separate retention decision.
+public struct ConversationTurnMemory: Codable, Equatable, Sendable {
+    public let interactionID: UUID
+    public let threadID: String
+    public let turnSequence: UInt64
+    public let role: ConversationParticipantRole
+    public let rawText: String
+    public let finalizedAt: Date
+    public let consolidationState: ConversationTurnConsolidationState
+    public let derivedMemoryIDs: [UUID]
+
+    public init(
+        interactionID: UUID,
+        threadID: String,
+        turnSequence: UInt64,
+        role: ConversationParticipantRole,
+        rawText: String,
+        finalizedAt: Date,
+        consolidationState: ConversationTurnConsolidationState = .pending,
+        derivedMemoryIDs: [UUID] = []
+    ) {
+        self.interactionID = interactionID
+        self.threadID = threadID
+        self.turnSequence = turnSequence
+        self.role = role
+        self.rawText = rawText
+        self.finalizedAt = finalizedAt
+        self.consolidationState = consolidationState
+        self.derivedMemoryIDs = derivedMemoryIDs
+    }
 }
 
 public enum MemorySensitivity: String, Codable, CaseIterable, Hashable, Sendable {
@@ -170,6 +215,62 @@ public struct PersonFactMemory: Codable, Equatable, Sendable {
         self.personEntityID = personEntityID
         self.key = key
         self.value = value
+    }
+}
+
+/// A bounded, remotely-shareable projection of a person's explicitly managed
+/// context. It intentionally contains no identity reference, face data, raw
+/// transcript, or local-only record.
+public struct PersonContextSnapshot: Codable, Equatable, Sendable {
+    public let personEntityID: UUID
+    public let preferredLanguageTag: String?
+    public let proactiveContactPreference: ProactiveContactPreference
+    public let rapport: RapportProfile?
+    public let facts: [String: String]
+
+    public init(
+        personEntityID: UUID,
+        preferredLanguageTag: String?,
+        proactiveContactPreference: ProactiveContactPreference,
+        rapport: RapportProfile?,
+        facts: [String: String]
+    ) {
+        self.personEntityID = personEntityID
+        self.preferredLanguageTag = preferredLanguageTag
+        self.proactiveContactPreference = proactiveContactPreference
+        self.rapport = rapport
+        self.facts = facts
+    }
+}
+
+public enum PersonContextFormat {
+    /// Accepts compact BCP-47 language tags used by speech and Live context.
+    /// It deliberately excludes arbitrary prose and locale underscores.
+    public static func normalizedLanguageTag(_ rawValue: String) -> String? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (2 ... 35).contains(value.utf8.count), !value.contains("_") else { return nil }
+        let components = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard let primary = components.first,
+              (2 ... 3).contains(primary.count),
+              primary.allSatisfy(\.isASCII) && primary.allSatisfy(\.isLetter),
+              components.dropFirst().allSatisfy({
+                  (1 ... 8).contains($0.count) &&
+                      $0.allSatisfy(\.isASCII) &&
+                      $0.allSatisfy { $0.isLetter || $0.isNumber }
+              }) else {
+            return nil
+        }
+        return components.enumerated().map { index, component in
+            let value = String(component)
+            if index == 0 { return value.lowercased() }
+            if value.count == 4, value.allSatisfy(\.isLetter) {
+                return value.prefix(1).uppercased() + value.dropFirst().lowercased()
+            }
+            if value.count == 2, value.allSatisfy(\.isLetter) || value.count == 3, value.allSatisfy(\.isNumber) {
+                return value.uppercased()
+            }
+            return value.lowercased()
+        }.joined(separator: "-")
     }
 }
 
@@ -317,6 +418,7 @@ public struct MemoryLink: Codable, Equatable, Sendable {
 }
 
 public enum CognitiveMemoryPayload: Equatable, Sendable {
+    case conversationTurn(ConversationTurnMemory)
     case entity(EntityMemory)
     case identity(IdentityMemory)
     case relationship(RelationshipMemory)
@@ -330,6 +432,7 @@ public enum CognitiveMemoryPayload: Equatable, Sendable {
 
     public var kind: MemoryKind {
         switch self {
+        case .conversationTurn: .conversationTurn
         case .entity: .entity
         case .identity: .identity
         case .relationship: .relationship
@@ -345,6 +448,8 @@ public enum CognitiveMemoryPayload: Equatable, Sendable {
 
     public var relatedIDs: Set<UUID> {
         switch self {
+        case let .conversationTurn(value):
+            Set([value.interactionID] + value.derivedMemoryIDs)
         case .entity:
             []
         case let .identity(value):
@@ -379,6 +484,7 @@ extension CognitiveMemoryPayload: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let kind = try container.decode(MemoryKind.self, forKey: .type)
         switch kind {
+        case .conversationTurn: self = .conversationTurn(try container.decode(ConversationTurnMemory.self, forKey: .value))
         case .entity: self = .entity(try container.decode(EntityMemory.self, forKey: .value))
         case .identity: self = .identity(try container.decode(IdentityMemory.self, forKey: .value))
         case .relationship: self = .relationship(try container.decode(RelationshipMemory.self, forKey: .value))
@@ -396,6 +502,7 @@ extension CognitiveMemoryPayload: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(kind, forKey: .type)
         switch self {
+        case let .conversationTurn(value): try container.encode(value, forKey: .value)
         case let .entity(value): try container.encode(value, forKey: .value)
         case let .identity(value): try container.encode(value, forKey: .value)
         case let .relationship(value): try container.encode(value, forKey: .value)
@@ -501,6 +608,7 @@ public struct CognitiveMemoryValidationPolicy: Equatable, Sendable {
     public let maximumSummaryBytes: Int
     public let maximumFieldBytes: Int
     public let maximumArrayItems: Int
+    public let maximumTranscriptBytes: Int
     public let maximumShortTermLifetime: TimeInterval
     public let maximumMediumTermLifetime: TimeInterval
 
@@ -508,12 +616,14 @@ public struct CognitiveMemoryValidationPolicy: Equatable, Sendable {
         maximumSummaryBytes: Int = 4_096,
         maximumFieldBytes: Int = 2_048,
         maximumArrayItems: Int = 128,
+        maximumTranscriptBytes: Int = 65_536,
         maximumShortTermLifetime: TimeInterval = 24 * 60 * 60,
         maximumMediumTermLifetime: TimeInterval = 180 * 24 * 60 * 60
     ) {
         self.maximumSummaryBytes = maximumSummaryBytes
         self.maximumFieldBytes = maximumFieldBytes
         self.maximumArrayItems = maximumArrayItems
+        self.maximumTranscriptBytes = maximumTranscriptBytes
         self.maximumShortTermLifetime = maximumShortTermLifetime
         self.maximumMediumTermLifetime = maximumMediumTermLifetime
     }
@@ -575,6 +685,9 @@ public struct CognitiveMemoryValidator: Sendable {
     }
 
     private func validateLifecycle(_ record: CognitiveMemoryRecord, failures: inout [String]) {
+        if record.kind == .conversationTurn, record.tier != .shortTerm {
+            failures.append("raw conversation turns must remain short-term")
+        }
         switch record.tier {
         case .shortTerm:
             validateExpiry(record, maximumLifetime: policy.maximumShortTermLifetime, failures: &failures)
@@ -605,6 +718,14 @@ public struct CognitiveMemoryValidator: Sendable {
     }
 
     private func validateDisclosure(_ record: CognitiveMemoryRecord, failures: inout [String]) {
+        if record.kind == .conversationTurn {
+            if record.disclosure != .localOnly {
+                failures.append("raw conversation turns must remain local")
+            }
+            if record.sensitivity != .personal {
+                failures.append("raw conversation turns require personal sensitivity")
+            }
+        }
         if record.disclosure == .remoteSummaryAllowed,
            record.sensitivity == .biometric || record.sensitivity == .secret {
             failures.append("biometric and secret memory cannot be projected remotely")
@@ -613,6 +734,25 @@ public struct CognitiveMemoryValidator: Sendable {
 
     private func validatePayload(_ record: CognitiveMemoryRecord, failures: inout [String]) {
         switch record.payload {
+        case let .conversationTurn(value):
+            validateRequired(value.threadID, name: "conversation thread ID", failures: &failures)
+            validateRequired(
+                value.rawText,
+                name: "raw conversation transcript",
+                maximum: policy.maximumTranscriptBytes,
+                failures: &failures
+            )
+            validateCount(value.derivedMemoryIDs.count, name: "derived memory IDs", failures: &failures)
+            if value.turnSequence == 0 { failures.append("conversation turn sequence must be positive") }
+            if value.consolidationState == .pending, !value.derivedMemoryIDs.isEmpty {
+                failures.append("pending conversation turn cannot identify derived memories")
+            }
+            if value.consolidationState == .consolidated, value.derivedMemoryIDs.isEmpty {
+                failures.append("consolidated conversation turn requires derived memory IDs")
+            }
+            if !record.provenance.contains(where: { $0.source == .l2Interaction }) {
+                failures.append("raw conversation turn requires L2 interaction provenance")
+            }
         case let .entity(value):
             validateStrings(value.aliases, name: "entity aliases", failures: &failures)
         case let .identity(value):
@@ -719,6 +859,24 @@ public struct RemoteMemoryProjection: Codable, Equatable, Sendable {
     public let summary: String
     public let confidence: Double
     public let updatedAt: Date
+
+    public init(
+        id: UUID,
+        revision: UInt64,
+        tier: MemoryTier,
+        kind: MemoryKind,
+        summary: String,
+        confidence: Double,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.revision = revision
+        self.tier = tier
+        self.kind = kind
+        self.summary = summary
+        self.confidence = confidence
+        self.updatedAt = updatedAt
+    }
 }
 
 public struct CognitiveMemoryStats: Equatable, Sendable {
@@ -1078,6 +1236,179 @@ public actor CognitiveMemoryStore {
         )
     }
 
+    /// Reads only person-context records that were explicitly marked safe for
+    /// remote summary. The entity ID is an opaque local reference, not a name
+    /// or biometric identifier.
+    public func personContext(
+        for personEntityID: UUID,
+        at date: Date = Date()
+    ) throws -> PersonContextSnapshot {
+        try ensureOpen()
+        let records = current.values
+            .filter { $0.updatedAt <= date && !$0.isExpired(at: date) }
+            .filter { $0.disclosure == .remoteSummaryAllowed }
+            .filter { $0.relatedIDs.contains(personEntityID) }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+
+        var facts: [String: String] = [:]
+        var rapport: RapportProfile?
+        for record in records {
+            switch record.payload {
+            case let .personFact(value) where value.personEntityID == personEntityID:
+                if facts[value.key] == nil { facts[value.key] = value.value }
+            case let .relationship(value) where value.personEntityID == personEntityID:
+                if rapport == nil { rapport = value.rapport }
+            default:
+                break
+            }
+        }
+        return PersonContextSnapshot(
+            personEntityID: personEntityID,
+            preferredLanguageTag: facts["preferred_language"],
+            proactiveContactPreference: rapport?.proactiveContact ?? .unknown,
+            rapport: rapport,
+            facts: facts
+        )
+    }
+
+    /// Writes an explicit user preference as a long-term, encrypted person
+    /// fact. Replacing the same key preserves a revision trail instead of
+    /// accumulating contradictory values.
+    @discardableResult
+    public func setExplicitPersonFact(
+        personEntityID: UUID,
+        key: String,
+        value: String,
+        sourceID: String = "l2_person_context_mcp",
+        at date: Date = Date()
+    ) throws -> PersonContextSnapshot {
+        try ensureOpen()
+        let normalizedKey = try Self.normalizedPersonFactKey(key)
+        let normalizedValue = try Self.normalizedPersonFactValue(value)
+        let draft = CognitiveMemoryDraft(
+            tier: .longTerm,
+            summary: "Person preference \(normalizedKey): \(normalizedValue)",
+            payload: .personFact(PersonFactMemory(
+                personEntityID: personEntityID,
+                key: normalizedKey,
+                value: normalizedValue
+            )),
+            confidence: 1,
+            provenance: [MemoryProvenance(
+                source: .explicitUser,
+                sourceID: String(sourceID.prefix(128)),
+                observedAt: date,
+                evidenceIDs: ["person_context:\(personEntityID.uuidString.lowercased())"]
+            )],
+            sensitivity: .personal,
+            disclosure: .remoteSummaryAllowed
+        )
+        let existing = current.values
+            .filter { record in
+                guard case let .personFact(fact) = record.payload else { return false }
+                return fact.personEntityID == personEntityID && fact.key == normalizedKey
+            }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        if let newest = existing.first, newest.tier == .longTerm {
+            _ = try correct(
+                id: newest.id,
+                replacement: draft,
+                reason: "person_context_update",
+                at: date
+            )
+            for duplicate in existing.dropFirst() {
+                try delete(id: duplicate.id, reason: "person_context_deduplicate", at: date)
+            }
+        } else {
+            for duplicate in existing {
+                try delete(id: duplicate.id, reason: "person_context_replace", at: date)
+            }
+            _ = try insert(draft, at: date)
+        }
+        return try personContext(for: personEntityID, at: date)
+    }
+
+    @discardableResult
+    public func clearExplicitPersonFact(
+        personEntityID: UUID,
+        key: String,
+        at date: Date = Date()
+    ) throws -> PersonContextSnapshot {
+        try ensureOpen()
+        let normalizedKey = try Self.normalizedPersonFactKey(key)
+        let matching = current.values.filter { record in
+            guard case let .personFact(fact) = record.payload else { return false }
+            return fact.personEntityID == personEntityID && fact.key == normalizedKey
+        }
+        for record in matching {
+            try delete(id: record.id, reason: "person_context_clear", at: date)
+        }
+        return try personContext(for: personEntityID, at: date)
+    }
+
+    /// Persists an explicit relationship setting separately from factual
+    /// preferences, so L1 can use contact comfort without turning it into an
+    /// arbitrary string fact.
+    @discardableResult
+    public func setExplicitPersonRapport(
+        personEntityID: UUID,
+        rapport: RapportProfile,
+        sourceID: String = "l2_person_context_mcp",
+        at date: Date = Date()
+    ) throws -> PersonContextSnapshot {
+        try ensureOpen()
+        let values = [rapport.familiarity, rapport.interactionComfort, rapport.communicationAlignment]
+        guard values.allSatisfy({ (0 ... 1).contains($0) }) else {
+            throw CognitiveMemoryError.validationFailed(["invalid rapport values"])
+        }
+        let draft = CognitiveMemoryDraft(
+            tier: .longTerm,
+            summary: "Person communication preferences updated",
+            payload: .relationship(RelationshipMemory(personEntityID: personEntityID, rapport: rapport)),
+            confidence: 1,
+            provenance: [MemoryProvenance(
+                source: .explicitUser,
+                sourceID: String(sourceID.prefix(128)),
+                observedAt: date,
+                evidenceIDs: ["person_context:\(personEntityID.uuidString.lowercased())"]
+            )],
+            sensitivity: .personal,
+            disclosure: .remoteSummaryAllowed
+        )
+        let existing = current.values
+            .filter { record in
+                guard case let .relationship(value) = record.payload else { return false }
+                return value.personEntityID == personEntityID
+            }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        if let newest = existing.first, newest.tier == .longTerm {
+            _ = try correct(
+                id: newest.id,
+                replacement: draft,
+                reason: "person_context_rapport_update",
+                at: date
+            )
+            for duplicate in existing.dropFirst() {
+                try delete(id: duplicate.id, reason: "person_context_rapport_deduplicate", at: date)
+            }
+        } else {
+            for duplicate in existing {
+                try delete(id: duplicate.id, reason: "person_context_rapport_replace", at: date)
+            }
+            _ = try insert(draft, at: date)
+        }
+        return try personContext(for: personEntityID, at: date)
+    }
+
     public func compact() throws {
         try ensureOpen()
         try rewriteJournal()
@@ -1170,6 +1501,28 @@ public actor CognitiveMemoryStore {
         guard !trimmed.isEmpty, trimmed.utf8.count <= validator.policy.maximumFieldBytes else {
             throw CognitiveMemoryError.invalidReason
         }
+    }
+
+    private static func normalizedPersonFactKey(_ rawValue: String) throws -> String {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !value.isEmpty,
+              value.utf8.count <= 64,
+              value.unicodeScalars.allSatisfy({
+                  CharacterSet.lowercaseLetters.contains($0)
+                      || CharacterSet.decimalDigits.contains($0)
+                      || $0 == "_"
+              }) else {
+            throw CognitiveMemoryError.validationFailed(["invalid person fact key"])
+        }
+        return value
+    }
+
+    private static func normalizedPersonFactValue(_ rawValue: String) throws -> String {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.utf8.count <= 1_024 else {
+            throw CognitiveMemoryError.validationFailed(["invalid person fact value"])
+        }
+        return value
     }
 
     private func ensureOpen() throws {
@@ -1271,5 +1624,132 @@ public actor CognitiveMemoryStore {
             sequence = entry.sequence
         }
         return (sequence, current, historyByID)
+    }
+}
+
+/// Writes exact L2 transcript turns into the encrypted short-term memory
+/// journal and exposes them to L1 for consolidation. The transcript remains
+/// local; derived typed memories have their own disclosure and retention.
+public actor ConversationTranscriptArchiver {
+    public let interactionID: UUID
+    public let threadID: String
+    public let retentionSeconds: TimeInterval
+
+    private let store: CognitiveMemoryStore
+    private var nextSequence: UInt64 = 1
+
+    public init(
+        store: CognitiveMemoryStore,
+        interactionID: UUID,
+        threadID: String,
+        retentionSeconds: TimeInterval = 24 * 60 * 60
+    ) {
+        precondition(!threadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        precondition(retentionSeconds > 0 && retentionSeconds <= 24 * 60 * 60)
+        self.store = store
+        self.interactionID = interactionID
+        self.threadID = threadID
+        self.retentionSeconds = retentionSeconds
+    }
+
+    @discardableResult
+    public func append(
+        role: ConversationParticipantRole,
+        rawText: String,
+        sourceEventID: String,
+        at date: Date = Date()
+    ) async throws -> CognitiveMemoryRecord {
+        let sequence = nextSequence
+        let turn = ConversationTurnMemory(
+            interactionID: interactionID,
+            threadID: threadID,
+            turnSequence: sequence,
+            role: role,
+            rawText: rawText,
+            finalizedAt: date
+        )
+        let record = try await store.insert(
+            CognitiveMemoryDraft(
+                tier: .shortTerm,
+                summary: "Raw L2 \(role.rawValue) transcript turn \(sequence) pending L1 consolidation",
+                payload: .conversationTurn(turn),
+                confidence: 1,
+                provenance: [
+                    MemoryProvenance(
+                        source: .l2Interaction,
+                        sourceID: "codex-thread:\(threadID)",
+                        observedAt: date,
+                        evidenceIDs: [sourceEventID]
+                    )
+                ],
+                sensitivity: .personal,
+                disclosure: .localOnly,
+                expiresAt: date.addingTimeInterval(retentionSeconds)
+            ),
+            at: date
+        )
+        nextSequence += 1
+        return record
+    }
+
+    public func pending(at date: Date = Date()) async throws -> [CognitiveMemoryRecord] {
+        try await store.query(
+            .init(tiers: [.shortTerm], kinds: [.conversationTurn], relatedTo: [interactionID], limit: 500),
+            at: date
+        ).filter {
+            guard case let .conversationTurn(turn) = $0.payload else { return false }
+            return turn.threadID == threadID && turn.consolidationState == .pending
+        }.sorted {
+            guard case let .conversationTurn(left) = $0.payload,
+                  case let .conversationTurn(right) = $1.payload else { return $0.id.uuidString < $1.id.uuidString }
+            return left.turnSequence < right.turnSequence
+        }
+    }
+
+    @discardableResult
+    public func markConsolidated(
+        recordID: UUID,
+        derivedMemoryIDs: [UUID],
+        at date: Date = Date()
+    ) async throws -> CognitiveMemoryRecord {
+        guard !derivedMemoryIDs.isEmpty,
+              let record = try await store.record(id: recordID, at: date),
+              case let .conversationTurn(turn) = record.payload,
+              turn.interactionID == interactionID,
+              turn.threadID == threadID else {
+            throw CognitiveMemoryError.recordNotFound(recordID)
+        }
+        let replacement = CognitiveMemoryDraft(
+            tier: .shortTerm,
+            summary: "Raw L2 \(turn.role.rawValue) transcript turn \(turn.turnSequence) consolidated by L1",
+            payload: .conversationTurn(ConversationTurnMemory(
+                interactionID: turn.interactionID,
+                threadID: turn.threadID,
+                turnSequence: turn.turnSequence,
+                role: turn.role,
+                rawText: turn.rawText,
+                finalizedAt: turn.finalizedAt,
+                consolidationState: .consolidated,
+                derivedMemoryIDs: derivedMemoryIDs
+            )),
+            confidence: record.confidence,
+            provenance: record.provenance + [
+                MemoryProvenance(
+                    source: .consolidation,
+                    sourceID: "l1-consolidation:\(interactionID.uuidString)",
+                    observedAt: date,
+                    evidenceIDs: derivedMemoryIDs.map(\.uuidString)
+                )
+            ],
+            sensitivity: .personal,
+            disclosure: .localOnly,
+            expiresAt: record.expiresAt
+        )
+        return try await store.correct(
+            id: recordID,
+            replacement: replacement,
+            reason: "L1 consolidated raw conversation turn into typed memory",
+            at: date
+        )
     }
 }

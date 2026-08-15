@@ -111,6 +111,65 @@ private struct ViewResultArguments: Codable {
     let requestId: String
 }
 
+private struct PersonContextArguments: Codable {
+    let personEntityId: UUID
+    let languageTag: String?
+    let proactiveContact: ProactiveContactPreference?
+    let familiarity: Double?
+    let interactionComfort: Double?
+    let communicationAlignment: Double?
+    let key: String?
+    let value: String?
+    let confirmedByUser: Bool?
+
+    func request(for operation: PersonContextIPCOperation) throws -> PersonContextIPCRequest {
+        switch operation {
+        case .get:
+            break
+        case .setPreferredLanguage:
+            guard languageTag != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("set_preferred_language requires language_tag and confirmed_by_user=true")
+            }
+        case .clearPreferredLanguage:
+            guard confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("clear_preferred_language requires confirmed_by_user=true")
+            }
+        case .setContactPreference:
+            guard proactiveContact != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("set_contact_preference requires proactive_contact and confirmed_by_user=true")
+            }
+        case .setRapport:
+            guard familiarity != nil,
+                  interactionComfort != nil,
+                  communicationAlignment != nil,
+                  proactiveContact != nil,
+                  confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("set_person_rapport requires rapport values, proactive_contact, and confirmed_by_user=true")
+            }
+        case .setFact:
+            guard key != nil, value != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("set_person_fact requires key, value, and confirmed_by_user=true")
+            }
+        case .removeFact:
+            guard key != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("remove_person_fact requires key and confirmed_by_user=true")
+            }
+        }
+        return PersonContextIPCRequest(
+            operation: operation,
+            personEntityID: personEntityId,
+            languageTag: languageTag,
+            proactiveContact: proactiveContact,
+            familiarity: familiarity,
+            interactionComfort: interactionComfort,
+            communicationAlignment: communicationAlignment,
+            factKey: key,
+            factValue: value,
+            confirmedByUser: confirmedByUser ?? false
+        )
+    }
+}
+
 private final class EmbodimentMCPServer {
     private let socketURL: URL
     private var initialized = false
@@ -162,7 +221,7 @@ private final class EmbodimentMCPServer {
                 "protocolVersion": supportedProtocolVersion,
                 "capabilities": ["tools": ["listChanged": false]],
                 "serverInfo": ["name": "soma-embodiment", "version": "0.3.0"],
-                "instructions": "Leased semantic embodiment control routed to the local SOMA L0 arbiter. Inspect physical_actuation_enabled before assuming a goal can move hardware; L0 always retains route, stabilization, watchdog, and SDK authority."
+                "instructions": "Leased semantic embodiment control routed to the local SOMA L0 arbiter. Text tool results are interaction context. capture_view returns both an MCP image content block and a short-lived local resource link when a settled frame is ready. Inspect physical_actuation_enabled before assuming a goal can move hardware; L0 always retains route, stabilization, watchdog, and SDK authority."
             ], id: id)
         case "notifications/initialized", "notifications/cancelled":
             return
@@ -214,6 +273,13 @@ private final class EmbodimentMCPServer {
             let value: ViewResultArguments = try decode(arguments)
             return try EmbodimentShadowSocketClient.send(
                 .init(kind: .captureResult, requestID: value.requestId),
+                socketURL: socketURL
+            )
+        }
+        if let operation = personContextOperation(forTool: name) {
+            let value: PersonContextArguments = try decode(arguments)
+            return try EmbodimentShadowSocketClient.send(
+                .init(kind: .personContext, personContext: try value.request(for: operation)),
                 socketURL: socketURL
             )
         }
@@ -322,6 +388,19 @@ private final class EmbodimentMCPServer {
         }
     }
 
+    private func personContextOperation(forTool name: String) -> PersonContextIPCOperation? {
+        switch name {
+        case "get_person_context": .get
+        case "set_preferred_language": .setPreferredLanguage
+        case "clear_preferred_language": .clearPreferredLanguage
+        case "set_contact_preference": .setContactPreference
+        case "set_person_rapport": .setRapport
+        case "set_person_fact": .setFact
+        case "remove_person_fact": .removeFact
+        default: nil
+        }
+    }
+
     private func toolResult(_ reply: EmbodimentIPCReply) -> [String: Any] {
         guard let structured = try? jsonObject(reply),
               let textData = try? encoder.encode(reply),
@@ -333,6 +412,9 @@ private final class EmbodimentMCPServer {
            resource.state == .ready,
            let imagePath = resource.imagePath,
            let mimeType = resource.mimeType {
+            if let image = imageContent(path: imagePath, mimeType: mimeType) {
+                content.append(image)
+            }
             content.append([
                 "type": "resource_link",
                 "name": "SOMA view \(resource.requestID)",
@@ -344,6 +426,27 @@ private final class EmbodimentMCPServer {
             "content": content,
             "structuredContent": structured,
             "isError": !reply.ok,
+        ]
+    }
+
+    private func imageContent(path: String, mimeType: String) -> [String: Any]? {
+        let supportedTypes: Set<String> = ["image/jpeg", "image/png", "image/webp"]
+        let maximumBytes = 8 * 1_048_576
+        guard supportedTypes.contains(mimeType.lowercased()),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let fileType = attributes[.type] as? FileAttributeType,
+              fileType == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.intValue > 0,
+              size.intValue <= maximumBytes,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe]),
+              data.count <= maximumBytes else {
+            return nil
+        }
+        return [
+            "type": "image",
+            "data": data.base64EncodedString(),
+            "mimeType": mimeType.lowercased(),
         ]
     }
 
@@ -395,6 +498,13 @@ private final class EmbodimentMCPServer {
             "capture_view",
             "express_gimbal",
             "release_embodiment",
+            "get_person_context",
+            "set_preferred_language",
+            "clear_preferred_language",
+            "set_contact_preference",
+            "set_person_rapport",
+            "set_person_fact",
+            "remove_person_fact",
         ]
     }
 
@@ -406,6 +516,42 @@ private final class EmbodimentMCPServer {
             tool("get_view_capture", "Read one short-lived capture result by request ID.", objectSchema([
                 "request_id": stringSchema(maxLength: 96),
             ], required: ["request_id"]), readOnly: true),
+            tool("get_person_context", "Read the current remote-shareable language, contact, rapport, and factual context for one opaque local person reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
+                "person_entity_id": uuidSchema(),
+            ], required: ["person_entity_id"]), readOnly: true),
+            tool("set_preferred_language", "Persist a person's stated BCP-47 language preference. Call only after the person explicitly states or confirms it.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "language_tag": stringSchema(maxLength: 35),
+                "confirmed_by_user": ["type": "boolean", "const": true],
+            ], required: ["person_entity_id", "language_tag", "confirmed_by_user"])),
+            tool("clear_preferred_language", "Remove a person's previously stated language preference after explicit confirmation.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "confirmed_by_user": ["type": "boolean", "const": true],
+            ], required: ["person_entity_id", "confirmed_by_user"])),
+            tool("set_contact_preference", "Persist a person's explicit preference about proactive contact. This is social context, not motor authority.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "proactive_contact": ["type": "string", "enum": ProactiveContactPreference.allCases.map(\.rawValue)],
+                "confirmed_by_user": ["type": "boolean", "const": true],
+            ], required: ["person_entity_id", "proactive_contact", "confirmed_by_user"])),
+            tool("set_person_rapport", "Persist explicitly confirmed rapport settings for one person. Do not infer values from a single utterance.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "familiarity": numberSchema(minimum: 0, maximum: 1),
+                "interaction_comfort": numberSchema(minimum: 0, maximum: 1),
+                "communication_alignment": numberSchema(minimum: 0, maximum: 1),
+                "proactive_contact": ["type": "string", "enum": ProactiveContactPreference.allCases.map(\.rawValue)],
+                "confirmed_by_user": ["type": "boolean", "const": true],
+            ], required: ["person_entity_id", "familiarity", "interaction_comfort", "communication_alignment", "proactive_contact", "confirmed_by_user"])),
+            tool("set_person_fact", "Persist one person fact only when the person explicitly gives or confirms it. For language use set_preferred_language instead.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "key": stringSchema(maxLength: 64),
+                "value": stringSchema(maxLength: 1024),
+                "confirmed_by_user": ["type": "boolean", "const": true],
+            ], required: ["person_entity_id", "key", "value", "confirmed_by_user"])),
+            tool("remove_person_fact", "Remove a person fact after explicit correction or deletion request.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "key": stringSchema(maxLength: 64),
+                "confirmed_by_user": ["type": "boolean", "const": true],
+            ], required: ["person_entity_id", "key", "confirmed_by_user"])),
             tool("register_semantic_target", "Register a stable semantic target label or visual query with L0.", objectSchema([
                 "control": controlSchema(),
                 "registration": registrationSchema(),
@@ -430,7 +576,7 @@ private final class EmbodimentMCPServer {
                 "control": controlSchema(),
                 "policy": explorationPolicySchema(),
             ], required: ["control", "policy"])),
-            tool("capture_view", "Align a contextual view, capture the next settled frame, and return a short-lived local JPEG resource link.", objectSchema([
+            tool("capture_view", "Align a contextual view, capture the next settled frame, and return it as MCP image content plus a short-lived local resource link.", objectSchema([
                 "control": controlSchema(),
                 "goal": captureGoalSchema(),
             ], required: ["control", "goal"])),
@@ -591,6 +737,10 @@ private final class EmbodimentMCPServer {
 
     private func stringSchema(maxLength: Int) -> [String: Any] {
         ["type": "string", "minLength": 1, "maxLength": maxLength]
+    }
+
+    private func uuidSchema() -> [String: Any] {
+        ["type": "string", "format": "uuid", "minLength": 36, "maxLength": 36]
     }
 
     private func numberSchema(minimum: Double, maximum: Double) -> [String: Any] {

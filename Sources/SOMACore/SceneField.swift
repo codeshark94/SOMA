@@ -277,6 +277,9 @@ public struct SceneCandidate: Sendable {
     /// Current System Vision validation that can promote a provisional face
     /// lock without waiting for a deliberate movement.
     public let faceVerificationEligible: Bool
+    /// Current directed-contact evidence. It never persists as motor authority
+    /// and is consumed only while this candidate is observed in the frame.
+    public let eyeContactEligible: Bool
     public let trackingBoundary: TrackingBoundary
     public let bearing: GimbalRelativeBearing?
     public let spatialConfidence: Double
@@ -294,7 +297,8 @@ public struct SceneCandidate: Sendable {
             sceneID: id,
             stabilityMilliseconds: stabilityMilliseconds,
             isActionEligible: isActionEligible,
-            isFaceVerified: faceVerificationEligible
+            isFaceVerified: faceVerificationEligible,
+            isEyeContactEligible: eyeContactEligible
         )
     }
 }
@@ -318,6 +322,7 @@ public struct SceneField: Sendable {
         var attentionWeight: Double
         var faceMotorEvidence: Bool
         var faceVerified: Bool
+        var eyeContactEligible: Bool
         var firstSeenNS: UInt64
         var lastSeenNS: UInt64
         var observationCount: Int
@@ -414,6 +419,7 @@ public struct SceneField: Sendable {
                     attentionWeight: observation.attentionWeight,
                     faceMotorEvidence: observation.isActionEligible,
                     faceVerified: observation.isFaceVerified,
+                    eyeContactEligible: observation.isEyeContactEligible,
                     firstSeenNS: monotonicNS,
                     lastSeenNS: monotonicNS,
                     observationCount: 1,
@@ -522,6 +528,7 @@ public struct SceneField: Sendable {
             // independent person corroboration.
             track.faceMotorEvidence = observation.isActionEligible
             track.faceVerified = observation.isFaceVerified
+            track.eyeContactEligible = observation.isEyeContactEligible
         }
         track.lastSeenNS = monotonicNS
         track.observationCount += 1
@@ -675,6 +682,7 @@ public struct SceneField: Sendable {
             isActionEligible: actionEligible,
             faceActivityEligible: faceActivityEligible,
             faceVerificationEligible: faceVerificationEligible,
+            eyeContactEligible: track.observedThisFrame && track.eyeContactEligible,
             trackingBoundary: track.trackingBoundary,
             bearing: track.bearing,
             spatialConfidence: spatialConfidence,

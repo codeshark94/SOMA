@@ -75,6 +75,65 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(CodexInteractionTurn.self, from: encoded), turn)
     }
 
+    func testSpeechTurnRequiresAuthorizedWakeAndClosesOnVoiceOffset() throws {
+        var segmenter = SpeechTurnSegmenter()
+        XCTAssertNil(segmenter.observe(voiceActive: true, at: 1_000_000_000))
+
+        let result = decision(
+            model: EventImportanceModel(),
+            features: EventImportanceFeatures(
+                explicitContact: 0.9,
+                socialSalience: 0.9,
+                crossModalCorroboration: 0.9,
+                humanPresence: 0.9
+            )
+        )
+        let wake = try HumanInteractionWakeRequest(
+            decision: result,
+            audioPreRollMilliseconds: 900
+        )
+        let started = segmenter.observe(
+            voiceActive: true,
+            at: 2_000_000_000,
+            authorizedWake: wake
+        )
+        guard case .started(let start) = started else {
+            return XCTFail("authorized voice did not start a turn")
+        }
+        XCTAssertEqual(start.speechStartedAtNS, 1_740_000_000)
+        XCTAssertNil(segmenter.observe(voiceActive: true, at: 2_500_000_000))
+
+        let finished = segmenter.observe(voiceActive: false, at: 3_000_000_000)
+        guard case .finished(let finish) = finished else {
+            return XCTFail("voice offset did not finish the turn")
+        }
+        XCTAssertEqual(finish.reason, .voiceOffset)
+        XCTAssertEqual(finish.speechStartedAtNS, start.speechStartedAtNS)
+        XCTAssertEqual(finish.speechEndedAtNS, 3_000_000_000)
+    }
+
+    func testSpeechTurnIsBoundedAndRearmsAfterCooldown() throws {
+        var segmenter = SpeechTurnSegmenter(configuration: .init(
+            analysisLookbackMilliseconds: 100,
+            maximumTurnMilliseconds: 1_000,
+            rearmMilliseconds: 500
+        ))
+        let result = decision(
+            model: EventImportanceModel(),
+            features: EventImportanceFeatures(explicitContact: 1, humanPresence: 1)
+        )
+        let wake = try HumanInteractionWakeRequest(decision: result, audioPreRollMilliseconds: 500)
+        XCTAssertNotNil(segmenter.observe(voiceActive: true, at: 1_000_000_000, authorizedWake: wake))
+
+        let bounded = segmenter.observe(voiceActive: true, at: 1_900_000_000)
+        guard case .finished(let finish) = bounded else {
+            return XCTFail("maximum utterance duration was not enforced")
+        }
+        XCTAssertEqual(finish.reason, .maximumDuration)
+        XCTAssertNil(segmenter.observe(voiceActive: true, at: 2_300_000_000, authorizedWake: wake))
+        XCTAssertNotNil(segmenter.observe(voiceActive: true, at: 2_400_000_000, authorizedWake: wake))
+    }
+
     func testCodexAccountBridgeBuildsBoundedScopedPromptAndParsesCLIJSONL() throws {
         let turn = try CodexInteractionTurn(
             interactionID: "interaction-account",
@@ -89,6 +148,8 @@ final class EventImportanceTests: XCTestCase {
         let context = try CodexInteractionContext(
             situationSummary: "A known human is centered in the current view.",
             identityReference: "person:local-owner",
+            preferredLanguageTag: "ko",
+            languageStartInstruction: "한국어로 자연스럽게 대답하세요.",
             rapportSummary: "familiar",
             activeTaskSummaries: ["Finish the SOMA interaction bridge."],
             memorySummaries: ["The user prefers concise Korean responses."],
@@ -99,6 +160,8 @@ final class EventImportanceTests: XCTestCase {
         let prompt = CodexAccountPromptBuilder.prompt(for: request)
         XCTAssertTrue(prompt.contains("지금 뭘 보고 있어?"))
         XCTAssertTrue(prompt.contains("person:local-owner"))
+        XCTAssertTrue(prompt.contains("Preferred response language: ko"))
+        XCTAssertTrue(prompt.contains("한국어로 자연스럽게 대답하세요."))
         XCTAssertTrue(prompt.contains("preceding turns in this same interaction"))
         XCTAssertFalse(prompt.lowercased().contains("raw audio"))
 
@@ -227,6 +290,110 @@ final class EventImportanceTests: XCTestCase {
             String(decoding: try JSONEncoder().encode(legacy), as: UTF8.self),
             "\"l2\""
         )
+    }
+
+    func testFirstConversationRequiresEyeContactOrBotSocialPulse() {
+        let start: UInt64 = 1_000_000_000
+        var gate = ConversationContactGate(configuration: .init(
+            eyeContactFreshnessMilliseconds: 450,
+            socialPulseResponseMilliseconds: 8_000,
+            conversationInactivityMilliseconds: 60_000
+        ))
+        XCTAssertNil(gate.authorizeSpeechOnset(at: start))
+
+        gate.observeEyeContact(at: start)
+        XCTAssertEqual(
+            gate.authorizeSpeechOnset(at: start + 450_000_000),
+            .eyeContact
+        )
+        XCTAssertNil(gate.authorizeSpeechOnset(at: start + 451_000_000))
+
+        gate.issueSocialPulse(at: start + 1_000_000_000)
+        XCTAssertEqual(
+            gate.authorizeSpeechOnset(at: start + 1_100_000_000),
+            .botInitiatedPulseResponse
+        )
+        XCTAssertNil(gate.authorizeSpeechOnset(at: start + 1_200_000_000))
+    }
+
+    func testOpenedConversationAllowsFollowUpsUntilInactivityExpiry() {
+        let start: UInt64 = 2_000_000_000
+        var gate = ConversationContactGate(configuration: .init(
+            eyeContactFreshnessMilliseconds: 450,
+            socialPulseResponseMilliseconds: 8_000,
+            conversationInactivityMilliseconds: 60_000
+        ))
+        gate.markConversationOpened(at: start)
+        XCTAssertEqual(
+            gate.authorizeSpeechOnset(at: start + 59_999_000_000),
+            .activeConversation
+        )
+        XCTAssertNil(gate.authorizeSpeechOnset(at: start + 60_000_000_000))
+    }
+
+    func testLiveVoiceSessionClosesAfterOneMinuteWithoutUserActivity() {
+        let start: UInt64 = 1_000_000_000
+        var gate = LiveVoiceSessionInactivityGate()
+        let initialDeadline = gate.activate(at: start)
+        XCTAssertFalse(gate.shouldClose(at: initialDeadline - 1))
+        XCTAssertTrue(gate.shouldClose(at: initialDeadline))
+
+        let renewedDeadline = gate.recordUserActivity(at: initialDeadline - 1)
+        XCTAssertEqual(renewedDeadline, initialDeadline + 59_999_999_999)
+        XCTAssertFalse(gate.shouldClose(at: renewedDeadline! - 1))
+        XCTAssertTrue(gate.shouldClose(at: renewedDeadline!))
+    }
+
+    func testIndicatorPriorityMakesSocialAndCognitiveStateLegible() {
+        var inputs = SubconsciousIndicatorInputs(
+            visualState: .none,
+            interactionState: .idle
+        )
+        XCTAssertEqual(inputs.resolvedState, .exploring)
+        inputs.visualState = .humanDetected
+        XCTAssertEqual(inputs.resolvedState, .humanDetected)
+        inputs.visualState = .eyeContact
+        XCTAssertEqual(inputs.resolvedState, .contactReady)
+        inputs.interactionState = .conversation
+        XCTAssertEqual(inputs.resolvedState, .conversation)
+        inputs.interactionState = .preparingReply
+        XCTAssertEqual(inputs.resolvedState, .working)
+        inputs.visualState = .none
+        inputs.interactionState = .idle
+        XCTAssertEqual(inputs.resolvedState, .exploring)
+    }
+
+    func testIndicatorHardwareTransitionsClearBeforeSetting() {
+        XCTAssertEqual(SubconsciousIndicatorState.contactReady.humanMeaning, "ready_speak_now")
+        XCTAssertEqual(SubconsciousIndicatorState.conversation.humanMeaning, "conversation_active")
+        XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "please_wait_preparing_reply")
+        XCTAssertEqual(
+            SOMALEDHardwareTransition.commands(previousStateID: nil, nextStateID: 18),
+            [.set(stateID: 18)]
+        )
+        XCTAssertEqual(
+            SOMALEDHardwareTransition.commands(previousStateID: 18, nextStateID: 57),
+            [.clear(stateID: 18), .set(stateID: 57)]
+        )
+        XCTAssertEqual(
+            SOMALEDHardwareTransition.commands(previousStateID: 57, nextStateID: 57),
+            []
+        )
+    }
+
+    func testLiveVoiceLaunchGateDebouncesAndHasBoundedRetry() {
+        var gate = LiveVoiceLaunchGate()
+        let start: UInt64 = 10_000_000_000
+        XCTAssertTrue(gate.beginLaunch(at: start))
+        XCTAssertFalse(gate.beginLaunch(at: start + 1))
+        gate.fail(at: start, retryMilliseconds: 5_000)
+        XCTAssertFalse(gate.beginLaunch(at: start + 4_999_999_999))
+        XCTAssertTrue(gate.beginLaunch(at: start + 5_000_000_000))
+        gate.observeActive()
+        XCTAssertEqual(gate.phase, .active)
+        XCTAssertFalse(gate.beginLaunch(at: start + 6_000_000_000))
+        gate.observeEnded()
+        XCTAssertTrue(gate.beginLaunch(at: start + 6_000_000_000))
     }
 
     private func decision(

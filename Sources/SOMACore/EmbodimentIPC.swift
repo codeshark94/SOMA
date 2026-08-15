@@ -5,21 +5,81 @@ public enum EmbodimentIPCCommandKind: String, Codable, Sendable {
     case submit
     case snapshot
     case captureResult = "capture_result"
+    case personContext = "person_context"
+    case indicatorCalibration = "indicator_calibration"
+}
+
+/// Local-only person-context operations exposed through the same current-user
+/// socket as embodiment. The L0 process owns the encrypted journal lock, so
+/// an MCP child never opens a competing memory store.
+public enum PersonContextIPCOperation: String, Codable, Sendable {
+    case get
+    case setPreferredLanguage = "set_preferred_language"
+    case clearPreferredLanguage = "clear_preferred_language"
+    case setContactPreference = "set_contact_preference"
+    case setRapport = "set_rapport"
+    case setFact = "set_fact"
+    case removeFact = "remove_fact"
+}
+
+public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
+    public let operation: PersonContextIPCOperation
+    public let personEntityID: UUID
+    public let languageTag: String?
+    public let proactiveContact: ProactiveContactPreference?
+    public let familiarity: Double?
+    public let interactionComfort: Double?
+    public let communicationAlignment: Double?
+    public let factKey: String?
+    public let factValue: String?
+    public let confirmedByUser: Bool
+
+    public init(
+        operation: PersonContextIPCOperation,
+        personEntityID: UUID,
+        languageTag: String? = nil,
+        proactiveContact: ProactiveContactPreference? = nil,
+        familiarity: Double? = nil,
+        interactionComfort: Double? = nil,
+        communicationAlignment: Double? = nil,
+        factKey: String? = nil,
+        factValue: String? = nil,
+        confirmedByUser: Bool = false
+    ) {
+        self.operation = operation
+        self.personEntityID = personEntityID
+        self.languageTag = languageTag.map { String($0.prefix(35)) }
+        self.proactiveContact = proactiveContact
+        self.familiarity = familiarity
+        self.interactionComfort = interactionComfort
+        self.communicationAlignment = communicationAlignment
+        self.factKey = factKey.map { String($0.prefix(64)) }
+        self.factValue = factValue.map { String($0.prefix(1_024)) }
+        self.confirmedByUser = confirmedByUser
+    }
 }
 
 public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
     public let kind: EmbodimentIPCCommandKind
     public let request: CognitiveEmbodimentRequest?
     public let requestID: String?
+    public let personContext: PersonContextIPCRequest?
+    /// An owner-local LED calibration request. A missing preset ends the
+    /// temporary override and hands the indicator back to normal L0 state.
+    public let indicatorPreset: SOMALEDFirmwarePreset?
 
     public init(
         kind: EmbodimentIPCCommandKind,
         request: CognitiveEmbodimentRequest? = nil,
-        requestID: String? = nil
+        requestID: String? = nil,
+        personContext: PersonContextIPCRequest? = nil,
+        indicatorPreset: SOMALEDFirmwarePreset? = nil
     ) {
         self.kind = kind
         self.request = request
         self.requestID = requestID.map { String($0.prefix(96)) }
+        self.personContext = personContext
+        self.indicatorPreset = indicatorPreset
     }
 }
 
@@ -29,19 +89,22 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
     public let decision: EmbodimentShadowDecision?
     public let snapshot: EmbodimentShadowSnapshot?
     public let viewResource: EmbodimentViewResource?
+    public let personContext: PersonContextSnapshot?
 
     public init(
         ok: Bool,
         error: String? = nil,
         decision: EmbodimentShadowDecision? = nil,
         snapshot: EmbodimentShadowSnapshot? = nil,
-        viewResource: EmbodimentViewResource? = nil
+        viewResource: EmbodimentViewResource? = nil,
+        personContext: PersonContextSnapshot? = nil
     ) {
         self.ok = ok
         self.error = error.map { String($0.prefix(240)) }
         self.decision = decision
         self.snapshot = snapshot
         self.viewResource = viewResource
+        self.personContext = personContext
     }
 }
 
@@ -79,12 +142,20 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         _ requestID: String,
         _ monotonicNS: UInt64
     ) -> EmbodimentViewResource?
+    public typealias PersonContextProvider = @Sendable (
+        _ request: PersonContextIPCRequest
+    ) -> Result<PersonContextSnapshot, Error>
+    public typealias IndicatorCalibrationHandler = @Sendable (
+        _ preset: SOMALEDFirmwarePreset?
+    ) -> Result<Void, Error>
 
     private let socketURL: URL
     private let arbiter: ShadowEmbodimentArbiter
     private let onDecision: DecisionHandler
     private let onHealth: HealthHandler
     private let captureResultProvider: CaptureResultProvider
+    private let personContextProvider: PersonContextProvider
+    private let indicatorCalibrationHandler: IndicatorCalibrationHandler
     private let queue = DispatchQueue(label: "soma.embodiment.shadow.socket")
     private let group = DispatchGroup()
     private let stateLock = NSLock()
@@ -99,12 +170,16 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         arbiter: ShadowEmbodimentArbiter = ShadowEmbodimentArbiter(),
         onDecision: @escaping DecisionHandler = { _, _ in },
         captureResultProvider: @escaping CaptureResultProvider = { _, _ in nil },
+        personContextProvider: @escaping PersonContextProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
+        indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
         onHealth: @escaping HealthHandler = { _, _ in }
     ) {
         self.socketURL = socketURL
         self.arbiter = arbiter
         self.onDecision = onDecision
         self.captureResultProvider = captureResultProvider
+        self.personContextProvider = personContextProvider
+        self.indicatorCalibrationHandler = indicatorCalibrationHandler
         self.onHealth = onHealth
     }
 
@@ -194,13 +269,19 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             let command = try JSONDecoder().decode(EmbodimentIPCCommand.self, from: data)
             switch command.kind {
             case .snapshot:
-                guard command.request == nil, command.requestID == nil else {
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.indicatorPreset == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
                 let snapshot = arbiter.snapshot(at: DispatchTime.now().uptimeNanoseconds)
                 writeReply(.init(ok: true, snapshot: snapshot), to: clientFD)
             case .submit:
-                guard let request = command.request, command.requestID == nil else {
+                guard let request = command.request,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.indicatorPreset == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
                 let decision = arbiter.submit(request, at: DispatchTime.now().uptimeNanoseconds)
@@ -213,6 +294,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 ), to: clientFD)
             case .captureResult:
                 guard command.request == nil,
+                      command.personContext == nil,
+                      command.indicatorPreset == nil,
                       let requestID = command.requestID,
                       !requestID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw EmbodimentIPCError.malformedMessage
@@ -233,6 +316,31 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                     snapshot: arbiter.snapshot(at: now),
                     viewResource: resource
                 ), to: clientFD)
+            case .personContext:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.indicatorPreset == nil,
+                      let request = command.personContext else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                switch personContextProvider(request) {
+                case let .success(context):
+                    writeReply(.init(ok: true, personContext: context), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
+            case .indicatorCalibration:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                switch indicatorCalibrationHandler(command.indicatorPreset) {
+                case .success:
+                    writeReply(.init(ok: true), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
             }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

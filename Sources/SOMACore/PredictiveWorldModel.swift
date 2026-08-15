@@ -61,6 +61,9 @@ public struct VisualObservation: Sendable {
     /// Independent System Vision confirmation for a face candidate. It is
     /// transient L0 validation, not identity data.
     public let isFaceVerified: Bool
+    /// A transient, non-identifying estimate that a landmark-verified face is
+    /// front-facing with both pupils directed through the social fovea.
+    public let isEyeContactEligible: Bool
 
     public init(
         rect: NormalizedRect,
@@ -73,7 +76,8 @@ public struct VisualObservation: Sendable {
         sceneID: String? = nil,
         stabilityMilliseconds: Double = 0,
         isActionEligible: Bool = false,
-        isFaceVerified: Bool = false
+        isFaceVerified: Bool = false,
+        isEyeContactEligible: Bool = false
     ) {
         self.rect = rect
         self.confidence = clamp(confidence)
@@ -86,6 +90,7 @@ public struct VisualObservation: Sendable {
         self.stabilityMilliseconds = max(0, stabilityMilliseconds)
         self.isActionEligible = isActionEligible
         self.isFaceVerified = isFaceVerified
+        self.isEyeContactEligible = isEyeContactEligible
     }
 }
 

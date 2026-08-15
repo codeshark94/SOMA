@@ -84,6 +84,8 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     private let writeIntervalNS: UInt64 = 1_000_000_000
     private let placeObservationIntervalNS: UInt64 = 1_000_000_000
     private let minimumProjectionQuality = 0.45
+    private let stationaryProjectionRefreshNS: UInt64 = 2_000_000_000
+    private let stationaryProjectionDistanceDegrees = 1.25
     private let placeEmbeddingEncoder = PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder
     private let placeEmbeddingRevision = VNGenerateImageFeaturePrintRequest().revision
     private var pending: Pending?
@@ -126,6 +128,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     private var lastWriteNS: UInt64 = 0
     private var lastUpdatedNS: UInt64?
     private var lastProjectedCaptureNS: UInt64?
+    private var lastProjectedPose: GimbalPose?
     private var reachableMask: [Bool]?
     private var reachablePixelCount = 0
     private var geometryCapturedFrames = 0
@@ -251,6 +254,18 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         guard let estimate = resolution.estimate else {
             poseInterpolationMisses += 1
             poseMissReasons[resolution.failure?.rawValue ?? "unknown", default: 0] += 1
+            return
+        }
+        // Re-projecting the same camera ray four times per second costs far
+        // more than it contributes to a persistent panorama. Keep the full
+        // 4 Hz strip path while the camera is traversing new spherical area,
+        // but coalesce a settled fixation until a short refresh is due.
+        if geometryCaptureDirectoryURL == nil,
+           let lastCaptureNS = lastProjectedCaptureNS,
+           let lastPose = lastProjectedPose,
+           frame.captureNS >= lastCaptureNS,
+           frame.captureNS - lastCaptureNS < stationaryProjectionRefreshNS,
+           poseDistanceDegrees(estimate.pose, lastPose) < stationaryProjectionDistanceDegrees {
             return
         }
         guard CVPixelBufferGetPixelFormatType(frame.pixelBuffer.value) == kCVPixelFormatType_32BGRA else {
@@ -525,6 +540,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         }
         acceptedFrames += 1
         lastProjectedCaptureNS = frame.captureNS
+        lastProjectedPose = projectedPose
         dynamicallyMaskedPixels += maskedThisFrame
         qualityProtectedPixels += protectedThisFrame
         let placeRecognition = onSpatialObservation(
@@ -546,6 +562,13 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         let now = DispatchTime.now().uptimeNanoseconds
         guard lastWriteNS == 0 || now - lastWriteNS >= writeIntervalNS else { return }
         writeSnapshot(at: now)
+    }
+
+    private func poseDistanceDegrees(_ lhs: GimbalPose, _ rhs: GimbalPose) -> Double {
+        var pan = (lhs.panDegrees - rhs.panDegrees).truncatingRemainder(dividingBy: 360)
+        if pan > 180 { pan -= 360 }
+        if pan < -180 { pan += 360 }
+        return hypot(pan, lhs.pitchDegrees - rhs.pitchDegrees)
     }
 
     private func align(

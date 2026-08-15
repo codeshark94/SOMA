@@ -82,6 +82,45 @@ Neural Engine. The live trace separately records Core ML inference duration and
 window-end-to-evidence duration; a speech onset necessarily also waits for up
 to one 260 ms input window.
 
+## ArcFace R50 local face identity
+
+- Runtime asset: `~/Library/Application Support/SOMA/models/arcface-r50-v1/ArcFaceR50.mlmodelc`
+  (installed locally, not committed to Git).
+- Source: InsightFace `buffalo_l` model package, recognition network
+  `w600k_r50.onnx`; 112x112 RGB input and a 512-dimensional ArcFace output.
+- Source archive SHA-256:
+  `80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f`.
+- Installed Core ML SHA-256: `model.mil`
+  `382fb18525e443c2f65d8334e7af7e617a3abd2a251a0eef271ea5ab48dc3ca6`,
+  `weights/weight.bin`
+  `c28620613d146a56565eadaacc22bbe9dd54533000ba79a6d666995a123c1545`.
+- Reproduction: `scripts/install-soma-face-identity-model.zsh` verifies the
+  archive, converts it with `scripts/convert_arcface_coreml.py`, and installs
+  the compiled model with owner-only permissions.
+
+The runtime aligns independently verified eye and nose landmarks to ArcFace's
+canonical template, then requests `.cpuAndNeuralEngine`. A deterministic probe
+against the converted PyTorch graph measured cosine similarity `0.99842`; a
+30-run warm probe measured median `1.95 ms`, p95 `2.10 ms`, and max `2.85 ms`
+on this machine. These numbers cover the embedding model, not face detection,
+landmark verification, or end-to-end identity latency. The compute setting is
+a requested Core ML policy and does not prove per-operation ANE placement.
+
+InsightFace code is MIT, but its pretrained recognition weights and training
+data are restricted to non-commercial research unless separately licensed.
+SOMA therefore treats this checkpoint as a local research asset rather than a
+redistributable product dependency.
+
+Known-person references require explicit enrollment and are encrypted locally.
+The identity store uses an owner-only local installation secret rather than a
+Keychain query on the persistent L0 startup path, so it cannot trigger or wait
+on a Keychain authorization dialog. Unenrolled people are compared by cosine
+similarity into bounded anonymous clusters; the exported `anon_*` handle is an
+installation-keyed HMAC of a random cluster ID, never a direct hash of the face
+vector. A cluster becomes durable only after repeated evidence, expires under
+the retention policy, can be forgotten, and never exports pixels or embeddings
+to Gemma, traces, or remote services.
+
 ## Active local Gemma 4 E2B MLX-VLM helper
 
 - Local directory: `~/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit`
@@ -94,12 +133,15 @@ to one 260 ms input window.
   is responsible for accepting and complying with those terms for the local
   downloaded checkpoint.
 
-This is L1's active optional local visual helper. A same-image three-request
+This is L1's optional local visual helper. A same-image three-request
 probe measured 1.47 s cold and 1.39 s warm-median inference with a 4.20 GB
 MLX-reported peak. It remains asynchronous advisory cognition and is never part
 of the L0 tracking or motor loop. MLX uses the Apple GPU and unified memory,
-not the Neural Engine. The persistent worker requires the existing local path
-and has no Ollama or network fallback.
+not the Neural Engine. The persistent launcher leaves it off by default because
+it adds multi-gigabyte unified-memory pressure without contributing to L0
+fixation or social decisions. Set `SOMA_ENABLE_L05_VLM=1` only for an explicit
+visual audit. The worker requires the existing local path and has no Ollama or
+network fallback.
 
 ## Evaluated local Gemma 4 E4B MLX-VLM fallback
 

@@ -269,6 +269,49 @@ final class CognitiveEmbodimentTests: XCTestCase {
         XCTAssertEqual(reply.snapshot?.physicalActuationEnabled, false)
     }
 
+    func testPersonContextUsesTheOwnerOnlySocketInsteadOfASecondMemoryStore() throws {
+        let suffix = UUID().uuidString.prefix(8)
+        let directory = URL(fileURLWithPath: "/private/tmp/soma-person-context-ipc-\(suffix)", isDirectory: true)
+        let socketURL = directory.appendingPathComponent("shadow.sock")
+        let personID = UUID()
+        let server = EmbodimentShadowSocketServer(
+            socketURL: socketURL,
+            personContextProvider: { request in
+                guard request.operation == .setPreferredLanguage,
+                      request.confirmedByUser,
+                      request.personEntityID == personID,
+                      request.languageTag == "zh-Hans" else {
+                    return .failure(EmbodimentIPCError.malformedMessage)
+                }
+                return .success(PersonContextSnapshot(
+                    personEntityID: personID,
+                    preferredLanguageTag: "zh-Hans",
+                    proactiveContactPreference: .unknown,
+                    rapport: nil,
+                    facts: ["preferred_language": "zh-Hans"]
+                ))
+            }
+        )
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let reply = try EmbodimentShadowSocketClient.send(
+            .init(kind: .personContext, personContext: PersonContextIPCRequest(
+                operation: .setPreferredLanguage,
+                personEntityID: personID,
+                languageTag: "zh-Hans",
+                confirmedByUser: true
+            )),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(reply.ok)
+        XCTAssertEqual(reply.personContext?.preferredLanguageTag, "zh-Hans")
+        XCTAssertNil(reply.snapshot)
+    }
+
     func testSemanticTargetBindingPreservesExplicitSceneIdentityOffscreen() {
         var binder = SemanticTargetBindingEngine()
         let registration = SemanticTargetRegistration(
