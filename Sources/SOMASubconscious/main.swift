@@ -865,49 +865,200 @@ private struct FaceIdentityEvent: Encodable, Sendable {
 /// applies an administrator label after the encrypted profile matcher has
 /// emitted its repeated-confirmation result, and it expires quickly when the
 /// matching face is no longer observed.
-private final class AdministratorRecognitionTracker: @unchecked Sendable {
+private struct InteractionParticipant: Sendable {
+    let entityID: UUID
+    let authority: SOMAInteractionAuthority
+}
+
+private struct IdentityPresenceRuntimeEvent: Encodable, Sendable {
+    let schemaVersion = 1
+    let event = "identity.presence"
+    let monotonicNS: UInt64
+    let state: String
+    let subject: String
+    let previousSubject: String?
+    let kind: String
+    let confirmations: Int?
+    let reason: String
+}
+
+private struct IdentityPresenceUpdate: Sendable {
+    let transition: IdentityPresenceTransition
+    let participant: InteractionParticipant?
+    let l1Decision: FaceIdentityRuntimeDecision?
+}
+
+/// Converts face-recognition samples into one socially meaningful presence
+/// stream. Its state is local only: opaque IDs select person memory, never a
+/// display name or a biometric projection.
+private final class IdentityPresenceCoordinator: @unchecked Sendable {
     private let administrator: SOMAAdministratorIdentity?
     private let lock = NSLock()
-    private var lastRecognizedNS: UInt64?
+    private var tracker = IdentityPresenceTracker()
+    private var latestParticipant: InteractionParticipant?
 
     init(administrator: SOMAAdministratorIdentity?) {
         self.administrator = administrator
     }
 
-    @discardableResult
-    func observe(_ decision: FaceIdentityRuntimeDecision, at monotonicNS: UInt64) -> Bool {
-        guard case let .known(entityID, _, _) = decision,
-              entityID == administrator?.entityID else {
-            return false
+    func observe(
+        _ decision: FaceIdentityRuntimeDecision,
+        at monotonicNS: UInt64
+    ) -> [IdentityPresenceUpdate] {
+        let identity: IdentityPresenceIdentity
+        switch decision {
+        case let .known(entityID, _, _):
+            identity = IdentityPresenceIdentity(entityID: entityID, kind: .enrolled)
+        case let .anonymous(entityID, _, _, _):
+            identity = IdentityPresenceIdentity(entityID: entityID, kind: .pseudonymous)
+        case .unknownCandidate, .knownCandidate:
+            return []
         }
         lock.lock()
-        lastRecognizedNS = monotonicNS
+        let updates = materialize(
+            tracker.observe(identity, at: monotonicNS),
+            decision: decision
+        )
         lock.unlock()
-        return true
+        return updates
     }
 
-    func interactionReference(at monotonicNS: UInt64) -> String? {
-        guard let administrator else { return nil }
+    func observeVerifiedFace(_ present: Bool, at monotonicNS: UInt64) -> [IdentityPresenceUpdate] {
         lock.lock()
         defer { lock.unlock() }
-        guard let lastRecognizedNS,
-              monotonicNS >= lastRecognizedNS,
-              monotonicNS - lastRecognizedNS <= 2_000_000_000 else {
-            return nil
+        if present {
+            tracker.recordVerifiedFace(at: monotonicNS)
         }
-        return "verified_local_administrator; person-context MCP reference: \(administrator.entityID.uuidString.lowercased()). Use it only with person-context tools; do not speak or expose it."
+        return materialize(tracker.advance(at: monotonicNS), decision: nil)
     }
 
-    func recognizedPersonEntityID(at monotonicNS: UInt64) -> UUID? {
-        guard let administrator else { return nil }
+    func interactionReference() -> String? {
+        guard let participant = currentParticipant() else { return nil }
+        switch participant.authority {
+        case .administrator:
+            return "verified_local_administrator; person context is available only through the supplied local MCP reference"
+        case .participant:
+            return "locally recognized conversation participant; do not infer or speak a name beyond explicitly stored person context"
+        }
+    }
+
+    func recognizedPersonEntityID() -> UUID? {
+        currentParticipant()?.entityID
+    }
+
+    func authority(for personEntityID: UUID) -> SOMAInteractionAuthority {
+        personEntityID == administrator?.entityID ? .administrator : .participant
+    }
+
+    func hasCurrentParticipant(_ personEntityID: UUID) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let lastRecognizedNS,
-              monotonicNS >= lastRecognizedNS,
-              monotonicNS - lastRecognizedNS <= 2_000_000_000 else {
-            return nil
+        return latestParticipant?.entityID == personEntityID
+    }
+
+    func currentParticipant() -> InteractionParticipant? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestParticipant
+    }
+
+    private func materialize(
+        _ transitions: [IdentityPresenceTransition],
+        decision: FaceIdentityRuntimeDecision?
+    ) -> [IdentityPresenceUpdate] {
+        transitions.map { transition in
+            switch transition {
+            case let .arrived(identity):
+                let participant = participant(for: identity)
+                latestParticipant = participant
+                return IdentityPresenceUpdate(
+                    transition: transition,
+                    participant: participant,
+                    l1Decision: decision
+                )
+            case let .replaced(_, current):
+                let participant = participant(for: current)
+                latestParticipant = participant
+                return IdentityPresenceUpdate(
+                    transition: transition,
+                    participant: participant,
+                    l1Decision: decision
+                )
+            case let .departed(identity):
+                if latestParticipant?.entityID == identity.entityID {
+                    latestParticipant = nil
+                }
+                return IdentityPresenceUpdate(
+                    transition: transition,
+                    participant: nil,
+                    l1Decision: nil
+                )
+            case .replacementCandidate:
+                return IdentityPresenceUpdate(
+                    transition: transition,
+                    participant: nil,
+                    l1Decision: nil
+                )
+            }
         }
-        return administrator.entityID
+    }
+
+    private func participant(for identity: IdentityPresenceIdentity) -> InteractionParticipant {
+        InteractionParticipant(
+            entityID: identity.entityID,
+            authority: identity.entityID == administrator?.entityID ? .administrator : .participant
+        )
+    }
+}
+
+private func identityPresenceRuntimeEvent(
+    for transition: IdentityPresenceTransition,
+    at monotonicNS: UInt64
+) -> IdentityPresenceRuntimeEvent {
+    func subject(_ identity: IdentityPresenceIdentity) -> String {
+        identity.entityID.uuidString.lowercased()
+    }
+    switch transition {
+    case let .arrived(identity):
+        return IdentityPresenceRuntimeEvent(
+            monotonicNS: monotonicNS,
+            state: "arrived",
+            subject: subject(identity),
+            previousSubject: nil,
+            kind: identity.kind.rawValue,
+            confirmations: nil,
+            reason: "recognized_identity"
+        )
+    case let .replacementCandidate(previous, candidate, confirmations):
+        return IdentityPresenceRuntimeEvent(
+            monotonicNS: monotonicNS,
+            state: "replacement_candidate",
+            subject: subject(candidate),
+            previousSubject: subject(previous),
+            kind: candidate.kind.rawValue,
+            confirmations: confirmations,
+            reason: "distinct_recognized_identity"
+        )
+    case let .replaced(previous, current):
+        return IdentityPresenceRuntimeEvent(
+            monotonicNS: monotonicNS,
+            state: "replaced",
+            subject: subject(current),
+            previousSubject: subject(previous),
+            kind: current.kind.rawValue,
+            confirmations: nil,
+            reason: "repeated_distinct_identity"
+        )
+    case let .departed(identity):
+        return IdentityPresenceRuntimeEvent(
+            monotonicNS: monotonicNS,
+            state: "departed",
+            subject: subject(identity),
+            previousSubject: nil,
+            kind: identity.kind.rawValue,
+            confirmations: nil,
+            reason: "verified_face_absent"
+        )
     }
 }
 
@@ -1275,6 +1426,9 @@ extension AudioDirectionEvent: TraceEvent {
 }
 extension VisionEvent: TraceEvent {}
 extension FaceIdentityEvent: TraceEvent {}
+extension IdentityPresenceRuntimeEvent: TraceEvent {
+    var longTermDisposition: LongTermDisposition { .always }
+}
 extension L1AuxiliarySemanticTraceEvent: TraceEvent {}
 extension L1AuxiliarySemanticInterruptTraceEvent: TraceEvent {
     var longTermDisposition: LongTermDisposition { .always }
@@ -2249,6 +2403,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 nativeTrackingActive = true
                 nativeTrackingStartPending = false
                 startNativeHeartbeatLoop()
+                // Native human tracking can replace the visible hardware
+                // indication while it activates. Reassert the selected SOMA
+                // signal after the device has confirmed that transition.
+                refreshIndicator(
+                    at: monotonicNanoseconds(),
+                    forceHardwareReassertion: true
+                )
             } else if state == "inactive" {
                 stopNativeHeartbeatLoop()
                 nativeTrackingActive = false
@@ -3645,6 +3806,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         _ target: GimbalRelativeBearing,
         toleranceDegrees: Double,
         motionStyle: EmbodimentMotionStyle,
+        accelerationMultiplier: Double = 1,
         state: String,
         calibration: ExternalGimbalCalibration,
         pose: GimbalPose,
@@ -3689,7 +3851,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 forPoseError: desiredPan,
                 projection: .obsbotTiny2Lite
             ),
-            at: monotonicNS
+            at: monotonicNS,
+            maximumPitchAcceleration: profile.pitchAcceleration * accelerationMultiplier,
+            maximumPanAcceleration: profile.panAcceleration * accelerationMultiplier
         )
         sendExternalVelocity(
             pitch: velocity.pitchDegreesPerSecond,
@@ -3932,6 +4096,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             target,
             toleranceDegrees: kind == .greeting ? 0.75 : 1.2,
             motionStyle: kind == .greeting ? .playful : .attentive,
+            accelerationMultiplier: kind == .greeting ? 4 : 1,
             state: "cognitive_expression_\(kind.rawValue)",
             calibration: calibration,
             pose: pose,
@@ -3956,7 +4121,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         case .greeting:
             // Explicit greetings are a brief bow and return, never a
             // side-to-side sweep that can dislodge the social target.
-            return [(pitch: -3, pan: 0), (pitch: 0, pan: 0)]
+            return [(pitch: 4, pan: 0), (pitch: 0, pan: 0)]
         }
     }
 
@@ -4844,7 +5009,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         return "\(prefix)-\(commandSequence)"
     }
 
-    private func refreshIndicator(at monotonicNS: UInt64) {
+    private func refreshIndicator(
+        at monotonicNS: UInt64,
+        forceHardwareReassertion: Bool = false
+    ) {
         guard indicatorCalibrationPreset == nil else { return }
         let next = indicatorInputs.resolvedState
         guard ledSettings.responseMode.permits(next) else {
@@ -4864,7 +5032,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             ))
             return
         }
-        guard helperReady, process.isRunning, next != activeIndicatorState else { return }
+        guard helperReady,
+              process.isRunning,
+              forceHardwareReassertion || next != activeIndicatorState else { return }
         let previous = activeIndicatorState
         let previousWasIlluminated = indicatorIlluminated
         activeIndicatorState = next
@@ -4875,7 +5045,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             : nil
         for command in SOMALEDHardwareTransition.commands(
             previousStateID: previousStateID,
-            nextStateID: nextStateID
+            nextStateID: nextStateID,
+            forceReassertion: forceHardwareReassertion
         ) {
             switch command {
             case let .clear(stateID):
@@ -5873,6 +6044,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let neuralObjectDetector: ANEObjectDetector?
     private let neuralFaceDetector: ANEFaceDetector?
     private let faceIdentityRuntime: FaceIdentityRuntime?
+    private let onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)?
     private let systemSaliencyDetector = SystemSaliencyDetector()
     private let systemFaceVerifier = SystemFaceVerifier()
     private let stateLock = NSLock()
@@ -5926,6 +6098,7 @@ private final class VisionWorker: @unchecked Sendable {
         onSceneCandidates: (([SceneCandidate], UInt64) -> Void)? = nil,
         onCoverage: ((GimbalPose, Double, GimbalPoseProjection, CameraProjectionModel, UInt64) -> Void)? = nil,
         onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, UInt64) -> Void)? = nil,
+        onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)? = nil,
         onFatalVisionFailure: (() -> Void)? = nil
     ) {
         self.worldModel = worldModel
@@ -5939,6 +6112,7 @@ private final class VisionWorker: @unchecked Sendable {
         self.onSceneCandidates = onSceneCandidates
         self.onCoverage = onCoverage
         self.onFatalVisionFailure = onFatalVisionFailure
+        self.onIdentityPresenceEvidence = onIdentityPresenceEvidence
         do {
             let detector = try ANEObjectDetector()
             neuralObjectDetector = detector
@@ -6403,6 +6577,7 @@ private final class VisionWorker: @unchecked Sendable {
         }
         sceneField.invalidateUnverifiedFaceTracks(matching: rejectedFaceRects)
         let verifiedFaceCount = candidates.filter { isFaceCandidate($0) && $0.isFaceVerified }.count
+        onIdentityPresenceEvidence?(verifiedFaceCount > 0, faceVerificationNow)
         if let identityFace = candidates
             .filter({ isFaceCandidate($0) && $0.isFaceVerified })
             .max(by: { $0.confidence < $1.confidence }),
@@ -6857,9 +7032,10 @@ private func run(_ options: Options) throws {
             message: String(error.localizedDescription.prefix(192))
         ))
     }
-    let administratorTracker = AdministratorRecognitionTracker(
+    let identityPresence = IdentityPresenceCoordinator(
         administrator: controlSettings.administrator
     )
+    let liveSessionCapabilities = SOMASessionCapabilityStore()
     let spatialAtlas = SphericalSceneAtlasStore()
     let placeEmbeddingEncoder = PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder
     let placeEmbeddingRevision = VNGenerateImageFeaturePrintRequest().revision
@@ -7101,6 +7277,39 @@ private func run(_ options: Options) throws {
         attentionGimbalBridge = nil
     }
     defer { attentionGimbalBridge?.stop() }
+    let liveVoiceLanguageRelay = LiveVoiceInstructionRelay()
+    let l1LanguageInstructions = L1LanguageInstructionCache(
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_language_instruction",
+                state: state,
+                message: message
+            ))
+        },
+        onReady: { _, directive in
+            liveVoiceLanguageRelay.publish(directive)
+        }
+    )
+    let l1MemoryContext = L1MemoryContextProvider(
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_memory",
+                state: state,
+                message: message
+            ))
+        },
+        onPreferredLanguageChanged: { _, languageTag in
+            l1LanguageInstructions.prepare(for: languageTag)
+        }
+    )
+    if let administratorID = controlSettings.administrator?.entityID {
+        l1MemoryContext.warmContext(for: administratorID)
+    }
+    let l1ThoughtRelay = L1ThoughtStreamRelay()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(voice: controlSettings.realtimeVoice) { event in
@@ -7115,9 +7324,18 @@ private func run(_ options: Options) throws {
                     state: "launch_requested",
                     message: "authorization=\(authorization)"
                 ))
-            case let .active(threadID):
+            case let .active(threadID, personEntityID):
                 conversationContact.markConversationOpened(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
+                if let personEntityID {
+                    l1ThoughtRelay.recordInteraction(with: personEntityID, at: eventNS)
+                }
+                if let threadID {
+                    l1MemoryContext.beginConversation(
+                        threadID: threadID,
+                        personEntityID: personEntityID
+                    )
+                }
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
                     monotonicNS: eventNS,
@@ -7140,6 +7358,14 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "output_ready",
                     message: "webrtc_audio_to_system_output"
+                ))
+            case .proactiveOpeningTriggered:
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "opening_triggered",
+                    message: "origin=controller_not_user_speech"
                 ))
             case .hearingUser:
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.hearingUser)
@@ -7167,8 +7393,16 @@ private func run(_ options: Options) throws {
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: "input_transcript_ready",
-                    message: "characters=\(min(characters, 65_535)); transcript_persisted=false"
+                    message: "characters=\(min(characters, 65_535)); transcript_trace=false; local_archive=on_final"
                 ))
+            case let .transcriptFinalized(threadID, role, text):
+                if let threadID {
+                    l1MemoryContext.archiveConversationTurn(
+                        threadID: threadID,
+                        role: role,
+                        rawText: text
+                    )
+                }
             case .preparingResponse:
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.preparingResponse)
             case .responding:
@@ -7207,6 +7441,9 @@ private func run(_ options: Options) throws {
             }
         }
         liveVisualContextRelay.attach(to: launcher)
+        liveVoiceLanguageRelay.attach { directive in
+            launcher.appendActiveContext(directive)
+        }
         liveVoiceLauncher = launcher
         writer.write(RuntimeEvent(
             event: "source.health",
@@ -7219,38 +7456,6 @@ private func run(_ options: Options) throws {
         liveVoiceLauncher = nil
     }
     defer { liveVoiceLauncher?.stop() }
-    let l1ThoughtRelay = L1ThoughtStreamRelay()
-    let l1LanguageInstructions = L1LanguageInstructionCache(
-        onHealth: { state, message in
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "l1_language_instruction",
-                state: state,
-                message: message
-            ))
-        },
-        onReady: { _, directive in
-            liveVoiceLauncher?.appendActiveContext(directive)
-        }
-    )
-    let l1MemoryContext = L1MemoryContextProvider(
-        onHealth: { state, message in
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "l1_memory",
-                state: state,
-                message: message
-            ))
-        },
-        onPreferredLanguageChanged: { _, languageTag in
-            l1LanguageInstructions.prepare(for: languageTag)
-        }
-    )
-    if let administratorID = controlSettings.administrator?.entityID {
-        l1MemoryContext.warmContext(for: administratorID)
-    }
     do {
         let l1ThoughtStream = try L1PresenceThoughtStream(
             memoryContext: l1MemoryContext,
@@ -7292,6 +7497,16 @@ private func run(_ options: Options) throws {
                     return
                 }
                 guard decision.action != .remainSilent else { return }
+                guard identityPresence.hasCurrentParticipant(decision.entityID) else {
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: completedNS,
+                        source: "l1_situation",
+                        state: "opening_suppressed",
+                        message: "participant_no_longer_present"
+                    ))
+                    return
+                }
                 if decision.action == .spokenOpening {
                     guard let opening = L1PurposefulOpeningGate.resolve(
                         decision: decision,
@@ -7306,6 +7521,12 @@ private func run(_ options: Options) throws {
                         ))
                         return
                     }
+                    let interactionAuthority = identityPresence.authority(for: decision.entityID)
+                    let sessionCapability = liveSessionCapabilities.issue(
+                        personEntityID: decision.entityID,
+                        authority: interactionAuthority,
+                        at: completedNS
+                    )
                     let context = l1ProactiveInteractionContext(
                         request: request,
                         frame: frame,
@@ -7313,6 +7534,11 @@ private func run(_ options: Options) throws {
                         purpose: opening,
                         languageStartInstruction: l1LanguageInstructions.directive(
                             for: request.preferredLanguageTag
+                        ),
+                        sessionCapability: sessionCapability,
+                        interactionAuthority: interactionAuthority,
+                        personMemoryMission: l1MemoryContext.cachedPersonMemoryMission(
+                            for: decision.entityID
                         )
                     )
                     // L1 owns social initiation and transfers directly to the
@@ -7321,10 +7547,10 @@ private func run(_ options: Options) throws {
                     liveVoiceLauncher?.startProactiveOpening(
                         text: opening.question,
                         context: context,
+                        personEntityID: decision.entityID,
                         at: completedNS
                     )
                     conversationContact.issueSocialPulse(at: completedNS)
-                    l1ThoughtRelay.recordInteraction(with: decision.entityID, at: completedNS)
                 }
                 let requestID = "l1-social-\(decision.opportunityID.uuidString.lowercased())"
                 // A greeting is a short physical overlay, not a long-lived
@@ -7337,6 +7563,16 @@ private func run(_ options: Options) throws {
                     expression: .greeting,
                     expiresAtNS: expiration
                 ))
+                if decision.action == .spokenOpening {
+                    l1ThoughtRelay.recordInteraction(with: decision.entityID, at: completedNS)
+                } else {
+                    // Repeated gestures are suppressed without silencing a
+                    // later L1 decision to open a purposeful conversation.
+                    l1ThoughtRelay.recordNonverbalInvitation(
+                        with: decision.entityID,
+                        at: completedNS
+                    )
+                }
             }
         )
         l1ThoughtRelay.install(l1ThoughtStream)
@@ -7405,7 +7641,17 @@ private func run(_ options: Options) throws {
                 }
                 semaphore.wait()
                 let result = resultBox.get() ?? .failure(EmbodimentIPCError.timeout)
+                if case let .success(snapshot) = result {
+                    writer.write(RuntimeEvent(
+                        event: "person_context.mission",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "person_context_mcp",
+                        state: snapshot.mission.isSatisfied ? "satisfied" : "pending",
+                        message: "operation=\(request.operation.rawValue); missing_required=\(snapshot.mission.missingRequiredKeys.count); recommended=\(snapshot.mission.recommendedKeys.count)"
+                    ))
+                }
                 if request.operation != .get, case let .success(snapshot) = result {
+                    l1ThoughtRelay.invalidateMemoryContext(for: request.personEntityID)
                     writer.write(RuntimeEvent(
                         event: "person_context.updated",
                         monotonicNS: monotonicNanoseconds(),
@@ -7436,6 +7682,18 @@ private func run(_ options: Options) throws {
                     return .failure(RuntimeError.unavailable("The local LED bridge is unavailable"))
                 }
                 return attentionGimbalBridge.calibrateIndicator(preset: preset)
+            },
+            sessionAuthorizationProvider: { token, scope in
+                switch liveSessionCapabilities.authorize(
+                    token: token,
+                    scope: scope,
+                    at: monotonicNanoseconds()
+                ) {
+                case .success:
+                    return .success(())
+                case let .failure(error):
+                    return .failure(error)
+                }
             },
             onHealth: { state, message in
                 writer.write(RuntimeEvent(
@@ -7488,16 +7746,32 @@ private func run(_ options: Options) throws {
             )
         },
         onIdentityDecision: { decision, monotonicNS in
-            if administratorTracker.observe(decision, at: monotonicNS) {
-                writer.write(RuntimeEvent(
-                    event: "administrator.identity",
-                    monotonicNS: monotonicNS,
-                    source: "administrator_identity",
-                    state: "verified",
-                    message: "recognized_local_profile; metadata_disclosure=local_only"
-                ))
+            for update in identityPresence.observe(decision, at: monotonicNS) {
+                writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
+                if case let .departed(identity) = update.transition {
+                    l1ThoughtRelay.depart(identity.entityID)
+                }
+                if update.participant?.authority == .administrator {
+                    writer.write(RuntimeEvent(
+                        event: "administrator.identity",
+                        monotonicNS: monotonicNS,
+                        source: "administrator_identity",
+                        state: "verified_presence",
+                        message: "recognized_local_profile; metadata_disclosure=local_only"
+                    ))
+                }
+                if let l1Decision = update.l1Decision {
+                    l1ThoughtRelay.observe(l1Decision, at: monotonicNS)
+                }
             }
-            l1ThoughtRelay.observe(decision, at: monotonicNS)
+        },
+        onIdentityPresenceEvidence: { verifiedFacePresent, monotonicNS in
+            for update in identityPresence.observeVerifiedFace(verifiedFacePresent, at: monotonicNS) {
+                writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
+                if case let .departed(identity) = update.transition {
+                    l1ThoughtRelay.depart(identity.entityID)
+                }
+            }
         },
         onFatalVisionFailure: {
             complete.signal()
@@ -7566,33 +7840,59 @@ private func run(_ options: Options) throws {
             if evidence.changed, options.l2LiveVoice {
                 attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
             }
-            let recognizedPersonEntityID = administratorTracker.recognizedPersonEntityID(at: completedNS)
+            let interactionParticipant = identityPresence.currentParticipant()
+            let recognizedPersonEntityID = interactionParticipant?.entityID
             let preferredLanguageTag = recognizedPersonEntityID.flatMap {
                 l1MemoryContext.cachedPreferredLanguage(for: $0)
             }
             let languageStartInstruction = l1LanguageInstructions.directive(for: preferredLanguageTag)
             if let openingAuthorization {
+                let sessionCapability = interactionParticipant.map {
+                    liveSessionCapabilities.issue(
+                        personEntityID: $0.entityID,
+                        authority: $0.authority,
+                        at: completedNS
+                    )
+                }
                 let context = speechInteractionContext(
                     from: belief,
                     visualSummary: liveVisualContextRelay.latestSummary,
-                    identityReference: administratorTracker.interactionReference(at: completedNS),
+                    identityReference: identityPresence.interactionReference(),
+                    participant: interactionParticipant,
+                    sessionCapability: sessionCapability,
+                    personMemoryMission: recognizedPersonEntityID.flatMap {
+                        l1MemoryContext.cachedPersonMemoryMission(for: $0)
+                    },
                     preferredLanguageTag: preferredLanguageTag,
                     languageStartInstruction: languageStartInstruction
                 )
                 liveVoiceLauncher?.startIfNeeded(
                     authorization: openingAuthorization.rawValue,
                     context: context,
+                    personEntityID: recognizedPersonEntityID,
                     at: completedNS
                 )
             }
-            if let speechInteraction,
-               let context = speechInteractionContext(
-                   from: belief,
-                   visualSummary: liveVisualContextRelay.latestSummary,
-                   identityReference: administratorTracker.interactionReference(at: completedNS),
-                   preferredLanguageTag: preferredLanguageTag,
-                   languageStartInstruction: languageStartInstruction
-               ) {
+            if let speechInteraction {
+                let sessionCapability = interactionParticipant.map {
+                    liveSessionCapabilities.issue(
+                        personEntityID: $0.entityID,
+                        authority: $0.authority,
+                        at: completedNS
+                    )
+                }
+                guard let context = speechInteractionContext(
+                    from: belief,
+                    visualSummary: liveVisualContextRelay.latestSummary,
+                    identityReference: identityPresence.interactionReference(),
+                    participant: interactionParticipant,
+                    sessionCapability: sessionCapability,
+                    personMemoryMission: recognizedPersonEntityID.flatMap {
+                        l1MemoryContext.cachedPersonMemoryMission(for: $0)
+                    },
+                    preferredLanguageTag: preferredLanguageTag,
+                    languageStartInstruction: languageStartInstruction
+                ) else { return }
                 let wake = openingAuthorization.flatMap {
                     speechInteractionWake(
                         model: eventImportanceModel,
@@ -7964,6 +8264,9 @@ private func speechInteractionContext(
     from belief: BeliefSnapshot,
     visualSummary: String? = nil,
     identityReference: String? = nil,
+    participant: InteractionParticipant? = nil,
+    sessionCapability: String? = nil,
+    personMemoryMission: PersonContextMission? = nil,
     preferredLanguageTag: String? = nil,
     languageStartInstruction: String? = nil
 ) -> CodexInteractionContext? {
@@ -7979,6 +8282,10 @@ private func speechInteractionContext(
     return try? CodexInteractionContext(
         situationSummary: situationSummary,
         identityReference: identityReference,
+        personEntityID: participant?.entityID,
+        sessionCapability: sessionCapability,
+        interactionAuthority: participant?.authority,
+        personMemoryMission: personMemoryMission,
         preferredLanguageTag: preferredLanguageTag,
         languageStartInstruction: languageStartInstruction,
         embodimentSummary: "Camera policy is \(belief.policy.rawValue); interaction readiness is \(String(format: "%.2f", belief.readyProbability))."
@@ -7990,7 +8297,10 @@ private func l1ProactiveInteractionContext(
     frame: L1SituationFrame,
     decision: L1SocialDecision,
     purpose: L1PurposefulOpening,
-    languageStartInstruction: String?
+    languageStartInstruction: String?,
+    sessionCapability: String?,
+    interactionAuthority: SOMAInteractionAuthority,
+    personMemoryMission: PersonContextMission?
 ) -> CodexInteractionContext? {
     let objective = "Conversation objective: \(purpose.objective)"
     let completion = "Conversation completion condition: \(purpose.completionCondition)"
@@ -8007,12 +8317,7 @@ private func l1ProactiveInteractionContext(
     let identityScope = request.beliefSummary.localizedCaseInsensitiveContains("pseudonymous")
         ? "locally pseudonymous recurring person; no name or biometric material is available"
         : "locally recognized person; do not infer an identity beyond supplied context"
-    let identity: String
-    if let personEntityID = request.presentEntityIDs.first {
-        identity = "\(identityScope). Person-context MCP reference: \(personEntityID.uuidString.lowercased()). Use it only with person-context tools; do not speak or expose it."
-    } else {
-        identity = identityScope
-    }
+    let identity = "\(identityScope). Person context is available only through the supplied local MCP reference."
     let rapport: String
     if let value = request.rapport {
         rapport = String(
@@ -8031,6 +8336,10 @@ private func l1ProactiveInteractionContext(
     return try? CodexInteractionContext(
         situationSummary: situation,
         identityReference: identity,
+        personEntityID: decision.entityID,
+        sessionCapability: sessionCapability,
+        interactionAuthority: interactionAuthority,
+        personMemoryMission: personMemoryMission,
         preferredLanguageTag: request.preferredLanguageTag,
         languageStartInstruction: languageStartInstruction,
         rapportSummary: rapport,

@@ -3,13 +3,15 @@ import SOMACore
 
 enum AppServerLiveVoiceEvent: Sendable {
     case launchRequested(authorization: String)
-    case active(threadID: String?)
+    case active(threadID: String?, personEntityID: UUID?)
     case inputTransportStarted
     case outputPlaybackReady
+    case proactiveOpeningTriggered
     case hearingUser
     case contextAppended
     case contextRejected(reason: String)
     case inputAccepted(characters: Int)
+    case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
     case preparingResponse
     case responding
     case responseCompleted
@@ -22,12 +24,16 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let threadID: String?
     let reason: String?
     let characters: Int?
+    let role: String?
+    let text: String?
 
     enum CodingKeys: String, CodingKey {
         case event
         case threadID = "thread_id"
         case reason
         case characters
+        case role
+        case text
     }
 }
 
@@ -58,6 +64,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var active = false
     private var stopped = false
     private var generation: UInt64 = 0
+    private var activePersonEntityID: UUID?
 
     init(
         projectDirectory: String = "/Users/seungyeop/workspace/Research/SOMA",
@@ -72,6 +79,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     func startIfNeeded(
         authorization: String,
         context: CodexInteractionContext?,
+        personEntityID: UUID? = nil,
         at monotonicNS: UInt64
     ) {
         queue.async { [weak self] in
@@ -86,6 +94,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 initialContext: context.map(Self.contextText) ?? "",
                 preferredLanguageTag: context?.preferredLanguageTag,
                 languageStartInstruction: context?.languageStartInstruction,
+                proactiveOpeningTrigger: nil,
+                personEntityID: personEntityID,
                 at: monotonicNS
             )
         }
@@ -97,6 +107,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     func startProactiveOpening(
         text: String,
         context: CodexInteractionContext?,
+        personEntityID: UUID,
         at monotonicNS: UInt64
     ) {
         let normalized = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(512))
@@ -111,6 +122,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 initialContext: String([base, directive].filter { !$0.isEmpty }.joined(separator: "\n\n").prefix(24_000)),
                 preferredLanguageTag: context?.preferredLanguageTag,
                 languageStartInstruction: context?.languageStartInstruction,
+                proactiveOpeningTrigger: "Controller event, not user speech: L1 has authorized the proactive opening described in the developer context. Speak exactly one brief opening question now, then listen.",
+                personEntityID: personEntityID,
                 at: monotonicNS
             )
         }
@@ -225,6 +238,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         initialContext: String,
         preferredLanguageTag: String?,
         languageStartInstruction: String?,
+        proactiveOpeningTrigger: String?,
+        personEntityID: UUID?,
         at monotonicNS: UInt64
     ) {
         inputTransportReported = false
@@ -270,6 +285,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
         self.process = process
         input = inputPipe.fileHandleForWriting
+        activePersonEntityID = personEntityID
         generation &+= 1
         let launchGeneration = generation
         send([
@@ -277,6 +293,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             "initialContext": String(initialContext.prefix(24_000)),
             "preferredLanguageTag": preferredLanguageTag ?? "",
             "languageStartInstruction": languageStartInstruction ?? "",
+            "proactiveOpeningTrigger": proactiveOpeningTrigger ?? "",
         ])
         onEvent(.launchRequested(authorization: authorization))
         queue.asyncAfter(deadline: .now() + 20) { [weak self] in
@@ -314,13 +331,15 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         "role": pendingContext.role,
                     ])
                 }
-                onEvent(.active(threadID: event.threadID))
+                onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
             case "audio_input_progress":
                 guard !inputTransportReported else { continue }
                 inputTransportReported = true
                 onEvent(.inputTransportStarted)
             case "output_playback_ready":
                 onEvent(.outputPlaybackReady)
+            case "proactive_opening_triggered":
+                onEvent(.proactiveOpeningTriggered)
             case "input_speech_started":
                 recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.hearingUser)
@@ -331,6 +350,20 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             case "input_transcript_ready":
                 recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.inputAccepted(characters: max(0, event.characters ?? 0)))
+            case "transcript_finalized":
+                guard let rawRole = event.role,
+                      let role = ConversationParticipantRole(rawValue: rawRole),
+                      let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !text.isEmpty else { continue }
+                if role == .user {
+                    recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
+                    onEvent(.inputAccepted(characters: text.count))
+                }
+                onEvent(.transcriptFinalized(
+                    threadID: event.threadID,
+                    role: role,
+                    text: String(text.prefix(8_192))
+                ))
             case "response_preparing":
                 onEvent(.preparingResponse)
             case "output_speech_started":
@@ -346,6 +379,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 inactivityGate.close()
                 process = nil
                 input = nil
+                activePersonEntityID = nil
                 onEvent(.ended(reason: String((event.reason ?? "session_ended").prefix(128))))
             case "failed", "audio_rejected":
                 failCurrent(reason: event.reason ?? event.event)
@@ -365,6 +399,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         if let process, process.isRunning { process.terminate() }
         self.process = nil
         input = nil
+        activePersonEntityID = nil
         onEvent(.failed(reason: String(reason.prefix(192))))
     }
 
@@ -449,6 +484,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ]
         if let value = context.situationSummary { lines.append("situation: \(value)") }
         if let value = context.identityReference { lines.append("identity: \(value)") }
+        if let value = context.personEntityID { lines.append("person_context_reference: \(value.uuidString.lowercased())") }
+        if let value = context.sessionCapability { lines.append("soma_session_token: \(value)") }
+        if let value = context.interactionAuthority { lines.append("interaction_authority: \(value.rawValue)") }
+        if let value = context.personMemoryMission {
+            lines.append("person_memory_mission_required: \(value.missingRequiredKeys.joined(separator: ","))")
+        }
         if let value = context.preferredLanguageTag { lines.append("preferred_language: \(value)") }
         if let value = context.languageStartInstruction { lines.append("l1_language_instruction: \(value)") }
         if let value = context.rapportSummary { lines.append("rapport: \(value)") }
@@ -526,9 +567,9 @@ func testAppServerLiveVoiceLauncher() -> String {
         case let .failed(reason):
             result.set("failed:\(reason)")
             semaphore.signal()
-        case .launchRequested, .inputTransportStarted, .outputPlaybackReady, .hearingUser,
+        case .launchRequested, .inputTransportStarted, .outputPlaybackReady, .proactiveOpeningTriggered, .hearingUser,
              .contextAppended, .contextRejected, .inputAccepted,
-             .preparingResponse, .responding, .responseCompleted, .ended:
+             .transcriptFinalized, .preparingResponse, .responding, .responseCompleted, .ended:
             break
         }
     }

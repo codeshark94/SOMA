@@ -263,23 +263,37 @@ private final class EmbodimentMCPServer {
     }
 
     private func callTool(name: String, arguments: [String: Any]) throws -> EmbodimentIPCReply {
+        let sessionAuthorization = try sessionAuthorization(for: name, arguments: arguments)
+        var toolArguments = arguments
+        toolArguments.removeValue(forKey: "session_token")
         if name == "get_embodiment_state"
             || name == "list_scene_entities"
             || name == "get_spatial_map" {
-            guard arguments.isEmpty else { throw ServerFailure.invalidArguments("\(name) takes no arguments") }
-            return try EmbodimentShadowSocketClient.send(.init(kind: .snapshot), socketURL: socketURL)
+            guard toolArguments.isEmpty else { throw ServerFailure.invalidArguments("\(name) takes no arguments") }
+            return try EmbodimentShadowSocketClient.send(
+                .init(kind: .snapshot, sessionAuthorization: sessionAuthorization),
+                socketURL: socketURL
+            )
         }
         if name == "get_view_capture" {
-            let value: ViewResultArguments = try decode(arguments)
+            let value: ViewResultArguments = try decode(toolArguments)
             return try EmbodimentShadowSocketClient.send(
-                .init(kind: .captureResult, requestID: value.requestId),
+                .init(
+                    kind: .captureResult,
+                    requestID: value.requestId,
+                    sessionAuthorization: sessionAuthorization
+                ),
                 socketURL: socketURL
             )
         }
         if let operation = personContextOperation(forTool: name) {
-            let value: PersonContextArguments = try decode(arguments)
+            let value: PersonContextArguments = try decode(toolArguments)
             return try EmbodimentShadowSocketClient.send(
-                .init(kind: .personContext, personContext: try value.request(for: operation)),
+                .init(
+                    kind: .personContext,
+                    personContext: try value.request(for: operation),
+                    sessionAuthorization: sessionAuthorization
+                ),
                 socketURL: socketURL
             )
         }
@@ -287,37 +301,41 @@ private final class EmbodimentMCPServer {
         let request: CognitiveEmbodimentRequest
         switch name {
         case "register_semantic_target":
-            let value: RegisterArguments = try decode(arguments)
+            let value: RegisterArguments = try decode(toolArguments)
             request = value.control.request(operation: .registerTarget(value.registration.value))
         case "remove_semantic_target":
-            let value: RemoveArguments = try decode(arguments)
+            let value: RemoveArguments = try decode(toolArguments)
             request = value.control.request(operation: .removeTarget(value.targetReference))
         case "set_attention_policy":
-            let value: AttentionArguments = try decode(arguments)
+            let value: AttentionArguments = try decode(toolArguments)
             request = value.control.request(operation: .setAttentionPolicy(value.policy))
         case "track_target":
-            let value: TrackArguments = try decode(arguments)
+            let value: TrackArguments = try decode(toolArguments)
             request = value.control.request(operation: .trackTarget(value.goal))
         case "orient_to":
-            let value: OrientArguments = try decode(arguments)
+            let value: OrientArguments = try decode(toolArguments)
             request = value.control.request(operation: .orient(value.goal))
         case "set_exploration_policy":
-            let value: ExploreArguments = try decode(arguments)
+            let value: ExploreArguments = try decode(toolArguments)
             request = value.control.request(operation: .explore(value.policy))
         case "capture_view":
-            let value: CaptureArguments = try decode(arguments)
+            let value: CaptureArguments = try decode(toolArguments)
             request = value.control.request(operation: .captureView(value.goal))
         case "express_gimbal":
-            let value: ExpressionArguments = try decode(arguments)
+            let value: ExpressionArguments = try decode(toolArguments)
             request = value.control.request(operation: .express(value.expression))
         case "release_embodiment":
-            let value: ReleaseArguments = try decode(arguments)
+            let value: ReleaseArguments = try decode(toolArguments)
             request = value.control.request(operation: .release)
         default:
             throw ServerFailure.invalidArguments("unknown tool: \(name)")
         }
         let initial = try EmbodimentShadowSocketClient.send(
-            .init(kind: .submit, request: request),
+            .init(
+                kind: .submit,
+                request: request,
+                sessionAuthorization: sessionAuthorization
+            ),
             socketURL: socketURL
         )
         guard name == "capture_view", initial.ok else { return initial }
@@ -329,12 +347,17 @@ private final class EmbodimentMCPServer {
                 snapshot: initial.snapshot
             )
         }
-        return try waitForViewCapture(request: request, initial: initial)
+        return try waitForViewCapture(
+            request: request,
+            initial: initial,
+            sessionAuthorization: sessionAuthorization
+        )
     }
 
     private func waitForViewCapture(
         request: CognitiveEmbodimentRequest,
-        initial: EmbodimentIPCReply
+        initial: EmbodimentIPCReply,
+        sessionAuthorization: String?
     ) throws -> EmbodimentIPCReply {
         let maximumWaitNS: UInt64 = 15_000_000_000
         let now = DispatchTime.now().uptimeNanoseconds
@@ -342,7 +365,11 @@ private final class EmbodimentMCPServer {
         var lastSnapshot = initial.snapshot
         while DispatchTime.now().uptimeNanoseconds < boundedDeadline {
             let reply = try EmbodimentShadowSocketClient.send(
-                .init(kind: .captureResult, requestID: request.requestID),
+                .init(
+                    kind: .captureResult,
+                    requestID: request.requestID,
+                    sessionAuthorization: sessionAuthorization
+                ),
                 socketURL: socketURL
             )
             lastSnapshot = reply.snapshot ?? lastSnapshot
@@ -377,6 +404,24 @@ private final class EmbodimentMCPServer {
             decision: initial.decision,
             snapshot: lastSnapshot
         )
+    }
+
+    private func sessionAuthorization(
+        for toolName: String,
+        arguments: [String: Any]
+    ) throws -> String? {
+        guard protectedToolNames.contains(toolName) else { return nil }
+        guard let token = arguments["session_token"] as? String else {
+            throw ServerFailure.invalidArguments("\(toolName) requires session_token from the current SOMA interaction context")
+        }
+        let normalized = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalized.count == 36,
+              normalized.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || $0 == "-"
+              }) else {
+            throw ServerFailure.invalidArguments("session_token is invalid")
+        }
+        return normalized
     }
 
     private func decode<T: Decodable>(_ arguments: [String: Any]) throws -> T {
@@ -484,7 +529,7 @@ private final class EmbodimentMCPServer {
     private func bounded(_ message: String) -> String { String(message.prefix(240)) }
 
     private var knownToolNames: Set<String> {
-        [
+        return [
             "get_embodiment_state",
             "list_scene_entities",
             "get_spatial_map",
@@ -508,15 +553,20 @@ private final class EmbodimentMCPServer {
         ]
     }
 
+    /// Every MCP operation is bound to one currently speaking participant.
+    /// L0 validates the opaque token; a model cannot select another person's
+    /// context or obtain motor authority merely by changing an argument.
+    private var protectedToolNames: Set<String> { knownToolNames }
+
     private func toolDefinitions() -> [[String: Any]] {
         [
-            tool("get_embodiment_state", "Read current L0 embodiment lease, target, and policy state.", objectSchema([:], required: []), readOnly: true),
-            tool("list_scene_entities", "Read the bounded scalar projection of L0's persistent scene entities and semantic bindings.", objectSchema([:], required: []), readOnly: true),
+            tool("get_embodiment_state", "Read current L0 embodiment lease, target, and policy state for this interaction.", objectSchema([:], required: []), readOnly: true),
+            tool("list_scene_entities", "Read the bounded scalar projection of L0's persistent scene entities and semantic bindings for this interaction.", objectSchema([:], required: []), readOnly: true),
             tool("get_spatial_map", "Read L0's bounded spherical coverage atlas, rolling panorama status, remembered scene bearings, and shared gimbal reachability envelope.", objectSchema([:], required: []), readOnly: true),
             tool("get_view_capture", "Read one short-lived capture result by request ID.", objectSchema([
                 "request_id": stringSchema(maxLength: 96),
             ], required: ["request_id"]), readOnly: true),
-            tool("get_person_context", "Read the current remote-shareable language, contact, rapport, and factual context for one opaque local person reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
+            tool("get_person_context", "Read the current participant's remote-shareable language, contact, rapport, and factual context. The session token must match this exact opaque local person reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
                 "person_entity_id": uuidSchema(),
             ], required: ["person_entity_id"]), readOnly: true),
             tool("set_preferred_language", "Persist a person's stated BCP-47 language preference. Call only after the person explicitly states or confirms it.", objectSchema([
@@ -594,12 +644,22 @@ private final class EmbodimentMCPServer {
         _ name: String,
         _ description: String,
         _ inputSchema: [String: Any],
-        readOnly: Bool = false
+        readOnly: Bool = false,
+        requiresSessionAuthorization: Bool = true
     ) -> [String: Any] {
-        [
+        var schema = inputSchema
+        if requiresSessionAuthorization {
+            var properties = schema["properties"] as? [String: Any] ?? [:]
+            properties["session_token"] = stringSchema(maxLength: 128)
+            schema["properties"] = properties
+            var required = schema["required"] as? [String] ?? []
+            required.append("session_token")
+            schema["required"] = Array(Set(required)).sorted()
+        }
+        return [
             "name": name,
             "description": description,
-            "inputSchema": inputSchema,
+            "inputSchema": schema,
             "annotations": [
                 "readOnlyHint": readOnly,
                 "destructiveHint": false,

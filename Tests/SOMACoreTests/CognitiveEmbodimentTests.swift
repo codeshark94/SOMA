@@ -4,6 +4,31 @@ import XCTest
 @testable import SOMACore
 
 final class CognitiveEmbodimentTests: XCTestCase {
+    func testParticipantCapabilityIsBoundToOwnContextAndAllowsEmbodiedConversation() {
+        let store = SOMASessionCapabilityStore(lifetimeSeconds: 60)
+        let participant = UUID()
+        let someoneElse = UUID()
+        let token = store.issue(
+            personEntityID: participant,
+            authority: .participant,
+            at: 1_000_000_000
+        )
+
+        switch store.authorize(token: token, scope: .personContext(participant), at: 1_000_000_001) {
+        case .success: break
+        case let .failure(error): XCTFail("own context unexpectedly denied: \(error)")
+        }
+        switch store.authorize(token: token, scope: .personContext(someoneElse), at: 1_000_000_001) {
+        case .success: XCTFail("participant accessed another person's context")
+        case .failure(.personContextDenied): break
+        case let .failure(error): XCTFail("wrong context error: \(error)")
+        }
+        switch store.authorize(token: token, scope: .embodimentControl, at: 1_000_000_001) {
+        case .success: break
+        case let .failure(error): XCTFail("ordinary embodied conversation unexpectedly denied: \(error)")
+        }
+    }
+
     func testEveryCognitiveLayerCanIssueTheSameLeasedTrackingGoal() throws {
         for layer in CognitiveControlLayer.allCases {
             let request = makeRequest(

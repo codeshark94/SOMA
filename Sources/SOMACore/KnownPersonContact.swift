@@ -562,6 +562,10 @@ public struct L1SocialOpportunity: Codable, Equatable, Sendable {
     public let observedAtNS: UInt64
     public let recognitionConfidence: Double
     public let availableActions: Set<L1SocialAction>
+    /// Whether SOMA has already offered a nonverbal invitation during the
+    /// current social cooldown. This is explicit prompt context, rather than
+    /// asking the model to infer an omitted action from the action list.
+    public let recentNonverbalInvitation: Bool
 
     public init(
         id: UUID = UUID(),
@@ -569,7 +573,8 @@ public struct L1SocialOpportunity: Codable, Equatable, Sendable {
         entityID: UUID,
         observedAtNS: UInt64,
         recognitionConfidence: Double,
-        availableActions: Set<L1SocialAction>
+        availableActions: Set<L1SocialAction>,
+        recentNonverbalInvitation: Bool = false
     ) {
         precondition(availableActions.contains(.remainSilent))
         self.id = id
@@ -578,6 +583,7 @@ public struct L1SocialOpportunity: Codable, Equatable, Sendable {
         self.observedAtNS = observedAtNS
         self.recognitionConfidence = recognitionConfidence
         self.availableActions = availableActions
+        self.recentNonverbalInvitation = recentNonverbalInvitation
     }
 }
 
@@ -738,6 +744,7 @@ public struct KnownPersonSocialOpportunityScheduler: Sendable {
     private var scheduledAtNS: UInt64?
     private var lastOpportunityNS: UInt64?
     private var lastInteractionByEntity: [UUID: UInt64] = [:]
+    private var lastNonverbalInvitationByEntity: [UUID: UInt64] = [:]
 
     public init(timing: KnownPersonContactTiming = .init()) {
         self.timing = timing
@@ -793,21 +800,57 @@ public struct KnownPersonSocialOpportunityScheduler: Sendable {
             return nil
         }
         lastOpportunityNS = monotonicNS
-        let actions: Set<L1SocialAction> = presence.proactiveContactPreference == .askFirst
+        var actions: Set<L1SocialAction> = presence.proactiveContactPreference == .askFirst
             ? [.remainSilent, .nonverbalInvitation]
             : [.remainSilent, .nonverbalInvitation, .spokenOpening]
+        let hasRecentNonverbalInvitation: Bool
+        if let lastInvitation = lastNonverbalInvitationByEntity[presence.entityID],
+           monotonicNS >= lastInvitation,
+           monotonicNS - lastInvitation < nanoseconds(timing.repeatCooldownMilliseconds) {
+            hasRecentNonverbalInvitation = true
+            actions.remove(.nonverbalInvitation)
+        } else {
+            hasRecentNonverbalInvitation = false
+        }
+        // For an ask-first contact, a recent nonverbal invitation exhausts the
+        // only proactive action. Do not spend another L1 cycle merely to pick
+        // silence. A person who permits spoken openings remains deliberable.
+        guard actions.count > 1 else { return nil }
         guard let presenceID else { return nil }
         return L1SocialOpportunity(
             presenceID: presenceID,
             entityID: presence.entityID,
             observedAtNS: monotonicNS,
             recognitionConfidence: presence.recognitionConfidence,
-            availableActions: actions
+            availableActions: actions,
+            recentNonverbalInvitation: hasRecentNonverbalInvitation
         )
     }
 
     public mutating func recordInteraction(with entityID: UUID, at monotonicNS: UInt64) {
         lastInteractionByEntity[entityID] = monotonicNS
+    }
+
+    public mutating func recordNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64) {
+        lastNonverbalInvitationByEntity[entityID] = monotonicNS
+    }
+
+    /// Ends the active social presence immediately after the perception layer
+    /// has established a real departure or a confirmed replacement. Personal
+    /// interaction history remains intact; only the active-presence schedule
+    /// is cleared.
+    public mutating func endPresence(for entityID: UUID) {
+        guard activeEntityID == entityID else { return }
+        clearPresence()
+    }
+
+    /// Rehydrates the short social cooldown after a process restart. The
+    /// supplied timestamp stays in the monotonic clock used by this scheduler.
+    public mutating func restoreNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64) {
+        if let current = lastNonverbalInvitationByEntity[entityID], current >= monotonicNS {
+            return
+        }
+        lastNonverbalInvitationByEntity[entityID] = monotonicNS
     }
 
     private mutating func beginPresence(for entityID: UUID, at monotonicNS: UInt64) {

@@ -353,12 +353,14 @@ final class CognitiveMemoryTests: XCTestCase {
         let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
         let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
         let interactionID = UUID()
+        let participantID = UUID()
         let threadID = "codex-live-thread-1"
         let start = Date(timeIntervalSince1970: 6_000)
         let archiver = ConversationTranscriptArchiver(
             store: store,
             interactionID: interactionID,
-            threadID: threadID
+            threadID: threadID,
+            participantEntityIDs: [participantID]
         )
         let exactText = "Please remember that I prefer status updates after lunch."
         let raw = try await archiver.append(
@@ -372,6 +374,8 @@ final class CognitiveMemoryTests: XCTestCase {
         }
         XCTAssertEqual(turn.rawText, exactText)
         XCTAssertEqual(turn.consolidationState, .pending)
+        XCTAssertEqual(turn.participantEntityIDs, [participantID])
+        XCTAssertTrue(raw.relatedIDs.contains(participantID))
         let pendingBeforeConsolidation = try await archiver.pending(at: start)
         XCTAssertEqual(pendingBeforeConsolidation.map(\.id), [raw.id])
 
@@ -435,6 +439,30 @@ final class CognitiveMemoryTests: XCTestCase {
             guard case .validationFailed = error else { return XCTFail("unexpected error: \(error)") }
         }
         try await store.close()
+    }
+
+    func testPersonContextMissionIsDerivedFromStoredFacts() {
+        let personID = UUID()
+        let incomplete = PersonContextSnapshot(
+            personEntityID: personID,
+            preferredLanguageTag: nil,
+            proactiveContactPreference: .unknown,
+            rapport: nil,
+            facts: [:]
+        )
+        XCTAssertEqual(incomplete.mission.missingRequiredKeys, ["preferred_name"])
+        XCTAssertFalse(incomplete.mission.isSatisfied)
+
+        let known = PersonContextSnapshot(
+            personEntityID: personID,
+            preferredLanguageTag: "ko",
+            proactiveContactPreference: .unknown,
+            rapport: nil,
+            facts: ["preferred_name": "승엽"]
+        )
+        XCTAssertTrue(known.mission.isSatisfied)
+        XCTAssertTrue(known.mission.missingRequiredKeys.isEmpty)
+        XCTAssertFalse(known.mission.recommendedKeys.contains("preferred_language"))
     }
 
     private func temporaryDirectory(_ suffix: String) -> URL {

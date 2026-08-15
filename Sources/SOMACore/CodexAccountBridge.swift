@@ -5,6 +5,16 @@ import Foundation
 public struct CodexInteractionContext: Codable, Equatable, Sendable {
     public let situationSummary: String?
     public let identityReference: String?
+    /// Opaque local person reference used only as a parameter to SOMA's
+    /// person-context MCP tools. It is not a name or biometric identifier.
+    public let personEntityID: UUID?
+    /// A short-lived local MCP capability for this interaction. It never
+    /// leaves developer context, trace output, or persistent memory.
+    public let sessionCapability: String?
+    public let interactionAuthority: SOMAInteractionAuthority?
+    /// Present only while the current participant has an unsatisfied social
+    /// information requirement. Completed missions are omitted entirely.
+    public let personMemoryMission: PersonContextMission?
     public let preferredLanguageTag: String?
     public let languageStartInstruction: String?
     public let rapportSummary: String?
@@ -16,6 +26,10 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
     public init(
         situationSummary: String? = nil,
         identityReference: String? = nil,
+        personEntityID: UUID? = nil,
+        sessionCapability: String? = nil,
+        interactionAuthority: SOMAInteractionAuthority? = nil,
+        personMemoryMission: PersonContextMission? = nil,
         preferredLanguageTag: String? = nil,
         languageStartInstruction: String? = nil,
         rapportSummary: String? = nil,
@@ -26,6 +40,28 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
     ) throws {
         self.situationSummary = try Self.optional(situationSummary, maximumCount: 8_192)
         self.identityReference = try Self.optional(identityReference, maximumCount: 128)
+        self.personEntityID = personEntityID
+        if let sessionCapability {
+            guard sessionCapability.count == 36,
+                  sessionCapability.unicodeScalars.allSatisfy({
+                      CharacterSet.alphanumerics.contains($0) || $0 == "-"
+                  }) else {
+                throw CodexAccountBridgeError.invalidContext
+            }
+            self.sessionCapability = sessionCapability.lowercased()
+        } else {
+            self.sessionCapability = nil
+        }
+        guard (personEntityID == nil) == (self.sessionCapability == nil) else {
+            throw CodexAccountBridgeError.invalidContext
+        }
+        guard self.sessionCapability == nil || interactionAuthority != nil else {
+            throw CodexAccountBridgeError.invalidContext
+        }
+        self.interactionAuthority = interactionAuthority
+        self.personMemoryMission = personMemoryMission?.isSatisfied == false
+            ? personMemoryMission
+            : nil
         self.preferredLanguageTag = try Self.optional(preferredLanguageTag, maximumCount: 35)
         self.languageStartInstruction = try Self.optional(languageStartInstruction, maximumCount: 1_024)
         self.rapportSummary = try Self.optional(rapportSummary, maximumCount: 2_048)
@@ -106,6 +142,10 @@ public struct CodexAccountTurnRequest: Codable, Equatable, Sendable {
         _ = try CodexInteractionContext(
             situationSummary: context.situationSummary,
             identityReference: context.identityReference,
+            personEntityID: context.personEntityID,
+            sessionCapability: context.sessionCapability,
+            interactionAuthority: context.interactionAuthority,
+            personMemoryMission: context.personMemoryMission,
             preferredLanguageTag: context.preferredLanguageTag,
             languageStartInstruction: context.languageStartInstruction,
             rapportSummary: context.rapportSummary,

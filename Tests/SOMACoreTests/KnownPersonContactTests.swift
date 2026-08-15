@@ -4,6 +4,38 @@ import XCTest
 @testable import SOMACore
 
 final class KnownPersonContactTests: XCTestCase {
+    func testIdentityPresenceDistinguishesTransientMismatchReplacementAndDeparture() {
+        let first = IdentityPresenceIdentity(entityID: UUID(), kind: .enrolled)
+        let second = IdentityPresenceIdentity(entityID: UUID(), kind: .pseudonymous)
+        var tracker = IdentityPresenceTracker(timing: .init(
+            departureAfterMilliseconds: 2_500,
+            replacementEvidenceWindowMilliseconds: 900,
+            replacementConfirmationsRequired: 2
+        ))
+
+        XCTAssertEqual(tracker.observe(first, at: 0), [.arrived(first)])
+        XCTAssertEqual(
+            tracker.observe(second, at: 200_000_000),
+            [.replacementCandidate(previous: first, candidate: second, confirmations: 1)]
+        )
+        XCTAssertEqual(tracker.observe(first, at: 400_000_000), [])
+        XCTAssertEqual(tracker.currentIdentity, first)
+
+        XCTAssertEqual(
+            tracker.observe(second, at: 600_000_000),
+            [.replacementCandidate(previous: first, candidate: second, confirmations: 1)]
+        )
+        XCTAssertEqual(
+            tracker.observe(second, at: 800_000_000),
+            [.replaced(previous: first, current: second)]
+        )
+        XCTAssertEqual(tracker.currentIdentity, second)
+
+        XCTAssertEqual(tracker.advance(at: 3_299_999_999), [])
+        XCTAssertEqual(tracker.advance(at: 3_300_000_000), [.departed(second)])
+        XCTAssertNil(tracker.currentIdentity)
+    }
+
     func testFaceIdentityRequiresOpenSetMarginAndRepeatedEvidence() throws {
         let personA = UUID()
         let personB = UUID()
@@ -243,6 +275,32 @@ final class KnownPersonContactTests: XCTestCase {
             [.remainSilent, .nonverbalInvitation, .spokenOpening]
         )
         XCTAssertNotNil(scheduler.observe(presence, at: 2_800_000_000, unitIntervalDraw: 0))
+    }
+
+    func testNonverbalInvitationCooldownPreservesSpokenDeliberation() {
+        let person = UUID()
+        var scheduler = KnownPersonSocialOpportunityScheduler(timing: .init(
+            identityStabilityMilliseconds: 100,
+            minimumOpeningDelayMilliseconds: 0,
+            maximumOpeningDelayMilliseconds: 0,
+            absenceResetsPresenceMilliseconds: 2_000,
+            repeatCooldownMilliseconds: 5_000
+        ))
+        let presence = KnownPersonPresence(entityID: person, recognitionConfidence: 0.92)
+
+        XCTAssertNil(scheduler.observe(presence, at: 0, unitIntervalDraw: 0))
+        XCTAssertNotNil(scheduler.observe(presence, at: 100_000_000, unitIntervalDraw: 0))
+        scheduler.recordNonverbalInvitation(with: person, at: 100_000_000)
+        let afterGreeting = scheduler.observe(presence, at: 1_000_000_000, unitIntervalDraw: 0)
+        XCTAssertEqual(afterGreeting?.availableActions, [.remainSilent, .spokenOpening])
+        XCTAssertEqual(afterGreeting?.recentNonverbalInvitation, true)
+
+        var restored = KnownPersonSocialOpportunityScheduler(timing: scheduler.timing)
+        XCTAssertNil(restored.observe(presence, at: 0, unitIntervalDraw: 0))
+        restored.restoreNonverbalInvitation(with: person, at: 100_000_000)
+        let afterRestart = restored.observe(presence, at: 1_000_000_000, unitIntervalDraw: 0)
+        XCTAssertEqual(afterRestart?.availableActions, [.remainSilent, .spokenOpening])
+        XCTAssertEqual(afterRestart?.recentNonverbalInvitation, true)
     }
 
     func testShortDetectorGapDoesNotCreateANewArrival() {

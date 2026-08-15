@@ -52,6 +52,9 @@ public struct ConversationTurnMemory: Codable, Equatable, Sendable {
     public let finalizedAt: Date
     public let consolidationState: ConversationTurnConsolidationState
     public let derivedMemoryIDs: [UUID]
+    /// Opaque local participant references keep raw turns queryable by the
+    /// same person context without exposing identity or transcript remotely.
+    public let participantEntityIDs: [UUID]
 
     public init(
         interactionID: UUID,
@@ -61,7 +64,8 @@ public struct ConversationTurnMemory: Codable, Equatable, Sendable {
         rawText: String,
         finalizedAt: Date,
         consolidationState: ConversationTurnConsolidationState = .pending,
-        derivedMemoryIDs: [UUID] = []
+        derivedMemoryIDs: [UUID] = [],
+        participantEntityIDs: [UUID] = []
     ) {
         self.interactionID = interactionID
         self.threadID = threadID
@@ -71,6 +75,39 @@ public struct ConversationTurnMemory: Codable, Equatable, Sendable {
         self.finalizedAt = finalizedAt
         self.consolidationState = consolidationState
         self.derivedMemoryIDs = derivedMemoryIDs
+        self.participantEntityIDs = Array(Set(participantEntityIDs)).sorted {
+            $0.uuidString < $1.uuidString
+        }.prefix(16).map { $0 }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case interactionID
+        case threadID
+        case turnSequence
+        case role
+        case rawText
+        case finalizedAt
+        case consolidationState
+        case derivedMemoryIDs
+        case participantEntityIDs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        interactionID = try container.decode(UUID.self, forKey: .interactionID)
+        threadID = try container.decode(String.self, forKey: .threadID)
+        turnSequence = try container.decode(UInt64.self, forKey: .turnSequence)
+        role = try container.decode(ConversationParticipantRole.self, forKey: .role)
+        rawText = try container.decode(String.self, forKey: .rawText)
+        finalizedAt = try container.decode(Date.self, forKey: .finalizedAt)
+        consolidationState = try container.decode(
+            ConversationTurnConsolidationState.self,
+            forKey: .consolidationState
+        )
+        derivedMemoryIDs = try container.decodeIfPresent([UUID].self, forKey: .derivedMemoryIDs) ?? []
+        participantEntityIDs = Array(Set(
+            try container.decodeIfPresent([UUID].self, forKey: .participantEntityIDs) ?? []
+        )).sorted { $0.uuidString < $1.uuidString }.prefix(16).map { $0 }
     }
 }
 
@@ -227,19 +264,73 @@ public struct PersonContextSnapshot: Codable, Equatable, Sendable {
     public let proactiveContactPreference: ProactiveContactPreference
     public let rapport: RapportProfile?
     public let facts: [String: String]
+    /// The current bounded memory-acquisition mission. An unsatisfied mission
+    /// may be supplied in the participant's session context and is always
+    /// confirmed by reading this snapshot again after a write.
+    public let mission: PersonContextMission
 
     public init(
         personEntityID: UUID,
         preferredLanguageTag: String?,
         proactiveContactPreference: ProactiveContactPreference,
         rapport: RapportProfile?,
-        facts: [String: String]
+        facts: [String: String],
+        mission: PersonContextMission? = nil
     ) {
         self.personEntityID = personEntityID
         self.preferredLanguageTag = preferredLanguageTag
         self.proactiveContactPreference = proactiveContactPreference
         self.rapport = rapport
         self.facts = facts
+        self.mission = mission ?? .from(
+            preferredLanguageTag: preferredLanguageTag,
+            proactiveContactPreference: proactiveContactPreference,
+            facts: facts
+        )
+    }
+}
+
+/// A social-information mission is a state description, not a scripted
+/// questionnaire. Its sole required first-meeting field is a respectful form
+/// of address; later preference gaps stay recommended so they are raised only
+/// when the conversation makes them useful.
+public struct PersonContextMission: Codable, Equatable, Sendable {
+    public let requiredKeys: [String]
+    public let missingRequiredKeys: [String]
+    public let recommendedKeys: [String]
+
+    public init(
+        requiredKeys: [String],
+        missingRequiredKeys: [String],
+        recommendedKeys: [String]
+    ) {
+        self.requiredKeys = requiredKeys
+        self.missingRequiredKeys = missingRequiredKeys
+        self.recommendedKeys = recommendedKeys
+    }
+
+    public var isSatisfied: Bool { missingRequiredKeys.isEmpty }
+
+    public static func from(
+        preferredLanguageTag: String?,
+        proactiveContactPreference: ProactiveContactPreference,
+        facts: [String: String]
+    ) -> Self {
+        let required = ["preferred_name"]
+        let missing = required.filter {
+            facts[$0]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+        }
+        var recommended: [String] = []
+        if preferredLanguageTag == nil { recommended.append("preferred_language") }
+        if proactiveContactPreference == .unknown { recommended.append("proactive_contact") }
+        if facts["relationship_context"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            recommended.append("relationship_context")
+        }
+        return .init(
+            requiredKeys: required,
+            missingRequiredKeys: missing,
+            recommendedKeys: recommended
+        )
     }
 }
 
@@ -449,7 +540,7 @@ public enum CognitiveMemoryPayload: Equatable, Sendable {
     public var relatedIDs: Set<UUID> {
         switch self {
         case let .conversationTurn(value):
-            Set([value.interactionID] + value.derivedMemoryIDs)
+            Set([value.interactionID] + value.derivedMemoryIDs + value.participantEntityIDs)
         case .entity:
             []
         case let .identity(value):
@@ -1634,6 +1725,7 @@ public actor ConversationTranscriptArchiver {
     public let interactionID: UUID
     public let threadID: String
     public let retentionSeconds: TimeInterval
+    public let participantEntityIDs: [UUID]
 
     private let store: CognitiveMemoryStore
     private var nextSequence: UInt64 = 1
@@ -1642,6 +1734,7 @@ public actor ConversationTranscriptArchiver {
         store: CognitiveMemoryStore,
         interactionID: UUID,
         threadID: String,
+        participantEntityIDs: [UUID] = [],
         retentionSeconds: TimeInterval = 24 * 60 * 60
     ) {
         precondition(!threadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -1649,6 +1742,9 @@ public actor ConversationTranscriptArchiver {
         self.store = store
         self.interactionID = interactionID
         self.threadID = threadID
+        self.participantEntityIDs = Array(Set(participantEntityIDs)).sorted {
+            $0.uuidString < $1.uuidString
+        }.prefix(16).map { $0 }
         self.retentionSeconds = retentionSeconds
     }
 
@@ -1666,7 +1762,8 @@ public actor ConversationTranscriptArchiver {
             turnSequence: sequence,
             role: role,
             rawText: rawText,
-            finalizedAt: date
+            finalizedAt: date,
+            participantEntityIDs: participantEntityIDs
         )
         let record = try await store.insert(
             CognitiveMemoryDraft(
@@ -1730,7 +1827,8 @@ public actor ConversationTranscriptArchiver {
                 rawText: turn.rawText,
                 finalizedAt: turn.finalizedAt,
                 consolidationState: .consolidated,
-                derivedMemoryIDs: derivedMemoryIDs
+                derivedMemoryIDs: derivedMemoryIDs,
+                participantEntityIDs: turn.participantEntityIDs
             )),
             confidence: record.confidence,
             provenance: record.provenance + [

@@ -2244,6 +2244,16 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertEqual(reversed.pitchDegreesPerSecond, 4, accuracy: 0.000_001)
         XCTAssertEqual(reversed.panDegreesPerSecond, 6, accuracy: 0.000_001)
         XCTAssertGreaterThanOrEqual(reversed.panDegreesPerSecond, 0)
+        var fastGesture = SmoothExplorationDynamics()
+        let gestureStart = fastGesture.advance(
+            towardPitch: 40,
+            pan: 0,
+            at: start,
+            maximumPitchAcceleration: 420,
+            maximumPanAcceleration: 760
+        )
+        XCTAssertEqual(gestureStart.pitchDegreesPerSecond, 21, accuracy: 0.000_001)
+        XCTAssertEqual(gestureStart.panDegreesPerSecond, 0, accuracy: 0.000_001)
         XCTAssertEqual(
             SmoothExplorationDynamics.stoppingVelocity(
                 errorDegrees: 2,

@@ -245,9 +245,10 @@ public enum SOMALEDHardwareCommand: Equatable, Sendable {
 public enum SOMALEDHardwareTransition {
     public static func commands(
         previousStateID: Int?,
-        nextStateID: Int
+        nextStateID: Int,
+        forceReassertion: Bool = false
     ) -> [SOMALEDHardwareCommand] {
-        guard previousStateID != nextStateID else { return [] }
+        guard forceReassertion || previousStateID != nextStateID else { return [] }
         if let previousStateID {
             return [.clear(stateID: previousStateID), .set(stateID: nextStateID)]
         }

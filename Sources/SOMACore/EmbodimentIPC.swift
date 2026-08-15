@@ -64,6 +64,9 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
     public let request: CognitiveEmbodimentRequest?
     public let requestID: String?
     public let personContext: PersonContextIPCRequest?
+    /// An opaque capability issued by the owning L0 process for one live
+    /// participant. It is checked locally and never persists in memory/trace.
+    public let sessionAuthorization: String?
     /// An owner-local LED calibration request. A missing preset ends the
     /// temporary override and hands the indicator back to normal L0 state.
     public let indicatorPreset: SOMALEDFirmwarePreset?
@@ -73,12 +76,14 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         request: CognitiveEmbodimentRequest? = nil,
         requestID: String? = nil,
         personContext: PersonContextIPCRequest? = nil,
+        sessionAuthorization: String? = nil,
         indicatorPreset: SOMALEDFirmwarePreset? = nil
     ) {
         self.kind = kind
         self.request = request
         self.requestID = requestID.map { String($0.prefix(96)) }
         self.personContext = personContext
+        self.sessionAuthorization = sessionAuthorization.map { String($0.prefix(128)) }
         self.indicatorPreset = indicatorPreset
     }
 }
@@ -148,6 +153,10 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     public typealias IndicatorCalibrationHandler = @Sendable (
         _ preset: SOMALEDFirmwarePreset?
     ) -> Result<Void, Error>
+    public typealias SessionAuthorizationProvider = @Sendable (
+        _ token: String?,
+        _ scope: SOMASessionCapabilityScope
+    ) -> Result<Void, Error>
 
     private let socketURL: URL
     private let arbiter: ShadowEmbodimentArbiter
@@ -156,6 +165,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let captureResultProvider: CaptureResultProvider
     private let personContextProvider: PersonContextProvider
     private let indicatorCalibrationHandler: IndicatorCalibrationHandler
+    private let sessionAuthorizationProvider: SessionAuthorizationProvider
     private let queue = DispatchQueue(label: "soma.embodiment.shadow.socket")
     private let group = DispatchGroup()
     private let stateLock = NSLock()
@@ -172,6 +182,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         captureResultProvider: @escaping CaptureResultProvider = { _, _ in nil },
         personContextProvider: @escaping PersonContextProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
+        sessionAuthorizationProvider: @escaping SessionAuthorizationProvider = { _, _ in .success(()) },
         onHealth: @escaping HealthHandler = { _, _ in }
     ) {
         self.socketURL = socketURL
@@ -180,6 +191,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.captureResultProvider = captureResultProvider
         self.personContextProvider = personContextProvider
         self.indicatorCalibrationHandler = indicatorCalibrationHandler
+        self.sessionAuthorizationProvider = sessionAuthorizationProvider
         self.onHealth = onHealth
     }
 
@@ -275,6 +287,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                       command.indicatorPreset == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
+                try authorize(command.sessionAuthorization, scope: .embodimentControl)
                 let snapshot = arbiter.snapshot(at: DispatchTime.now().uptimeNanoseconds)
                 writeReply(.init(ok: true, snapshot: snapshot), to: clientFD)
             case .submit:
@@ -284,6 +297,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                       command.indicatorPreset == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
+                try authorize(command.sessionAuthorization, scope: .embodimentControl)
                 let decision = arbiter.submit(request, at: DispatchTime.now().uptimeNanoseconds)
                 onDecision(request, decision)
                 writeReply(.init(
@@ -300,6 +314,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                       !requestID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw EmbodimentIPCError.malformedMessage
                 }
+                try authorize(command.sessionAuthorization, scope: .embodimentControl)
                 let now = DispatchTime.now().uptimeNanoseconds
                 guard let resource = captureResultProvider(requestID, now) else {
                     writeReply(.init(
@@ -323,6 +338,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                       let request = command.personContext else {
                     throw EmbodimentIPCError.malformedMessage
                 }
+                try authorize(command.sessionAuthorization, scope: .personContext(request.personEntityID))
                 switch personContextProvider(request) {
                 case let .success(context):
                     writeReply(.init(ok: true, personContext: context), to: clientFD)
@@ -335,6 +351,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                       command.personContext == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
+                try authorize(command.sessionAuthorization, scope: .embodimentControl)
                 switch indicatorCalibrationHandler(command.indicatorPreset) {
                 case .success:
                     writeReply(.init(ok: true), to: clientFD)
@@ -345,6 +362,18 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             writeReply(.init(ok: false, error: message), to: clientFD)
+        }
+    }
+
+    private func authorize(
+        _ token: String?,
+        scope: SOMASessionCapabilityScope
+    ) throws {
+        switch sessionAuthorizationProvider(token, scope) {
+        case .success:
+            return
+        case let .failure(error):
+            throw error
         }
     }
 

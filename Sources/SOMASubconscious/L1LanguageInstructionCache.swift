@@ -5,6 +5,27 @@ private struct L1LanguageInstructionResponse: Decodable {
     let directive: String?
 }
 
+/// Decouples language-instruction generation from the lifetime of a Live
+/// Voice session. A directive is delivered only while a session is attached;
+/// launch-time context still obtains the cached directive directly.
+final class LiveVoiceInstructionRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: (@Sendable (String) -> Void)?
+
+    func attach(_ sink: @escaping @Sendable (String) -> Void) {
+        lock.lock()
+        self.sink = sink
+        lock.unlock()
+    }
+
+    func publish(_ directive: String) {
+        lock.lock()
+        let sink = self.sink
+        lock.unlock()
+        sink?(directive)
+    }
+}
+
 /// L1 turns a BCP-47 preference into a concise native-language instruction for
 /// the next L2 Live session. It receives only a language tag, never a person
 /// identifier, face data, image, or conversation content.

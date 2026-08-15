@@ -624,12 +624,17 @@ bool requestNativeHumanTracking(
     const std::string &commandID,
     const std::string &cleanupCommandID
 ) noexcept {
+    // The Tiny's indicator-state colors depend on this device-wide mode.
+    // Keep the mode open for native human tracking; closing it after a human
+    // acquisition changes the physical rendering of the same state IDs.
+    int indicatorModeResult = RM_RET_ERR;
+    try { indicatorModeResult = device->cameraSetLedCtrlU(true); } catch (...) {}
     trace.event(
         "camera.command",
         "native_ai",
         "human_normal_sent",
         0,
-        "Tiny 2 Lite; vertical_tracking_mode=motion",
+        "Tiny 2 Lite; vertical_tracking_mode=motion; indicator_mode=enabled",
         commandID
     );
     int startResult = RM_RET_ERR;
@@ -644,10 +649,6 @@ bool requestNativeHumanTracking(
     try { trackingModeResult = device->aiSetTrackingModeR(Device::AiVTrackMotion); } catch (...) {}
     bool activated = false;
     try { activated = waitForMode(device, Device::AiWorkModeHuman, 2'000); } catch (...) {}
-    int nativeLedPatternResult = RM_RET_ERR;
-    if (activated) {
-        try { nativeLedPatternResult = device->cameraSetLedCtrlU(false); } catch (...) {}
-    }
     const int confirmedTrackingMode = verticalTrackingMode(device).value_or(-1);
     trace.event(
         "camera.ack",
@@ -655,8 +656,8 @@ bool requestNativeHumanTracking(
         activated ? "human_normal_active" : "start_unconfirmed",
         activated ? RM_RET_OK : RM_RET_ERR,
         "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device))
+            + "; indicator_mode_enable_result=" + std::to_string(indicatorModeResult)
             + "; tracking_mode_set_result=" + std::to_string(trackingModeResult)
-            + "; native_led_pattern_disable_result=" + std::to_string(nativeLedPatternResult)
             + "; camera_status_vertical_tracking_mode=" + std::to_string(confirmedTrackingMode),
         commandID
     );

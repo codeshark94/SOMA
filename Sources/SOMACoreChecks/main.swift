@@ -96,6 +96,41 @@ liveVoiceGate.observeActive()
 require(!liveVoiceGate.beginLaunch(at: start + 6_000_000_000), "active Voice relaunched")
 liveVoiceGate.observeEnded()
 require(liveVoiceGate.beginLaunch(at: start + 6_000_000_000), "ended Voice did not rearm")
+let firstPresenceIdentity = IdentityPresenceIdentity(
+    entityID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+    kind: .enrolled
+)
+let secondPresenceIdentity = IdentityPresenceIdentity(
+    entityID: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+    kind: .pseudonymous
+)
+var identityPresence = IdentityPresenceTracker()
+require(
+    identityPresence.observe(firstPresenceIdentity, at: start) == [.arrived(firstPresenceIdentity)],
+    "recognized person did not create one arrival"
+)
+require(
+    identityPresence.observe(secondPresenceIdentity, at: start + 200_000_000)
+        == [.replacementCandidate(previous: firstPresenceIdentity, candidate: secondPresenceIdentity, confirmations: 1)],
+    "one mismatched identity replaced the active participant"
+)
+require(
+    identityPresence.observe(firstPresenceIdentity, at: start + 400_000_000).isEmpty
+        && identityPresence.currentIdentity == firstPresenceIdentity,
+    "returning identity did not clear a replacement candidate"
+)
+require(
+    identityPresence.observe(secondPresenceIdentity, at: start + 600_000_000)
+        == [.replacementCandidate(previous: firstPresenceIdentity, candidate: secondPresenceIdentity, confirmations: 1)]
+        && identityPresence.observe(secondPresenceIdentity, at: start + 800_000_000)
+        == [.replaced(previous: firstPresenceIdentity, current: secondPresenceIdentity)],
+    "repeated alternate identity did not create a confirmed replacement"
+)
+require(
+    identityPresence.advance(at: start + 3_299_999_999).isEmpty
+        && identityPresence.advance(at: start + 3_300_000_000) == [.departed(secondPresenceIdentity)],
+    "identity presence departed before or after its visual-absence boundary"
+)
 let wideHorizontalFOV = CameraFieldOfView.horizontalDegrees(
     diagonalDegrees: 86,
     aspectRatio: 16.0 / 9.0

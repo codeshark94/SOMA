@@ -223,7 +223,9 @@ public struct SmoothExplorationDynamics: Sendable {
     public mutating func advance(
         towardPitch desiredPitch: Double,
         pan desiredPan: Double,
-        at monotonicNS: UInt64
+        at monotonicNS: UInt64,
+        maximumPitchAcceleration: Double = 80,
+        maximumPanAcceleration: Double = 120
     ) -> SmoothExplorationVelocity {
         let elapsed: Double
         if let lastNS, monotonicNS > lastNS {
@@ -235,12 +237,12 @@ public struct SmoothExplorationDynamics: Sendable {
             pitchDegreesPerSecond: slew(
                 from: velocity.pitchDegreesPerSecond,
                 to: desiredPitch,
-                maximumChange: 80 * elapsed
+                maximumChange: max(0, maximumPitchAcceleration) * elapsed
             ),
             panDegreesPerSecond: slew(
                 from: velocity.panDegreesPerSecond,
                 to: desiredPan,
-                maximumChange: 120 * elapsed
+                maximumChange: max(0, maximumPanAcceleration) * elapsed
             )
         )
         lastNS = monotonicNS

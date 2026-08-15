@@ -177,6 +177,24 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(result.usage?.cachedInputTokens, 20)
     }
 
+    func testCompletedPersonMemoryMissionIsOmittedFromLiveContext() throws {
+        let personID = UUID()
+        let completed = PersonContextMission(
+            requiredKeys: ["preferred_name"],
+            missingRequiredKeys: [],
+            recommendedKeys: ["relationship_context"]
+        )
+        let context = try CodexInteractionContext(
+            personEntityID: personID,
+            sessionCapability: UUID().uuidString.lowercased(),
+            interactionAuthority: .participant,
+            personMemoryMission: completed
+        )
+        XCTAssertNil(context.personMemoryMission)
+        XCTAssertEqual(context.personEntityID, personID)
+        XCTAssertNotNil(context.sessionCapability)
+    }
+
     func testCodexAccountBridgeRejectsAnInvalidDecodedTurn() throws {
         let json = """
         {"schemaVersion":1,"turn":{"interactionID":"interaction","turnID":"turn","transcript":"   ","speechStartedAtNS":20,"transcriptFinalizedAtNS":10,"evidenceIDs":[]},"context":{"activeTaskSummaries":[],"memorySummaries":[],"privacyScope":"interaction_scoped"}}
@@ -378,6 +396,14 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(
             SOMALEDHardwareTransition.commands(previousStateID: 57, nextStateID: 57),
             []
+        )
+        XCTAssertEqual(
+            SOMALEDHardwareTransition.commands(
+                previousStateID: 18,
+                nextStateID: 18,
+                forceReassertion: true
+            ),
+            [.clear(stateID: 18), .set(stateID: 18)]
         )
     }
 

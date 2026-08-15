@@ -53,6 +53,7 @@ struct L1MemoryContext: Sendable {
     let rapport: L1RapportContext?
     let proactiveContactPreference: ProactiveContactPreference
     let preferredLanguageTag: String?
+    let lastNonverbalInvitationAt: Date?
 }
 
 /// Keeps the L1 cloud packet on the allowed side of the memory boundary.
@@ -60,11 +61,19 @@ struct L1MemoryContext: Sendable {
 /// in the encrypted journal; only marked summaries, rapport, and information
 /// motives can become situation context.
 final class L1MemoryContextProvider: @unchecked Sendable {
+    private struct ActiveConversation {
+        let archiver: ConversationTranscriptArchiver
+        let startedAt: Date
+    }
+
     private let store: CognitiveMemoryStore?
     private let onHealth: @Sendable (String, String) -> Void
     private let onPreferredLanguageChanged: @Sendable (UUID, String?) -> Void
     private let preferredLanguageLock = NSLock()
     private var preferredLanguageByPersonID: [UUID: String] = [:]
+    private var personContextByPersonID: [UUID: PersonContextSnapshot] = [:]
+    private let conversationLock = NSLock()
+    private var activeConversations: [String: ActiveConversation] = [:]
 
     init(
         onHealth: @escaping @Sendable (String, String) -> Void,
@@ -97,7 +106,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 informationNeeds: [],
                 rapport: nil,
                 proactiveContactPreference: .unknown,
-                preferredLanguageTag: nil
+                preferredLanguageTag: nil,
+                lastNonverbalInvitationAt: nil
             )
         }
         do {
@@ -145,6 +155,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 }
                 return (record.updatedAt, value.rapport)
             }.max { $0.0 < $1.0 }?.1
+            let lastNonverbalInvitationAt = records.compactMap { record -> Date? in
+                guard case let .situation(value) = record.payload,
+                      value.state == "nonverbal_invitation",
+                      value.participantEntityIDs.contains(entityID) else {
+                    return nil
+                }
+                return record.updatedAt
+            }.max()
             let remotelyAllowedRapport = allowed.compactMap { record -> (Date, L1RapportContext)? in
                 guard case let .relationship(value) = record.payload,
                       value.personEntityID == entityID else {
@@ -160,22 +178,27 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     )
                 )
             }.max { $0.0 < $1.0 }?.1
-            if relationship == nil, needs.isEmpty {
+            let hasPreferredName = records.contains { record in
+                guard case let .personFact(value) = record.payload else { return false }
+                return value.personEntityID == entityID && value.key == "preferred_name"
+            }
+            if !hasPreferredName, needs.isEmpty {
                 needs.append(L1InformationNeed(
                     motiveID: UUID(),
                     source: .initialSocialOrientation,
-                    informationGoal: "Learn whether a proactive spoken opening is welcome now, should follow a nonverbal cue, or should be avoided.",
-                    expectedInformationGain: 0.70
+                    informationGoal: "Learn the person's preferred name or form of address for future respectful interaction.",
+                    expectedInformationGain: 0.95
                 ))
             }
             let personContext = try await store.personContext(for: entityID, at: now)
-            cachePreferredLanguage(personContext.preferredLanguageTag, for: entityID)
+            cachePersonContext(personContext)
             return L1MemoryContext(
                 projections: projections,
                 informationNeeds: needs,
                 rapport: remotelyAllowedRapport,
                 proactiveContactPreference: relationship?.proactiveContact ?? .unknown,
-                preferredLanguageTag: personContext.preferredLanguageTag
+                preferredLanguageTag: personContext.preferredLanguageTag,
+                lastNonverbalInvitationAt: lastNonverbalInvitationAt
             )
         } catch {
             onHealth("memory_unavailable", String(error.localizedDescription.prefix(192)))
@@ -184,8 +207,115 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 informationNeeds: [],
                 rapport: nil,
                 proactiveContactPreference: .unknown,
-                preferredLanguageTag: nil
+                preferredLanguageTag: nil,
+                lastNonverbalInvitationAt: nil
             )
+        }
+    }
+
+    /// Stores a short, non-biometric social fact so an app relaunch cannot
+    /// make the next L1 packet forget that it already acknowledged this person.
+    func recordNonverbalInvitation(with entityID: UUID, at date: Date = Date()) async {
+        guard let store else { return }
+        do {
+            let existing = try await store.query(
+                .init(kinds: [.situation], relatedTo: [entityID], limit: 96),
+                at: date
+            )
+            if existing.contains(where: { record in
+                guard case let .situation(value) = record.payload else { return false }
+                return value.state == "nonverbal_invitation" && value.participantEntityIDs.contains(entityID)
+            }) {
+                return
+            }
+            _ = try await store.insert(
+                CognitiveMemoryDraft(
+                    tier: .shortTerm,
+                    summary: "A nonverbal invitation was already offered in the current social encounter. Do not repeat a greeting; remain silent or use one purposeful spoken opening when warranted.",
+                    payload: .situation(SituationMemory(
+                        state: "nonverbal_invitation",
+                        participantEntityIDs: [entityID]
+                    )),
+                    confidence: 1,
+                    provenance: [
+                        MemoryProvenance(
+                            source: .l1Inference,
+                            sourceID: "l1_nonverbal_invitation",
+                            observedAt: date,
+                            evidenceIDs: ["social:\(entityID.uuidString.lowercased())"],
+                            modelID: "gemma4:31b-cloud"
+                        )
+                    ],
+                    sensitivity: .personal,
+                    disclosure: .remoteSummaryAllowed,
+                    expiresAt: date.addingTimeInterval(300)
+                ),
+                at: date
+            )
+            onHealth("social_contact_recorded", "kind=nonverbal_invitation")
+        } catch {
+            onHealth("social_contact_record_failed", String(error.localizedDescription.prefix(192)))
+        }
+    }
+
+    /// Keeps exact Live Voice turns on this Mac until a higher-layer memory
+    /// pass turns them into typed facts, episodes, tasks, or questions.
+    func beginConversation(threadID: String, personEntityID: UUID?) {
+        let normalized = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty, let store else { return }
+        conversationLock.lock()
+        defer { conversationLock.unlock() }
+        if activeConversations[normalized] == nil {
+            if activeConversations.count >= 32,
+               let oldestThreadID = activeConversations.min(by: {
+                   $0.value.startedAt < $1.value.startedAt
+               })?.key {
+                activeConversations.removeValue(forKey: oldestThreadID)
+            }
+            activeConversations[normalized] = ActiveConversation(
+                archiver: ConversationTranscriptArchiver(
+                    store: store,
+                    interactionID: UUID(),
+                    threadID: normalized,
+                    participantEntityIDs: personEntityID.map { [$0] } ?? []
+                ),
+                startedAt: Date()
+            )
+        }
+    }
+
+    func archiveConversationTurn(
+        threadID: String,
+        role: ConversationParticipantRole,
+        rawText: String,
+        at date: Date = Date()
+    ) {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty, !normalizedText.isEmpty else { return }
+        conversationLock.lock()
+        let active = activeConversations[normalizedThreadID]
+        conversationLock.unlock()
+        guard let active else {
+            onHealth("conversation_turn_unassociated", "role=\(role.rawValue); chars=\(normalizedText.count)")
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await active.archiver.append(
+                    role: role,
+                    rawText: String(normalizedText.prefix(8_192)),
+                    sourceEventID: "live_voice:\(normalizedThreadID):\(role.rawValue)",
+                    at: date
+                )
+                self.onHealth(
+                    "conversation_turn_stored",
+                    "role=\(role.rawValue); chars=\(normalizedText.count); storage=encrypted_short_term"
+                )
+            } catch {
+                self.onHealth("conversation_turn_store_failed", String(error.localizedDescription.prefix(192)))
+            }
         }
     }
 
@@ -196,6 +326,12 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         preferredLanguageLock.lock()
         defer { preferredLanguageLock.unlock() }
         return preferredLanguageByPersonID[personEntityID]
+    }
+
+    func cachedPersonMemoryMission(for personEntityID: UUID) -> PersonContextMission? {
+        preferredLanguageLock.lock()
+        defer { preferredLanguageLock.unlock() }
+        return personContextByPersonID[personEntityID]?.mission
     }
 
     func warmContext(for personEntityID: UUID) {
@@ -280,17 +416,18 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 key: key
             )
         }
-        cachePreferredLanguage(snapshot.preferredLanguageTag, for: request.personEntityID)
+        cachePersonContext(snapshot)
         return snapshot
     }
 
-    private func cachePreferredLanguage(_ languageTag: String?, for personEntityID: UUID) {
+    private func cachePersonContext(_ snapshot: PersonContextSnapshot) {
         preferredLanguageLock.lock()
-        let previous = preferredLanguageByPersonID[personEntityID]
-        preferredLanguageByPersonID[personEntityID] = languageTag
+        let previous = preferredLanguageByPersonID[snapshot.personEntityID]
+        preferredLanguageByPersonID[snapshot.personEntityID] = snapshot.preferredLanguageTag
+        personContextByPersonID[snapshot.personEntityID] = snapshot
         preferredLanguageLock.unlock()
-        guard previous != languageTag else { return }
-        onPreferredLanguageChanged(personEntityID, languageTag)
+        guard previous != snapshot.preferredLanguageTag else { return }
+        onPreferredLanguageChanged(snapshot.personEntityID, snapshot.preferredLanguageTag)
     }
 
     private func ensurePseudonymousEntity(
@@ -476,7 +613,7 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
 
         Return JSON only: no Markdown, prose, alternate field names, or omitted required fields. Copy at least one supplied evidence ID into evidence_ids; never emit an empty evidence_ids array. Use this exact shape, replacing values only:
         {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence"},"action":"remain_silent|nonverbal_invitation|spoken_opening|null","confidence":0.5,"rationale":"short","opening":null}
-        The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. An information_need is a motive, not a prewritten question. If relationship information is sparse, initial_social_orientation can create curiosity, but it still does not require an interruption. A spoken opening is permitted only as one question that can reduce exactly one supplied information_need. Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If there is no concrete, closeable purpose, choose remain_silent or nonverbal_invitation instead. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null.
+        The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, existing motives, rapport, and prior thought before deciding. If they contain no new, concrete purpose for this person, choose remain_silent: do not turn an empty relationship field, a known person's presence, or generic politeness into an opening. A nonverbal invitation also needs a distinct current social reason; it is not a fallback greeting. If social_opportunity.recent_nonverbal_invitation is true, SOMA has already greeted this person; do not recreate or rationalize another greeting. A spoken opening is permitted only as one question that can reduce exactly one supplied information_need. Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null.
 
         packet:
         \(requestJSON)
@@ -601,6 +738,39 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         }
     }
 
+    /// Presence transitions are emitted by L0, not inferred from a delayed
+    /// L1 request. Remove only active scheduling state; cached local memory
+    /// and the rolling thought state remain available on a later arrival.
+    func depart(_ entityID: UUID) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            presences.removeValue(forKey: entityID)
+            pendingObservations.removeValue(forKey: entityID)
+            nextDeliberationNS.removeValue(forKey: entityID)
+            scheduler.endPresence(for: entityID)
+        }
+    }
+
+    /// A successful MCP person-context write must be visible to the next L1
+    /// deliberation immediately; retaining the old 60-second projection would
+    /// otherwise let an already-satisfied information mission be reopened.
+    func invalidateMemoryContext(for entityID: UUID) {
+        queue.async { [weak self] in
+            self?.cachedMemoryContexts.removeValue(forKey: entityID)
+        }
+    }
+
+    func recordNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            scheduler.recordNonverbalInvitation(with: entityID, at: monotonicNS)
+            cachedMemoryContexts.removeValue(forKey: entityID)
+            Task { [weak self] in
+                await self?.memoryContext.recordNonverbalInvitation(with: entityID)
+            }
+        }
+    }
+
     func stop() {
         queue.sync {
             stopped = true
@@ -619,6 +789,14 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         for entityID: UUID,
         with context: L1MemoryContext
     ) {
+        if let invitedAt = context.lastNonverbalInvitationAt {
+            let elapsed = max(0, Date().timeIntervalSince(invitedAt))
+            let elapsedNS = UInt64(min(elapsed * 1_000_000_000, Double(UInt64.max)))
+            let restoredAt = elapsedNS >= observation.monotonicNS
+                ? 0
+                : observation.monotonicNS - elapsedNS
+            scheduler.restoreNonverbalInvitation(with: entityID, at: restoredAt)
+        }
         let presence = KnownPersonPresence(
             entityID: entityID,
             recognitionConfidence: min(max(observation.similarity, 0), 1),
@@ -716,6 +894,27 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
         let stream = self.stream
         lock.unlock()
         stream?.recordInteraction(with: entityID, at: monotonicNS)
+    }
+
+    func depart(_ entityID: UUID) {
+        lock.lock()
+        let stream = self.stream
+        lock.unlock()
+        stream?.depart(entityID)
+    }
+
+    func invalidateMemoryContext(for entityID: UUID) {
+        lock.lock()
+        let stream = self.stream
+        lock.unlock()
+        stream?.invalidateMemoryContext(for: entityID)
+    }
+
+    func recordNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64) {
+        lock.lock()
+        let stream = self.stream
+        lock.unlock()
+        stream?.recordNonverbalInvitation(with: entityID, at: monotonicNS)
     }
 
     func stop() {

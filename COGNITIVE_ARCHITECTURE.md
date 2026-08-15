@@ -129,7 +129,11 @@ precedence. A late frame is discarded if the person is no longer current.
 greeting overlay: a small down-and-return bow that releases its lease as soon
 as it completes, rather than a side-to-side sweep or a timeout-held pose. The
 face-lock state survives the overlay and resumes fixation immediately after the
-return. A spoken opening transfers directly
+return. The invitation is recorded separately from spoken interaction, so the
+same recognized person cannot be greeted again during the social repeat
+cooldown while L1 may still decide to make a grounded spoken opening. The
+acknowledgement is retained as a short-lived encrypted social fact, so a
+runtime restart cannot erase it before the cooldown ends. A spoken opening transfers directly
 from L1 to the account-backed Live session only when it is a question bound to
 one current information motive; the same packet carries the motive's explicit
 completion condition. The motive is private L2 orientation, not an opening
@@ -179,8 +183,9 @@ silently overwriting history.
   social cost, cooldown, and resolution.
 - `memory_link`: typed relationship among canonical records.
 - `conversation_turn`: exact user or assistant transcript text, Codex thread and
-  interaction IDs, ordered turn sequence, and pending/consolidated state. It is
-  local-only short-term evidence, not a remotely projectable person fact.
+  interaction IDs, opaque local participant references, ordered turn sequence,
+  and pending/consolidated state. It is local-only short-term evidence, not a
+  remotely projectable person fact.
 
 Face presence, person presence, and human identity are separate variables. A
 face or voice resemblance may create an identity hypothesis, but identity stays
@@ -208,12 +213,26 @@ profile cap is twenty-four. This is appearance-space coverage, not a claim that
 SOMA has a calibrated semantic head-pose measurement. Biometric templates stay
 encrypted locally and never enter L1 or L2 prompts.
 
+Identity is also a presence state, not a frame label. L0 records only the
+discrete local transitions `arrived`, `replacement_candidate`, `replaced`, and
+`departed`. A different recognized identity must recur within the replacement
+evidence window before it replaces the active participant; a temporary
+open-set miss therefore cannot create a second person or reopen an already
+fulfilled person-context mission. Departure requires sustained absence of an
+independently verified face, rather than a stalled identity inference. Only an
+arrival or confirmed replacement is passed to L1 as a social deliberation
+opportunity; an L1 opening is suppressed if that participant has departed
+before the model responds.
+
 ### Write path
 
 1. L0 emits timestamped observations; it never creates semantic person facts.
 2. L2 appends exact finalized user and assistant transcript turns to the
-   encrypted short-term journal. It may flag explicit user facts, corrections,
-   and memory requests as high-confidence proposals.
+   encrypted short-term journal, linked only to opaque local participant
+   references. It records explicit name, preferred-language, and proactive
+   contact instructions through the owner-only person-context MCP before it
+   acknowledges them; raw transcript text never enters the trace or a remote
+   L1 packet.
 3. L1 is the default curator: it reads raw turns with situation context,
    resolves them against existing memory, and proposes typed episode, person,
    relationship, task, and open-question mutations.
@@ -423,8 +442,14 @@ specifications; stdout contains JSON-RPC messages only.
 ### Person-context tools
 
 L2 needs more than a camera lease: it must be able to retrieve and maintain
-the explicitly shared social context of the person it is speaking with. The
-same current-user MCP endpoint therefore provides `get_person_context`,
+the explicitly shared social context of the person it is speaking with. Each
+Live session receives a short-lived opaque capability bound to that one local
+person reference. It may read and update that person's context, and it may use
+the ordinary bounded perception and embodiment tools for conversation. It
+cannot query another person's context. Administrator status is reserved for
+explicit external work; it is not required to look, track, explore, capture a
+view, or make a brief social expression during ordinary conversation. The same
+current-user MCP endpoint therefore provides `get_person_context`,
 `set_preferred_language`, `clear_preferred_language`,
 `set_contact_preference`, `set_person_rapport`, `set_person_fact`, and
 `remove_person_fact`. A person-context request reaches the L0-owned encrypted
@@ -435,6 +460,15 @@ its disclosure policy permits it. The returned reference is an opaque local
 person UUID for tool routing, never a name or biometric template. Face vectors,
 raw media, raw transcripts, and local-only identity records are unavailable to
 these tools.
+
+Social-information collection is memory-derived rather than a fixed session
+questionnaire. `PersonContextSnapshot` computes the current mission from stored
+facts: a respectful name is required only while absent; language, contact
+preference, and relationship context remain optional signals for a relevant
+future conversation. An unsatisfied mission is included in L1/L2 context and
+can be checked again through `get_person_context`. Once its required fields are
+stored, the mission is omitted entirely from the session context, so a new
+session does not repeat a completed request.
 
 When a person has an explicit language preference, L1 receives only the
 normalized BCP-47 tag and creates a compact native-language Live-session
@@ -594,7 +628,9 @@ the bounded response to a greeting pulse initiated by SOMA. An authorized event
 opens an L2 turn directly from L0 and never
 waits for the 31B L1 stream. L1 prepares richer situation and memory context in
 parallel. An accepted L1 social decision may also open a turn; recognized
-identity alone never does.
+identity alone never does. L1 receives a recognized participant only at a
+local presence arrival or confirmed replacement, never from repeated frame
+samples or an unconfirmed identity mismatch.
 Automatic speech remains disabled until SOMA authorizes the turn. The local
 fallback retains a bounded in-memory pre-roll; the Live route reuses the same
 L0 PCM stream and schedules a one-second memory-only pre-roll. L0/L1
