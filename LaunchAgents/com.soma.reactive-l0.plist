@@ -17,8 +17,8 @@
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardOutPath</key>
-  <string>/tmp/soma-reactive-l0.out.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/soma-reactive-l0.err.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>

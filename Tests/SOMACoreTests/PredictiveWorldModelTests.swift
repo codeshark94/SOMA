@@ -3,6 +3,127 @@ import XCTest
 @testable import SOMACore
 
 final class PredictiveWorldModelTests: XCTestCase {
+    func testDiagonalCameraFOVConvertsToActiveHorizontalAndVerticalAngles() {
+        let aspect = 16.0 / 9.0
+        XCTAssertEqual(
+            CameraFieldOfView.horizontalDegrees(diagonalDegrees: 86, aspectRatio: aspect) ?? 0,
+            78.205,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            CameraFieldOfView.verticalDegrees(diagonalDegrees: 86, aspectRatio: aspect) ?? 0,
+            49.137,
+            accuracy: 0.001
+        )
+        XCTAssertNil(CameraFieldOfView.horizontalDegrees(diagonalDegrees: 180, aspectRatio: aspect))
+        XCTAssertNil(CameraFieldOfView.horizontalDegrees(diagonalDegrees: 86, aspectRatio: 0))
+    }
+
+    func testTiny2LiteFOVModesResolveAgainstPhysicalWideOptics() {
+        XCTAssertEqual(
+            OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 86) ?? 0,
+            67.2,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 78) ?? 0,
+            59.966,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 65) ?? 0,
+            48.827,
+            accuracy: 0.001
+        )
+        XCTAssertNil(OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 70))
+    }
+
+    func testCameraGeometryCalibrationRequiresIndependentValidation() {
+        let projection = CameraProjectionModel(
+            focalXNormalized: 0.824,
+            focalYNormalized: 1.408,
+            principalXNormalized: 0.490,
+            principalYNormalized: 0.537
+        )
+        let calibration = CameraGeometryCalibration(
+            deviceProfile: "obsbot_tiny_2_lite",
+            fovMode: 86,
+            imageWidth: 1920,
+            imageHeight: 1080,
+            projection: projection,
+            capturedFrames: 29,
+            fittedPairs: 15,
+            fittedMatches: 837,
+            validationPairs: 5,
+            validationMatches: 270,
+            initialRMSEPixels: 23.44,
+            calibratedRMSEPixels: 5.96,
+            calibratedP90Pixels: 9.37,
+            generatedAt: "2026-08-15T00:00:00Z"
+        )
+        XCTAssertTrue(calibration.isValid)
+        XCTAssertEqual(projection.horizontalFieldOfViewDegrees, 62.493, accuracy: 0.001)
+        let centre = SphericalPanoramaProjection.sourceCoordinate(
+            for: GimbalRelativeBearing(azimuthDegrees: -20, elevationDegrees: -5),
+            cameraPose: GimbalPose(pitchDegrees: 5, panDegrees: 20, monotonicNS: 1),
+            horizontalFieldOfViewDegrees: 67.2,
+            poseProjection: .obsbotTiny2Lite,
+            cameraProjectionModel: projection
+        )
+        XCTAssertEqual(centre?.normalizedX ?? 0, 0.490, accuracy: 0.001)
+        XCTAssertEqual(centre?.normalizedY ?? 0, 0.537, accuracy: 0.001)
+        var sceneField = SceneField()
+        let upperImageCandidate = sceneField.ingest(
+            [VisualObservation(
+                rect: NormalizedRect(x: 0.45, y: 0.70, width: 0.10, height: 0.10),
+                confidence: 0.9,
+                source: .neuralDetector,
+                kind: .object,
+                label: "test"
+            )],
+            at: 1,
+            cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1),
+            horizontalFieldOfViewDegrees: 67.2,
+            cameraSettled: true,
+            poseProjection: .identity,
+            cameraProjectionModel: projection
+        ).first
+        XCTAssertGreaterThan(upperImageCandidate?.bearing?.elevationDegrees ?? -90, 0)
+        let unvalidated = CameraGeometryCalibration(
+            deviceProfile: "obsbot_tiny_2_lite",
+            fovMode: 86,
+            imageWidth: 1920,
+            imageHeight: 1080,
+            projection: projection,
+            capturedFrames: 29,
+            fittedPairs: 15,
+            fittedMatches: 837,
+            validationPairs: 1,
+            validationMatches: 40,
+            initialRMSEPixels: 23.44,
+            calibratedRMSEPixels: 5.96,
+            calibratedP90Pixels: 9.37,
+            generatedAt: "2026-08-15T00:00:00Z"
+        )
+        XCTAssertFalse(unvalidated.isValid)
+    }
+
+    func testRadialCameraProjectionRoundTripsAnOffAxisRay() {
+        let projection = CameraProjectionModel(
+            focalXNormalized: 0.825,
+            focalYNormalized: 1.431,
+            principalXNormalized: 0.481,
+            principalYNormalized: 0.560,
+            radialK1: 0.065,
+            radialK2: 0.035
+        )
+        let ideal = (0.31, -0.18, 1.0)
+        let actual = projection.idealToActual(ideal)
+        let recovered = projection.actualToIdeal(actual)
+        XCTAssertEqual(recovered.0 / recovered.2, ideal.0, accuracy: 0.000_001)
+        XCTAssertEqual(recovered.1 / recovered.2, ideal.1, accuracy: 0.000_001)
+    }
+
     func testFaceConfirmationLeaseRequiresFreshOverlappingGeometry() {
         let face = NormalizedRect(x: 0.42, y: 0.28, width: 0.12, height: 0.14)
         var lease = FaceConfirmationLease()
@@ -942,9 +1063,9 @@ final class PredictiveWorldModelTests: XCTestCase {
         let stalledVerticalObservation = VisualObservation(
             rect: NormalizedRect(x: 0.70, y: 0.12, width: 0.15, height: 0.15),
             confidence: 0.90,
-            source: .neuralFaceDetector,
+            source: .neuralDetector,
             kind: .human,
-            label: "face",
+            label: "person",
             posteriorProbability: 0.80,
             sceneID: "stalled-top-face",
             stabilityMilliseconds: 500,
@@ -956,7 +1077,10 @@ final class PredictiveWorldModelTests: XCTestCase {
                 stalledVerticalObservation,
                 at: 7_200_000_000 + UInt64(update) * 100_000_000
             )
-            guard case let .velocity(pitch, _) = stalledVerticalGate.update(belief) else {
+            guard case let .velocity(pitch, _) = stalledVerticalGate.update(
+                belief,
+                allowSocialReframing: true
+            ) else {
                 return XCTFail("stalled vertical target did not preserve pan observation")
             }
             XCTAssertNotEqual(pitch, 0)
@@ -965,7 +1089,10 @@ final class PredictiveWorldModelTests: XCTestCase {
             stalledVerticalObservation,
             at: 7_500_000_000
         )
-        guard case let .velocity(stalledPitch, stalledPan) = stalledVerticalGate.update(stalledVerticalBelief) else {
+        guard case let .velocity(stalledPitch, stalledPan) = stalledVerticalGate.update(
+            stalledVerticalBelief,
+            allowSocialReframing: true
+        ) else {
             return XCTFail("stalled vertical target did not retain pan-only observation")
         }
         XCTAssertEqual(stalledPitch, 0)
@@ -975,9 +1102,9 @@ final class PredictiveWorldModelTests: XCTestCase {
             VisualObservation(
                 rect: NormalizedRect(x: 0.70, y: 0.02, width: 0.15, height: 0.15),
                 confidence: 0.90,
-                source: .neuralFaceDetector,
+                source: .neuralDetector,
                 kind: .human,
-                label: "face",
+                label: "person",
                 posteriorProbability: 0.80,
                 sceneID: "stalled-top-face",
                 stabilityMilliseconds: 500,
@@ -985,8 +1112,11 @@ final class PredictiveWorldModelTests: XCTestCase {
             ),
             at: 7_600_000_000
         )
-        guard case let .velocity(movingPitch, _) = stalledVerticalGate.update(movingVerticalBelief) else {
-            return XCTFail("a vertically moving face lost its tracking command")
+        guard case let .velocity(movingPitch, _) = stalledVerticalGate.update(
+            movingVerticalBelief,
+            allowSocialReframing: true
+        ) else {
+            return XCTFail("a vertically moving social target lost its tracking command")
         }
         XCTAssertNotEqual(movingPitch, 0)
 
@@ -1257,7 +1387,7 @@ final class PredictiveWorldModelTests: XCTestCase {
             )
         ], at: start,
            cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start))
-        XCTAssertEqual(weightedScene.first?.observation.attentionWeight, 0.9, accuracy: 0.000_001)
+        XCTAssertEqual(weightedScene.first?.observation.attentionWeight ?? -1, 0.9, accuracy: 0.000_001)
 
         var wallField = SceneField()
         var wallCandidate: SceneCandidate?
@@ -1455,7 +1585,8 @@ final class PredictiveWorldModelTests: XCTestCase {
                 source: .neuralFaceDetector,
                 kind: .human,
                 label: "face",
-                isActionEligible: true
+                isActionEligible: true,
+                isFaceVerified: true
             )],
             at: start,
             cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 20, monotonicNS: start),
@@ -1473,7 +1604,8 @@ final class PredictiveWorldModelTests: XCTestCase {
                 source: .neuralFaceDetector,
                 kind: .human,
                 label: "face",
-                isActionEligible: true
+                isActionEligible: true,
+                isFaceVerified: true
             )],
             at: start + 1_000_000_000,
             cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 50, monotonicNS: start + 1_000_000_000),
@@ -1601,6 +1733,452 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertFalse(pose.isFresh(for: 999_999_999, maximumAgeNS: 50_000_000))
     }
 
+    func testPanoramaPoseUsesBracketedCaptureTimeInsteadOfThePreviousAttitude() {
+        let estimate = CaptureAlignedPoseInterpolator.estimate(
+            samples: [
+                GimbalPose(pitchDegrees: -8, panDegrees: 10, monotonicNS: 1_000_000_000),
+                GimbalPose(pitchDegrees: 4, panDegrees: 34, monotonicNS: 1_040_000_000),
+            ],
+            at: 1_010_000_000
+        )
+        XCTAssertEqual(estimate?.mode, .bracketed)
+        XCTAssertEqual(estimate?.pose.panDegrees ?? 0, 16, accuracy: 0.000_001)
+        XCTAssertEqual(estimate?.pose.pitchDegrees ?? 0, -5, accuracy: 0.000_001)
+        XCTAssertEqual(estimate?.interpolationFraction ?? 0, 0.25, accuracy: 0.000_001)
+        XCTAssertEqual(estimate?.pose.monotonicNS, 1_010_000_000)
+        XCTAssertEqual(
+            estimate?.angularVelocityDegreesPerSecond ?? 0,
+            hypot(24, 12) / 0.04,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testPanoramaPoseRejectsUnbracketedAndWidelySpacedAttitudes() {
+        XCTAssertNil(CaptureAlignedPoseInterpolator.estimate(
+            samples: [GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1_000_000_000)],
+            at: 1_010_000_000
+        ))
+        XCTAssertNil(CaptureAlignedPoseInterpolator.estimate(
+            samples: [
+                GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1_000_000_000),
+                GimbalPose(pitchDegrees: 0, panDegrees: 40, monotonicNS: 1_100_000_000),
+            ],
+            at: 1_050_000_000
+        ))
+    }
+
+    func testPanoramaExactPoseStillMeasuresLocalAngularVelocity() {
+        let estimate = CaptureAlignedPoseInterpolator.estimate(
+            samples: [
+                GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1_000_000_000),
+                GimbalPose(pitchDegrees: 0, panDegrees: 10, monotonicNS: 1_100_000_000),
+                GimbalPose(pitchDegrees: 0, panDegrees: 20, monotonicNS: 1_200_000_000),
+            ],
+            at: 1_100_000_000
+        )
+        XCTAssertEqual(estimate?.mode, .exact)
+        XCTAssertEqual(estimate?.pose.panDegrees ?? 0, 10, accuracy: 0.000_001)
+        XCTAssertEqual(
+            estimate?.angularVelocityDegreesPerSecond ?? 0,
+            100,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testPanoramaProjectionUsesCalibratedImageSignsAndDynamicMasks() {
+        let pose = GimbalPose(pitchDegrees: 5, panDegrees: 20, monotonicNS: 1)
+        let center = SphericalPanoramaProjection.sourceCoordinate(
+            for: GimbalRelativeBearing(azimuthDegrees: -20, elevationDegrees: -5),
+            cameraPose: pose,
+            horizontalFieldOfViewDegrees: 86,
+            poseProjection: .obsbotTiny2Lite
+        )
+        XCTAssertEqual(center?.normalizedX ?? 0, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(center?.normalizedY ?? 0, 0.5, accuracy: 0.000_001)
+        let imageRight = SphericalPanoramaProjection.sourceCoordinate(
+            for: GimbalRelativeBearing(azimuthDegrees: -10, elevationDegrees: -5),
+            cameraPose: pose,
+            horizontalFieldOfViewDegrees: 86,
+            poseProjection: .obsbotTiny2Lite
+        )
+        XCTAssertGreaterThan(imageRight?.normalizedX ?? 0, 0.5)
+        let imageTop = SphericalPanoramaProjection.sourceCoordinate(
+            for: GimbalRelativeBearing(azimuthDegrees: -20, elevationDegrees: 5),
+            cameraPose: pose,
+            horizontalFieldOfViewDegrees: 86,
+            poseProjection: .obsbotTiny2Lite
+        )
+        XCTAssertLessThan(imageTop?.normalizedY ?? 1, 0.5)
+        let imageBottom = SphericalPanoramaProjection.sourceCoordinate(
+            for: GimbalRelativeBearing(azimuthDegrees: -20, elevationDegrees: -15),
+            cameraPose: pose,
+            horizontalFieldOfViewDegrees: 86,
+            poseProjection: .obsbotTiny2Lite
+        )
+        XCTAssertGreaterThan(imageBottom?.normalizedY ?? 0, 0.5)
+        XCTAssertTrue(SphericalPanoramaProjection.isDynamicallyMasked(
+            sourceCoordinate: imageRight!,
+            visionRects: [NormalizedRect(x: 0.5, y: 0.35, width: 0.2, height: 0.3)]
+        ))
+        XCTAssertTrue(SphericalPanoramaProjection.isDynamicallyMasked(
+            sourceCoordinate: imageTop!,
+            visionRects: [NormalizedRect(x: 0.45, y: 0.65, width: 0.1, height: 0.25)]
+        ))
+        XCTAssertFalse(SphericalPanoramaProjection.isDynamicallyMasked(
+            sourceCoordinate: imageTop!,
+            visionRects: [NormalizedRect(x: 0.45, y: 0.05, width: 0.1, height: 0.15)]
+        ))
+        XCTAssertNil(SphericalPanoramaProjection.sourceCoordinate(
+            for: GimbalRelativeBearing(azimuthDegrees: 100, elevationDegrees: -5),
+            cameraPose: pose,
+            horizontalFieldOfViewDegrees: 86,
+            poseProjection: .obsbotTiny2Lite
+        ))
+    }
+
+    func testPanoramaRasterUsesAStandardWorldSphericalOrientation() {
+        let upperLeft = SphericalPanoramaProjection.outputBearing(
+            column: 0,
+            row: 0,
+            width: 100,
+            height: 50,
+            minimumElevationDegrees: -45,
+            maximumElevationDegrees: 45
+        )
+        let lowerRight = SphericalPanoramaProjection.outputBearing(
+            column: 99,
+            row: 49,
+            width: 100,
+            height: 50,
+            minimumElevationDegrees: -45,
+            maximumElevationDegrees: 45
+        )
+        XCTAssertLessThan(upperLeft.azimuthDegrees, lowerRight.azimuthDegrees)
+        XCTAssertGreaterThan(upperLeft.elevationDegrees, lowerRight.elevationDegrees)
+    }
+
+    func testPanoramaProjectionCouplesYawAndPitchOnTheSphere() {
+        let coordinate = SphericalPanoramaProjection.sourceCoordinate(
+            for: GimbalRelativeBearing(azimuthDegrees: 30, elevationDegrees: 30),
+            cameraPose: GimbalPose(pitchDegrees: 30, panDegrees: 0, monotonicNS: 1),
+            horizontalFieldOfViewDegrees: 86,
+            poseProjection: .identity
+        )
+        XCTAssertNotNil(coordinate)
+        XCTAssertGreaterThan(abs((coordinate?.normalizedY ?? 0.5) - 0.5), 0.01)
+    }
+
+    func testPanoramaQualityProtectsAStablePixelFromAFastPass() {
+        XCTAssertEqual(
+            PanoramaObservationQuality.motionQuality(angularVelocityDegreesPerSecond: 0),
+            1,
+            accuracy: 0.000_001
+        )
+        let fastQuality = PanoramaObservationQuality.motionQuality(
+            angularVelocityDegreesPerSecond: 60
+        )
+        XCTAssertLessThan(fastQuality, 0.15)
+        XCTAssertTrue(PanoramaObservationQuality.admitsProjection(
+            angularVelocityDegreesPerSecond: 2.0
+        ))
+        XCTAssertFalse(PanoramaObservationQuality.admitsProjection(
+            angularVelocityDegreesPerSecond: 2.001
+        ))
+        XCTAssertTrue(PanoramaObservationQuality.admitsCalibration(
+            angularVelocityDegreesPerSecond: 0.75
+        ))
+        XCTAssertFalse(PanoramaObservationQuality.admitsCalibration(
+            angularVelocityDegreesPerSecond: 0.751
+        ))
+        XCTAssertNil(PanoramaObservationQuality.continuousStripHalfWidthNormalized(
+            angularVelocityDegreesPerSecond: 2.0,
+            horizontalFieldOfViewDegrees: 62
+        ))
+        let strip = PanoramaObservationQuality.continuousStripHalfWidthNormalized(
+            angularVelocityDegreesPerSecond: 20,
+            horizontalFieldOfViewDegrees: 62
+        )
+        XCTAssertEqual(strip ?? 0, 7.0 / 124.0, accuracy: 0.000_001)
+        let delayedStrip = PanoramaObservationQuality.continuousStripHalfWidthNormalized(
+            angularVelocityDegreesPerSecond: 30,
+            horizontalFieldOfViewDegrees: 62,
+            admissionIntervalSeconds: 0.70
+        )
+        XCTAssertEqual(delayedStrip ?? 0, 23.0 / 124.0, accuracy: 0.000_001)
+        XCTAssertGreaterThan(delayedStrip ?? 0, strip ?? 0)
+        XCTAssertGreaterThanOrEqual(
+            PanoramaObservationQuality.motionQuality(angularVelocityDegreesPerSecond: 18) * 0.78,
+            0.45
+        )
+        XCTAssertLessThan(
+            PanoramaObservationQuality.motionQuality(angularVelocityDegreesPerSecond: 30) * 0.78,
+            0.45
+        )
+        XCTAssertNil(PanoramaObservationQuality.continuousStripHalfWidthNormalized(
+            angularVelocityDegreesPerSecond: 40.001,
+            horizontalFieldOfViewDegrees: 62
+        ))
+        XCTAssertFalse(PanoramaObservationQuality.shouldReplace(
+            existingQuality: 0.9,
+            incomingQuality: fastQuality
+        ))
+        XCTAssertTrue(PanoramaObservationQuality.shouldReplace(
+            existingQuality: 0,
+            incomingQuality: fastQuality
+        ))
+        XCTAssertFalse(PanoramaObservationQuality.shouldReplace(
+            existingQuality: 0.9,
+            incomingQuality: 0.89
+        ))
+        XCTAssertTrue(PanoramaObservationQuality.shouldReplace(
+            existingQuality: 0.9,
+            incomingQuality: 0.94
+        ))
+    }
+
+    func testPanoramaReachabilitySeparatesPhysicalCoverageFromFullSphere() {
+        let projection = CameraProjectionModel.pinhole(horizontalFieldOfViewDegrees: 62.4)
+        XCTAssertTrue(SphericalPanoramaProjection.isReachable(
+            GimbalRelativeBearing(azimuthDegrees: 130, elevationDegrees: 40),
+            cameraProjectionModel: projection,
+            poseProjection: .obsbotTiny2Lite
+        ))
+        XCTAssertFalse(SphericalPanoramaProjection.isReachable(
+            GimbalRelativeBearing(azimuthDegrees: 175, elevationDegrees: 0),
+            cameraProjectionModel: projection,
+            poseProjection: .obsbotTiny2Lite
+        ))
+        XCTAssertFalse(SphericalPanoramaProjection.isReachable(
+            GimbalRelativeBearing(azimuthDegrees: 0, elevationDegrees: 44.5),
+            cameraProjectionModel: projection,
+            poseProjection: .obsbotTiny2Lite
+        ))
+    }
+
+    func testExplorationTimeoutDoesNotCutOffALongReachableStrip() {
+        XCTAssertGreaterThan(
+            SmoothExplorationDynamics.waypointTimeoutSeconds(
+                panErrorDegrees: 220,
+                pitchErrorDegrees: 0,
+                maximumPanDegreesPerSecond: 12,
+                maximumPitchDegreesPerSecond: 8
+            ),
+            19
+        )
+    }
+
+    func testPanoramaRegistrationRefinesOnlyLocalPoseResiduals() {
+        let width = 1_280
+        let translationForTenDegrees = tan(10 * .pi / 180)
+            / (2 * tan(43 * .pi / 180)) * Double(width)
+        let refined = PanoramaPoseRefinement.refine(
+            previousPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 9, monotonicNS: 2),
+            alignmentTranslationX: translationForTenDegrees,
+            alignmentTranslationY: 0,
+            imageWidth: width,
+            imageHeight: 720,
+            horizontalFieldOfViewDegrees: 86,
+            confidence: 1,
+            poseProjection: .identity
+        )
+        XCTAssertTrue(refined.accepted)
+        XCTAssertGreaterThan(refined.correctedPose.panDegrees, 9)
+        XCTAssertLessThanOrEqual(refined.correctedPose.panDegrees, 10)
+        XCTAssertLessThanOrEqual(abs(refined.panCorrectionDegrees), 86 * 0.04)
+
+        let rejected = PanoramaPoseRefinement.refine(
+            previousPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 9, monotonicNS: 2),
+            alignmentTranslationX: 1_200,
+            alignmentTranslationY: 0,
+            imageWidth: width,
+            imageHeight: 720,
+            horizontalFieldOfViewDegrees: 86,
+            confidence: 1,
+            poseProjection: .identity
+        )
+        XCTAssertFalse(rejected.accepted)
+        XCTAssertEqual(rejected.correctedPose.panDegrees, 9, accuracy: 0.000_001)
+
+        let lowConfidence = PanoramaPoseRefinement.refine(
+            previousPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 9, monotonicNS: 2),
+            alignmentTranslationX: translationForTenDegrees,
+            alignmentTranslationY: 0,
+            imageWidth: width,
+            imageHeight: 720,
+            horizontalFieldOfViewDegrees: 86,
+            confidence: 0.4,
+            poseProjection: .identity
+        )
+        XCTAssertFalse(lowConfidence.accepted)
+        XCTAssertEqual(lowConfidence.correctedPose.panDegrees, 9, accuracy: 0.000_001)
+    }
+
+    func testCompatibleLearnedEmbeddingRevisitsOneSphericalCell() {
+        let base = Array(1...24).map(Float.init)
+        guard let embedding = PanoramaPlaceEmbedding(
+            encoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+            revision: 2,
+            values: base
+        ), let scaledEmbedding = PanoramaPlaceEmbedding(
+            encoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+            revision: 2,
+            values: base.map { $0 * 3 }
+        ) else {
+            return XCTFail("expected valid learned place embeddings")
+        }
+        XCTAssertEqual(
+            embedding.similarity(to: scaledEmbedding) ?? 0,
+            1,
+            accuracy: 0.000_001
+        )
+
+        let start: UInt64 = 44_000_000_000
+        let pose = GimbalPose(pitchDegrees: 1, panDegrees: 3, monotonicNS: start)
+        var field = SpatialCoverageField()
+        let first = field.observePlace(
+            embedding: embedding,
+            pose: pose,
+            observationQuality: 1,
+            at: start
+        )
+        let revisit = field.observePlace(
+            embedding: scaledEmbedding,
+            pose: pose,
+            observationQuality: 1,
+            at: start + 1_000_000_000
+        )
+        XCTAssertFalse(first?.isRevisit ?? true)
+        XCTAssertTrue(revisit?.isRevisit ?? false)
+        XCTAssertEqual(first?.bearing, revisit?.bearing)
+        XCTAssertEqual(revisit?.observationCount, 2)
+        XCTAssertGreaterThan(revisit?.familiarity ?? 0, 0.999)
+
+        let cells = field.snapshot(at: start + 1_000_000_000)
+        let recognized = cells.filter { $0.placeObservationCount > 0 }
+        XCTAssertEqual(recognized.count, 1)
+        XCTAssertEqual(recognized.first?.placeObservationCount, 2)
+        let unknown = cells.first { $0.placeObservationCount == 0 }
+        XCTAssertGreaterThan(
+            unknown?.expectedInformationGain ?? 0,
+            recognized.first?.expectedInformationGain ?? 1
+        )
+
+        let memory = field.placeMemorySnapshot(generatedAtUnixMilliseconds: 123)
+        var restoredField = SpatialCoverageField()
+        XCTAssertEqual(restoredField.restorePlaceMemory(
+            memory,
+            expectedEncoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+            expectedRevision: 2
+        ), 1)
+        XCTAssertEqual(
+            restoredField.snapshot(at: start + 2_000_000_000)
+                .filter { $0.placeObservationCount > 0 }
+                .first?.placeObservationCount,
+            2
+        )
+    }
+
+    func testIncompatiblePlaceEncoderCannotBecomeARevisit() {
+        let pose = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1)
+        let revisionTwo = PanoramaPlaceEmbedding(
+            encoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+            revision: 2,
+            values: Array(repeating: 1, count: 16)
+        )!
+        let revisionThree = PanoramaPlaceEmbedding(
+            encoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+            revision: 3,
+            values: Array(repeating: 1, count: 16)
+        )!
+        var field = SpatialCoverageField()
+        XCTAssertFalse(field.observePlace(
+            embedding: revisionTwo,
+            pose: pose,
+            observationQuality: 1,
+            at: 1
+        )!.isRevisit)
+        let incompatible = field.observePlace(
+            embedding: revisionThree,
+            pose: pose,
+            observationQuality: 1,
+            at: 2
+        )
+        XCTAssertFalse(incompatible?.isRevisit ?? true)
+        XCTAssertEqual(incompatible?.observationCount, 1)
+    }
+
+    func testPanoramaBackgroundAdmissionBridgesHumanDetectorGaps() {
+        let start: UInt64 = 40_000_000_000
+        XCTAssertTrue(PanoramaEntityMaskPolicy.shouldMask(.human))
+        XCTAssertFalse(PanoramaEntityMaskPolicy.shouldMask(.object))
+        XCTAssertFalse(PanoramaEntityMaskPolicy.shouldMask(.unknown))
+        var admission = PanoramaBackgroundAdmission(humanHoldNS: 750_000_000)
+        XCTAssertFalse(admission.admits(hasObservedHuman: true, at: start))
+        XCTAssertFalse(admission.admits(hasObservedHuman: false, at: start + 749_999_999))
+        XCTAssertTrue(admission.admits(hasObservedHuman: false, at: start + 750_000_000))
+    }
+
+    func testPanoramaQualityDeficitRemainsAnExplorationTarget() {
+        let start: UInt64 = 12_500_000_000
+        var field = SpatialCoverageField()
+        for pitch in [-24.0, 24.0] {
+            for pan in [-110.0, 0.0, 110.0] {
+                field.observe(
+                    pose: GimbalPose(pitchDegrees: pitch, panDegrees: pan, monotonicNS: start),
+                    horizontalFieldOfViewDegrees: 86,
+                    at: start
+                )
+            }
+        }
+        field.observePanorama(
+            pose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+            horizontalFieldOfViewDegrees: 86,
+            frameQuality: 1,
+            dynamicVisionRects: [],
+            poseProjection: .identity,
+            at: start
+        )
+        let cells = field.snapshot(at: start)
+        let centre = cells.first { $0.bearing.azimuthDegrees == 0 && $0.bearing.elevationDegrees == 0 }
+        XCTAssertEqual(centre?.panoramaQuality ?? 0, 1, accuracy: 0.000_001)
+        let selected = field.nextDirection(
+            from: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+            at: start + 1_000_000
+        )
+        XCTAssertNotNil(selected)
+        XCTAssertLessThan(selected?.panoramaQuality ?? 1, 0.1)
+    }
+
+    func testCoverageUsesCalibratedPrincipalPointAndMotorAxisSigns() {
+        let start: UInt64 = 12_750_000_000
+        let model = CameraProjectionModel(
+            focalXNormalized: 0.824,
+            focalYNormalized: 1.408,
+            principalXNormalized: 0.60,
+            principalYNormalized: 0.50
+        )
+        var field = SpatialCoverageField()
+        field.observe(
+            pose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+            horizontalFieldOfViewDegrees: 86,
+            poseProjection: .obsbotTiny2Lite,
+            cameraProjectionModel: model,
+            at: start
+        )
+        let cells = field.snapshot(at: start)
+        let positiveMotorCell = cells.first {
+            $0.bearing.azimuthDegrees == 36 && $0.bearing.elevationDegrees == 0
+        }
+        let negativeMotorCell = cells.first {
+            $0.bearing.azimuthDegrees == -36 && $0.bearing.elevationDegrees == 0
+        }
+        XCTAssertEqual(positiveMotorCell?.observationCount, 1)
+        XCTAssertEqual(negativeMotorCell?.observationCount, 0)
+    }
+
     func testCoverageFieldPrefersAnUnseenDirection() {
         let start: UInt64 = 12_000_000_000
         let origin = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
@@ -1610,11 +2188,11 @@ final class PredictiveWorldModelTests: XCTestCase {
             return XCTFail("expected an unseen exploration direction")
         }
         XCTAssertGreaterThan(abs(first.bearing.azimuthDegrees), 43)
-        XCTAssertLessThanOrEqual(abs(first.bearing.elevationDegrees), 30)
+        XCTAssertLessThanOrEqual(abs(first.bearing.elevationDegrees), 39)
         guard let sampled = field.sampleNextDirection(from: origin, at: start + 100_000_000, temperature: 1.4, uniform: 0) else {
             return XCTFail("expected a sampled unseen direction")
         }
-        XCTAssertEqual(abs(sampled.bearing.elevationDegrees), 30, accuracy: 0.000_001)
+        XCTAssertEqual(abs(sampled.bearing.elevationDegrees), 39, accuracy: 0.000_001)
         let sampledProbability = sampled.probability
         field.recordUnproductiveVisit(to: sampled)
         XCTAssertLessThan(
@@ -1687,7 +2265,7 @@ final class PredictiveWorldModelTests: XCTestCase {
                 panErrorDegrees: 180,
                 pitchErrorDegrees: 0
             ),
-            4.5,
+            3 / 0.45 + 1.5,
             accuracy: 0.000_001
         )
         XCTAssertTrue(
@@ -1703,6 +2281,16 @@ final class PredictiveWorldModelTests: XCTestCase {
             )
         )
         let origin = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
+        let envelope = GimbalKinematicEnvelope.obsbotTiny2Lite
+        XCTAssertTrue(envelope.containsTrackingCenter(
+            GimbalRelativeBearing(azimuthDegrees: 110.8, elevationDegrees: 24.8)
+        ))
+        XCTAssertFalse(envelope.containsTrackingCenter(
+            GimbalRelativeBearing(azimuthDegrees: 126.1, elevationDegrees: 0)
+        ))
+        XCTAssertFalse(envelope.containsTrackingCenter(
+            GimbalRelativeBearing(azimuthDegrees: 0, elevationDegrees: -34.1)
+        ))
         let boundaryGuide = GimbalVisibilityRoutePlanner.guide(
             to: GimbalRelativeBearing(azimuthDegrees: 108, elevationDegrees: 30),
             from: origin
@@ -1714,6 +2302,30 @@ final class PredictiveWorldModelTests: XCTestCase {
             XCTAssertGreaterThan(boundaryGuide.elevationDegrees, 0)
             XCTAssertLessThan(boundaryGuide.elevationDegrees, 24)
         }
+        let nearestVisible = GimbalVisibilityRoutePlanner.guide(
+            to: GimbalRelativeBearing(azimuthDegrees: 72, elevationDegrees: 0),
+            from: origin
+        )
+        let panoramaCentred = GimbalVisibilityRoutePlanner.guide(
+            to: GimbalRelativeBearing(azimuthDegrees: 72, elevationDegrees: 0),
+            from: origin,
+            observationPreference: .centered
+        )
+        XCTAssertLessThan(nearestVisible?.azimuthDegrees ?? .infinity, 72)
+        XCTAssertEqual(panoramaCentred?.azimuthDegrees ?? 0, 72, accuracy: 0.000_001)
+        let edgeVisiblePlan = GimbalVisibilityRoutePlanner.plan(
+            to: GimbalRelativeBearing(azimuthDegrees: 140, elevationDegrees: 38),
+            from: origin
+        )
+        XCTAssertNotNil(edgeVisiblePlan)
+        XCTAssertLessThanOrEqual(
+            abs(edgeVisiblePlan?.observationPose.azimuthDegrees ?? .infinity),
+            GimbalKinematicEnvelope.obsbotTiny2Lite.maximumAutonomousPanDegrees
+        )
+        XCTAssertLessThanOrEqual(
+            abs(edgeVisiblePlan?.observationPose.elevationDegrees ?? .infinity),
+            GimbalKinematicEnvelope.obsbotTiny2Lite.maximumAutonomousPitchDegrees
+        )
         XCTAssertNil(
             GimbalVisibilityRoutePlanner.guide(
                 to: GimbalRelativeBearing(azimuthDegrees: 170, elevationDegrees: 0),
@@ -1728,6 +2340,12 @@ final class PredictiveWorldModelTests: XCTestCase {
         if let seamSafeGuide {
             XCTAssertLessThan(seamSafeGuide.azimuthDegrees, 0)
         }
+        let atlasSnapshot = SpatialCoverageField().snapshot(at: start + 300_000_000)
+        XCTAssertTrue(atlasSnapshot.contains { abs($0.bearing.azimuthDegrees) > 110 })
+        XCTAssertTrue(atlasSnapshot.contains { abs($0.bearing.elevationDegrees) > 30 })
+        XCTAssertTrue(atlasSnapshot.allSatisfy { cell in
+            GimbalVisibilityRoutePlanner.plan(to: cell.bearing, from: origin) != nil
+        })
         let calibration = ExternalGimbalCalibration(
             panSign: 1,
             pitchSign: -1,
@@ -1783,13 +2401,13 @@ final class PredictiveWorldModelTests: XCTestCase {
         )
     }
 
-    func testL05AdmissionIsEventBoundedAndPeriodicallyRefreshed() {
+    func testL1AuxiliaryAdmissionIsEventBoundedAndPeriodicallyRefreshed() {
         func context(
             at monotonicNS: UInt64,
             label: String? = nil,
             surprise: Double = 0
-        ) -> L05FrameContext {
-            L05FrameContext(
+        ) -> L1AuxiliaryFrameContext {
+            L1AuxiliaryFrameContext(
                 captureNS: monotonicNS,
                 trigger: "test",
                 surprise: surprise,
@@ -1804,7 +2422,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         }
 
         let start: UInt64 = 30_000_000_000
-        var gate = L05SemanticAdmissionGate()
+        var gate = L1AuxiliarySemanticAdmissionGate()
         XCTAssertTrue(gate.admit(context(at: start)))
         XCTAssertFalse(gate.admit(context(at: start + 999_000_000, label: "face")))
         XCTAssertTrue(gate.admit(context(at: start + 1_000_000_000, label: "face")))
@@ -1813,15 +2431,15 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertTrue(gate.admit(context(at: start + 7_000_000_000, label: "face", surprise: 0.7)))
     }
 
-    func testL05SemanticInterruptRequiresConsistentCredibleEvidenceAndDebounces() {
+    func testL1AuxiliarySemanticInterruptRequiresConsistentCredibleEvidenceAndDebounces() {
         func cue(
             at monotonicNS: UInt64,
-            situation: L05Situation,
-            reason: L05WakeReason,
+            situation: L1AuxiliarySituation,
+            reason: L1AuxiliaryWakeReason,
             score: Double = 0.9,
             confidence: Double = 0.9
-        ) -> L05SemanticCue {
-            L05SemanticCue(
+        ) -> L1AuxiliarySemanticCue {
+            L1AuxiliarySemanticCue(
                 requestID: monotonicNS,
                 captureNS: monotonicNS,
                 completedNS: monotonicNS,
@@ -1839,7 +2457,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         }
 
         let start: UInt64 = 40_000_000_000
-        var gate = L05SemanticInterruptGate()
+        var gate = L1AuxiliarySemanticInterruptGate()
         XCTAssertNil(gate.recommend(cue(at: start, situation: .ambient, reason: .none)))
         XCTAssertNil(gate.recommend(cue(at: start, situation: .socialBid, reason: .presentedObject)))
         XCTAssertNotNil(gate.recommend(cue(at: start, situation: .socialBid, reason: .directSocialBid)))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent local-only Gemma 4 MLX-VLM JSONL worker for SOMA L0.5."""
+"""Persistent local-only Gemma 4 MLX-VLM JSONL helper for SOMA L1."""
 
 from __future__ import annotations
 
@@ -44,6 +44,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     args = parser.parse_args()
+    model_slug = os.path.basename(os.path.normpath(args.model)).lower()
+    if "e2b" in model_slug:
+        source_name = "gemma4_e2b_mlx_vlm"
+    elif "e4b" in model_slug:
+        source_name = "gemma4_e4b_mlx_vlm"
+    else:
+        source_name = "gemma4_mlx_vlm"
 
     try:
         with contextlib.redirect_stdout(sys.stderr):
@@ -85,7 +92,7 @@ def main() -> int:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             context_text = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
             instruction = (
-                "You are SOMA's low-rate preconscious visual interpretation layer. "
+                "You are SOMA L1's bounded local visual interpretation helper. "
                 "Describe only currently visible evidence. Do not identify a person, infer private traits, "
                 "or issue motor commands. Return exactly one JSON object with keys: "
                 "summary (max 120 characters), novelty (0..1), social_presence (0..1), "
@@ -93,6 +100,7 @@ def main() -> int:
                 "situation (social_bid|object_presentation|scene_transition|ambient|uncertain), "
                 "wake_reason (direct_social_bid|presented_object|unexpected_change|ambiguity|none), "
                 "wake_score (0..1), confidence (0..1). "
+                "Every textual value, including every enum value, must be enclosed in JSON double quotes. "
                 "Use attention_hint=person whenever any human, face, or body is visible; use object only "
                 "when no human is visible. social_presence is the probability that a human is visible. "
                 "A quiet static background is ambient with wake_reason=none and low wake_score. "
@@ -114,14 +122,23 @@ def main() -> int:
                     processor=processor,
                     prompt=prompt,
                     image=[image],
-                    max_tokens=128,
+                    max_tokens=192,
                     temperature=0.0,
                     enable_thinking=False,
                     verbose=False,
                 )
             inference_ms = (time.perf_counter() - started) * 1_000
             text = getattr(generated, "text", generated)
-            parsed = parse_object(str(text))
+            try:
+                parsed = parse_object(str(text))
+            except ValueError as error:
+                emit({
+                    "type": "error",
+                    "message": str(error),
+                    "modelOutput": str(text)[:500],
+                    "inferenceMS": inference_ms,
+                })
+                continue
             hint = str(parsed.get("attention_hint", "none"))
             if hint not in {"person", "object", "sound_source", "explore", "none"}:
                 hint = "none"
@@ -135,7 +152,8 @@ def main() -> int:
                 "type": "result",
                 "requestID": request_id,
                 "captureNS": capture_ns,
-                "source": "gemma4_e4b_mlx_vlm",
+                "source": source_name,
+                "model": model_slug,
                 "summary": str(parsed.get("summary", ""))[:160],
                 "novelty": bounded_probability(parsed.get("novelty")),
                 "socialPresence": bounded_probability(parsed.get("social_presence")),

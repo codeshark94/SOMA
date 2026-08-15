@@ -1,6 +1,6 @@
 import Foundation
 
-public enum L05AttentionHint: String, Codable, CaseIterable, Sendable {
+public enum L1AuxiliaryAttentionHint: String, Codable, CaseIterable, Sendable {
     case person
     case object
     case soundSource = "sound_source"
@@ -8,7 +8,7 @@ public enum L05AttentionHint: String, Codable, CaseIterable, Sendable {
     case none
 }
 
-public enum L05Situation: String, Codable, CaseIterable, Sendable {
+public enum L1AuxiliarySituation: String, Codable, CaseIterable, Sendable {
     case socialBid = "social_bid"
     case objectPresentation = "object_presentation"
     case sceneTransition = "scene_transition"
@@ -16,7 +16,7 @@ public enum L05Situation: String, Codable, CaseIterable, Sendable {
     case uncertain
 }
 
-public enum L05WakeReason: String, Codable, CaseIterable, Sendable {
+public enum L1AuxiliaryWakeReason: String, Codable, CaseIterable, Sendable {
     case directSocialBid = "direct_social_bid"
     case presentedObject = "presented_object"
     case unexpectedChange = "unexpected_change"
@@ -24,9 +24,9 @@ public enum L05WakeReason: String, Codable, CaseIterable, Sendable {
     case none
 }
 
-/// Scalar context accompanying one in-memory L0.5 keyframe. It deliberately
+/// Scalar context accompanying one in-memory L1 auxiliary keyframe. It deliberately
 /// excludes pixels; the transport owns the ephemeral image payload.
-public struct L05FrameContext: Codable, Equatable, Sendable {
+public struct L1AuxiliaryFrameContext: Codable, Equatable, Sendable {
     public let captureNS: UInt64
     public let trigger: String
     public let surprise: Double
@@ -80,7 +80,7 @@ public struct L05FrameContext: Codable, Equatable, Sendable {
     }
 }
 
-public struct L05SemanticCue: Codable, Equatable, Sendable {
+public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
     public let requestID: UInt64
     public let captureNS: UInt64
     public let completedNS: UInt64
@@ -88,9 +88,9 @@ public struct L05SemanticCue: Codable, Equatable, Sendable {
     public let summary: String
     public let novelty: Double
     public let socialPresence: Double
-    public let attentionHint: L05AttentionHint
-    public let situation: L05Situation
-    public let wakeReason: L05WakeReason
+    public let attentionHint: L1AuxiliaryAttentionHint
+    public let situation: L1AuxiliarySituation
+    public let wakeReason: L1AuxiliaryWakeReason
     public let wakeScore: Double
     public let confidence: Double
     public let inferenceMS: Double
@@ -103,9 +103,9 @@ public struct L05SemanticCue: Codable, Equatable, Sendable {
         summary: String,
         novelty: Double,
         socialPresence: Double,
-        attentionHint: L05AttentionHint,
-        situation: L05Situation,
-        wakeReason: L05WakeReason,
+        attentionHint: L1AuxiliaryAttentionHint,
+        situation: L1AuxiliarySituation,
+        wakeReason: L1AuxiliaryWakeReason,
         wakeScore: Double,
         confidence: Double,
         inferenceMS: Double
@@ -126,20 +126,20 @@ public struct L05SemanticCue: Codable, Equatable, Sendable {
     }
 }
 
-/// Scalar proposal to wake a future conscious layer. It has no motor,
-/// dialogue, memory, or task-execution authority.
-public struct L05SemanticInterrupt: Codable, Equatable, Sendable {
+/// Scalar proposal from the local visual helper to the primary L1 stream. It
+/// has no independent motor, dialogue, memory, or task-execution authority.
+public struct L1AuxiliarySemanticInterrupt: Codable, Equatable, Sendable {
     public let requestID: UInt64
     public let captureNS: UInt64
     public let completedNS: UInt64
-    public let situation: L05Situation
-    public let reason: L05WakeReason
+    public let situation: L1AuxiliarySituation
+    public let reason: L1AuxiliaryWakeReason
     public let score: Double
     public let confidence: Double
     public let evidence: String
 }
 
-public struct L05SemanticInterruptGate: Sendable {
+public struct L1AuxiliarySemanticInterruptGate: Sendable {
     private let minimumWakeScore: Double
     private let minimumConfidence: Double
     private let repeatIntervalNS: UInt64
@@ -156,7 +156,7 @@ public struct L05SemanticInterruptGate: Sendable {
         repeatIntervalNS = repeatIntervalMilliseconds * 1_000_000
     }
 
-    public mutating func recommend(_ cue: L05SemanticCue) -> L05SemanticInterrupt? {
+    public mutating func recommend(_ cue: L1AuxiliarySemanticCue) -> L1AuxiliarySemanticInterrupt? {
         guard cue.wakeScore >= minimumWakeScore,
               cue.confidence >= minimumConfidence,
               isConsistent(situation: cue.situation, reason: cue.wakeReason) else {
@@ -171,7 +171,7 @@ public struct L05SemanticInterruptGate: Sendable {
         }
         lastSignature = signature
         lastEmittedNS = cue.completedNS
-        return L05SemanticInterrupt(
+        return L1AuxiliarySemanticInterrupt(
             requestID: cue.requestID,
             captureNS: cue.captureNS,
             completedNS: cue.completedNS,
@@ -183,7 +183,7 @@ public struct L05SemanticInterruptGate: Sendable {
         )
     }
 
-    private func isConsistent(situation: L05Situation, reason: L05WakeReason) -> Bool {
+    private func isConsistent(situation: L1AuxiliarySituation, reason: L1AuxiliaryWakeReason) -> Bool {
         switch (situation, reason) {
         case (.socialBid, .directSocialBid),
              (.objectPresentation, .presentedObject),
@@ -196,10 +196,10 @@ public struct L05SemanticInterruptGate: Sendable {
     }
 }
 
-/// Event-driven admission for a slow semantic side loop. A changed target or
+/// Event-driven admission for L1's local semantic helper. A changed target or
 /// high-surprise frame may run at most once per second; an unchanged scene gets
 /// a sparse five-second refresh. This gate never delays the L0 capture thread.
-public struct L05SemanticAdmissionGate: Sendable {
+public struct L1AuxiliarySemanticAdmissionGate: Sendable {
     private let eventIntervalNS: UInt64
     private let refreshIntervalNS: UInt64
     private let salienceThreshold: Double
@@ -216,7 +216,7 @@ public struct L05SemanticAdmissionGate: Sendable {
         self.salienceThreshold = min(max(salienceThreshold, 0), 1)
     }
 
-    public mutating func admit(_ context: L05FrameContext) -> Bool {
+    public mutating func admit(_ context: L1AuxiliaryFrameContext) -> Bool {
         guard let lastAcceptedNS else {
             accept(context)
             return true
@@ -232,7 +232,7 @@ public struct L05SemanticAdmissionGate: Sendable {
         return true
     }
 
-    private mutating func accept(_ context: L05FrameContext) {
+    private mutating func accept(_ context: L1AuxiliaryFrameContext) {
         lastAcceptedNS = context.captureNS
         lastTargetSignature = context.targetSignature
     }

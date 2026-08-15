@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Ollama vision models for SOMA L0.5 without changing the live service."""
+"""Compare Ollama vision models for SOMA L1 without changing the live service."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def main() -> int:
     encoded_image = base64.b64encode(buffer.getvalue()).decode("ascii")
 
     prompt = (
-        "You are SOMA's low-rate preconscious visual interrupt evaluator. "
+        "You are SOMA L1's bounded local visual helper evaluator. "
         "Describe only visible evidence. Do not identify people or infer private traits. "
         "Return only one JSON object with exactly these keys: summary, situation, wake_reason, "
         "wake_score, confidence. Do not use markdown. summary is at most 120 characters. "

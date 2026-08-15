@@ -14,6 +14,68 @@ private func rect(_ x: Double) -> NormalizedRect {
 
 let model = PredictiveWorldModel()
 let start: UInt64 = 1_000_000_000
+let wideHorizontalFOV = CameraFieldOfView.horizontalDegrees(
+    diagonalDegrees: 86,
+    aspectRatio: 16.0 / 9.0
+)
+let wideVerticalFOV = CameraFieldOfView.verticalDegrees(
+    diagonalDegrees: 86,
+    aspectRatio: 16.0 / 9.0
+)
+require(
+    abs((wideHorizontalFOV ?? 0) - 78.205) < 0.001
+        && abs((wideVerticalFOV ?? 0) - 49.137) < 0.001,
+    "generic diagonal FOV conversion is inconsistent"
+)
+require(
+    abs((OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 86) ?? 0) - 67.2) < 0.001
+        && abs((OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 78) ?? 0) - 59.966) < 0.001
+        && abs((OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 65) ?? 0) - 48.827) < 0.001
+        && OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 70) == nil,
+    "Tiny 2 Lite FOV mode was treated as a physical diagonal angle"
+)
+let validatedCameraGeometry = CameraGeometryCalibration(
+    deviceProfile: "obsbot_tiny_2_lite",
+    fovMode: 86,
+    imageWidth: 1920,
+    imageHeight: 1080,
+    projection: CameraProjectionModel(
+        focalXNormalized: 0.824,
+        focalYNormalized: 1.408,
+        principalXNormalized: 0.490,
+        principalYNormalized: 0.537
+    ),
+    capturedFrames: 29,
+    fittedPairs: 15,
+    fittedMatches: 837,
+    validationPairs: 5,
+    validationMatches: 270,
+    initialRMSEPixels: 23.44,
+    calibratedRMSEPixels: 5.96,
+    calibratedP90Pixels: 9.37,
+    generatedAt: "2026-08-15T00:00:00Z"
+)
+require(validatedCameraGeometry.isValid, "independently validated camera geometry was rejected")
+var calibratedSceneField = SceneField()
+let calibratedUpperCandidate = calibratedSceneField.ingest(
+    [VisualObservation(
+        rect: NormalizedRect(x: 0.45, y: 0.70, width: 0.10, height: 0.10),
+        confidence: 0.9,
+        source: .neuralDetector,
+        kind: .object,
+        label: "test"
+    )],
+    at: start,
+    cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+    horizontalFieldOfViewDegrees: 67.2,
+    cameraSettled: true,
+    poseProjection: .identity,
+    cameraProjectionModel: validatedCameraGeometry.projection
+).first
+require(
+    (calibratedUpperCandidate?.bearing?.elevationDegrees ?? -90) > 0,
+    "Vision bottom-left coordinates were not converted into calibrated camera pixels"
+)
 _ = model.ingestVisual(VisualObservation(rect: rect(0.30), confidence: 0.95, source: .neuralFaceDetector), at: start)
 _ = model.ingestVisual(VisualObservation(rect: rect(0.40), confidence: 0.95, source: .tracker), at: start + 100_000_000)
 let voiced = model.ingestVoice(active: true, confidence: 0.95, at: start + 120_000_000)
@@ -349,8 +411,8 @@ require(
     SmoothExplorationDynamics.waypointTimeoutSeconds(
         panErrorDegrees: 180,
         pitchErrorDegrees: 0
-    ) == 4.5,
-    "distant exploration waypoint kept the fixed timeout and could stop halfway"
+    ) == (3 / 0.45 + 1.5),
+    "distant exploration waypoint ignored realized-speed margin and could stop halfway"
 )
 require(
     SmoothExplorationDynamics.shouldBlendToNextWaypoint(
@@ -367,6 +429,19 @@ require(
     "exploration handed off before entering the look-ahead radius"
 )
 let routeOrigin = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
+let gimbalEnvelope = GimbalKinematicEnvelope.obsbotTiny2Lite
+require(
+    gimbalEnvelope.containsTrackingCenter(
+        GimbalRelativeBearing(azimuthDegrees: 110.8, elevationDegrees: 24.8)
+    )
+        && !gimbalEnvelope.containsTrackingCenter(
+            GimbalRelativeBearing(azimuthDegrees: 126.1, elevationDegrees: 0)
+        )
+        && !gimbalEnvelope.containsTrackingCenter(
+            GimbalRelativeBearing(azimuthDegrees: 0, elevationDegrees: -34.1)
+        ),
+    "tracking-envelope recovery did not preserve normal autonomous-boundary overshoot"
+)
 let boundaryCoverageGuide = GimbalVisibilityRoutePlanner.guide(
     to: GimbalRelativeBearing(azimuthDegrees: 108, elevationDegrees: 30),
     from: routeOrigin
@@ -378,6 +453,27 @@ require(
         && boundaryCoverageGuide!.elevationDegrees > 0
         && boundaryCoverageGuide!.elevationDegrees < 24,
     "coverage planner did not choose the nearest FOV-valid joint-space guide"
+)
+let panoramaCentredGuide = GimbalVisibilityRoutePlanner.guide(
+    to: GimbalRelativeBearing(azimuthDegrees: 72, elevationDegrees: 0),
+    from: routeOrigin,
+    observationPreference: .centered
+)
+require(
+    abs((panoramaCentredGuide?.azimuthDegrees ?? 0) - 72) < 0.000_001,
+    "panorama exploration left a reachable quality target at the FOV edge"
+)
+let edgeVisibleRoute = GimbalVisibilityRoutePlanner.plan(
+    to: GimbalRelativeBearing(azimuthDegrees: 140, elevationDegrees: 38),
+    from: routeOrigin
+)
+require(
+    edgeVisibleRoute != nil
+        && abs(edgeVisibleRoute!.observationPose.azimuthDegrees)
+            <= GimbalKinematicEnvelope.obsbotTiny2Lite.maximumAutonomousPanDegrees
+        && abs(edgeVisibleRoute!.observationPose.elevationDegrees)
+            <= GimbalKinematicEnvelope.obsbotTiny2Lite.maximumAutonomousPitchDegrees,
+    "edge-visible target produced an out-of-envelope camera centre"
 )
 require(
     GimbalVisibilityRoutePlanner.guide(
@@ -1366,6 +1462,273 @@ require(distinctSpatial.count == 2, "same label at a different bearing merged in
 let freshSpatialPose = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
 require(freshSpatialPose.isFresh(for: start + 50_000_000, maximumAgeNS: 50_000_000), "capture-aligned pose was rejected")
 require(!freshSpatialPose.isFresh(for: start + 50_000_001, maximumAgeNS: 50_000_000), "stale pose was accepted")
+let panoramaPose = CaptureAlignedPoseInterpolator.estimate(
+    samples: [
+        GimbalPose(pitchDegrees: -8, panDegrees: 10, monotonicNS: start),
+        GimbalPose(pitchDegrees: 4, panDegrees: 34, monotonicNS: start + 40_000_000),
+    ],
+    at: start + 10_000_000
+)
+require(panoramaPose?.mode == .bracketed, "panorama did not bracket its exposure attitude")
+require(abs((panoramaPose?.pose.panDegrees ?? 0) - 16) < 0.000_001, "panorama pan interpolation drifted")
+require(abs((panoramaPose?.pose.pitchDegrees ?? 0) + 5) < 0.000_001, "panorama pitch interpolation drifted")
+require(
+    abs((panoramaPose?.angularVelocityDegreesPerSecond ?? 0) - hypot(24, 12) / 0.04) < 0.000_001,
+    "panorama motion quality lost the bracketed angular velocity"
+)
+let exactMovingPanoramaPose = CaptureAlignedPoseInterpolator.estimate(
+    samples: [
+        GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+        GimbalPose(pitchDegrees: 0, panDegrees: 10, monotonicNS: start + 100_000_000),
+        GimbalPose(pitchDegrees: 0, panDegrees: 20, monotonicNS: start + 200_000_000),
+    ],
+    at: start + 100_000_000
+)
+require(
+    exactMovingPanoramaPose?.mode == .exact
+        && abs((exactMovingPanoramaPose?.angularVelocityDegreesPerSecond ?? 0) - 100) < 0.000_001,
+    "exact panorama pose hid local camera motion"
+)
+require(
+    CaptureAlignedPoseInterpolator.estimate(
+        samples: [freshSpatialPose],
+        at: start + 10_000_000
+    ) == nil,
+    "panorama guessed a pose without a future measured attitude"
+)
+let panoramaCenter = SphericalPanoramaProjection.sourceCoordinate(
+    for: GimbalRelativeBearing(azimuthDegrees: 0, elevationDegrees: 0),
+    cameraPose: freshSpatialPose,
+    horizontalFieldOfViewDegrees: 86
+)
+require(abs((panoramaCenter?.normalizedX ?? 0) - 0.5) < 0.000_001, "panorama horizontal centre projection drifted")
+require(abs((panoramaCenter?.normalizedY ?? 0) - 0.5) < 0.000_001, "panorama vertical centre projection drifted")
+let obsbotCanonicalCenter = SphericalPanoramaProjection.sourceCoordinate(
+    for: GimbalRelativeBearing(azimuthDegrees: -20, elevationDegrees: -5),
+    cameraPose: GimbalPose(pitchDegrees: 5, panDegrees: 20, monotonicNS: start),
+    horizontalFieldOfViewDegrees: 86,
+    poseProjection: .obsbotTiny2Lite
+)
+let obsbotCanonicalTop = SphericalPanoramaProjection.sourceCoordinate(
+    for: GimbalRelativeBearing(azimuthDegrees: -20, elevationDegrees: 5),
+    cameraPose: GimbalPose(pitchDegrees: 5, panDegrees: 20, monotonicNS: start),
+    horizontalFieldOfViewDegrees: 86,
+    poseProjection: .obsbotTiny2Lite
+)
+require(
+    abs((obsbotCanonicalCenter?.normalizedX ?? 0) - 0.5) < 0.000_001
+        && abs((obsbotCanonicalCenter?.normalizedY ?? 0) - 0.5) < 0.000_001
+        && (obsbotCanonicalTop?.normalizedY ?? 1) < 0.5,
+    "OBSBOT SDK attitude was not converted once into the upright canonical sphere"
+)
+let panoramaUpperLeft = SphericalPanoramaProjection.outputBearing(
+    column: 0,
+    row: 0,
+    width: 100,
+    height: 50,
+    minimumElevationDegrees: -45,
+    maximumElevationDegrees: 45
+)
+let panoramaLowerRight = SphericalPanoramaProjection.outputBearing(
+    column: 99,
+    row: 49,
+    width: 100,
+    height: 50,
+    minimumElevationDegrees: -45,
+    maximumElevationDegrees: 45
+)
+require(
+    panoramaUpperLeft.azimuthDegrees < panoramaLowerRight.azimuthDegrees
+        && panoramaUpperLeft.elevationDegrees > panoramaLowerRight.elevationDegrees,
+    "panorama raster did not preserve the standard world spherical orientation"
+)
+let coupledSphericalCoordinate = SphericalPanoramaProjection.sourceCoordinate(
+    for: GimbalRelativeBearing(azimuthDegrees: 30, elevationDegrees: 30),
+    cameraPose: GimbalPose(pitchDegrees: 30, panDegrees: 0, monotonicNS: start),
+    horizontalFieldOfViewDegrees: 86,
+    poseProjection: .identity
+)
+require(
+    coupledSphericalCoordinate != nil
+        && abs(coupledSphericalCoordinate!.normalizedY - 0.5) > 0.01,
+    "panorama projection treated yaw and pitch as independent planar offsets"
+)
+let fastPanoramaQuality = PanoramaObservationQuality.motionQuality(
+    angularVelocityDegreesPerSecond: 60
+)
+require(
+    PanoramaObservationQuality.admitsProjection(angularVelocityDegreesPerSecond: 2.0)
+        && !PanoramaObservationQuality.admitsProjection(angularVelocityDegreesPerSecond: 2.001)
+        && PanoramaObservationQuality.admitsCalibration(angularVelocityDegreesPerSecond: 0.75)
+        && !PanoramaObservationQuality.admitsCalibration(angularVelocityDegreesPerSecond: 0.751)
+        && PanoramaObservationQuality.continuousStripHalfWidthNormalized(
+            angularVelocityDegreesPerSecond: 20,
+            horizontalFieldOfViewDegrees: 62
+        ) != nil
+        && PanoramaObservationQuality.continuousStripHalfWidthNormalized(
+            angularVelocityDegreesPerSecond: 40.001,
+            horizontalFieldOfViewDegrees: 62
+        ) == nil
+        && fastPanoramaQuality < 0.15
+        && !PanoramaObservationQuality.shouldReplace(
+            existingQuality: 0.9,
+            incomingQuality: fastPanoramaQuality
+        )
+        && PanoramaObservationQuality.shouldReplace(
+            existingQuality: 0,
+            incomingQuality: fastPanoramaQuality
+        ),
+    "panorama quality selection allowed a fast pass to smear a stable tile"
+)
+require(
+    !PanoramaObservationQuality.shouldReplace(
+        existingQuality: 0.9,
+        incomingQuality: 0.9
+    )
+        && PanoramaObservationQuality.shouldReplace(
+            existingQuality: 0.9,
+            incomingQuality: 0.94
+        ),
+    "panorama overlap lacked best-observation replacement hysteresis"
+)
+let registrationWidth = 1_280
+let registrationTranslation = tan(10 * .pi / 180)
+    / (2 * tan(43 * .pi / 180)) * Double(registrationWidth)
+let refinedPanoramaPose = PanoramaPoseRefinement.refine(
+    previousPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+    currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 9, monotonicNS: start + 1),
+    alignmentTranslationX: registrationTranslation,
+    alignmentTranslationY: 0,
+    imageWidth: registrationWidth,
+    imageHeight: 720,
+    horizontalFieldOfViewDegrees: 86,
+    confidence: 1,
+    poseProjection: .identity
+)
+require(
+    refinedPanoramaPose.accepted
+        && refinedPanoramaPose.correctedPose.panDegrees > 9
+        && refinedPanoramaPose.correctedPose.panDegrees <= 10
+        && abs(refinedPanoramaPose.panCorrectionDegrees) <= 86 * 0.04,
+    "local image registration did not refine the capture-aligned panorama pose"
+)
+let rejectedPanoramaPose = PanoramaPoseRefinement.refine(
+    previousPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+    currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 9, monotonicNS: start + 1),
+    alignmentTranslationX: 1_200,
+    alignmentTranslationY: 0,
+    imageWidth: registrationWidth,
+    imageHeight: 720,
+    horizontalFieldOfViewDegrees: 86,
+    confidence: 1,
+    poseProjection: .identity
+)
+require(
+    !rejectedPanoramaPose.accepted
+        && abs(rejectedPanoramaPose.correctedPose.panDegrees - 9) < 0.000_001,
+    "out-of-model image motion overrode the measured gimbal pose"
+)
+let lowConfidencePanoramaPose = PanoramaPoseRefinement.refine(
+    previousPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+    currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 9, monotonicNS: start + 1),
+    alignmentTranslationX: registrationTranslation,
+    alignmentTranslationY: 0,
+    imageWidth: registrationWidth,
+    imageHeight: 720,
+    horizontalFieldOfViewDegrees: 86,
+    confidence: 0.4,
+    poseProjection: .identity
+)
+require(
+    !lowConfidencePanoramaPose.accepted
+        && abs(lowConfidencePanoramaPose.correctedPose.panDegrees - 9) < 0.000_001,
+    "low-confidence image registration overrode the measured gimbal pose"
+)
+let placeValues = Array(1...24).map(Float.init)
+let placeEmbedding = PanoramaPlaceEmbedding(
+    encoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+    revision: 2,
+    values: placeValues
+)
+let scaledPlaceEmbedding = PanoramaPlaceEmbedding(
+    encoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+    revision: 2,
+    values: placeValues.map { $0 * 3 }
+)
+require(
+    placeEmbedding != nil
+        && scaledPlaceEmbedding != nil
+        && abs((placeEmbedding!.similarity(to: scaledPlaceEmbedding!) ?? 0) - 1) < 0.000_001,
+    "compatible learned place embedding lost scale-invariant similarity"
+)
+var placeCoverageField = SpatialCoverageField()
+let firstPlace = placeCoverageField.observePlace(
+    embedding: placeEmbedding!,
+    pose: GimbalPose(pitchDegrees: 1, panDegrees: 3, monotonicNS: start),
+    observationQuality: 1,
+    at: start
+)
+let revisitedPlace = placeCoverageField.observePlace(
+    embedding: scaledPlaceEmbedding!,
+    pose: GimbalPose(pitchDegrees: 1, panDegrees: 3, monotonicNS: start + 1_000_000_000),
+    observationQuality: 1,
+    at: start + 1_000_000_000
+)
+let placeCells = placeCoverageField.snapshot(at: start + 1_000_000_000)
+let recognizedPlaceCells = placeCells.filter { $0.placeObservationCount > 0 }
+let unknownPlaceCell = placeCells.first { $0.placeObservationCount == 0 }
+require(
+    firstPlace?.isRevisit == false
+        && revisitedPlace?.isRevisit == true
+        && firstPlace?.bearing == revisitedPlace?.bearing
+        && revisitedPlace?.observationCount == 2
+        && (revisitedPlace?.familiarity ?? 0) > 0.999
+        && recognizedPlaceCells.count == 1
+        && recognizedPlaceCells.first?.placeObservationCount == 2,
+    "spherical place revisit created a duplicate or lost familiarity"
+)
+require(
+    (unknownPlaceCell?.expectedInformationGain ?? 0)
+        > (recognizedPlaceCells.first?.expectedInformationGain ?? 1),
+    "epistemic exploration did not prefer an unresolved spherical place"
+)
+let placeMemorySnapshot = placeCoverageField.placeMemorySnapshot(
+    generatedAtUnixMilliseconds: 123
+)
+var restoredPlaceCoverageField = SpatialCoverageField()
+require(
+    restoredPlaceCoverageField.restorePlaceMemory(
+        placeMemorySnapshot,
+        expectedEncoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+        expectedRevision: 2
+    ) == 1
+        && restoredPlaceCoverageField.snapshot(at: start + 2_000_000_000)
+            .filter { $0.placeObservationCount > 0 }
+            .first?.placeObservationCount == 2,
+    "compatible spherical place memory did not survive a session restore"
+)
+let incompatiblePlaceEmbedding = PanoramaPlaceEmbedding(
+    encoder: PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder,
+    revision: 3,
+    values: placeValues
+)!
+let incompatiblePlace = placeCoverageField.observePlace(
+    embedding: incompatiblePlaceEmbedding,
+    pose: GimbalPose(pitchDegrees: 1, panDegrees: 3, monotonicNS: start + 2_000_000_000),
+    observationQuality: 1,
+    at: start + 2_000_000_000
+)
+require(
+    incompatiblePlace?.isRevisit == false && incompatiblePlace?.observationCount == 1,
+    "an incompatible place encoder revision was merged as a revisit"
+)
+var panoramaAdmission = PanoramaBackgroundAdmission(humanHoldNS: 750_000_000)
+require(
+    !panoramaAdmission.admits(hasObservedHuman: true, at: start)
+        && !panoramaAdmission.admits(hasObservedHuman: false, at: start + 749_999_999)
+        && panoramaAdmission.admits(hasObservedHuman: false, at: start + 750_000_000),
+    "panorama background admission leaked a human through a detector gap"
+)
 var coverageField = SpatialCoverageField()
 coverageField.observe(pose: freshSpatialPose, horizontalFieldOfViewDegrees: 86, at: start)
 let unexploredDirection = coverageField.nextDirection(from: freshSpatialPose, at: start + 100_000_000)
@@ -1374,7 +1737,56 @@ require(
     abs(unexploredDirection!.bearing.azimuthDegrees) > 43,
     "coverage field selected a direction already inside the current view"
 )
-require(abs(unexploredDirection!.bearing.elevationDegrees) <= 30, "coverage field exceeded its elevation comfort band")
+var panoramaCoverageField = SpatialCoverageField()
+for pitch in [-24.0, 24.0] {
+    for pan in [-110.0, 0.0, 110.0] {
+        panoramaCoverageField.observe(
+            pose: GimbalPose(pitchDegrees: pitch, panDegrees: pan, monotonicNS: start),
+            horizontalFieldOfViewDegrees: 86,
+            at: start
+        )
+    }
+}
+panoramaCoverageField.observePanorama(
+    pose: freshSpatialPose,
+    horizontalFieldOfViewDegrees: 86,
+    frameQuality: 1,
+    dynamicVisionRects: [],
+    poseProjection: .identity,
+    at: start
+)
+let panoramaDeficitDirection = panoramaCoverageField.nextDirection(
+    from: freshSpatialPose,
+    at: start + 1_000_000
+)
+require(
+    panoramaDeficitDirection != nil && panoramaDeficitDirection!.panoramaQuality < 0.1,
+    "coverage exploration ignored a poor spherical panorama tile"
+)
+var calibratedCoverageField = SpatialCoverageField()
+calibratedCoverageField.observe(
+    pose: freshSpatialPose,
+    horizontalFieldOfViewDegrees: 86,
+    poseProjection: .obsbotTiny2Lite,
+    cameraProjectionModel: CameraProjectionModel(
+        focalXNormalized: 0.824,
+        focalYNormalized: 1.408,
+        principalXNormalized: 0.60,
+        principalYNormalized: 0.50
+    ),
+    at: start
+)
+let calibratedCoverageCells = calibratedCoverageField.snapshot(at: start)
+require(
+    calibratedCoverageCells.first {
+        $0.bearing.azimuthDegrees == 36 && $0.bearing.elevationDegrees == 0
+    }?.observationCount == 1
+        && calibratedCoverageCells.first {
+            $0.bearing.azimuthDegrees == -36 && $0.bearing.elevationDegrees == 0
+        }?.observationCount == 0,
+    "coverage atlas ignored calibrated principal point or SDK motor-axis signs"
+)
+require(abs(unexploredDirection!.bearing.elevationDegrees) <= 39, "coverage atlas exceeded its reachable vertical field")
 let sampledCoverageDirection = coverageField.sampleNextDirection(
     from: freshSpatialPose,
     at: start + 100_000_000,
@@ -1382,7 +1794,7 @@ let sampledCoverageDirection = coverageField.sampleNextDirection(
     uniform: 0
 )
 require(sampledCoverageDirection != nil, "coverage posterior sampling did not draw a direction")
-require(abs(sampledCoverageDirection!.bearing.elevationDegrees) == 30, "coverage posterior omitted its vertical exploration layers")
+require(abs(sampledCoverageDirection!.bearing.elevationDegrees) == 39, "coverage posterior omitted its edge-visible vertical layers")
 let sampledCoverageProbability = sampledCoverageDirection!.probability
 coverageField.recordUnproductiveVisit(to: sampledCoverageDirection!)
 require(
@@ -1694,13 +2106,13 @@ require(arbiter.confirmManualStop() && arbiter.owner == .manual, "fault could no
 require(arbiter.request(.external), "manual owner could not enter external control")
 require(arbiter.confirmManualStop() && arbiter.owner == .manual, "external control could not return to manual")
 
-func l05Context(
+func l1AuxiliaryContext(
     at monotonicNS: UInt64,
     label: String? = nil,
     surprise: Double = 0,
     informationGain: Double = 0
-) -> L05FrameContext {
-    L05FrameContext(
+) -> L1AuxiliaryFrameContext {
+    L1AuxiliaryFrameContext(
         captureNS: monotonicNS,
         trigger: "test",
         surprise: surprise,
@@ -1713,22 +2125,22 @@ func l05Context(
         targetStatus: label == nil ? .none : .tracked
     )
 }
-let l05Start: UInt64 = 30_000_000_000
-var l05Admission = L05SemanticAdmissionGate()
-require(l05Admission.admit(l05Context(at: l05Start)), "L0.5 rejected its first keyframe")
-require(!l05Admission.admit(l05Context(at: l05Start + 999_000_000, label: "face")), "L0.5 exceeded its one-hertz event bound")
-require(l05Admission.admit(l05Context(at: l05Start + 1_000_000_000, label: "face")), "L0.5 did not admit a changed target at one second")
-require(!l05Admission.admit(l05Context(at: l05Start + 5_999_000_000, label: "face")), "L0.5 refreshed an unchanged scene before five seconds")
-require(l05Admission.admit(l05Context(at: l05Start + 6_000_000_000, label: "face")), "L0.5 did not refresh an unchanged scene at five seconds")
-require(l05Admission.admit(l05Context(at: l05Start + 7_000_000_000, label: "face", surprise: 0.7)), "L0.5 did not admit a salient event at one second")
-func l05Cue(
+let l1AuxiliaryStart: UInt64 = 30_000_000_000
+var l1AuxiliaryAdmission = L1AuxiliarySemanticAdmissionGate()
+require(l1AuxiliaryAdmission.admit(l1AuxiliaryContext(at: l1AuxiliaryStart)), "L1 auxiliary rejected its first keyframe")
+require(!l1AuxiliaryAdmission.admit(l1AuxiliaryContext(at: l1AuxiliaryStart + 999_000_000, label: "face")), "L1 auxiliary exceeded its one-hertz event bound")
+require(l1AuxiliaryAdmission.admit(l1AuxiliaryContext(at: l1AuxiliaryStart + 1_000_000_000, label: "face")), "L1 auxiliary did not admit a changed target at one second")
+require(!l1AuxiliaryAdmission.admit(l1AuxiliaryContext(at: l1AuxiliaryStart + 5_999_000_000, label: "face")), "L1 auxiliary refreshed an unchanged scene before five seconds")
+require(l1AuxiliaryAdmission.admit(l1AuxiliaryContext(at: l1AuxiliaryStart + 6_000_000_000, label: "face")), "L1 auxiliary did not refresh an unchanged scene at five seconds")
+require(l1AuxiliaryAdmission.admit(l1AuxiliaryContext(at: l1AuxiliaryStart + 7_000_000_000, label: "face", surprise: 0.7)), "L1 auxiliary did not admit a salient event at one second")
+func l1AuxiliaryCue(
     at monotonicNS: UInt64,
-    situation: L05Situation,
-    reason: L05WakeReason,
+    situation: L1AuxiliarySituation,
+    reason: L1AuxiliaryWakeReason,
     score: Double = 0.9,
     confidence: Double = 0.9
-) -> L05SemanticCue {
-    L05SemanticCue(
+) -> L1AuxiliarySemanticCue {
+    L1AuxiliarySemanticCue(
         requestID: monotonicNS,
         captureNS: monotonicNS,
         completedNS: monotonicNS,
@@ -1744,25 +2156,523 @@ func l05Cue(
         inferenceMS: 100
     )
 }
-var l05InterruptGate = L05SemanticInterruptGate()
+var l1AuxiliaryInterruptGate = L1AuxiliarySemanticInterruptGate()
 require(
-    l05InterruptGate.recommend(l05Cue(at: l05Start, situation: .ambient, reason: .none)) == nil,
-    "ambient L0.5 evidence emitted a conscious interrupt"
+    l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart, situation: .ambient, reason: .none)) == nil,
+    "ambient L1 auxiliary evidence emitted a conscious wake proposal"
 )
 require(
-    l05InterruptGate.recommend(l05Cue(at: l05Start, situation: .socialBid, reason: .presentedObject)) == nil,
-    "inconsistent L0.5 situation and wake reason emitted an interrupt"
+    l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart, situation: .socialBid, reason: .presentedObject)) == nil,
+    "inconsistent L1 auxiliary situation and wake reason emitted a proposal"
 )
 require(
-    l05InterruptGate.recommend(l05Cue(at: l05Start, situation: .socialBid, reason: .directSocialBid)) != nil,
-    "credible direct social bid did not emit an L0.5 interrupt recommendation"
+    l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart, situation: .socialBid, reason: .directSocialBid)) != nil,
+    "credible direct social bid did not emit an L1 auxiliary wake proposal"
 )
 require(
-    l05InterruptGate.recommend(l05Cue(at: l05Start + 4_999_000_000, situation: .socialBid, reason: .directSocialBid)) == nil,
-    "L0.5 repeated the same interrupt inside its debounce interval"
+    l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart + 4_999_000_000, situation: .socialBid, reason: .directSocialBid)) == nil,
+    "L1 auxiliary repeated the same proposal inside its debounce interval"
 )
 require(
-    l05InterruptGate.recommend(l05Cue(at: l05Start + 5_000_000_000, situation: .socialBid, reason: .directSocialBid)) != nil,
-    "L0.5 did not re-admit a persistent interrupt after its debounce interval"
+    l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart + 5_000_000_000, situation: .socialBid, reason: .directSocialBid)) != nil,
+    "L1 auxiliary did not re-admit a persistent proposal after its debounce interval"
 )
+
+let importanceModel = EventImportanceModel()
+func importanceDecision(_ id: String, _ features: EventImportanceFeatures) -> EventImportanceDecision {
+    importanceModel.evaluate(
+        EventImportanceInput(
+            eventID: id,
+            monotonicNS: l1AuxiliaryStart,
+            evidenceIDs: ["core-check:\(id)"],
+            features: features
+        )
+    )
+}
+let nonHumanNovelty = importanceDecision(
+    "nonhuman-novelty",
+    EventImportanceFeatures(
+        novelty: 1,
+        predictionError: 0.9,
+        informationGain: 0.9,
+        persistence: 0.8
+    )
+)
+require(nonHumanNovelty.recommendedRoute == .wakeL1, "non-human novelty did not route to L1")
+require(nonHumanNovelty.distribution.requestHumanInteraction == 0, "non-human novelty could open human interaction")
+require(abs(nonHumanNovelty.distribution.sum - 1) < 1e-12, "event route probabilities do not normalize")
+let directContact = importanceDecision(
+    "direct-contact",
+    EventImportanceFeatures(
+        explicitContact: 0.95,
+        socialSalience: 0.9,
+        interruptionCost: 1,
+        recentWakePressure: 1,
+        humanPresence: 0.95
+    )
+)
+require(directContact.recommendedRoute == .requestHumanInteraction, "explicit human contact did not open interaction")
+require(directContact.dispatch.openHumanInteraction, "explicit human contact did not dispatch interaction immediately")
+require(directContact.dispatch.wakeL1Context, "explicit human contact did not build L1 context in parallel")
+require(directContact.dispatch.bypassesL1Admission, "explicit human contact still waited for L1 admission")
+require(directContact.policyReason == .explicitHumanContact, "direct contact lost its transition reason")
+do {
+    let interactionWake = try HumanInteractionWakeRequest(
+        decision: directContact,
+        audioPreRollMilliseconds: 900
+    )
+    require(interactionWake.bypassesL1Admission, "interaction wake no longer bypasses L1 admission")
+    let codexTurn = try CodexInteractionTurn(
+        interactionID: "core-check-interaction",
+        turnID: "core-check-turn",
+        transcript: "hello",
+        speechStartedAtNS: l1AuxiliaryStart,
+        transcriptFinalizedAtNS: l1AuxiliaryStart + 1,
+        evidenceIDs: interactionWake.evidenceIDs,
+        contextPacketReference: "context:core-check"
+    )
+    let encodedTurn = try JSONEncoder().encode(codexTurn)
+    require(
+        !String(decoding: encodedTurn, as: UTF8.self).lowercased().contains("audio"),
+        "Codex interaction contract admitted raw audio"
+    )
+    let codexContext = try CodexInteractionContext(
+        situationSummary: "A person is addressing the camera.",
+        identityReference: "person:unknown",
+        activeTaskSummaries: ["Respond to the current user turn."],
+        memorySummaries: ["No identity claim is authorized."]
+    )
+    let codexRequest = try CodexAccountTurnRequest(turn: codexTurn, context: codexContext)
+    let codexPrompt = CodexAccountPromptBuilder.prompt(for: codexRequest)
+    require(codexPrompt.contains("hello"), "Codex account prompt dropped the transcript")
+    let codexFixture = Data("""
+    {"type":"thread.started","thread_id":"core-thread"}
+    {"type":"item.completed","item":{"type":"agent_message","text":"hello back"}}
+    {"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":0}}
+    """.utf8)
+    let codexResult = try CodexCLIJSONLParser.parse(codexFixture)
+    require(codexResult.threadID == "core-thread", "Codex account parser lost the thread ID")
+    require(codexResult.assistantText == "hello back", "Codex account parser lost the reply")
+} catch {
+    require(false, "explicit contact interaction handoff failed: \(error)")
+}
+let localSafety = importanceDecision(
+    "local-safety",
+    EventImportanceFeatures(
+        explicitContact: 1,
+        urgency: 1,
+        safetyRisk: 1,
+        humanPresence: 1
+    )
+)
+require(localSafety.recommendedRoute == .stayL0, "immediate protection escaped L0")
+require(localSafety.distribution.requestHumanInteraction == 0, "local safety could open human interaction")
+let importanceLabels = [
+    LabelledEventImportanceExample(
+        id: "quiet",
+        partition: .calibration,
+        expectedRoute: .stayL0,
+        features: EventImportanceFeatures(interruptionCost: 0.8)
+    ),
+    LabelledEventImportanceExample(
+        id: "novel",
+        partition: .calibration,
+        expectedRoute: .wakeL1,
+        features: EventImportanceFeatures(novelty: 1, predictionError: 0.9, informationGain: 0.9)
+    ),
+    LabelledEventImportanceExample(
+        id: "contact",
+        partition: .calibration,
+        expectedRoute: .requestHumanInteraction,
+        features: EventImportanceFeatures(explicitContact: 1, socialSalience: 1, humanPresence: 1)
+    ),
+]
+do {
+    let importanceMetrics = try EventImportanceEvaluator.evaluate(
+        model: importanceModel,
+        examples: importanceLabels
+    )
+    require(importanceMetrics.unauthorizedHumanInteractionRequests == 0, "event evaluation admitted an unauthorized interaction")
+    let fittedTemperature = try EventImportanceEvaluator.calibratedTemperature(
+        parameters: .bootstrap,
+        examples: importanceLabels
+    )
+    let calibratedParameters = try EventImportanceParameters.bootstrap.withTemperature(fittedTemperature)
+    let calibratedMetrics = try EventImportanceEvaluator.evaluate(
+        model: EventImportanceModel(parameters: calibratedParameters),
+        examples: importanceLabels
+    )
+    require(
+        calibratedMetrics.negativeLogLikelihood <= importanceMetrics.negativeLogLikelihood + 1e-12,
+        "temperature calibration increased calibration loss"
+    )
+} catch {
+    require(false, "event importance evaluation failed: \(error)")
+}
+
+do {
+    for layer in CognitiveControlLayer.allCases {
+        let embodimentRequest = CognitiveEmbodimentRequest(
+            requestID: "core-check:\(layer.rawValue)",
+            layer: layer,
+            reason: "bounded semantic tracking goal",
+            evidenceIDs: ["core-check:scene"],
+            lease: EmbodimentLease(
+                ownerID: "owner:\(layer.rawValue)",
+                priority: 50,
+                issuedAtNS: l1AuxiliaryStart,
+                durationMilliseconds: 5_000,
+                cancellationToken: "cancel:\(layer.rawValue)"
+            ),
+            operation: .trackTarget(
+                TrackTargetGoal(
+                    targetReference: "target:core-check",
+                    reacquireIfOccluded: true,
+                    motionStyle: .smooth
+                )
+            )
+        )
+        try embodimentRequest.validate()
+    }
+    let attentionPolicy = AttentionPolicyGoal(
+        targets: [
+            TargetAttentionDirective(
+                targetReference: "target:person",
+                selectionLogPrior: 2,
+                trackingCommitment: 1
+            ),
+            TargetAttentionDirective(
+                targetReference: "target:object",
+                selectionLogPrior: -1,
+                trackingCommitment: 0.2
+            ),
+        ]
+    )
+    require(
+        abs(attentionPolicy.normalizedTargetPriors.values.reduce(0, +) - 1) < 1e-12,
+        "cognitive target priors do not normalize"
+    )
+    let explorationPolicy = ExplorationPolicyGoal(
+        mode: .directedSurvey,
+        preferredDirections: [
+            DirectionalPreference(
+                bearing: GimbalRelativeBearing(azimuthDegrees: -45, elevationDegrees: 0),
+                concentration: 4,
+                weight: 3
+            ),
+            DirectionalPreference(
+                bearing: GimbalRelativeBearing(azimuthDegrees: 45, elevationDegrees: 10),
+                concentration: 2,
+                weight: 1
+            ),
+        ]
+    )
+    require(
+        explorationPolicy.normalizedDirectionWeights == [0.75, 0.25],
+        "cognitive exploration directions do not normalize"
+    )
+    let motorNow: UInt64 = 70_000_000_000
+    let motorArbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+    var motorCoordinator = EmbodimentMotorCoordinator()
+    let motorRequest = CognitiveEmbodimentRequest(
+        requestID: "core-check:motor-orient",
+        layer: .l1,
+        reason: "verify leased L0 motor handoff",
+        evidenceIDs: ["core-check:spatial-goal"],
+        lease: EmbodimentLease(
+            ownerID: "owner:l1-motor",
+            priority: 60,
+            issuedAtNS: motorNow,
+            durationMilliseconds: 100,
+            cancellationToken: "cancel:core-check-motor"
+        ),
+        operation: .orient(OrientGoal(
+            bearing: GimbalRelativeBearing(azimuthDegrees: 18, elevationDegrees: 3),
+            motionStyle: .smooth
+        ))
+    )
+    let motorDecision = motorArbiter.submit(motorRequest, at: motorNow)
+    require(
+        motorDecision.snapshot.physicalActuationEnabled
+            && motorDecision.snapshot.mode == "active",
+        "physical embodiment arbiter did not expose its explicit opt-in state"
+    )
+    if case let .orient(requestID, bearing, _, _, _, _) = motorCoordinator.apply(
+        request: motorRequest,
+        decision: motorDecision,
+        at: motorNow
+    ) {
+        require(
+            requestID == motorRequest.requestID && bearing.azimuthDegrees == 18,
+            "accepted orientation changed before reaching L0"
+        )
+    } else {
+        require(false, "accepted orientation did not become an L0 motor intent")
+    }
+    require(
+        motorCoordinator.expire(at: motorNow + 99_000_000) == nil,
+        "cognitive motor lease expired early"
+    )
+    require(
+        motorCoordinator.expire(at: motorNow + 100_000_000)
+            == .release(requestID: motorRequest.requestID, reason: "lease_expired"),
+        "cognitive motor lease did not release at its exact deadline"
+    )
+    let captureRequest = CognitiveEmbodimentRequest(
+        requestID: "core-check:capture-view",
+        layer: .l1,
+        reason: "capture one settled contextual view",
+        evidenceIDs: ["core-check:spatial-goal"],
+        lease: EmbodimentLease(
+            ownerID: "owner:l1-motor",
+            priority: 60,
+            issuedAtNS: motorNow + 200_000_000,
+            durationMilliseconds: 5_000,
+            cancellationToken: "cancel:core-check-capture"
+        ),
+        operation: .captureView(CaptureViewGoal(
+            bearing: GimbalRelativeBearing(azimuthDegrees: -20, elevationDegrees: 5),
+            fieldOfViewDegrees: 45
+        ))
+    )
+    let captureDecision = motorArbiter.submit(captureRequest, at: motorNow + 200_000_000)
+    if case let .capture(requestID, _, _, bearing, fieldOfView, _) = motorCoordinator.apply(
+        request: captureRequest,
+        decision: captureDecision,
+        at: motorNow + 200_000_000
+    ) {
+        require(
+            requestID == captureRequest.requestID
+                && bearing.azimuthDegrees == -20
+                && fieldOfView == 45,
+            "capture view lost its requested spatial framing"
+        )
+    } else {
+        require(false, "capture view did not become a distinct L0 sensory-motor intent")
+    }
+    require(
+        motorArbiter.completeMotorGoal(
+            requestID: captureRequest.requestID,
+            at: motorNow + 200_000_001
+        ),
+        "one-shot capture did not complete its arbiter goal"
+    )
+    require(
+        motorCoordinator.complete(requestID: captureRequest.requestID)
+            == .release(requestID: captureRequest.requestID, reason: "capture_completed"),
+        "one-shot capture did not release L0 motor authority"
+    )
+} catch {
+    require(false, "cognitive embodiment contract failed: \(error)")
+}
+
+let rotationDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("soma-core-rotation-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: rotationDirectory) }
+let rotationBaseURL = rotationDirectory.appendingPathComponent("detail.jsonl")
+let rotationPolicy = JSONLRotationPolicy(maximumBytes: 2, retainedFiles: 2)
+do {
+    let firstStore = try RotatingJSONLStore(baseURL: rotationBaseURL, policy: rotationPolicy)
+    for value in ["a\n", "b\n", "c\n", "d\n"] {
+        try firstStore.write(Data(value.utf8))
+    }
+    try firstStore.close()
+    var segments = try RotatingJSONLStore.segmentURLs(for: rotationBaseURL)
+    require(segments.count == 2, "rotating JSONL store did not cap segment count")
+    let firstRetained = try String(contentsOf: segments[0], encoding: .utf8)
+    let secondRetained = try String(contentsOf: segments[1], encoding: .utf8)
+    require(firstRetained == "c\n", "rotating JSONL store retained an old segment")
+    require(secondRetained == "d\n", "rotating JSONL store lost the newest segment")
+
+    let restartedStore = try RotatingJSONLStore(baseURL: rotationBaseURL, policy: rotationPolicy)
+    try restartedStore.write(Data("e\n".utf8))
+    try restartedStore.close()
+    segments = try RotatingJSONLStore.segmentURLs(for: rotationBaseURL)
+    require(segments.count == 2, "rotating JSONL store exceeded retention after restart")
+    let restartedFirst = try String(contentsOf: segments[0], encoding: .utf8)
+    let restartedSecond = try String(contentsOf: segments[1], encoding: .utf8)
+    require(restartedFirst == "d\n", "restart retention discarded the wrong segment")
+    require(restartedSecond == "e\n", "restart retention did not create a new segment")
+} catch {
+    require(false, "rotating JSONL store failed: \(error.localizedDescription)")
+}
+
+let memoryDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("soma-core-memory-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: memoryDirectory) }
+do {
+    let memoryKey = try CognitiveMemoryEncryptionKey(
+        rawRepresentation: Data((0 ..< 32).map { UInt8($0) })
+    )
+    let memoryStart = Date(timeIntervalSince1970: 10_000)
+    let personID = UUID()
+    let memoryStore = try CognitiveMemoryStore(directoryURL: memoryDirectory, encryptionKey: memoryKey)
+    let inserted = try await memoryStore.insert(
+        CognitiveMemoryDraft(
+            tier: .mediumTerm,
+            summary: "A known collaborator prefers concise status summaries",
+            payload: .personFact(
+                PersonFactMemory(personEntityID: personID, key: "status_style", value: "concise")
+            ),
+            confidence: 1,
+            provenance: [
+                MemoryProvenance(
+                    source: .explicitUser,
+                    sourceID: "core-check:user",
+                    observedAt: memoryStart,
+                    evidenceIDs: ["core-check:turn"]
+                )
+            ],
+            sensitivity: .personal,
+            disclosure: .remoteSummaryAllowed,
+            expiresAt: memoryStart.addingTimeInterval(30 * 24 * 60 * 60)
+        ),
+        at: memoryStart
+    )
+    let journalURL = memoryDirectory.appendingPathComponent(CognitiveMemoryStore.journalFilename)
+    let encryptedJournal = try Data(contentsOf: journalURL)
+    let memoryDirectoryAttributes = try FileManager.default.attributesOfItem(atPath: memoryDirectory.path)
+    let memoryJournalAttributes = try FileManager.default.attributesOfItem(atPath: journalURL.path)
+    let memoryDirectoryPermissions = (memoryDirectoryAttributes[.posixPermissions] as? NSNumber)?.intValue
+    let memoryJournalPermissions = (memoryJournalAttributes[.posixPermissions] as? NSNumber)?.intValue
+    require(memoryDirectoryPermissions == 0o700, "cognitive memory directory permissions are not private")
+    require(memoryJournalPermissions == 0o600, "cognitive memory journal permissions are not private")
+    require(
+        !String(decoding: encryptedJournal, as: UTF8.self).contains(inserted.summary),
+        "cognitive memory journal persisted plaintext"
+    )
+    let correctedAt = memoryStart.addingTimeInterval(60)
+    let corrected = try await memoryStore.correct(
+        id: inserted.id,
+        replacement: CognitiveMemoryDraft(
+            tier: .mediumTerm,
+            summary: "The collaborator explicitly confirmed concise status summaries",
+            payload: inserted.payload,
+            confidence: 1,
+            provenance: [
+                MemoryProvenance(
+                    source: .explicitUser,
+                    sourceID: "core-check:user",
+                    observedAt: correctedAt,
+                    evidenceIDs: ["core-check:confirmation"]
+                )
+            ],
+            sensitivity: .personal,
+            disclosure: .remoteSummaryAllowed,
+            expiresAt: correctedAt.addingTimeInterval(30 * 24 * 60 * 60)
+        ),
+        reason: "explicit correction",
+        at: correctedAt
+    )
+    require(corrected.revision == 2, "cognitive memory correction did not advance its revision")
+    let promotedAt = memoryStart.addingTimeInterval(120)
+    let promoted = try await memoryStore.promote(
+        id: inserted.id,
+        to: .longTerm,
+        expiresAt: nil,
+        provenance: [
+            MemoryProvenance(
+                source: .consolidation,
+                sourceID: "core-check:consolidation",
+                observedAt: promotedAt,
+                evidenceIDs: [inserted.id.uuidString]
+            )
+        ],
+        reason: "explicit fact consolidated",
+        at: promotedAt
+    )
+    require(promoted.revision == 3, "cognitive memory promotion did not preserve revision history")
+    let memoryHistory = try await memoryStore.history(id: inserted.id)
+    require(memoryHistory.map(\.revision) == [1, 2, 3], "cognitive memory revision history is incomplete")
+    let projections = try await memoryStore.remoteProjection(
+        .init(relatedTo: [personID]),
+        at: promotedAt
+    )
+    require(projections.map(\.id) == [inserted.id], "memory projection lost an allowed summary")
+    let expiring = try await memoryStore.insert(
+        CognitiveMemoryDraft(
+            tier: .shortTerm,
+            summary: "Transient presence",
+            payload: .situation(SituationMemory(state: "person_present")),
+            confidence: 0.8,
+            provenance: [
+                MemoryProvenance(
+                    source: .sensorSummary,
+                    sourceID: "core-check:l0",
+                    observedAt: promotedAt,
+                    evidenceIDs: ["core-check:presence"]
+                )
+            ],
+            expiresAt: promotedAt.addingTimeInterval(1)
+        ),
+        at: promotedAt
+    )
+    let expiredIDs = try await memoryStore.purgeExpired(at: promotedAt.addingTimeInterval(2))
+    require(expiredIDs == [expiring.id], "cognitive memory retention did not purge the expired record")
+    do {
+        _ = try CognitiveMemoryStore(directoryURL: memoryDirectory, encryptionKey: memoryKey)
+        require(false, "cognitive memory admitted a second writer")
+    } catch let error as CognitiveMemoryError {
+        require(error == .storeLocked, "cognitive memory returned the wrong second-writer error")
+    }
+    do {
+        _ = try await memoryStore.insert(
+            CognitiveMemoryDraft(
+                tier: .longTerm,
+                summary: "Ungrounded durable model inference",
+                payload: .situation(SituationMemory(state: "unconfirmed")),
+                confidence: 0.7,
+                provenance: [
+                    MemoryProvenance(
+                        source: .l1Inference,
+                        sourceID: "core-check:l1",
+                        observedAt: memoryStart,
+                        evidenceIDs: ["core-check:frame"]
+                    )
+                ]
+            ),
+            at: memoryStart
+        )
+        require(false, "direct L1 inference entered long-term memory")
+    } catch let error as CognitiveMemoryError {
+        if case .validationFailed = error {
+            // Expected: long-term writes require an authorized durable source.
+        } else {
+            require(false, "cognitive memory returned the wrong durable-write error")
+        }
+    }
+    try await memoryStore.close()
+
+    let wrongMemoryKey = try CognitiveMemoryEncryptionKey(
+        rawRepresentation: Data(repeating: 0xFF, count: 32)
+    )
+    do {
+        _ = try CognitiveMemoryStore(directoryURL: memoryDirectory, encryptionKey: wrongMemoryKey)
+        require(false, "cognitive memory accepted the wrong encryption key")
+    } catch let error as CognitiveMemoryError {
+        if case .corruptJournal = error {
+            // Expected: AES-GCM authentication rejects the journal.
+        } else {
+            require(false, "cognitive memory returned the wrong authentication error")
+        }
+    }
+
+    let reopenedMemory = try CognitiveMemoryStore(directoryURL: memoryDirectory, encryptionKey: memoryKey)
+    let restoredMemory = try await reopenedMemory.record(id: inserted.id, at: promotedAt)
+    require(
+        restoredMemory == promoted,
+        "cognitive memory did not survive encrypted journal replay"
+    )
+    try await reopenedMemory.delete(id: inserted.id, reason: "core check deletion", at: promotedAt)
+    let deletedMemory = try await reopenedMemory.record(id: inserted.id, at: promotedAt)
+    require(
+        deletedMemory == nil,
+        "deleted cognitive memory remained queryable"
+    )
+    try await reopenedMemory.close()
+    let deletedJournal = try Data(contentsOf: journalURL)
+    require(deletedJournal.isEmpty, "deletion retained the record in the active journal")
+} catch {
+    require(false, "cognitive memory store failed: \(error)")
+}
 print("soma-core-check: PASS")

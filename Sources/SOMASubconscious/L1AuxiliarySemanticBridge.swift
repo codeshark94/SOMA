@@ -4,7 +4,7 @@ import CoreVideo
 import Foundation
 import SOMACore
 
-private final class L05PixelBuffer: @unchecked Sendable {
+private final class L1AuxiliaryPixelBuffer: @unchecked Sendable {
     let value: CVPixelBuffer
 
     init(_ value: CVPixelBuffer) {
@@ -12,22 +12,22 @@ private final class L05PixelBuffer: @unchecked Sendable {
     }
 }
 
-private final class L05WeakBridge: @unchecked Sendable {
-    weak var value: L05SemanticBridge?
+private final class L1AuxiliaryWeakBridge: @unchecked Sendable {
+    weak var value: L1AuxiliarySemanticBridge?
 
-    init(_ value: L05SemanticBridge) {
+    init(_ value: L1AuxiliarySemanticBridge) {
         self.value = value
     }
 }
 
-private struct L05WorkerRequest: Encodable {
+private struct L1AuxiliaryWorkerRequest: Encodable {
     let type = "infer"
     let requestID: UInt64
-    let context: L05FrameContext
+    let context: L1AuxiliaryFrameContext
     let imageJPEGBase64: String
 }
 
-private struct L05WorkerEnvelope: Decodable {
+private struct L1AuxiliaryWorkerEnvelope: Decodable {
     let type: String
     let state: String?
     let message: String?
@@ -39,34 +39,34 @@ private struct L05WorkerEnvelope: Decodable {
     let summary: String?
     let novelty: Double?
     let socialPresence: Double?
-    let attentionHint: L05AttentionHint?
-    let situation: L05Situation?
-    let wakeReason: L05WakeReason?
+    let attentionHint: L1AuxiliaryAttentionHint?
+    let situation: L1AuxiliarySituation?
+    let wakeReason: L1AuxiliaryWakeReason?
     let wakeScore: Double?
     let confidence: Double?
     let inferenceMS: Double?
 }
 
-/// Optional local-only L0.5 transport. Frames are JPEG-encoded on a utility
-/// queue, sent to one persistent MLX worker, and never written to disk. At most
-/// one inference and one replaceable pending frame exist at a time.
-final class L05SemanticBridge: @unchecked Sendable {
+/// Local visual helper owned by L1. Frames are JPEG-encoded on a utility queue,
+/// sent to one persistent MLX worker, and never written to disk. It can propose
+/// L1 context updates but is not a separate cognitive or motor authority.
+final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private struct Pending: Sendable {
-        let pixelBuffer: L05PixelBuffer
-        let context: L05FrameContext
+        let pixelBuffer: L1AuxiliaryPixelBuffer
+        let context: L1AuxiliaryFrameContext
     }
 
-    private let queue = DispatchQueue(label: "soma.subconscious.l05-vlm", qos: .utility)
+    private let queue = DispatchQueue(label: "soma.l1.auxiliary-vlm", qos: .utility)
     private let imageContext = CIContext(options: [.cacheIntermediates: false])
     private let process = Process()
     private let input: FileHandle
     private let output: FileHandle
     private let errorOutput: FileHandle
     private let onHealth: @Sendable (String, String) -> Void
-    private let onCue: @Sendable (L05SemanticCue) -> Void
-    private let onInterrupt: @Sendable (L05SemanticInterrupt) -> Void
-    private var admission = L05SemanticAdmissionGate()
-    private var interruptGate = L05SemanticInterruptGate()
+    private let onCue: @Sendable (L1AuxiliarySemanticCue) -> Void
+    private let onInterrupt: @Sendable (L1AuxiliarySemanticInterrupt) -> Void
+    private var admission = L1AuxiliarySemanticAdmissionGate()
+    private var interruptGate = L1AuxiliarySemanticInterruptGate()
     private var pending: Pending?
     private var inFlight = false
     private var ready = false
@@ -82,8 +82,8 @@ final class L05SemanticBridge: @unchecked Sendable {
         workerURL: URL,
         model: String,
         onHealth: @escaping @Sendable (String, String) -> Void,
-        onCue: @escaping @Sendable (L05SemanticCue) -> Void,
-        onInterrupt: @escaping @Sendable (L05SemanticInterrupt) -> Void
+        onCue: @escaping @Sendable (L1AuxiliarySemanticCue) -> Void,
+        onInterrupt: @escaping @Sendable (L1AuxiliarySemanticInterrupt) -> Void
     ) throws {
         self.onHealth = onHealth
         self.onCue = onCue
@@ -102,7 +102,7 @@ final class L05SemanticBridge: @unchecked Sendable {
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"
         process.environment = environment
-        let weakBridge = L05WeakBridge(self)
+        let weakBridge = L1AuxiliaryWeakBridge(self)
         process.terminationHandler = { completed in
             weakBridge.value?.queue.async {
                 guard let self = weakBridge.value else { return }
@@ -139,8 +139,8 @@ final class L05SemanticBridge: @unchecked Sendable {
         onHealth("starting", "model=\(model); transport=jsonl_base64_jpeg; pending_capacity=1")
     }
 
-    func submit(pixelBuffer: CVPixelBuffer, context: L05FrameContext) {
-        let sendablePixelBuffer = L05PixelBuffer(pixelBuffer)
+    func submit(pixelBuffer: CVPixelBuffer, context: L1AuxiliaryFrameContext) {
+        let sendablePixelBuffer = L1AuxiliaryPixelBuffer(pixelBuffer)
         queue.async { [weak self] in
             guard let self, self.accepting, self.admission.admit(context) else { return }
             if self.pending != nil { self.supersededFrames += 1 }
@@ -189,7 +189,7 @@ final class L05SemanticBridge: @unchecked Sendable {
             pump()
             return
         }
-        let request = L05WorkerRequest(
+        let request = L1AuxiliaryWorkerRequest(
             requestID: requestID,
             context: pending.context,
             imageJPEGBase64: jpeg.base64EncodedString()
@@ -217,7 +217,7 @@ final class L05SemanticBridge: @unchecked Sendable {
 
     private func consumeWorkerLine(_ line: String) {
         guard let data = line.data(using: .utf8),
-              let envelope = try? JSONDecoder().decode(L05WorkerEnvelope.self, from: data) else {
+              let envelope = try? JSONDecoder().decode(L1AuxiliaryWorkerEnvelope.self, from: data) else {
             onHealth("protocol_error", String(line.prefix(200)))
             return
         }
@@ -253,7 +253,7 @@ final class L05SemanticBridge: @unchecked Sendable {
                 onHealth("protocol_error", "incomplete_result")
                 return
             }
-            let cue = L05SemanticCue(
+            let cue = L1AuxiliarySemanticCue(
                 requestID: requestID,
                 captureNS: captureNS,
                 completedNS: DispatchTime.now().uptimeNanoseconds,

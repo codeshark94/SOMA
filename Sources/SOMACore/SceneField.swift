@@ -1,5 +1,51 @@
 import Foundation
 
+public enum CameraFieldOfView {
+    /// Converts a physical diagonal field of view to the horizontal field of
+    /// view required by projection, tracking boundaries, and spherical coverage.
+    /// Device-specific mode labels must first be resolved to physical optics.
+    public static func horizontalDegrees(
+        diagonalDegrees: Double,
+        aspectRatio: Double
+    ) -> Double? {
+        guard diagonalDegrees.isFinite,
+              diagonalDegrees > 0,
+              diagonalDegrees < 180,
+              aspectRatio.isFinite,
+              aspectRatio > 0 else { return nil }
+        let diagonalHalf = diagonalDegrees * .pi / 360
+        let tangentScale = sqrt(1 + 1 / (aspectRatio * aspectRatio))
+        return atan(tan(diagonalHalf) / tangentScale) * 360 / .pi
+    }
+
+    public static func verticalDegrees(
+        diagonalDegrees: Double,
+        aspectRatio: Double
+    ) -> Double? {
+        guard let horizontal = horizontalDegrees(
+            diagonalDegrees: diagonalDegrees,
+            aspectRatio: aspectRatio
+        ) else { return nil }
+        return atan(tan(horizontal * .pi / 360) / aspectRatio) * 360 / .pi
+    }
+}
+
+public enum OBSBOTTiny2LiteOptics {
+    public static let wideHorizontalDegrees = 67.2
+    public static let nominalWideModeDegrees = 86.0
+
+    /// libdev exposes generic 86/78/65 mode names, while Tiny 2 Lite's optical
+    /// specification gives the wide horizontal angle as 67.2 degrees. Preserve
+    /// the generic modes' tangent-space crop ratios without treating their
+    /// labels as this camera's physical angles.
+    public static func horizontalDegrees(forFOVMode modeDegrees: Double) -> Double? {
+        guard [65.0, 78.0, 86.0].contains(modeDegrees) else { return nil }
+        let nominalRatio = tan(modeDegrees * .pi / 360)
+            / tan(nominalWideModeDegrees * .pi / 360)
+        return atan(tan(wideHorizontalDegrees * .pi / 360) * nominalRatio) * 360 / .pi
+    }
+}
+
 /// A gimbal-relative direction, in degrees, anchored at the camera's home
 /// orientation rather than at a geographic reference frame.
 public struct GimbalRelativeBearing: Codable, Equatable, Sendable {
@@ -20,7 +66,7 @@ public struct GimbalRelativeBearing: Codable, Equatable, Sendable {
 }
 
 /// A measured physical Tiny 2 Lite attitude, in the SDK's pitch/pan axes.
-public struct GimbalPose: Sendable {
+public struct GimbalPose: Codable, Equatable, Sendable {
     public let pitchDegrees: Double
     public let panDegrees: Double
     public let monotonicNS: UInt64
@@ -33,6 +79,53 @@ public struct GimbalPose: Sendable {
 
     public func isFresh(for timestampNS: UInt64, maximumAgeNS: UInt64) -> Bool {
         timestampNS >= monotonicNS && timestampNS - monotonicNS <= maximumAgeNS
+    }
+}
+
+/// One source of truth for the camera's finite joint space.  Scene evidence
+/// may exist outside the autonomous centre envelope when it is visible near a
+/// frame edge, but every planned camera centre must remain inside that
+/// envelope.  The wider tracking envelope is reserved for live visual servo
+/// corrections and never used to generate exploratory waypoints.
+public struct GimbalKinematicEnvelope: Codable, Equatable, Sendable {
+    public let maximumTrackingPanDegrees: Double
+    public let maximumTrackingPitchDegrees: Double
+    public let maximumAutonomousPanDegrees: Double
+    public let maximumAutonomousPitchDegrees: Double
+
+    public init(
+        maximumTrackingPanDegrees: Double,
+        maximumTrackingPitchDegrees: Double,
+        maximumAutonomousPanDegrees: Double,
+        maximumAutonomousPitchDegrees: Double
+    ) {
+        self.maximumTrackingPanDegrees = abs(maximumTrackingPanDegrees)
+        self.maximumTrackingPitchDegrees = abs(maximumTrackingPitchDegrees)
+        self.maximumAutonomousPanDegrees = min(
+            abs(maximumAutonomousPanDegrees),
+            self.maximumTrackingPanDegrees
+        )
+        self.maximumAutonomousPitchDegrees = min(
+            abs(maximumAutonomousPitchDegrees),
+            self.maximumTrackingPitchDegrees
+        )
+    }
+
+    public static let obsbotTiny2Lite = GimbalKinematicEnvelope(
+        maximumTrackingPanDegrees: 126,
+        maximumTrackingPitchDegrees: 34,
+        maximumAutonomousPanDegrees: 110,
+        maximumAutonomousPitchDegrees: 24
+    )
+
+    public func containsTrackingCenter(_ bearing: GimbalRelativeBearing) -> Bool {
+        abs(bearing.azimuthDegrees) <= maximumTrackingPanDegrees
+            && abs(bearing.elevationDegrees) <= maximumTrackingPitchDegrees
+    }
+
+    public func containsAutonomousCenter(_ bearing: GimbalRelativeBearing) -> Bool {
+        abs(bearing.azimuthDegrees) <= maximumAutonomousPanDegrees
+            && abs(bearing.elevationDegrees) <= maximumAutonomousPitchDegrees
     }
 }
 
@@ -69,7 +162,8 @@ public struct TrackingBoundary: Equatable, Sendable {
     public init(
         cameraPose: GimbalPose?,
         horizontalFieldOfViewDegrees: Double = 70,
-        aspectRatio: Double = 16.0 / 9.0
+        aspectRatio: Double = 16.0 / 9.0,
+        kinematicEnvelope: GimbalKinematicEnvelope = .obsbotTiny2Lite
     ) {
         let baseMinimumX = 0.18
         let baseMaximumX = 0.82
@@ -89,12 +183,6 @@ public struct TrackingBoundary: Equatable, Sendable {
         }
         isPoseAligned = true
 
-        // The observed Tiny 2 Lite pan end is about 147°. Leave a 21° motor
-        // margin so a target at an outer image edge cannot keep pressing the
-        // joint. The vertical envelope stays inside autonomous-coverage's
-        // comfortable field rather than pursuing ceiling/floor detections.
-        let maximumAzimuthDegrees = 126.0
-        let maximumElevationDegrees = 34.0
         let horizontalHalfRadians = max(1, min(horizontalFieldOfViewDegrees, 170)) * .pi / 360
         let verticalHalfRadians = atan(tan(horizontalHalfRadians) / max(aspectRatio, 0.1))
         let horizontalHalfDegrees = horizontalHalfRadians * 180 / .pi
@@ -110,10 +198,18 @@ public struct TrackingBoundary: Equatable, Sendable {
             return 0.5 + tan(degrees * .pi / 180) / (2 * tan(verticalHalfRadians))
         }
 
-        physicalMinimumCenterX = imageCenter(forHorizontalOffset: -maximumAzimuthDegrees - cameraPose.panDegrees)
-        physicalMaximumCenterX = imageCenter(forHorizontalOffset: maximumAzimuthDegrees - cameraPose.panDegrees)
-        physicalMinimumCenterY = imageCenter(forVerticalOffset: -maximumElevationDegrees - cameraPose.pitchDegrees)
-        physicalMaximumCenterY = imageCenter(forVerticalOffset: maximumElevationDegrees - cameraPose.pitchDegrees)
+        physicalMinimumCenterX = imageCenter(
+            forHorizontalOffset: -kinematicEnvelope.maximumTrackingPanDegrees - cameraPose.panDegrees
+        )
+        physicalMaximumCenterX = imageCenter(
+            forHorizontalOffset: kinematicEnvelope.maximumTrackingPanDegrees - cameraPose.panDegrees
+        )
+        physicalMinimumCenterY = imageCenter(
+            forVerticalOffset: -kinematicEnvelope.maximumTrackingPitchDegrees - cameraPose.pitchDegrees
+        )
+        physicalMaximumCenterY = imageCenter(
+            forVerticalOffset: kinematicEnvelope.maximumTrackingPitchDegrees - cameraPose.pitchDegrees
+        )
         minimumCenterX = max(baseMinimumX, physicalMinimumCenterX)
         maximumCenterX = min(baseMaximumX, physicalMaximumCenterX)
         minimumCenterY = max(baseMinimumY, physicalMinimumCenterY)
@@ -274,7 +370,8 @@ public struct SceneField: Sendable {
         horizontalFieldOfViewDegrees: Double = 70,
         aspectRatio: Double = 16.0 / 9.0,
         cameraSettled: Bool = false,
-        poseProjection: GimbalPoseProjection = .identity
+        poseProjection: GimbalPoseProjection = .identity,
+        cameraProjectionModel: CameraProjectionModel? = nil
     ) -> [SceneCandidate] {
         for index in tracks.indices { tracks[index].observedThisFrame = false }
         var claimedSources: [Int: Set<VisualObservationSource>] = [:]
@@ -291,7 +388,8 @@ public struct SceneField: Sendable {
                     cameraPose: $0,
                     horizontalFieldOfViewDegrees: horizontalFieldOfViewDegrees,
                     aspectRatio: aspectRatio,
-                    poseProjection: poseProjection
+                    poseProjection: poseProjection,
+                    cameraProjectionModel: cameraProjectionModel
                 )
             }
             if let index = bestMatch(for: observation, bearing: bearing, excluding: claimedSources) {
@@ -305,6 +403,7 @@ public struct SceneField: Sendable {
                     at: monotonicNS
                 )
             } else {
+                let newIndex = tracks.count
                 tracks.append(Track(
                     id: "scene-\(nextID)",
                     rect: observation.rect,
@@ -325,6 +424,7 @@ public struct SceneField: Sendable {
                     lastFaceActivityNS: nil,
                     pendingFaceMotion: nil
                 ))
+                claimedSources[newIndex, default: []].insert(observation.source)
                 nextID += 1
             }
         }
@@ -587,8 +687,45 @@ public struct SceneField: Sendable {
         cameraPose: GimbalPose,
         horizontalFieldOfViewDegrees: Double,
         aspectRatio: Double,
-        poseProjection: GimbalPoseProjection
+        poseProjection: GimbalPoseProjection,
+        cameraProjectionModel: CameraProjectionModel?
     ) -> GimbalRelativeBearing {
+        if let cameraProjectionModel, cameraProjectionModel.isValid {
+            let actualRay = (
+                (rect.centerX - cameraProjectionModel.principalXNormalized)
+                    / cameraProjectionModel.focalXNormalized,
+                ((1 - rect.centerY) - cameraProjectionModel.principalYNormalized)
+                    / cameraProjectionModel.focalYNormalized,
+                1.0
+            )
+            let idealRay = cameraProjectionModel.actualToIdeal(actualRay)
+            let panSign = poseProjection.panImageSign >= 0 ? 1.0 : -1.0
+            let pitchSign = poseProjection.pitchImageSign >= 0 ? 1.0 : -1.0
+            let cameraAzimuth = cameraPose.panDegrees * panSign * .pi / 180
+            let cameraElevation = cameraPose.pitchDegrees * pitchSign * .pi / 180
+            let forward = (
+                cos(cameraElevation) * sin(cameraAzimuth),
+                sin(cameraElevation),
+                cos(cameraElevation) * cos(cameraAzimuth)
+            )
+            let right = (cos(cameraAzimuth), 0.0, -sin(cameraAzimuth))
+            let up = (
+                -sin(cameraElevation) * sin(cameraAzimuth),
+                cos(cameraElevation),
+                -sin(cameraElevation) * cos(cameraAzimuth)
+            )
+            let world = (
+                right.0 * idealRay.0 - up.0 * idealRay.1 + forward.0 * idealRay.2,
+                right.1 * idealRay.0 - up.1 * idealRay.1 + forward.1 * idealRay.2,
+                right.2 * idealRay.0 - up.2 * idealRay.1 + forward.2 * idealRay.2
+            )
+            let canonicalAzimuth = atan2(world.0, world.2) * 180 / .pi
+            let canonicalElevation = atan2(world.1, hypot(world.0, world.2)) * 180 / .pi
+            return GimbalRelativeBearing(
+                azimuthDegrees: canonicalAzimuth / panSign,
+                elevationDegrees: canonicalElevation / pitchSign
+            )
+        }
         let horizontalHalfRadians = max(1, min(horizontalFieldOfViewDegrees, 170)) * .pi / 360
         let verticalHalfRadians = atan(tan(horizontalHalfRadians) / max(aspectRatio, 0.1))
         let horizontalOffset = atan((rect.centerX - 0.5) * 2 * tan(horizontalHalfRadians)) * 180 / .pi

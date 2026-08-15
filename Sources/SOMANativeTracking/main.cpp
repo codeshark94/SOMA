@@ -7,7 +7,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include <dev/devs.hpp>
 #include <mach/mach_time.h>
@@ -39,6 +43,8 @@ struct Options {
     bool durationSpecified = false;
     int durationSeconds = 10;
     std::string outputPath;
+    size_t traceMaximumBytes = 0;
+    int traceRetainedFiles = 0;
 };
 
 Options parseOptions(int argc, char **argv) {
@@ -60,8 +66,21 @@ Options parseOptions(int argc, char **argv) {
         } else if (argument == "--output") {
             if (++index >= argc) throw std::runtime_error("--output requires a JSONL path");
             options.outputPath = argv[index];
+        } else if (argument == "--trace-max-megabytes") {
+            if (++index >= argc) throw std::runtime_error("--trace-max-megabytes requires a positive integer");
+            const auto megabytes = std::stoull(argv[index]);
+            if (megabytes == 0 || megabytes > std::numeric_limits<size_t>::max() / 1'048'576) {
+                throw std::runtime_error("--trace-max-megabytes is out of range");
+            }
+            options.traceMaximumBytes = static_cast<size_t>(megabytes * 1'048'576);
+        } else if (argument == "--trace-retained-files") {
+            if (++index >= argc) throw std::runtime_error("--trace-retained-files requires a positive integer");
+            options.traceRetainedFiles = std::stoi(argv[index]);
+            if (options.traceRetainedFiles <= 0) {
+                throw std::runtime_error("--trace-retained-files requires a positive integer");
+            }
         } else if (argument == "--help" || argument == "-h") {
-            std::cout << "Usage: soma-native-track --list | --allow-camera-motion --duration <0=continuous|1-30> --output <trace.jsonl> [--serve|--center]\n";
+            std::cout << "Usage: soma-native-track --list | --allow-camera-motion --duration <0=continuous|1-30> --output <trace.jsonl> [--trace-max-megabytes MB --trace-retained-files count] [--serve|--center]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown argument: " + argument);
@@ -87,6 +106,9 @@ Options parseOptions(int argc, char **argv) {
     }
     if (!options.list && options.outputPath.empty()) {
         throw std::runtime_error("--output is required for a motion run");
+    }
+    if ((options.traceMaximumBytes == 0) != (options.traceRetainedFiles == 0)) {
+        throw std::runtime_error("--trace-max-megabytes and --trace-retained-files must be supplied together as positive integers");
     }
     return options;
 }
@@ -129,8 +151,18 @@ std::string escape(const std::string &value) {
 
 class Trace {
 public:
-    explicit Trace(const std::string &path) : file_(path) {
-        if (!file_) throw std::runtime_error("Cannot create trace: " + path);
+    Trace(const std::string &path, size_t maximumBytes, int retainedFiles)
+        : basePath_(path), maximumBytes_(maximumBytes), retainedFiles_(retainedFiles) {
+        const auto directory = basePath_.parent_path();
+        if (!directory.empty()) std::filesystem::create_directories(directory);
+        if (maximumBytes_ > 0) {
+            const auto segments = matchingSegments();
+            sequence_ = segments.empty() ? 1 : segments.back().first + 1;
+            open(segmentPath(sequence_));
+            prune();
+        } else {
+            open(basePath_);
+        }
     }
 
     void event(
@@ -142,21 +174,93 @@ public:
         const std::string &commandID = ""
     ) noexcept {
         try {
-            file_ << "{\"event\":\"" << event
-                  << "\",\"monotonic_ns\":" << monotonicNanoseconds()
-                  << ",\"owner\":\"" << owner
-                  << "\",\"state\":\"" << state
-                  << "\",\"result_code\":" << resultCode
-                  << ",\"message\":\"" << escape(message) << "\"";
-            if (!commandID.empty()) file_ << ",\"command_id\":\"" << escape(commandID) << "\"";
-            file_ << "}\n";
-            file_.flush();
+            std::ostringstream line;
+            line << "{\"event\":\"" << event
+                 << "\",\"monotonic_ns\":" << monotonicNanoseconds()
+                 << ",\"owner\":\"" << owner
+                 << "\",\"state\":\"" << state
+                 << "\",\"result_code\":" << resultCode
+                 << ",\"message\":\"" << escape(message) << "\"";
+            if (!commandID.empty()) line << ",\"command_id\":\"" << escape(commandID) << "\"";
+            line << "}\n";
+            write(line.str());
         } catch (...) {
             // A diagnostic failure must never suppress a camera safety command.
         }
     }
 
 private:
+    using Segment = std::pair<uint64_t, std::filesystem::path>;
+
+    void write(const std::string &line) {
+        if (maximumBytes_ > 0
+            && bytesWritten_ > 0
+            && bytesWritten_ + line.size() > maximumBytes_) {
+            file_.close();
+            open(segmentPath(++sequence_));
+            prune();
+        }
+        file_ << line;
+        if (!file_) throw std::runtime_error("Cannot write trace: " + currentPath_.string());
+        bytesWritten_ += line.size();
+        file_.flush();
+    }
+
+    void open(const std::filesystem::path &path) {
+        currentPath_ = path;
+        file_.open(path, std::ios::out | std::ios::trunc);
+        if (!file_) throw std::runtime_error("Cannot create trace: " + path.string());
+        bytesWritten_ = 0;
+    }
+
+    std::filesystem::path segmentPath(uint64_t sequence) const {
+        std::ostringstream filename;
+        filename << basePath_.stem().string() << '-' << std::setw(8) << std::setfill('0') << sequence
+                 << basePath_.extension().string();
+        return basePath_.parent_path() / filename.str();
+    }
+
+    std::vector<Segment> matchingSegments() const {
+        std::vector<Segment> segments;
+        const auto directory = basePath_.parent_path().empty()
+            ? std::filesystem::path(".")
+            : basePath_.parent_path();
+        const auto prefix = basePath_.stem().string() + '-';
+        const auto extension = basePath_.extension().string();
+        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+            if (!entry.is_regular_file()) continue;
+            const auto name = entry.path().filename().string();
+            if (name.size() != prefix.size() + 8 + extension.size()
+                || name.rfind(prefix, 0) != 0
+                || name.substr(name.size() - extension.size()) != extension) {
+                continue;
+            }
+            const auto sequenceText = name.substr(prefix.size(), 8);
+            if (!std::all_of(sequenceText.begin(), sequenceText.end(), ::isdigit)) continue;
+            segments.emplace_back(std::stoull(sequenceText), entry.path());
+        }
+        std::sort(segments.begin(), segments.end(), [](const Segment &lhs, const Segment &rhs) {
+            return lhs.first < rhs.first;
+        });
+        return segments;
+    }
+
+    void prune() {
+        const auto segments = matchingSegments();
+        const auto excess = segments.size() > static_cast<size_t>(retainedFiles_)
+            ? segments.size() - static_cast<size_t>(retainedFiles_)
+            : 0;
+        for (size_t index = 0; index < excess; ++index) {
+            std::filesystem::remove(segments[index].second);
+        }
+    }
+
+    std::filesystem::path basePath_;
+    std::filesystem::path currentPath_;
+    size_t maximumBytes_ = 0;
+    int retainedFiles_ = 0;
+    uint64_t sequence_ = 0;
+    size_t bytesWritten_ = 0;
     std::ofstream file_;
 };
 
@@ -244,6 +348,49 @@ std::optional<int> cameraHorizontalFieldOfViewDegrees(const std::shared_ptr<Devi
     case Device::FovType65: return 65;
     default: return std::nullopt;
     }
+}
+
+std::optional<float> cameraZoomFactor(const std::shared_ptr<Device> &device) noexcept {
+    try {
+        float zoom = 0;
+        if (device->cameraGetZoomAbsoluteR(zoom) == RM_RET_OK && std::isfinite(zoom)) {
+            return zoom;
+        }
+    } catch (...) {}
+    return std::nullopt;
+}
+
+bool configureFixedCameraZoom(const std::shared_ptr<Device> &device, Trace &trace) noexcept {
+    int autoZoomResult = RM_RET_ERR;
+    int zoomResult = RM_RET_ERR;
+    try { autoZoomResult = device->aiSetAiAutoZoomR(false); } catch (...) {}
+    try { zoomResult = device->cameraSetZoomAbsoluteR(1.0f); } catch (...) {}
+    std::optional<float> zoom;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(1'500);
+    while (Clock::now() < deadline && !interrupted) {
+        zoom = cameraZoomFactor(device);
+        if (zoom && std::abs(*zoom - 1.0f) <= 0.02f) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const bool confirmed = zoomResult == RM_RET_OK && zoom && std::abs(*zoom - 1.0f) <= 0.02f;
+    const std::string message = "auto_zoom_disable_result=" + std::to_string(autoZoomResult)
+        + "; zoom_set_result=" + std::to_string(zoomResult)
+        + (zoom ? "; zoom_factor=" + std::to_string(*zoom) : "; zoom_factor=unavailable");
+    trace.event(
+        "camera.ack",
+        confirmed ? "manual" : "fault",
+        confirmed ? "fixed_zoom_active" : "fixed_zoom_unconfirmed",
+        confirmed ? RM_RET_OK : RM_RET_ERR,
+        message,
+        "startup-zoom-1x"
+    );
+    try {
+        std::cerr << "SOMA_CAMERA_ZOOM factor="
+                  << (zoom ? std::to_string(*zoom) : "unavailable")
+                  << " fixed=" << (confirmed ? "true" : "false")
+                  << "\n" << std::flush;
+    } catch (...) {}
+    return confirmed;
 }
 
 bool waitForMode(const std::shared_ptr<Device> &device, int expectedMode, int timeoutMilliseconds) {
@@ -596,6 +743,7 @@ std::optional<std::string> readBridgeLine() noexcept {
 int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int durationSeconds) {
     constexpr auto nativeWatchdog = std::chrono::milliseconds(750);
     constexpr auto externalWatchdog = std::chrono::milliseconds(700);
+    if (!configureFixedCameraZoom(device, trace)) return 5;
     if (const auto fieldOfView = cameraHorizontalFieldOfViewDegrees(device)) emitHorizontalFieldOfView(*fieldOfView);
     if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
     trace.event("camera.owner", "manual", "bridge_ready", RM_RET_OK, "awaiting_local_attention_commands");
@@ -869,7 +1017,7 @@ int main(int argc, char **argv) {
             return listed ? 0 : 2;
         }
 
-        Trace trace(options.outputPath);
+        Trace trace(options.outputPath, options.traceMaximumBytes, options.traceRetainedFiles);
         trace.event("camera.owner", "manual", "discovering", 0, "motion_control_requested");
         devicesWereOpened = true;
         const auto discovery = waitForTiny2Lite();

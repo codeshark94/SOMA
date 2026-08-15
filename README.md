@@ -8,6 +8,86 @@ It does not invoke the supplied OBSBOT SDK or OSC control surface, move the
 gimbal, select a tracking mode, record raw audio/video, alter macOS's default
 input device, or call an LLM or network service.
 
+## Project architecture
+
+The project-wide cognitive design is tracked in
+[COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md). L0 remains the local,
+low-latency perception and motor layer. The selected primary L1 path is
+`gemma4:31b-cloud`; the direct-MLX E2B worker is only an L1-owned visual helper,
+not an independent L0.5 layer or authority. L1 owns active situational
+interpretation through a typed short-, medium-, and long-term memory service.
+L2 is the Codex human-interaction, reasoning, and task layer. Authorized
+explicit human contact may open L2 directly from L0 while L1 builds richer
+context in parallel, so directed contact does not wait for the 31B stream.
+Every accepted final transcript is handed to the owner's ChatGPT-authenticated
+Codex session with scoped context and evidence IDs; raw audio stays in the local
+speech transport. Neither L1 nor L2 drives the camera SDK directly; both use the leased
+embodiment MCP contract described in that document.
+
+That MCP is not a weak suggestion channel. L1 and L2 share leased goals
+for semantic labels, per-target probabilistic attention priors, target tracking,
+orientation, exploration regions and directional distributions, view capture,
+and social motion. L0 retains SDK timing, stabilization, watchdogs, joint-limit
+handling, and immediate physical vetoes. The versioned request types exist in
+`Sources/SOMACore/CognitiveEmbodiment.swift`. A local stdio MCP process now
+forwards those requests over a current-user Unix socket to the running L0
+process. The L0 executor validates, leases, rejects, preempts, expires, and
+traces goals. Physical execution is a separate opt-in
+`--allow-embodiment-motor-control` adapter: without that flag the same endpoint
+remains shadow-only. The persistent launcher enables it because camera motion
+was explicitly authorized for this installation.
+
+The C2 model-independent memory core is present in
+`Sources/SOMACore/CognitiveMemory.swift`: typed short-, medium-, and long-term
+records use an authenticated encrypted journal, provenance/consent validation,
+revision and deletion lifecycles, and a minimal remote-summary projection. It
+is not yet connected to an L1 runtime. The C3 transition core is also present:
+it produces a versioned, normalized distribution over `stay_l0`, `wake_l1`,
+and `request_human_interaction`, records bounded evidence references and the
+policy reason, dispatches explicit contact directly to L2 with parallel L1
+context preparation, and prevents non-human events from opening interaction.
+The `soma-codex-bridge` executable is the first live L2 account boundary. It
+requires the installed Codex CLI to report `Logged in using ChatGPT`, reads one
+bounded transcript/context request per JSONL line, invokes Codex outside the L0
+process, parses JSONL replies, and retains the returned Codex thread ID for
+multi-turn interaction. No API key is stored by SOMA. The account smoke on this
+host returned correctly in 9.36 seconds; that proves authentication and content
+delivery, not conversational latency. Local ASR, audio pre-roll, TTS, and live
+C3 contact wiring remain pending.
+
+Verify the account and start the JSONL bridge with:
+
+```sh
+codex login status
+swift run soma-codex-bridge
+```
+
+The process first emits `bridge.ready`. It accepts version-1
+`CodexAccountTurnRequest` values on standard input and emits `turn.completed`
+with the assistant text, Codex thread ID, monotonic latency, and token counts.
+Requests use `CodexInteractionContext`, which bounds situation, identity,
+rapport, task, memory, embodiment, and privacy projections. A caller can supply
+the returned thread ID after a bridge restart; while the process stays alive it
+automatically resumes the thread for the same interaction ID.
+
+Tiny 2 Lite
+LED investigation also confirmed a predefined RGB palette/pattern engine with
+four brightness levels, not arbitrary RGB; its leased MCP/native contract and
+evidence are recorded in the architecture document.
+
+Run the C3 bootstrap contract evaluator with:
+
+```sh
+swift run soma-event-eval
+```
+
+Its 32 labelled rows are deliberately split into calibration and evaluation
+partitions and cover ambient activity, uncertain sampling, persistent novelty,
+direct contact, accepted memory curiosity, cooldown, and local safety. They are
+an executable routing contract, not captured deployment data or an accuracy
+claim. Live, time-aligned camera/audio labels are required before this router
+can govern real L0-to-L1 or L0-to-L2 interaction transitions.
+
 ## Run
 
 List the host-recognized devices and their available video formats, then copy
@@ -113,32 +193,117 @@ swift run soma-subconscious --duration 30 \
   --output artifacts/subconscious/run.jsonl
 ```
 
-## Optional local L0.5 semantic side loop
+Continuous operation uses two scalar journals. The detailed journal retains
+full belief, vision, scene, control-intent, and metrics evidence only within a
+bounded rotating window. The important journal keeps source/controller state
+changes, target acquire/loss transitions, voice onset/offset, L1 auxiliary wake proposals,
+camera mode changes, and an hourly metrics checkpoint; repeated unchanged
+states are suppressed. Rotation is configured explicitly rather than inferred
+from filenames:
 
-`gemma-4-e4b-it-nvfp4` can run directly through `mlx-vlm`, without Ollama, as
-an explicitly enabled low-rate semantic side loop. It is not part of the L0
-control path and it is not L1: it produces a bounded scene summary, novelty,
-social-presence probability, an advisory attention hint, a bounded situation
-hypothesis, and a semantic wake score. Every result is written as a scalar
-`l05.semantic` event. A deterministic consistency/confidence gate may also
-emit `l05.interrupt` for `social_bid`, `object_presentation`,
-`scene_transition`, or high-confidence ambiguity. This is only a recommendation
-for a future conscious layer; neither event enters target
-selection, face lock, camera ownership, or a gimbal command.
+```sh
+--output runtime/detail/subconscious.jsonl \
+--trace-max-megabytes 128 --trace-retained-files 8 \
+--important-output runtime/important/subconscious-important.jsonl \
+--important-max-megabytes 16 --important-retained-files 8
+```
+
+Those stable basenames create numbered segments and prune older segments both
+when a process starts and whenever a segment fills. The native actuator journal
+uses the same contract through `--gimbal-trace-max-megabytes` and
+`--gimbal-trace-retained-files`. The installed persistent launcher retains up to
+1 GiB of detailed evidence, 128 MiB of important history, 128 MiB of actuator
+evidence, and four 1 MiB launcher logs. Raw face JPEG diagnostics are not enabled
+by the persistent launcher.
+
+## L1 local visual helper
+
+`gemma-4-e2b-it-4bit` runs directly through `mlx-vlm`, without Ollama, as an
+optional low-rate helper inside L1. The fast cloud 31B route remains the primary
+situational stream; L1 may use E2B for a local image sketch or a remote-data
+restriction. E2B produces a bounded scene summary, novelty, social-presence
+probability, attention hint, situation hypothesis, and wake proposal. Results
+are scalar `l1.auxiliary.semantic` and `l1.auxiliary.wake_proposal` events. The
+helper has no separate memory, dialogue, target-selection, camera-ownership, or
+motor authority.
+
+The shared embodiment transport is live independently of that automatic
+adapter. An MCP client launches:
+
+```sh
+.build/soma-live/arm64-apple-macosx/debug/soma-embodiment \
+  --socket "$PWD/artifacts/subconscious/runtime/ipc/embodiment-shadow.sock"
+```
+
+It implements MCP `initialize`, `ping`, `tools/list`, and `tools/call` over
+stdio. The current thirteen tools cover state, scene-entity and spherical-map inspection,
+semantic target registration/removal, probabilistic attention policy, target tracking,
+orientation, exploration policy, view requests, social gimbal expression, and
+lease release. The LaunchAgent creates the Unix socket as mode `0600` inside a
+mode `0700` directory. Every accepted or rejected mutation is recorded as a
+scalar `embodiment.decision` event. `mode=active` and
+`physical_actuation_enabled=true` mean the optional L0 adapter is connected;
+default command-line runs remain `mode=shadow` and non-actuating.
+
+The running L0 now also projects its persistent `SceneField` and shared
+spherical coverage atlas into the MCP state as scalar scene entities and map
+cells, and resolves registered semantic targets against them on
+a bounded latest-value worker. An explicit `scene_id` remains the same binding
+when that entity goes offscreen. Descriptor-only targets use a normalized
+association posterior and return `ambiguous` instead of inventing an identity
+when several entities fit. Binding transitions are recorded as
+`semantic.binding`; pixels, embeddings, facial landmarks, and biometric
+templates are never added to this channel.
+
+Accepted motor goals now pass through one semantic intent coordinator and the
+existing L0 gimbal owner queue. `orient_to` and `capture_view` align a reachable
+gimbal-home-relative bearing; `track_target` moves only after its registered
+reference has one non-ambiguous SceneField binding with a spatial bearing;
+`set_exploration_policy` reshapes the existing spherical information-gain
+distribution; and `express_gimbal` expands a semantic expression into a bounded
+smooth route. An unresolved target suspends motion while preserving the lease,
+so a later binding can resume without inventing an identity. Preemption,
+owner-scoped release, target removal, expiry, process shutdown, stale pose,
+joint reachability, and the native helper watchdog all converge on the same L0
+stop path.
+
+`capture_view` is a one-shot active-sensing operation rather than an alias for
+orientation. L0 uses the native stabilized absolute-position path, refreshes it
+within the helper watchdog interval, enters a 2-degree alignment window, leaves
+only beyond 4.5 degrees, and requires 180 ms of settled pose before accepting
+the next exposure-aligned frame. The frame is centre-cropped to the requested
+field of view, encoded as a 640x360 JPEG, and returned as an MCP resource link.
+`get_view_capture` recovers a timed-out caller by request ID. Resources live in
+an owner-only directory, files are mode `0600`, at most 16 handles exist, and a
+60-second timer deletes the pixels even if no later query arrives. Only scalar
+capture state and geometry enter JSONL traces. Completing capture releases the
+one-shot motor goal without deleting the owner's semantic targets or policy.
+
+The physical smoke run `physical-orient-smoke-2` used a 1.2 s L1 lease. The
+native trace recorded the first direct command through `manual_active` in
+1.274 s, then the existing L0 exploration resumed 0.509 s later. A later
+`capture_view` request at azimuth/elevation 0/0 degrees and 65-degree field of
+view returned a visually checked, sharp frame in 1.6 s at measured pose
+-0.35/-0.05 degrees. A registered `bicycle` bound to `scene-10` became grounded
+in 108 ms, was freshly re-observed in 187 ms, drove the physical helper to a
+holding stop in 3.83 s, and released on its 20 s lease deadline. These are
+deployment checks for active sensing, semantic binding, physical reacquisition,
+deadline release, and ownership return—not recognition-accuracy or L1 cognition
+claims.
 
 The video callback never waits for the model. An event gate admits a changed
 or salient keyframe at most once per second and refreshes an unchanged scene
 once per five seconds. The bridge has one in-flight request and one replaceable
 pending frame, converts the latter to a 512x288 in-memory JPEG on a utility
 queue, and sends it to one persistent local Python process. Neither the JPEG
-nor model input is written by the L0.5 path. A local model directory is required
+nor model input is written by the L1 auxiliary path. A local model directory is required
 so enabling the bridge cannot silently download a model or call a remote API.
 The worker also sets an 8 GB MLX evaluation limit and a 256 MB free-cache limit;
 an over-limit inference fails in the advisory process instead of consuming
 unbounded unified memory.
 
 The live implementation invokes `mlx-vlm` directly. It does not use Ollama and
-has no Ollama fallback. `scripts/soma_l05_ollama_probe.py` is a benchmark-only
+has no Ollama fallback. `scripts/soma_l1_auxiliary_ollama_probe.py` is a benchmark-only
 tool for an explicitly named comparison model; it is not imported or launched
 by `soma-subconscious`.
 
@@ -149,18 +314,18 @@ The installed reference environment is:
   "$HOME/Library/Application Support/SOMA/venvs/l05"
 "$HOME/Library/Application Support/SOMA/venvs/l05/bin/python" -m pip install mlx-vlm
 "$HOME/Library/Application Support/SOMA/venvs/l05/bin/hf" download \
-  mlx-community/gemma-4-e4b-it-nvfp4 \
-  --local-dir "$HOME/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4"
+  mlx-community/gemma-4-e2b-it-4bit \
+  --local-dir "$HOME/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit"
 ```
 
 Probe it without changing the running camera service:
 
 ```sh
 "$HOME/Library/Application Support/SOMA/venvs/l05/bin/python" \
-  scripts/soma_l05_probe.py \
+  scripts/soma_l1_auxiliary_probe.py \
   --python "$HOME/Library/Application Support/SOMA/venvs/l05/bin/python" \
-  --worker "$PWD/scripts/soma_l05_vlm_worker.py" \
-  --model "$HOME/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4" \
+  --worker "$PWD/scripts/soma_l1_auxiliary_vlm_worker.py" \
+  --model "$HOME/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit" \
   --image /absolute/path/to/one-consented-test-frame.jpg
 ```
 
@@ -171,29 +336,38 @@ with all three flags:
 swift run soma-subconscious --duration 30 \
   --video-id '<OBSBOT video unique ID>' \
   --audio-id '<OBSBOT microphone unique ID>' \
-  --output artifacts/subconscious/l05-run.jsonl \
-  --l05-vlm-python "$HOME/Library/Application Support/SOMA/venvs/l05/bin/python" \
-  --l05-vlm-worker "$PWD/scripts/soma_l05_vlm_worker.py" \
-  --l05-vlm-model "$HOME/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4"
+  --output artifacts/subconscious/l1-auxiliary-run.jsonl \
+  --l1-auxiliary-vlm-python "$HOME/Library/Application Support/SOMA/venvs/l05/bin/python" \
+  --l1-auxiliary-vlm-worker "$PWD/scripts/soma_l1_auxiliary_vlm_worker.py" \
+  --l1-auxiliary-vlm-model "$HOME/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit"
 ```
 
-On the 24 GB Apple Silicon host, the 512x288 benchmark loaded the 4.8 GB
-checkpoint in 2.5–3.8 s, took 3.50–4.77 s for a first image and 2.89–4.25 s for
-subsequent images, and reported a 5.75 GB MLX peak. This makes E4B suitable only
-for an approximately 0.2–0.35 Hz advisory loop. During a concurrent benchmark,
+On the 24 GB Apple Silicon host, a three-request same-image direct-MLX
+comparison measured E2B at 1.47 s cold and 1.39 s warm median, versus E4B at
+3.00 s cold and 2.75 s warm median. The E2B checkpoint occupies 3.3 GiB instead
+of 4.8 GiB and reported a 4.20 GB MLX peak instead of 5.75 GB. E2B is therefore
+the persistent helper and E4B remains a comparison fallback. Short-probe
+process RSS moved in the opposite direction—3.33 GB for E2B versus 2.31 GB for
+E4B—so this is not a claim that every memory metric improved. The person-free
+fixture stayed `ambient / none` under E2B, while E4B proposed
+`object_presentation / presented_object`; broader labelled human and object
+evaluation remains open. During an earlier concurrent E4B benchmark,
 the repaired L0 advanced 1,749 video callbacks, 700 person-model attempts,
 1,750 face-model attempts, and 1,750 vision updates during a 70-second window
 containing 20 consecutive E4B requests. Skipped frames and cumulative inference
 maxima did not increase, the L0 PID survived, and its trace recorded no runtime
-error or stall. The worker loaded in 2.79 s and its 20-request run measured a
+error or stall. That worker loaded in 2.79 s and its 20-request run measured a
 3.41 s cold inference and 2.79 s warm median. This is a bounded coexistence
 stress result, not permission to put semantic output in the motor path.
 
-With the semantic-interrupt schema, a fresh three-request direct-MLX run loaded
+With the semantic-interrupt schema, an earlier E4B direct-MLX run loaded
 in 2.22 s, took 3.27 s cold and 2.65 s warm median, and consistently classified
 the person-free fixture as `ambient / none / 0.1`. The benchmark-only
 `gemma4:31b-cloud` comparison took 0.79 s cold and 0.89 s warm median on the
-same fixture. It was faster, but it is remote and is not a runtime candidate.
+same fixture. It was faster and has now been selected as the primary L1
+situational model. Its active situation-stream adapter still requires the
+memory, privacy projection, event
+router, and authority boundaries in [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md).
 The Ollama `gemma4:e4b-mlx` and `gemma4:12b-mlx` packages both returned HTTP 400
 for image input; loading them for that capability check also increased L0's
 cumulative Vision maximum, so both were unloaded and excluded.
@@ -205,12 +379,14 @@ after every processed frame. A same-PID L0-only run then lasted 898.43 seconds,
 advanced from 23 to 22,422 video callbacks, recorded zero Vision runtime
 error/stall events, and showed no linear RSS growth. The persistent LaunchAgent
 now enables the direct-MLX side loop. Its first 234.34-second integrated smoke
-produced 48 semantic events, zero interrupt false positives, and zero L0.5
+produced 48 semantic events, zero interrupt false positives, and zero auxiliary-worker
 runtime errors; semantic inference ranged from 2.70 to 3.25 seconds. This is
 enough for continuous development use, but it is not a multi-hour thermal
 qualification.
-The original latency run is recorded in
+The original E4B latency run is recorded in
 [l05-e4b-mlx-benchmark-20260815.json](artifacts/subconscious/l05-e4b-mlx-benchmark-20260815.json);
+the current E2B/E4B same-image decision is recorded in
+[l1-auxiliary-e2b-vs-e4b-20260815.json](artifacts/subconscious/l1-auxiliary-e2b-vs-e4b-20260815.json);
 the repaired L0 soak and 20-request coexistence window are recorded in
 [l0-lifetime-l05-coexistence-20260815.json](artifacts/subconscious/l0-lifetime-l05-coexistence-20260815.json).
 The interrupt feature, Ollama comparison, and integrated smoke are recorded in
@@ -449,7 +625,13 @@ remain first-class targets for an L1 thought, question, or memory lookup.
 count, stability, corroborating-source count, and `action_eligible` flag for
 every active candidate. With the direct gimbal bridge it also projects each
 candidate into gimbal-relative `azimuth_degrees` and `elevation_degrees` from
-the SDK-reported attitude and current 86°/78°/65° FOV mode. An offscreen
+the SDK-reported attitude and current 86/78/65 FOV mode label. These generic
+libdev labels are not treated as Tiny 2 Lite physical angles. The specification
+profile is only the fallback; the persistent runtime loads the current
+provisional normalized pinhole and camera-to-gimbal rotation from
+[`camera-geometry-tiny2lite-20260815.json`](artifacts/subconscious/camera-geometry-tiny2lite-20260815.json).
+SceneField, spherical coverage, and panorama projection therefore share the
+same focal lengths, principal point, axis signs, and rigid extrinsic. An offscreen
 candidate remains in the spatial field for the running session with decaying
 `spatial_confidence`; a later compatible observation near that bearing refreshes
 the existing scene rather than creating a duplicate. It stores scalar metadata
@@ -462,6 +644,8 @@ accumulate camera buffers or starve live vision. Filenames carry the matching mo
 also appends a scalar `gimbal-stop-reports.jsonl` record
 in that directory with the stop reason, latest face/target state, gimbal attitude,
 and the newest retained diagnostic-frame filename; it never duplicates raw pixels.
+The 60-image ring bounds one requested diagnostic session; the caller owns that
+directory's lifetime. It is therefore unsuitable as an always-on runtime flag.
 
 An empty completed detector result is a real visual miss: it advances retained
 tracks into their offscreen-decay state, and the trace reports that spatial
@@ -477,21 +661,29 @@ broad coverage begins. This keeps the social reference without freezing the
 last gimbal pose. Predictions, audio, periodic belief snapshots, objects, and
 unverified faces cannot use this path.
 
-When no retained scene hypothesis wins, L0 falls back to a coarse gimbal-relative
-coverage field rather than a fixed left/right scan. Every fresh-pose video frame
-marks the current 86°/78°/65° FOV on a spherical azimuth/elevation grid as
-observed; directions that have not recently been covered receive the larger
-exploration posterior and guide both pan and pitch of the next waypoint. The
-grid uses five comfort-bounded elevation layers from -30° through +30°, keeps
-visited regions suppressed for 90 seconds, and supplies successive waypoints to
-one continuous exploration trajectory. The spatial target remains unchanged;
-the motor planner intersects every camera pose that can see it with the safe
-pan/pitch joint envelope, then chooses the nearest reachable pose. A target
-with no such intersection is rejected before motion and another posterior
-sample is drawn, while an opposite-side target is routed through the finite
-joint interior instead of wrapping across the ±180° seam.
+When no retained scene hypothesis wins, L0 falls back to a shared spherical
+scene atlas rather than a fixed left/right scan. Every fresh-pose video frame
+marks the actual FOV on a seven-layer azimuth/elevation map spanning every
+direction visible from a valid autonomous camera centre. The atlas retains
+coverage counts, recency, unproductive visits, panorama quality, compact
+place familiarity/conflict, expected information gain, and remembered entity bearings;
+`get_spatial_map` exposes the same bounded scalar state to L1. Directions not
+well resolved receive the larger exploration posterior, while repeated
+unproductive visits are penalized and then recover gradually rather than
+becoming permanently forbidden.
+
+`GimbalKinematicEnvelope` is the single source of truth shared by frame-edge
+eligibility, atlas construction, autonomous route planning, and offscreen face
+re-acquisition. The planner first finds the nearest reachable camera centre
+whose usable FOV contains the requested world bearing. It therefore observes
+an edge-visible target without centring the joint on that target, rejects an
+unreachable direction before motion, and routes an opposite-side target through
+the finite joint interior instead of wrapping across the ±180° seam. Normal
+routes never ask the later boundary-recovery state to repair a bad waypoint;
+that state is reserved for measured external displacement or stale legacy
+controller state.
 Pan and pitch velocities are updated at
-50 ms control intervals with 60°/s pan and 30°/s pitch caps, 120/80°/s²
+50 ms control intervals with 30°/s pan and 18°/s pitch exploration caps, 120/80°/s²
 acceleration limits, and stopping-distance braking;
 a new waypoint is selected inside a 10° look-ahead radius and blends into the
 current velocity instead of hitting the exact centre and inserting a stop/rest
@@ -500,8 +692,121 @@ a distant route at a fixed duration. The helper discards superseded direct-motio
 SDK call is in flight, so delayed commands cannot accumulate behind perception.
 An unexpected attitude outside the planned envelope receives an inward velocity
 curve; the SDK's absolute centre operation is reserved for a measured
-two-direction stall. This is scalar spatial recency only,
-not image storage or L1 memory.
+two-direction stall. The JSONL trace remains scalar. When `--panorama-output`
+is supplied, a separate utility-priority compositor also maintains exactly one
+rolling 1024×256 JPEG and one metadata JSON; it does not append raw frames.
+Each process publishes an empty session map before admitting frames, so a
+human-occluded startup cannot expose the previous process's panorama as current.
+The equirectangular raster has a fixed world convention—azimuth increases from
+left to right and elevation from bottom to top. The OBSBOT SDK attitude is
+converted once into canonical visual yaw/elevation before projection; its
+image-axis signs are not applied again to individual source rays. Source
+sampling uses a coupled 3D yaw/pitch camera basis rather than two independent
+planar offsets, so elevated diagonal views remain on the same sphere.
+
+The panorama path admits at most 4 frames/s into a one-slot mailbox and may wait
+125 ms for the attitude sample after exposure. It interpolates only between
+measured packets no farther than 120 ms from exposure and with a bracket no
+wider than 200 ms; unbracketed or wider poses are dropped rather than projected
+from stale pre-motion state. These bounds cover the SDK's observed native-AI
+sampling gaps without permitting extrapolation. The real-time face detector
+and motor controller keep their strict timestamps and never wait for this
+branch. People are masked from the background composite; non-human detections
+remain ordinary scene content rather than opening holes in the panorama. A
+frame with a current person rectangle may contribute only its
+unmasked background; after that rectangle disappears, the entire frame is
+rejected for 750 ms across short detector gaps. Feature Print requires an
+empty dynamic mask.
+The compositor does not average repeated pixels. It scores each observation
+from the bracketed gimbal angular velocity and view-centre geometry. At up to
+2°/s it may use the full frame; from 2°/s through 40°/s it uses only a central
+vertical strip whose width covers the elapsed interval since the last projected
+frame. Faster frames are rejected. The raster worker evaluates only the
+spherical window that the current perspective frame can see, preventing its
+mailbox from falling behind a continuous sweep. The camera model and pose basis
+are validated and prepared once per frame rather than rebuilt per output pixel.
+It otherwise replaces an empty
+pixel or a prior pixel only when quality improves by a fixed hysteresis margin.
+The higher-quality observation owns the overlap interior while a bounded
+OpenCV feather weight softens only its seam; repeated views are not globally
+averaged into a progressively blurred image. On the same utility queue, Vision
+translation registration compares consecutive overlapping background views
+that already pass the motion gate and refines only the residual between their
+image motion and measured gimbal motion. The correction requires both request
+confidence and robust residual weight, is bounded to 4% of each FOV, and is
+rejected when the motion exceeds the local translation model; every pair is
+re-anchored to measured attitude, so errors do not accumulate as visual
+odometry. At most once per second, a human-free stable view also runs Apple's
+Vision Feature Print model and contributes its normalized learned embedding to
+the nearest fixed spherical cell. Returning to that bearing with the same
+encoder, revision, and element count updates the same cell and records
+familiarity or conflict instead of creating another location. An incompatible
+model revision starts new evidence and is never treated as a revisit. These
+embeddings are scene appearance cues, are not used as biometric or object
+identity, and remain sensitive local derived data.
+
+`--panorama-place-memory /absolute/place-memory.json` persists only those
+versioned embeddings, bearings, familiarity/conflict, and observation counts.
+It requires `--panorama-output`, overwrites one bounded schema-1 file atomically,
+caps it at 4 MiB/256 cells, and applies `0600` file plus `0700` directory
+permissions. Pixel data, labels, people, scene entities, and monotonic runtime
+state are absent. Startup validates the encoder/revision and rejects an
+incompatible or malformed file instead of silently merging it. The rolling
+JPEG still starts empty each process; only compatible place evidence is
+restored across sessions.
+`get_spatial_map` reports the
+local image path, revision, raw and quality coverage, mean observation quality,
+pose misses, low-quality frame rejection, quality-protected pixels,
+masked-pixel count, alignment timing and
+acceptance, Feature Print timing/failures, place revisit statistics, restored
+place count, and active encoder revision.
+
+### Tiny 2 Lite camera geometry calibration
+
+The native helper disables auto zoom, commands 1×, and requires a successful
+zoom readback before it exposes the motor bridge. An explicit calibration
+session then follows 21 overlapping absolute pan/pitch waypoints and records
+only frames measured at no more than 0.75°/s. The fitter uses pose-separated
+SIFT pairs with MAGSAC and a disjoint validation split to estimate normalized
+intrinsics plus one camera-to-gimbal rotation.
+
+The deployed schema-1 model comes from a fresh fixed-zoom 1× capture with 28
+settled frames. It fits normalized intrinsics, Brown radial distortion, and the
+camera-to-gimbal rotation from 12 training pairs/813 matches, then validates on
+five disjoint pairs/369 matches. Held-out reprojection improves from 41.325 px
+RMSE to 6.098 px, with 8.204 px p90. Rotation-centre parallax remains visible
+for nearby desk objects because a single rotational camera model cannot remove
+translation caused by the offset lens centre. Raw calibration JPEGs stay
+temporary and are not enabled by the persistent launcher.
+
+`--panorama-strip-scan` is an explicit diagnostic route, not the normal social
+controller. With panorama output and autonomous external control enabled, it
+runs a continuous boustrophedon sweep over four overlapping elevations while
+the ordinary runtime still lets human tracking preempt normal exploration.
+The compositor uses Vision translation for pose residuals, then OpenCV channel
+exposure compensation and feather seam weights on the spherical observation.
+An AE/AWB-on physical circuit projected 643 frames with no low-quality
+rejection, accepted 605/622 registration attempts, and covered 96.9% of the
+physically reachable raster; 73.6% reached the high-quality threshold. Mean
+registration and stitch stages were 6.68 ms and 5.28 ms on the separate utility
+queue. An OpenCV pyramidal-LK comparison accepted only 152/548 pairs at 9.37 ms
+mean, so it is not the deployed registration path. Automatic exposure and white
+balance remain enabled: measured channel compensation averaged about 1%, while
+locking the camera would reduce its ability to expose differently lit
+directions. The Tiny 2 Lite SDK exposes manual white-balance and exposure
+controls; a future comparison must save and restore the prior values as one
+explicit scan session rather than changing persistent camera state.
+
+No-target exploration consumes the same spherical quality state. Its sampling
+posterior uses expected information gain: 20% scalar recency novelty, 45%
+panorama-quality deficit, and 35% unresolved or conflicting place evidence,
+while retaining route distance, failure, elevation, and joint-boundary terms.
+A high-information tile is brought as near the image centre as the gimbal
+envelope permits; a familiar clear tile blends earlier into the next route so
+normal exploration remains continuous. Fresh human
+tracking still preempts this path; panorama pixels never constitute person or
+object motor evidence. Nothing uploads the panorama to a cloud model
+automatically.
 
 A non-human `scene_observation` can delay the start of a new blind search while
 its posterior-weighted dwell is active, but it cannot interrupt a coverage

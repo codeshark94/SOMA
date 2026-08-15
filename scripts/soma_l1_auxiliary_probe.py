@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the persistent SOMA L0.5 worker without touching the live service."""
+"""Benchmark the persistent SOMA L1 visual helper without touching the live service."""
 
 from __future__ import annotations
 
@@ -87,7 +87,18 @@ def main() -> int:
         wall_ms = (time.perf_counter() - request_started) * 1_000
         if envelope.get("type") != "result":
             raise RuntimeError(f"inference failed: {envelope}")
-        results.append({**envelope, "wallMS": wall_ms})
+        try:
+            rss_kilobytes = int(subprocess.check_output(
+                ["ps", "-o", "rss=", "-p", str(process.pid)],
+                text=True,
+            ).strip())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            rss_kilobytes = 0
+        results.append({
+            **envelope,
+            "wallMS": wall_ms,
+            "workerRSSMB": rss_kilobytes / 1024,
+        })
 
     process.stdin.write('{"type":"shutdown"}\n')
     process.stdin.flush()
@@ -105,6 +116,8 @@ def main() -> int:
         "cold_inference_ms": inference_times[0],
         "warm_inference_ms": inference_times[1:],
         "warm_inference_median_ms": statistics.median(inference_times[1:]) if len(inference_times) > 1 else None,
+        "maximum_worker_rss_mb": max(float(result["workerRSSMB"]) for result in results),
+        "maximum_reported_peak_memory_gb": max(float(result.get("peakMemoryGB", 0)) for result in results),
         "wall_ms": wall_times,
         "results": results,
     }, ensure_ascii=False, indent=2))

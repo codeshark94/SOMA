@@ -1,5 +1,21 @@
 # Bundled models
 
+## Apple Vision Feature Print
+
+SOMA uses the system `VNGenerateImageFeaturePrintRequest` only on stable,
+human-free panorama frames, at most once per second on the utility compositor
+queue. The encoder revision and element count are stored with every normalized
+Float32 scene embedding; a mismatch is rejected rather than compared. The
+embedding supports fixed-base spherical place familiarity and change evidence,
+not face identity, object identity, dialogue, or direct motor authority.
+
+This model is supplied by macOS rather than bundled in the repository. Apple
+does not expose a per-request Neural Engine placement guarantee for this Vision
+operation, so SOMA records its revision, attempts, failures, and latency without
+claiming ANE execution. Optional cross-session storage contains only bounded
+embeddings and scalar spherical-cell statistics in an owner-only local file;
+no camera pixels or scene entities are included.
+
 ## YOLOv3TinyFP16
 
 - File: `Sources/SOMASubconscious/Resources/YOLOv3TinyFP16.mlmodel`
@@ -66,7 +82,26 @@ Neural Engine. The live trace separately records Core ML inference duration and
 window-end-to-evidence duration; a speech onset necessarily also waits for up
 to one 260 ms input window.
 
-## Optional local Gemma 4 E4B MLX-VLM
+## Active local Gemma 4 E2B MLX-VLM helper
+
+- Local directory: `~/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit`
+  (downloaded runtime asset; not bundled in the Swift package or Git repository).
+- Repository: [mlx-community/gemma-4-e2b-it-4bit](https://huggingface.co/mlx-community/gemma-4-e2b-it-4bit)
+  at revision `238767527555cb75a05732a84dff5d6ba0dd6809`.
+- Variant: 4-bit; `model.safetensors` size 3,550,670,554 bytes and SHA-256
+  `038e39a37a7667373d2c3991375446b10c96ae1d717a68674870343db376b76e`.
+- License: Gemma terms, as declared by the conversion model card. The operator
+  is responsible for accepting and complying with those terms for the local
+  downloaded checkpoint.
+
+This is L1's active optional local visual helper. A same-image three-request
+probe measured 1.47 s cold and 1.39 s warm-median inference with a 4.20 GB
+MLX-reported peak. It remains asynchronous advisory cognition and is never part
+of the L0 tracking or motor loop. MLX uses the Apple GPU and unified memory,
+not the Neural Engine. The persistent worker requires the existing local path
+and has no Ollama or network fallback.
+
+## Evaluated local Gemma 4 E4B MLX-VLM fallback
 
 - Local directory: `~/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4`
   (downloaded runtime asset; not bundled in the Swift package or Git repository).
@@ -80,9 +115,9 @@ to one 260 ms input window.
   is responsible for accepting and complying with those terms for the local
   downloaded checkpoint.
 
-This model is used only by the optional `mlx-vlm` L0.5 side process. MLX runs
-it on the Apple GPU and unified memory, not the Neural Engine. The real-time L0
-path never waits for it, and its scalar advisory output has no target-selection
-or actuator authority. The command line requires an existing local directory;
-there is no runtime network fallback. The persistent worker calls `mlx-vlm`
-directly and never routes the local checkpoint through Ollama.
+E4B remains an evaluated comparison fallback, not the persistent default. MLX
+runs it on the Apple GPU and unified memory, not the Neural Engine. The
+real-time L0 path never waits for it, and its scalar advisory output has no
+target-selection or actuator authority. The command line requires an existing
+local directory; there is no runtime network fallback. The worker calls
+`mlx-vlm` directly and never routes the local checkpoint through Ollama.

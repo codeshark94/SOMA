@@ -1,5 +1,10 @@
 # Subconscious v0 execution plan
 
+This file tracks the L0 execution history and acceptance gates. The primary
+post-L0 cognitive objective, including the 31B L1 model, memory, L2 Codex interaction,
+embodiment MCP, LED capability boundary, and panoramic spatial memory,
+is tracked in [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md).
+
 ## Definition of done
 
 Subconscious v0 is complete when the connected Tiny 2 Lite can continuously
@@ -37,7 +42,7 @@ interpretation of a sentence and cannot trigger speech or an external action.
 | P1 - event and trace contract | Small versioned event schema plus a bounded local trace writer. | A replay of a fixed short capture preserves event ordering and computes capture-to-event latency; no event needs an LLM response. |
 | P2 - perception loop | Latest-frame person/face/hand detection, a persistent scene field, posterior target selection, temporal tracker, and audio VAD. | A credible face holds social attention through a detector gap; an observed non-face candidate remains scene attention without acquiring motor authority; coverage exploration resumes only after confirmed visual absence. |
 | P3 - interaction preparation | State estimator combining target continuity, voice activity, visible gesture, and idle time into readiness and intent-hint events. | The system emits evidence and confidence only; it emits no text, speech, command execution, or ungrounded semantic intent. |
-| P3.5 - optional L0.5 semantics | A persistent local MLX-VLM side process interprets sparse keyframes without blocking L0. | One-in-flight/latest-one-pending transport; scalar advisory output only; no target-selection, memory, dialogue, or motor authority. |
+| P3.5 - L1 visual auxiliary | A persistent local MLX-VLM helper interprets sparse keyframes for L1 without blocking L0. | One-in-flight/latest-one-pending inference transport; scalar semantic output; no independent layer or SDK authority. |
 | P4 - native tracking evaluation | Controlled comparison of the Tiny 2 Lite's native human/group/hand tracking modes. | Logs show start, lock/loss, stop, and camera state for each mode. Native tracking remains disabled by default after the test. |
 | P5 - actuator state machine | One-owner camera arbiter, manual stop, native-AI control, and optional external pan/tilt/zoom control. | AI and direct control cannot overlap; disconnect, failed acknowledgement, or explicit stop enters `fault` or `manual` and sends zero-speed/stop as applicable. |
 | P6 - end-to-end evaluation | Repeatable, consented scenarios and a baseline report. | Compare native and external paths for latency, target retention, overshoot, recovery after loss, and false readiness events. Choose one control owner for the next milestone. |
@@ -125,43 +130,68 @@ camera events.
 This is strictly L0 work. It does not add L1 dialogue, language inference,
 memory, identity, rapport, or semantic reasoning.
 
-## Optional P3.5 L0.5 semantic interpretation
+## P3.5 L1 auxiliary semantic interpretation
 
-The E4B MLX-VLM experiment is an optional side loop between reflexive L0 and a
-future deliberative L1. The capture, perception, and actuator loops never wait
+The E2B MLX-VLM worker is an optional visual helper owned by L1. The primary
+31B cloud route decides when its local sketch is useful; E2B is not a separate
+cognitive layer. The capture, perception, and actuator loops never wait
 for it. A changed or salient scene may submit at most one keyframe per second;
 an unchanged scene refreshes at five seconds. One persistent worker accepts one
 inference plus one replaceable pending 512x288 in-memory JPEG. Its strict result
 contains only a scene summary, novelty, social-presence probability, advisory
 attention hint, bounded situation/wake hypotheses, confidence, and timing. A
-deterministic gate emits a scalar `l05.interrupt` recommendation only when the
+deterministic gate emits a scalar `l1.auxiliary.wake_proposal` only when the
 situation and wake reason agree, wake score is at least 0.65, and confidence is
 at least 0.55; identical recommendations are suppressed for five seconds.
 
-The result is trace evidence, not authority. It cannot select or suppress a
-target, change a face lock, claim the camera owner, move the gimbal, speak,
-identify a person, retrieve memory, or invoke L1. The model path must already
-exist locally; no network or Ollama fallback is permitted. Direct MLX uses the Apple GPU
+E2B cannot by itself select or suppress a target, change a face lock, claim the camera owner,
+move the gimbal, speak, identify a person, retrieve memory, or invoke L1. The
+shared MCP transport and running L0 arbiter accept the same leased semantic
+embodiment goals from L1 and L2—labels, attention priors, tracking, orientation,
+exploration, view alignment, and expression. The separately enabled motor
+adapter is active in the authorized persistent launcher; E2B still cannot claim
+that lease or invoke the MCP by itself. The model path
+must already exist locally; no network or Ollama fallback is permitted. Direct MLX uses the Apple GPU
 and unified memory, while L0 Core ML remains independently ANE-preferred. The
 worker has an 8 GB MLX evaluation limit and a 256 MB free-cache limit.
 
-The 2026-08-15 24 GB host benchmark found about 3.27 s cold and 2.65 s warm
-median direct-MLX latency with a 5.75 GB MLX-reported peak. E4B is therefore a
-roughly 0.3 Hz semantic observer, not a reflex or tracking component. The L0
+The 2026-08-15 same-image direct-MLX comparison found E2B at 1.47 s cold and
+1.39 s warm median, versus E4B at 3.00 s cold and 2.75 s warm median. E2B's
+MLX-reported peak was 4.20 GB versus 5.75 GB, and its local checkpoint was
+3.3 GiB versus 4.8 GiB. E2B is therefore the persistent helper; E4B remains a
+comparison fallback. Process RSS moved in the opposite direction in this short
+probe (3.33 GB E2B versus 2.31 GB E4B), so the decision is based on latency,
+MLX peak, disk footprint, and the bounded-worker isolation—not a claim that
+every memory metric is lower. Both remain semantic observers, not reflex or
+tracking components. The L0
 Vision worker's missing per-frame autorelease boundary was fixed and a same-PID
 898.43-second L0-only run reached 22,422 video callbacks with zero runtime
 error/stall events and bounded RSS. A following 20-request E4B stress window
 advanced L0 by 1,749 video callbacks with no new skipped frames or cumulative
 latency maxima. The persistent LaunchAgent now enables direct MLX and a first
 234.34-second integrated smoke produced 48 semantic events, no interrupt false
-positive, and no L0.5 runtime error. A longer thermal qualification remains an
-operational follow-up. Ollama is benchmark-only and never part of this runtime.
+positive, and no auxiliary-worker runtime error. A longer thermal qualification remains an
+operational follow-up. The E2B/E4B semantic comparison used one person-free
+panorama fixture, so broader human and object accuracy evaluation remains open.
+Ollama is benchmark-only and never part of this runtime.
+
+The persistent runtime now separates bounded forensic detail from durable
+operational history. Full scalar evidence rotates at 128 MiB with eight retained
+segments; native actuator evidence rotates at 32 MiB with four retained
+segments. A separate important journal retains only source/controller state
+changes, target acquire/loss transitions, voice transitions, semantic
+interrupts, camera-mode changes, and hourly metrics, also under a segment cap.
+Repeated unchanged states are not promoted. Face-lock JPEG diagnostics remain a
+manual, session-scoped tool and are not enabled by the persistent launcher.
 
 ## P8 gimbal-relative spatial scene field
 
 When the direct gimbal bridge is present, the native helper reports the Tiny 2
-Lite's current pitch/pan attitude and 86°/78°/65° FOV mode over the local scalar
-pipe. `SceneField` projects every observed rectangle to a gimbal-relative
+Lite's current pitch/pan attitude and generic 86/78/65 FOV mode label over the
+local scalar pipe. A specification-derived optical profile remains the fallback.
+The provisional 86-mode calibration instead shares normalized intrinsics and one
+camera-to-gimbal rotation across `SceneField`, coverage, and panorama projection
+before every observed rectangle is projected to a gimbal-relative
 azimuth/elevation bearing, retains an offscreen candidate for the running
 session with decaying spatial confidence, and refreshes a compatible labelled candidate
 near that bearing after the camera moves. Offscreen bearings are normally map
@@ -173,23 +203,71 @@ but do not become motor targets.
 This is a local spatial index for L0 exploration, not a claim of object identity
 or a new L1 memory system.
 
-When no retained scene wins that posterior, a coarse spherical coverage field
+The native helper disables auto zoom, commands 1×, and requires its readback
+before exposing motion. Calibration capture uses absolute 21-waypoint motion
+and accepts only frames at no more than 0.75°/s. The deployed 28-frame schema-1
+model fits intrinsics, Brown radial distortion, and camera-to-gimbal rotation;
+five held-out pairs/369 matches improve from 41.325 px RMSE to 6.098 px with
+8.204 px p90. Rotation-centre parallax remains open calibration work.
+
+When no retained scene wins that posterior, the shared spherical scene atlas
 marks every fresh-pose FOV as seen and chooses an unobserved azimuth/elevation
-direction from five -30°...+30° elevation layers for the next exploration
-waypoint, driving both pan and pitch. Waypoints feed a continuous 50 ms control
-trajectory capped at 60°/s pan and 30°/s pitch, with 120/80°/s² acceleration
+direction across the complete edge-visible field for the next exploration
+waypoint, driving both pan and pitch. The same bounded scalar atlas is readable
+through `get_spatial_map` and retains scene bearings for L1. Waypoints feed a continuous 50 ms control
+trajectory capped at 30°/s pan and 18°/s pitch for exploration, with 120/80°/s² acceleration
 limits and stopping-distance braking. For each spatial cell, the planner
-intersects its FOV-valid camera poses with the safe joint envelope and chooses
-the nearest reachable guide; unreachable cells are rejected before motion and
+intersects its FOV-valid camera poses with one shared `GimbalKinematicEnvelope`
+and chooses the nearest reachable guide; unreachable cells are rejected before motion and
 opposite-side routes stay inside finite joint space instead of crossing the
 angular seam. A 10° look-ahead transition changes direction before the exact
 guide centre, so normal routes neither plan a joint boundary nor insert a hard
 stop/rest. The waypoint deadline scales with angular travel. The native helper
 coalesces superseded direct-motion commands while the synchronous SDK call is
 in flight. Normal exploration continues from the current world-relative pose;
-re-centering is reserved for an extreme physical attitude or measured
+re-centering is reserved for measured external displacement or a
 two-direction pan stall. This replaces a fixed scan order with scalar spatial
-recency; it does not store frames or introduce L1 memory.
+recency. An optional separate panorama worker writes one rolling 1024×256 JPEG
+plus metadata at most once per second and resets that session artifact at
+startup. It uses a 4 Hz one-slot input, waits up
+to 125 ms for the post-exposure attitude packet, interpolates only measured
+samples within a 120/200 ms distance/bracket bound, and
+drops unaligned frames without delaying L0. Stable frames up to 2°/s may use
+the full image; continuous motion from 2°/s through 40°/s contributes a central
+vertical strip sized from the actual interval since the previous projection.
+The compositor evaluates only the perspective frame's candidate spherical
+window so the one-slot worker can keep pace with a sweep. The explicit
+`--panorama-strip-scan` traverses four overlapping alternating elevation strips.
+An AE/AWB-on physical circuit projected 643 frames, rejected zero for quality,
+accepted 605/622 Vision translation refinements, and covered 96.9% of reachable
+pixels with 73.6% high-quality coverage. OpenCV channel exposure compensation
+and feather seam weights averaged 5.28 ms on the independent utility queue;
+OpenCV pyramidal LK was measured and rejected because both acceptance and
+latency were worse. People are kept out of the background composite; non-human
+detections remain scene content. A currently detected person is masked
+while the remaining background may contribute; an unmasked detector gap is
+rejected for 750 ms. Per-pixel quality selection replaces the former
+accumulating average: frames below the stable projection threshold are rejected,
+and an existing pixel changes only for a materially better observation. Its
+standard world equirectangular raster converts the OBSBOT SDK attitude once
+into canonical visual axes, and source rays use a coupled 3D yaw/pitch basis
+rather than separable planar offsets. Consecutive overlapping background views
+receive a utility-queue translational registration pass only after the motion
+gate; its residual correction is confidence-gated, robustly weighted, bounded,
+and re-anchored to measured attitude on every pair.
+Stable human-free views run a versioned Apple Vision Feature Print at most once
+per second on the utility queue and contribute its normalized learned embedding
+to a fixed spherical cell. A compatible revisit updates that cell and records
+familiarity or appearance conflict rather than creating another location;
+encoder/revision mismatch cannot merge. An explicit place-memory path persists
+only embeddings and bounded scalar cell state in one atomic 4 MiB/256-cell,
+owner-only file, while the rolling image and dynamic entities remain
+session-scoped. The exploration
+posterior combines scalar recency, spherical image-quality deficit, and place
+uncertainty as expected information gain, then centres a reachable deficient
+tile in the FOV. MCP exposes coverage/quality, registration and embedding
+timing, restored/revisit/conflict, encoder revision, and information-gain state;
+cloud transfer is not automatic.
 Non-human scene observation may delay a new search but cannot terminate an
 already active coverage trajectory; social evidence retains preemption.
 
@@ -369,11 +447,50 @@ also rules out any hard real-time end-to-end claim.
 
 ## Immediate next action
 
-Stay within L0. Collect a labelled, no-motion scene sequence containing real
-people, ordinary objects, empty wall, reflections, and occlusion. Score scene
-retention, false-label rate, source agreement, eligibility false positives, and
-capture-to-belief latency before enabling another physical gimbal trial. Do not
-start L1 dialogue, memory, identity, or language work until explicitly asked.
+Implement the direct interaction path and C4 without coupling their latency.
+L0 first publishes C3 contact dispatch in shadow mode; a local speech transport
+then consumes its bounded in-memory audio pre-roll and live stream, forwards
+every accepted final transcript plus scoped context to the ChatGPT-authenticated
+L2 Codex account bridge, and records wake-to-audio, speech-start-to-transcript,
+Codex, and speech-output latency.
+Meanwhile the primary 31B situational stream consumes a bounded
+`SituationFrame`, C2 memory projection, and C6 embodiment MCP and prepares the
+richer interaction context in parallel. It requests transient views only for
+visual disambiguation, proposes rather than directly commits memory, and uses a
+leased embodiment action rather than SDK access. Extend the labelled L0 corpus
+with directed and non-directed speech, gaze/contact bids, people, ordinary
+objects, empty wall, reflections, and occlusion so false interaction wakes and
+missed contacts remain measurable.
+
+The C2 core is now implemented as a typed, encrypted local journal with
+provenance, consent, tier retention, promotion, correction, deletion, and
+remote-summary projection boundaries. Keychain provisioning and L1 integration
+remain runtime work. The C3 core now supplies a versioned probabilistic router,
+direct L2 interaction dispatch, parallel L1 context preparation, interaction
+authorization and local-safety policy masks, deterministic replay sampling,
+temperature calibration, and false-wake/missed-wake metrics. Its 32-row
+bootstrap corpus is only an executable contract. The next C3 gate is a
+time-aligned, labelled deployment corpus from real camera, audio, memory, and
+task events, followed by out-of-sample calibration and a shadow-mode latency
+test before the router can schedule L1 or open L2 interaction.
+
+The leased physical embodiment gate is complete. SceneField projection and
+semantic binding feed a separately enabled L0 motor adapter: explicit scene
+references preserve object permanence offscreen, descriptor matches expose a
+normalized association posterior, and ambiguous or unavailable bindings
+suspend rather than move. Accepted `orient`, grounded `track`, policy-shaped
+`explore`, active view capture, and bounded social expressions share the existing
+gimbal owner queue. Higher-priority leases preempt, owner release and target
+removal invalidate, expiry is independently scheduled, and every exit returns
+through the native stop/watchdog path. `capture_view` now settles against pose
+feedback, captures the next exposure-aligned frame, returns a bounded 60-second
+MCP image resource, and releases only its one-shot motor goal. Live checks
+returned a sharp 640x360 frame in 1.6 s at -0.35/-0.05 degrees for a 0/0-degree
+request. A registered `bicycle` bound to `scene-10`, reacquired fresh visual
+evidence, physically tracked to hold, and released at the 20-second deadline.
+The next implementation gate is C4: wire the primary 31B situational stream to
+the typed C2 memory projection and calibrated C3 event router, using C6 tools
+for active observation rather than adding another actuator path.
 
 ## P4 audiovisual attention field
 
@@ -447,7 +564,7 @@ app-detector cadence through short gaps. Continuous social loss for 1.2 seconds
 releases native ownership and re-arms probabilistic spatial exploration; a new
 verified face preempts that exploration and reacquires tracking. A
 motion-enabled non-native session searches 450 ms after visual absence with a
-continuous acceleration-limited trajectory at up to 60°/s pan and 30°/s pitch,
+continuous acceleration-limited trajectory at up to 30°/s pan and 18°/s pitch,
 resampling the spherical posterior as each waypoint is reached or times out
 until vision returns. The helper reads physical pitch/pan attitude but does not infer
 an axis sign and overwrite the requested direction. Coverage exploration compares
