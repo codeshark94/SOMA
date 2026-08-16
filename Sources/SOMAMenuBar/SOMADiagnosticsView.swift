@@ -99,8 +99,9 @@ final class SOMADiagnosticsModel: ObservableObject {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
-        let readOffset = Int(max(0, size - UInt64(bytes)))
-        try? handle.seek(toOffset: UInt64(readOffset))
+        // Guard against UInt64 underflow when the file is smaller than `bytes`.
+        let readOffset = size > UInt64(bytes) ? size - UInt64(bytes) : 0
+        try? handle.seek(toOffset: readOffset)
         guard let data = try? handle.readToEnd(),
               let text = String(data: data, encoding: .utf8) else { return [] }
         let raw = text.split(separator: "\n", omittingEmptySubsequences: false)
