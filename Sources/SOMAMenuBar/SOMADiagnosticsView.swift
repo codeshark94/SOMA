@@ -186,40 +186,23 @@ struct SOMADiagnosticsView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
 
-            if model.isLive {
-                cameraView
-                    .frame(height: 340)
-                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.gray.opacity(0.4)))
+            cameraView
+                .frame(height: 340)
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.gray.opacity(0.4)))
 
-                HStack {
-                    Text("Thought stream · \(model.thoughts.count) events")
-                        .font(.subheadline)
-                    Spacer()
-                    if model.captureLagSeconds > 0 {
-                        Text(String(format: "frame lag %.1fs", model.captureLagSeconds))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal)
-
-                thoughtLog
-            } else {
-                VStack(spacing: 8) {
-                    Spacer()
-                    Image(systemName: "pause.circle.fill")
-                        .font(.system(size: 36))
-                        .foregroundStyle(.secondary)
-                    Text("SOMA is not running")
-                        .font(.headline)
-                    Text("Camera and thought stream are paused. Start SOMA to resume.")
+            HStack {
+                Text("Thought stream · \(model.thoughts.count) events")
+                    .font(.subheadline)
+                Spacer()
+                if model.isLive && model.captureLagSeconds > 0 {
+                    Text(String(format: "frame lag %.1fs", model.captureLagSeconds))
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Spacer()
                 }
-                .frame(maxWidth: .infinity)
-                .frame(height: 400)
             }
+            .padding(.horizontal)
+
+            thoughtLog
         }
         .frame(width: 760, height: 640)
         .onAppear { model.start() }
@@ -275,8 +258,10 @@ struct SOMADiagnosticsView: View {
                     .clipped()
                 } else {
                     Rectangle().fill(Color.black)
-                    Text("Waiting for camera frame…")
-                        .foregroundStyle(.white)
+                    if model.isLive {
+                        Text("Waiting for camera frame…")
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
                 }
             }
         }
