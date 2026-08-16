@@ -4,6 +4,12 @@ import LocalAuthentication
 import SOMACore
 import SwiftUI
 
+/// Deep dark blue accent color used across the Control Center UI.
+enum SOMAAccent {
+    static let color = Color(red: 0.13, green: 0.27, blue: 0.56)
+    static let nsColor = NSColor(red: 0.13, green: 0.27, blue: 0.56, alpha: 1)
+}
+
 private enum SOMAPaths {
     static let runtimeRoot = URL(fileURLWithPath: "/Users/seungyeop/workspace/Research/SOMA/artifacts/subconscious/runtime", isDirectory: true)
     static let serviceLabel = "com.soma.reactive-l0"
@@ -442,7 +448,7 @@ private struct SOMAMascot {
         NSBezierPath(ovalIn: NSRect(x: size * 0.32, y: size * 0.51, width: size * 0.10, height: size * 0.10)).fill()
         NSBezierPath(ovalIn: NSRect(x: size * 0.58, y: size * 0.51, width: size * 0.10, height: size * 0.10)).fill()
         if !template {
-            NSColor.systemPink.withAlphaComponent(0.62).setFill()
+            SOMAAccent.nsColor.withAlphaComponent(0.62).setFill()
             NSBezierPath(ovalIn: NSRect(x: size * 0.24, y: size * 0.40, width: size * 0.12, height: size * 0.07)).fill()
             NSBezierPath(ovalIn: NSRect(x: size * 0.64, y: size * 0.40, width: size * 0.12, height: size * 0.07)).fill()
         }
@@ -551,7 +557,7 @@ private struct SOMASettingsView: View {
             }
         }
         .frame(minWidth: 770, idealWidth: 820, minHeight: 580, idealHeight: 620)
-        .tint(.pink)
+        .tint(SOMAAccent.color)
     }
 
     private var sidebar: some View {
@@ -603,7 +609,7 @@ private struct SOMASettingsView: View {
                         .padding(.horizontal, SOMASettingsSidebarLayout.rowHorizontalInset)
                         .padding(.vertical, 8)
                         .background(
-                            Color.pink.opacity(0.15),
+                            SOMAAccent.color.opacity(0.15),
                             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                         )
                 }
