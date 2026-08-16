@@ -33,6 +33,44 @@ func somaOllamaHost() -> String {
     return raw.replacingOccurrences(of: "/$", with: "", options: .regularExpression)
 }
 
+/// Runs registered graceful-stop closures when the process receives SIGTERM or
+/// SIGINT (e.g. `launchctl bootout` from the menu bar "Stop SOMA"). Without this
+/// the runtime is killed abruptly and the camera's built-in AI tracking is left
+/// enabled, so it keeps following people after SOMA has been stopped.
+private final class GracefulShutdown: @unchecked Sendable {
+    private let lock = NSLock()
+    private var actions: [() -> Void] = []
+    private let source: DispatchSourceSignal
+
+    init(signals: [Int32]) {
+        for sig in signals { signal(sig, SIG_IGN) }
+        let src = DispatchSource.makeSignalSource(
+            signal: signals[0],
+            queue: DispatchQueue.global(qos: .userInitiated)
+        )
+        self.source = src
+        src.setEventHandler { [weak self] in self?.fire() }
+        src.resume()
+    }
+
+    func onTerminate(_ action: @escaping () -> Void) {
+        lock.lock()
+        actions.append(action)
+        lock.unlock()
+    }
+
+    private func fire() {
+        lock.lock()
+        let current = actions
+        lock.unlock()
+        current.forEach { $0() }
+        // Give the shutdown command (AI-tracking off + park) time to flush
+        // before the process exits.
+        usleep(700_000)
+        Foundation.exit(EXIT_SUCCESS)
+    }
+}
+
 /// Mutable holder for the anonymous-registration review gate. The FaceIdentity
 /// runtime consults `approve()` before surfacing a new anonymous identity; the
 /// reviewer is installed once L1 setup is ready and otherwise defaults to allow.
@@ -7825,6 +7863,7 @@ private final class PanoramaPlaceMemoryPersistence: @unchecked Sendable {
 }
 
 private func run(_ options: Options) throws {
+    let termination = GracefulShutdown(signals: [SIGTERM, SIGINT])
     try requestAccess(for: .video, label: "camera")
     try requestAccess(for: .audio, label: "microphone")
     guard let videoDevice = obsbotDevice(for: .video, uniqueID: options.videoID) else {
@@ -8125,6 +8164,9 @@ private func run(_ options: Options) throws {
         attentionGimbalBridge = nil
     }
     defer { attentionGimbalBridge?.stop() }
+    // On stop (menu bar "Stop SOMA" = launchctl bootout), turn off the camera's
+    // built-in AI tracking and park the gimbal before the process exits.
+    termination.onTerminate { attentionGimbalBridge?.stop() }
     let liveVoiceLanguageRelay = LiveVoiceInstructionRelay()
     let l1LanguageInstructions = L1LanguageInstructionCache(
         onHealth: { state, message in

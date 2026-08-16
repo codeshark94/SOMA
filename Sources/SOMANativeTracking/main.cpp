@@ -1344,13 +1344,31 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                 indicator.reconcile(command.value, command.specialPatternEnabled, command.commandID);
                 break;
             case BridgeCommandType::shutdown:
-                if (nativeTracking || externalControl) {
+                {
                     const std::string owner = externalControl ? "external" : "native_ai";
-                    const bool stopped = requestManualStop(device, trace, "bridge_shutdown", command.commandID, owner);
-                    return stopped ? 0 : 4;
+                    if (nativeTracking || externalControl) {
+                        const bool stopped = requestManualStop(device, trace, "bridge_shutdown", command.commandID, owner);
+                        if (!stopped) return 4;
+                    } else {
+                        trace.event("camera.ack", "manual", "manual_active", RM_RET_OK, "bridge_shutdown_manual", command.commandID);
+                    }
+                    // Put the camera into sleep mode so it fully powers down its
+                    // AI tracking rather than continuing to follow people after
+                    // SOMA has been stopped.
+                    int sleepResult = RM_RET_ERR;
+                    try {
+                        sleepResult = device->cameraSetDevRunStatusR(Device::DevStatusSleep);
+                    } catch (...) {}
+                    trace.event(
+                        "camera.ack",
+                        sleepResult == RM_RET_OK ? "sleep" : "fault",
+                        sleepResult == RM_RET_OK ? "sleep_requested" : "sleep_rejected",
+                        sleepResult,
+                        "bridge_shutdown_sleep",
+                        command.commandID
+                    );
+                    return 0;
                 }
-                trace.event("camera.ack", "manual", "manual_active", RM_RET_OK, "bridge_shutdown_manual", command.commandID);
-                return 0;
             case BridgeCommandType::invalid:
                 trace.event("camera.ack", "fault", "bridge_command_rejected", RM_RET_ERR, "invalid_local_command");
                 break;
