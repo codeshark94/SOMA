@@ -288,6 +288,41 @@ public struct PersonContextSnapshot: Codable, Equatable, Sendable {
             facts: facts
         )
     }
+
+    /// Well-known per-person preference keys. Facts stored under these keys are
+    /// treated as durable, enforceable preferences rather than generic notes.
+    public static let preferenceKeys: Set<String> = [
+        "preferred_name",
+        "preferred_language",
+        "speech_register",
+        "address_form",
+        "communication_preference",
+    ]
+
+    /// Builds explicit, model-directed instruction lines from the stored
+    /// per-person preferences so they are actually followed in conversation.
+    /// The preferred language is intentionally omitted: it is already carried
+    /// by `preferredLanguageTag` and the language-start directive.
+    public func preferenceDirectives() -> [String] {
+        var directives: [String] = []
+        if let value = trimmed(facts["preferred_name"]), !value.isEmpty {
+            directives.append("Address this person as \"\(value)\".")
+        }
+        if let value = trimmed(facts["speech_register"]), !value.isEmpty {
+            directives.append("Use \(value) speech register with this person.")
+        }
+        if let value = trimmed(facts["address_form"]), !value.isEmpty {
+            directives.append("Call this person \"\(value)\".")
+        }
+        if let value = trimmed(facts["communication_preference"]), !value.isEmpty {
+            directives.append("Respect this person's ongoing preference: \(value).")
+        }
+        return directives
+    }
+
+    private func trimmed(_ value: String?) -> String? {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 /// A social-information mission is a state description, not a scripted

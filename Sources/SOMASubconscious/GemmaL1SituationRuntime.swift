@@ -187,6 +187,7 @@ struct L1MemoryContext: Sendable {
     let proactiveContactPreference: ProactiveContactPreference
     let preferredLanguageTag: String?
     let contactHistory: [L1SocialContactEvent]
+    let personPreferences: String
 }
 
 private final class SynchronousWriteResult: @unchecked Sendable {
@@ -266,7 +267,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 rapport: nil,
                 proactiveContactPreference: .unknown,
                 preferredLanguageTag: nil,
-                contactHistory: []
+                contactHistory: [],
+                personPreferences: ""
             )
         }
         do {
@@ -381,7 +383,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 rapport: remotelyAllowedRapport,
                 proactiveContactPreference: relationship?.proactiveContact ?? .unknown,
                 preferredLanguageTag: personContext.preferredLanguageTag,
-                contactHistory: Array(contactHistory.prefix(16))
+                contactHistory: Array(contactHistory.prefix(16)),
+                personPreferences: personContext.preferenceDirectives().joined(separator: " ")
             )
         } catch {
             onHealth("memory_unavailable", String(error.localizedDescription.prefix(192)))
@@ -391,7 +394,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 rapport: nil,
                 proactiveContactPreference: .unknown,
                 preferredLanguageTag: nil,
-                contactHistory: []
+                contactHistory: [],
+                personPreferences: ""
             )
         }
     }
@@ -664,6 +668,111 @@ final class L1MemoryContextProvider: @unchecked Sendable {
 
     func warmContext(for personEntityID: UUID) {
         Task { _ = await context(for: personEntityID) }
+    }
+
+    /// Persists durable, enforceable per-person preferences captured from a
+    /// live user turn. Runs on the L1 queue; extraction is a lightweight local
+    /// model call and only writes when the user stated a new/changed preference.
+    func captureUserPreferences(
+        threadID: String?,
+        role: ConversationParticipantRole,
+        rawText: String,
+        at date: Date = Date()
+    ) async {
+        guard role == .user else { return }
+        let normalizedThreadID = threadID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty, !text.isEmpty else { return }
+        guard let personEntityID = activePersonEntityID(forThread: normalizedThreadID), let store else { return }
+        let extracted = await Self.extractUserPreferences(from: text)
+        guard !extracted.isEmpty else { return }
+        do {
+            var changed = false
+            let current = try await store.personContext(for: personEntityID, at: date)
+            for (key, value) in extracted {
+                guard PersonContextSnapshot.preferenceKeys.contains(key) else { continue }
+                if current.facts[key]?.trimmingCharacters(in: .whitespacesAndNewlines) == value {
+                    continue
+                }
+                _ = try await store.setExplicitPersonFact(
+                    personEntityID: personEntityID,
+                    key: key,
+                    value: value,
+                    sourceID: "l2_live_voice:\(normalizedThreadID)",
+                    at: date
+                )
+                changed = true
+            }
+            if changed {
+                cachePersonContext(try await store.personContext(for: personEntityID, at: date))
+                onHealth("person_preference_captured", "entity=\(personEntityID.uuidString.lowercased()); keys=\(extracted.map(\.key).joined(separator: ","))")
+            }
+        } catch {
+            onHealth("person_preference_capture_failed", String(error.localizedDescription.prefix(192)))
+        }
+    }
+
+    private func activePersonEntityID(forThread threadID: String) -> UUID? {
+        conversationLock.lock()
+        defer { conversationLock.unlock() }
+        return activeConversations[threadID]?.personEntityID
+    }
+
+    /// Reads the stored preference directives for a person as one instruction
+    /// string (used by the L1 packet and the L2 conversation context).
+    func personPreferenceDirectives(for personEntityID: UUID) -> String {
+        preferredLanguageLock.lock()
+        defer { preferredLanguageLock.unlock() }
+        guard let snapshot = personContextByPersonID[personEntityID] else { return "" }
+        let directives = snapshot.preferenceDirectives()
+        return directives.isEmpty ? "" : directives.joined(separator: " ")
+    }
+
+    /// Asks the local model whether the user stated any durable preference or
+    /// request in this turn, and returns the extracted {key, value} pairs.
+    private static func extractUserPreferences(
+        from text: String
+    ) async -> [(key: String, value: String)] {
+        let allowed = PersonContextSnapshot.preferenceKeys.sorted().joined(separator: ", ")
+        let prompt = """
+        The user just said: "\(text)"
+        Did they state a durable preference, how to address them, or an ongoing request?
+        If yes, choose the matching key from this set: \(allowed).
+        Return strict JSON only: {"preferences":[{"key":"...","value":"..."}]} or {"preferences":[]}.
+        Keep each value short and concrete. If nothing durable was stated, return {"preferences":[]}.
+        """
+        guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return [] }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": ProcessInfo.processInfo.environment["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud",
+            "prompt": prompt,
+            "stream": false,
+            "format": "json",
+            "options": ["temperature": 0.1, "num_predict": 160],
+        ])
+        request.timeoutInterval = 15
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let outer = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let content = outer["response"] as? String,
+                  let contentData = content.data(using: .utf8),
+                  let parsed = try JSONSerialization.jsonObject(with: contentData) as? [String: Any],
+                  let rawPreferences = parsed["preferences"] as? [[String: Any]] else {
+                return []
+            }
+            return rawPreferences.compactMap { item -> (key: String, value: String)? in
+                guard let key = item["key"] as? String,
+                      let value = item["value"] as? String else { return nil }
+                let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalizedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalizedKey.isEmpty, !normalizedValue.isEmpty else { return nil }
+                return (normalizedKey, normalizedValue)
+            }
+        } catch {
+            return []
+        }
     }
 
     /// Seeds durable person facts for the local administrator from the control
@@ -1238,6 +1347,7 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
         The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is private reasoning, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. If they contain no new, concrete purpose for this person, do not speak: do not turn an empty relationship field, a known person's presence, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact; prefer it over remain_silent for an available known person. A spoken opening is permitted only as one question that can reduce exactly one supplied information_need. Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
 
         If curiosity_context is non-empty, it contains fresh material that was gathered to help you hold a good conversation with the person present — recent, concrete things related to their interests, situation, or open questions. Treat it as conversation preparation, not your own idle curiosity. When the person is present and the moment fits (right rapport, low interruption cost, not a redundant greeting), use a specific, relevant detail from it as a natural spoken opening. Reference a concrete fact so it feels genuinely grounded, and never force it: if the detail is weak or the context is wrong, stay quiet. It never overrides rapport or interruption cost.
+        If personPreferences is non-empty, it contains the person's explicitly stated, durable preferences (how to address them, speech register, ongoing requests). Honor them as binding rules in how you engage this person — for example the correct name/address form and whether to use formal or casual speech. They are not optional suggestions.
         packet:
         \(requestJSON)
         """
@@ -1744,7 +1854,8 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             visualResourceOffers: environment.visualResourceOffers,
             visuals: [currentFrameProvider()].compactMap { $0 },
             socialOpportunity: opportunity,
-            curiosityContext: curiosityContextProvider()
+            curiosityContext: curiosityContextProvider(),
+            personPreferences: context.personPreferences
         )
         onHealth(
             "wake",

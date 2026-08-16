@@ -397,6 +397,9 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
     /// Collected web material on curiosity topics, surfaced so L1 can craft a
     /// more grounded, topical conversation opener.
     public let curiosityContext: String?
+    /// Explicit per-person preference directives (speech register, address form,
+    /// etc.) that L1 must honor in how it engages this person.
+    public let personPreferences: String?
 
     public init(
         cycleID: UUID = UUID(),
@@ -418,7 +421,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         visuals: [L1VisualResource] = [],
         socialOpportunity: L1SocialOpportunity? = nil,
         behaviorContext: L1BehaviorContext? = nil,
-        curiosityContext: String? = nil
+        curiosityContext: String? = nil,
+        personPreferences: String? = nil
     ) {
         self.cycleID = cycleID
         self.observedAt = observedAt
@@ -440,6 +444,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         self.socialOpportunity = socialOpportunity
         self.behaviorContext = behaviorContext
         self.curiosityContext = curiosityContext.map { String($0.prefix(2_000)) }
+        self.personPreferences = personPreferences.map { String($0.prefix(1_500)) }
     }
 
     public func continuing(with visuals: [L1VisualResource]) -> Self {
@@ -461,7 +466,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
             visualResourceOffers: visualResourceOffers,
             visuals: visuals,
             socialOpportunity: socialOpportunity,
-            curiosityContext: curiosityContext
+            curiosityContext: curiosityContext,
+            personPreferences: personPreferences
         )
     }
 }

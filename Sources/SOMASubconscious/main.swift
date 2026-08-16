@@ -8335,6 +8335,16 @@ private func run(_ options: Options) throws {
                         role: role,
                         rawText: text
                     )
+                    if role == .user {
+                        Task {
+                            await l1MemoryContext.captureUserPreferences(
+                                threadID: threadID,
+                                role: role,
+                                rawText: text,
+                                at: Date()
+                            )
+                        }
+                    }
                 }
             case .preparingResponse:
                 l1LiveConversationState.setParticipantSpeaking(false)
@@ -9671,6 +9681,9 @@ private func l1ProactiveInteractionContext(
     let language = request.preferredLanguageTag.map {
         "The person's explicitly stated preferred language is \($0); use it when naturally appropriate."
     }
+    let preferences = request.personPreferences.map {
+        "The person's explicitly stated durable preferences — honor these as binding rules in how you engage them: \($0)"
+    }
     return try? CodexInteractionContext(
         situationSummary: situation,
         identityReference: identity,
@@ -9681,7 +9694,7 @@ private func l1ProactiveInteractionContext(
         preferredLanguageTag: request.preferredLanguageTag,
         languageStartInstruction: languageStartInstruction,
         rapportSummary: rapport,
-        activeTaskSummaries: [objective, completion] + (language.map { [$0] } ?? []),
+        activeTaskSummaries: [objective, completion] + (language.map { [$0] } ?? []) + (preferences.map { [$0] } ?? []),
         memorySummaries: request.memory.map(\.summary),
         embodimentSummary: "L0 is maintaining visual attention while L2 leads the interaction. Do not issue camera-control instructions as part of ordinary conversation."
     )
