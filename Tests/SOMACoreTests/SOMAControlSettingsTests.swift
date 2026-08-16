@@ -62,7 +62,11 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertEqual(SOMALEDColor.yellow.displayName, "Yellow")
         XCTAssertEqual(SOMALEDColor.green.displayName, "Green")
         XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, 57)
-        XCTAssertEqual(decoded.led.signal(for: .contactReady).firmwareStateID, 18)
+        XCTAssertEqual(decoded.led.signal(for: .contactReady).firmwareStateID, 57)
+        XCTAssertEqual(
+            decoded.led.signal(for: .contactReady).deviceRendering,
+            .init(stateID: 57, specialPatternEnabled: true)
+        )
     }
 
     func testVersionOneSettingsMigrateToStateSignals() throws {

@@ -77,6 +77,19 @@ public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
     }
 }
 
+/// The Tiny 2 Lite renders the same indicator ID differently when its
+/// special-pattern gate is open. Treat both values as one hardware state so
+/// callers cannot accidentally select a colour without its rendering mode.
+public struct SOMALEDDeviceRendering: Equatable, Sendable {
+    public let stateID: Int
+    public let specialPatternEnabled: Bool
+
+    public init(stateID: Int, specialPatternEnabled: Bool) {
+        self.stateID = stateID
+        self.specialPatternEnabled = specialPatternEnabled
+    }
+}
+
 /// Internal calibration entries for the Tiny 2 Lite. These describe the
 /// firmware's state IDs and are deliberately kept out of the user settings
 /// surface: names such as `tracking` are device implementation details, not
@@ -91,14 +104,17 @@ public enum SOMALEDFirmwarePreset: String, CaseIterable, Codable, Sendable {
     public var colorName: String {
         switch self {
         case .targetLost: "Yellow"
-        case .targetLock, .gesture, .tracking: "Blue"
+        case .targetLock, .gesture: "Green"
         case .normalWork: "Green"
+        case .tracking: "Blue"
         }
     }
 
     public var hasFirmwareBlink: Bool {
-        if case .gesture = self { return true }
-        return false
+        switch self {
+        case .targetLock, .gesture: true
+        case .targetLost, .normalWork, .tracking: false
+        }
     }
 
     /// The native bridge validates this small fixed set before it ever reaches
@@ -134,7 +150,7 @@ public enum SOMALEDPattern: String, CaseIterable, Codable, Sendable {
     }
 
     /// The Tiny 2 Lite exposes only a steady indicator plus one physically
-    /// verified continuous blue firmware blink. Its state-clear API accepts
+    /// verified continuous blue blink through the special-pattern gate. Its state-clear API accepts
     /// commands but does not produce a reliable visible off phase, so host
     /// cadence names are retained only to migrate old settings safely.
     public func isPhysicallySupported(for color: SOMALEDColor) -> Bool {
@@ -191,10 +207,15 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
         color == .blue && pattern == .blink
     }
 
+    public var deviceRendering: SOMALEDDeviceRendering {
+        .init(
+            stateID: color.firmwareStateID,
+            specialPatternEnabled: usesFirmwareBlink
+        )
+    }
+
     public var firmwareStateID: Int {
-        usesFirmwareBlink
-            ? SOMALEDFirmwarePreset.gesture.firmwareStateID
-            : color.firmwareStateID
+        deviceRendering.stateID
     }
 
     public func normalizedForDevice() -> Self {
@@ -235,24 +256,29 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
 }
 
 public enum SOMALEDHardwareCommand: Equatable, Sendable {
+    case specialPattern(enabled: Bool)
     case clear(stateID: Int)
     case set(stateID: Int)
 }
 
-/// Produces the only legal hardware transition: a previously asserted state
-/// is released before another one is asserted. The Tiny retains state IDs, so
-/// this prevents two semantic signals from overlapping on the physical LED.
+/// Produces an atomic rendering transition. The special-pattern gate must be
+/// selected with the state ID because it changes the Tiny's visible palette.
 public enum SOMALEDHardwareTransition {
     public static func commands(
-        previousStateID: Int?,
-        nextStateID: Int,
+        previous: SOMALEDDeviceRendering?,
+        next: SOMALEDDeviceRendering,
         forceReassertion: Bool = false
     ) -> [SOMALEDHardwareCommand] {
-        guard forceReassertion || previousStateID != nextStateID else { return [] }
-        if let previousStateID {
-            return [.clear(stateID: previousStateID), .set(stateID: nextStateID)]
+        var commands: [SOMALEDHardwareCommand] = []
+        if forceReassertion || previous?.specialPatternEnabled != next.specialPatternEnabled {
+            commands.append(.specialPattern(enabled: next.specialPatternEnabled))
         }
-        return [.set(stateID: nextStateID)]
+        guard forceReassertion || previous?.stateID != next.stateID else { return commands }
+        if let previous {
+            commands.append(.clear(stateID: previous.stateID))
+        }
+        commands.append(.set(stateID: next.stateID))
+        return commands
     }
 }
 
@@ -310,7 +336,7 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         switch state {
         case .exploring: .init(color: .yellow, pattern: .steady)
         case .humanDetected: .init(color: .blue, pattern: .steady)
-        // State 18 is the physically verified continuous blue firmware blink.
+        // Blue blink uses the steady-blue state with the special-pattern gate.
         case .contactReady: .init(color: .blue, pattern: .blink)
         case .conversation, .listening, .speaking: .init(color: .blue, pattern: .steady)
         case .working: .init(color: .green, pattern: .steady)

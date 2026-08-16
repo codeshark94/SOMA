@@ -71,9 +71,11 @@ require(indicatorInputs.resolvedState == .conversation, "conversation LED priori
 indicatorInputs.interactionState = .preparingReply
 require(indicatorInputs.resolvedState == .working, "working LED priority is wrong")
 require(
-    SOMALEDHardwareTransition.commands(previousStateID: 18, nextStateID: 57)
-        == [.clear(stateID: 18), .set(stateID: 57)],
-    "LED state transition did not release the prior firmware state first"
+    SOMALEDHardwareTransition.commands(
+        previous: .init(stateID: 57, specialPatternEnabled: true),
+        next: .init(stateID: 57, specialPatternEnabled: false)
+    ) == [.specialPattern(enabled: false)],
+    "LED state transition did not restore the steady rendering"
 )
 require(
     SubconsciousIndicatorState.contactReady.humanMeaning == "ready_speak_now"
