@@ -3,7 +3,9 @@ import Foundation
 import SwiftUI
 
 /// Live diagnostic panel model. Polls the files that the runtime's
-/// `LiveDiagnosticsWriter` emits while the panel is open.
+/// `LiveDiagnosticsWriter` emits while the panel is open. Each file is only
+/// decoded again when its content actually changed, and the panel goes fully
+/// blank when the runtime is stopped.
 final class SOMADiagnosticsModel: ObservableObject {
     struct Rect: Decodable, Sendable {
         let x: Double
@@ -33,6 +35,12 @@ final class SOMADiagnosticsModel: ObservableObject {
         var id: UInt64 { monotonicNS }
     }
 
+    private struct FileStamp: Equatable {
+        let size: Int64
+        let modifiedAt: TimeInterval
+    }
+
+    @Published var isLive = false
     @Published var frameImage: NSImage?
     @Published var candidates: [Candidate] = []
     @Published var thoughts: [Thought] = []
@@ -42,9 +50,11 @@ final class SOMADiagnosticsModel: ObservableObject {
     private let visionURL: URL
     private let thoughtsURL: URL
     private var timer: Timer?
-    /// Max log lines kept in memory for the panel. Bounds memory and avoids a
-    /// growing file causing the 10 Hz refresh to rebuild an unbounded array.
+    /// Max log lines kept in memory for the panel.
     private let maxThoughts = 300
+    private var frameStamp: FileStamp?
+    private var visionStamp: FileStamp?
+    private var thoughtsStamp: FileStamp?
 
     init(runtimeRoot: URL) {
         self.frameURL = runtimeRoot.appendingPathComponent("live-frame.jpg")
@@ -55,7 +65,7 @@ final class SOMADiagnosticsModel: ObservableObject {
     func start() {
         stop()
         refresh()
-        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -67,22 +77,65 @@ final class SOMADiagnosticsModel: ObservableObject {
         timer = nil
     }
 
+    /// Called when the runtime is stopped or the panel reappears, so a stale
+    /// camera frame and old logs are never shown.
+    func clearContent() {
+        frameImage = nil
+        candidates = []
+        thoughts = []
+        captureLagSeconds = 0
+        frameStamp = nil
+        visionStamp = nil
+        thoughtsStamp = nil
+    }
+
     func refresh() {
-        frameImage = NSImage(contentsOf: frameURL)
-        if let data = try? Data(contentsOf: visionURL),
-           let snapshot = try? JSONDecoder().decode(VisionSnapshot.self, from: data) {
-            candidates = snapshot.candidates
-            if snapshot.capturedAtNS > 0 {
-                let now = DispatchTime.now().uptimeNanoseconds
-                captureLagSeconds = Double(now - snapshot.capturedAtNS) / 1_000_000_000
+        let frame = stamp(of: frameURL)
+        // The runtime writes a fresh frame continuously while live. A frame
+        // file missing or untouched for ~3s means SOMA is stopped.
+        let live: Bool
+        if let frame {
+            live = frame.size > 0 && (Date().timeIntervalSince1970 - frame.modifiedAt) < 3.0
+        } else {
+            live = false
+        }
+        if live != isLive {
+            isLive = live
+            if !live { clearContent() }
+        }
+        guard live else { return }
+
+        if frame != frameStamp {
+            frameStamp = frame
+            frameImage = NSImage(contentsOf: frameURL)
+        }
+        if let vision = stamp(of: visionURL), vision != visionStamp {
+            visionStamp = vision
+            if let data = try? Data(contentsOf: visionURL),
+               let snapshot = try? JSONDecoder().decode(VisionSnapshot.self, from: data) {
+                candidates = snapshot.candidates
+                if snapshot.capturedAtNS > 0 {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    captureLagSeconds = Double(now - snapshot.capturedAtNS) / 1_000_000_000
+                }
             }
         }
-        thoughts = loadThoughts()
+        if let thought = stamp(of: thoughtsURL), thought != thoughtsStamp {
+            thoughtsStamp = thought
+            thoughts = loadThoughts()
+        }
+    }
+
+    private func stamp(of url: URL) -> FileStamp? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber,
+              let date = attrs[.modificationDate] as? Date else { return nil }
+        return FileStamp(size: size.int64Value, modifiedAt: date.timeIntervalSince1970)
     }
 
     private func loadThoughts() -> [Thought] {
         // Read only the tail of the file instead of the whole (potentially
-        // large) log on every 100 ms refresh.
+        // large) log on every refresh.
         let decoder = JSONDecoder()
         return tail(of: thoughtsURL, bytes: 128 * 1024, lines: maxThoughts)
             .compactMap { line in
@@ -133,23 +186,40 @@ struct SOMADiagnosticsView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
 
-            cameraView
-                .frame(height: 340)
-                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.gray.opacity(0.4)))
+            if model.isLive {
+                cameraView
+                    .frame(height: 340)
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.gray.opacity(0.4)))
 
-            HStack {
-                Text("Thought stream · \(model.thoughts.count) events")
-                    .font(.subheadline)
-                Spacer()
-                if model.captureLagSeconds > 0 {
-                    Text(String(format: "frame lag %.1fs", model.captureLagSeconds))
+                HStack {
+                    Text("Thought stream · \(model.thoughts.count) events")
+                        .font(.subheadline)
+                    Spacer()
+                    if model.captureLagSeconds > 0 {
+                        Text(String(format: "frame lag %.1fs", model.captureLagSeconds))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal)
+
+                thoughtLog
+            } else {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "pause.circle.fill")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.secondary)
+                    Text("SOMA is not running")
+                        .font(.headline)
+                    Text("Camera and thought stream are paused. Start SOMA to resume.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Spacer()
                 }
+                .frame(maxWidth: .infinity)
+                .frame(height: 400)
             }
-            .padding(.horizontal)
-
-            thoughtLog
         }
         .frame(width: 760, height: 640)
         .onAppear { model.start() }
