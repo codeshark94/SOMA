@@ -9,10 +9,14 @@ public struct L1ModelConfiguration: Codable, Equatable, Sendable {
     public let model: String
     public let situationDeadlineMilliseconds: UInt64
     public let consolidationDeadlineMilliseconds: UInt64
+    /// How readily L1 opens a spoken conversation despite the person appearing
+    /// busy/focused. Range 0...1, from SOMA_L1_SPOKEN_OPENING_TENDENCY.
+    public let spokenOpeningTendency: Double
 
     public init(
         situationDeadlineMilliseconds: UInt64 = 20_000,
-        consolidationDeadlineMilliseconds: UInt64 = 60_000
+        consolidationDeadlineMilliseconds: UInt64 = 60_000,
+        spokenOpeningTendency: Double = 0.5
     ) {
         precondition(situationDeadlineMilliseconds > 0)
         precondition(consolidationDeadlineMilliseconds >= situationDeadlineMilliseconds)
@@ -21,6 +25,12 @@ public struct L1ModelConfiguration: Codable, Equatable, Sendable {
         self.model = (configuredModel?.isEmpty == false ? configuredModel : "gemma4:31b-cloud")!
         self.situationDeadlineMilliseconds = situationDeadlineMilliseconds
         self.consolidationDeadlineMilliseconds = consolidationDeadlineMilliseconds
+        if let raw = ProcessInfo.processInfo.environment["SOMA_L1_SPOKEN_OPENING_TENDENCY"],
+           let value = Double(raw) {
+            self.spokenOpeningTendency = min(max(value, 0), 1)
+        } else {
+            self.spokenOpeningTendency = min(max(spokenOpeningTendency, 0), 1)
+        }
     }
 
     public static let gemma31 = L1ModelConfiguration()
@@ -400,6 +410,9 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
     /// Explicit per-person preference directives (speech register, address form,
     /// etc.) that L1 must honor in how it engages this person.
     public let personPreferences: String?
+    /// How readily L1 opens a spoken conversation despite the person appearing
+    /// busy/focused. 0 = conservative, 1 = talkative.
+    public let spokenOpeningTendency: Double
 
     public init(
         cycleID: UUID = UUID(),
@@ -422,7 +435,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         socialOpportunity: L1SocialOpportunity? = nil,
         behaviorContext: L1BehaviorContext? = nil,
         curiosityContext: String? = nil,
-        personPreferences: String? = nil
+        personPreferences: String? = nil,
+        spokenOpeningTendency: Double = 0.5
     ) {
         self.cycleID = cycleID
         self.observedAt = observedAt
@@ -445,6 +459,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         self.behaviorContext = behaviorContext
         self.curiosityContext = curiosityContext.map { String($0.prefix(2_000)) }
         self.personPreferences = personPreferences.map { String($0.prefix(1_500)) }
+        self.spokenOpeningTendency = min(max(spokenOpeningTendency, 0), 1)
     }
 
     public func continuing(with visuals: [L1VisualResource]) -> Self {
@@ -467,7 +482,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
             visuals: visuals,
             socialOpportunity: socialOpportunity,
             curiosityContext: curiosityContext,
-            personPreferences: personPreferences
+            personPreferences: personPreferences,
+            spokenOpeningTendency: spokenOpeningTendency
         )
     }
 }

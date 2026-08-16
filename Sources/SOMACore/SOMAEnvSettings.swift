@@ -40,6 +40,10 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     public var l1CuriosityCollectionEnabled: Bool
     /// How often (hours) the curiosity collector re-searches its topics.
     public var l1CollectionIntervalHours: Double
+    /// How readily L1 opens a spoken conversation despite the person appearing
+    /// busy/focused. 0 = conservative (stay quiet when busy), 1 = talkative
+    /// (open even when the person looks focused on something).
+    public var l1SpokenOpeningTendency: Double
 
     // MARK: L2 — human interaction & conversation
     /// Whether L1 may initiate proactive spoken openings that hand off to the
@@ -57,6 +61,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l1IdleCadenceSeconds: Double = 150,
         l1CuriosityCollectionEnabled: Bool = true,
         l1CollectionIntervalHours: Double = 24,
+        l1SpokenOpeningTendency: Double = 0.5,
         l2ProactiveOpeningsEnabled: Bool = true
     ) {
         self.schemaVersion = schemaVersion
@@ -69,6 +74,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         self.l1IdleCadenceSeconds = l1IdleCadenceSeconds
         self.l1CuriosityCollectionEnabled = l1CuriosityCollectionEnabled
         self.l1CollectionIntervalHours = l1CollectionIntervalHours
+        self.l1SpokenOpeningTendency = min(max(l1SpokenOpeningTendency, 0), 1)
         self.l2ProactiveOpeningsEnabled = l2ProactiveOpeningsEnabled
     }
 
@@ -87,6 +93,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
             "SOMA_L1_IDLE_CADENCE_SECONDS=\(String(format: "%g", l1IdleCadenceSeconds))",
             "SOMA_L1_CURIOSITY_ENABLED=\(l1CuriosityCollectionEnabled ? "true" : "false")",
             "SOMA_L1_CURIOSITY_INTERVAL_HOURS=\(String(format: "%g", l1CollectionIntervalHours))",
+            "SOMA_L1_SPOKEN_OPENING_TENDENCY=\(String(format: "%g", l1SpokenOpeningTendency))",
             "SOMA_L2_PROACTIVE_OPENINGS=\(l2ProactiveOpeningsEnabled ? "true" : "false")",
         ]
     }
@@ -102,6 +109,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         case l1IdleCadenceSeconds
         case l1CuriosityCollectionEnabled
         case l1CollectionIntervalHours
+        case l1SpokenOpeningTendency
         case l2ProactiveOpeningsEnabled
     }
 
@@ -117,6 +125,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l1IdleCadenceSeconds = try values.decodeIfPresent(Double.self, forKey: .l1IdleCadenceSeconds) ?? 150
         l1CuriosityCollectionEnabled = try values.decodeIfPresent(Bool.self, forKey: .l1CuriosityCollectionEnabled) ?? true
         l1CollectionIntervalHours = try values.decodeIfPresent(Double.self, forKey: .l1CollectionIntervalHours) ?? 24
+        l1SpokenOpeningTendency = min(max(try values.decodeIfPresent(Double.self, forKey: .l1SpokenOpeningTendency) ?? 0.5, 0), 1)
         l2ProactiveOpeningsEnabled = try values.decodeIfPresent(Bool.self, forKey: .l2ProactiveOpeningsEnabled) ?? true
     }
 }

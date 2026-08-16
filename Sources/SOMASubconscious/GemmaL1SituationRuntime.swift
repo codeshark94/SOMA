@@ -1348,6 +1348,7 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
 
         If curiosity_context is non-empty, it contains fresh material that was gathered to help you hold a good conversation with the person present — recent, concrete things related to their interests, situation, or open questions. Treat it as conversation preparation, not your own idle curiosity. When the person is present and the moment fits (right rapport, low interruption cost, not a redundant greeting), use a specific, relevant detail from it as a natural spoken opening. Reference a concrete fact so it feels genuinely grounded, and never force it: if the detail is weak or the context is wrong, stay quiet. It never overrides rapport or interruption cost.
         If personPreferences is non-empty, it contains the person's explicitly stated, durable preferences (how to address them, speech register, ongoing requests). Honor them as binding rules in how you engage this person — for example the correct name/address form and whether to use formal or casual speech. They are not optional suggestions.
+        spokenOpeningTendency (0...1) is a configured dial for how willing you are to open a spoken conversation despite the person appearing busy or focused. Near 1.0, be talkative: initiate a spoken opening when there is a genuine question tied to an information_need even if the person looks occupied. Near 0.0, stay conservative: do not interrupt someone who appears deeply focused. Weigh the value of the question against interruption cost, scaling with this value.
         packet:
         \(requestJSON)
         """
@@ -1855,7 +1856,8 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             visuals: [currentFrameProvider()].compactMap { $0 },
             socialOpportunity: opportunity,
             curiosityContext: curiosityContextProvider(),
-            personPreferences: context.personPreferences
+            personPreferences: context.personPreferences,
+            spokenOpeningTendency: min(max(somaEnvDouble("SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.5), 0), 1)
         )
         onHealth(
             "wake",

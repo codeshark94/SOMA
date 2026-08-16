@@ -732,6 +732,16 @@ private struct SOMASettingsView: View {
                     Text("hours")
                 }
                 .disabled(!model.envSettings.l1CuriosityCollectionEnabled)
+                Divider()
+                HStack {
+                    Text("Spoken opening tendency")
+                    Spacer()
+                    Text("\(Int(model.envSettings.l1SpokenOpeningTendency * 100))%")
+                        .monospacedDigit().foregroundStyle(.secondary)
+                }
+                Slider(value: l1SpokenOpeningTendencyBinding, in: 0...1, step: 0.1)
+                Text("How readily L1 starts a spoken conversation when you look busy. Low = stays quiet, high = more talkative.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             SettingsCard(title: "L2 — Conversation & interaction", subtitle: "Whether SOMA may start a spoken conversation on its own. The live-voice voice itself is set under Experience.") {
                 Toggle("Allow proactive spoken openings", isOn: l2ProactiveOpeningsBinding)
@@ -935,6 +945,13 @@ private struct SOMASettingsView: View {
         Binding(
             get: { model.envSettings.l1CuriosityCollectionEnabled },
             set: { model.envSettings.l1CuriosityCollectionEnabled = $0 }
+        )
+    }
+
+    private var l1SpokenOpeningTendencyBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l1SpokenOpeningTendency },
+            set: { model.envSettings.l1SpokenOpeningTendency = min(max($0, 0), 1) }
         )
     }
 
