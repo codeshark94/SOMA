@@ -42,6 +42,9 @@ final class SOMADiagnosticsModel: ObservableObject {
     private let visionURL: URL
     private let thoughtsURL: URL
     private var timer: Timer?
+    /// Max log lines kept in memory for the panel. Bounds memory and avoids a
+    /// growing file causing the 10 Hz refresh to rebuild an unbounded array.
+    private let maxThoughts = 300
 
     init(runtimeRoot: URL) {
         self.frameURL = runtimeRoot.appendingPathComponent("live-frame.jpg")
@@ -78,13 +81,37 @@ final class SOMADiagnosticsModel: ObservableObject {
     }
 
     private func loadThoughts() -> [Thought] {
-        guard let text = try? String(contentsOf: thoughtsURL, encoding: .utf8) else { return [] }
+        // Read only the tail of the file instead of the whole (potentially
+        // large) log on every 100 ms refresh.
         let decoder = JSONDecoder()
-        return text.split(separator: "\n").compactMap { line in
-            guard let data = line.data(using: .utf8),
-                  let thought = try? decoder.decode(Thought.self, from: data) else { return nil }
-            return thought
+        return tail(of: thoughtsURL, bytes: 128 * 1024, lines: maxThoughts)
+            .compactMap { line in
+                guard let data = line.data(using: .utf8),
+                      let thought = try? decoder.decode(Thought.self, from: data) else { return nil }
+                return thought
+            }
+    }
+
+    /// Returns the last `lines` complete lines from the tail of the file,
+    /// reading at most `bytes` from the end so cost stays bounded regardless
+    /// of how large the log has grown.
+    private func tail(of url: URL, bytes: Int, lines: Int) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let readOffset = Int(max(0, size - UInt64(bytes)))
+        try? handle.seek(toOffset: UInt64(readOffset))
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let raw = text.split(separator: "\n", omittingEmptySubsequences: false)
+        // Drop the first line if we started mid-line.
+        let complete: [Substring]
+        if readOffset == 0 {
+            complete = Array(raw)
+        } else {
+            complete = Array(raw.dropFirst())
         }
+        return complete.suffix(lines).map(String.init)
     }
 }
 
@@ -214,7 +241,7 @@ struct SOMADiagnosticsView: View {
                 }
             }
             .background(Color.black.opacity(0.06))
-            .onChange(of: model.thoughts.count) { _ in
+            .onChange(of: model.thoughts.last?.id) { _ in
                 if let last = model.thoughts.last {
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo(last.id, anchor: .bottom)
