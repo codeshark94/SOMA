@@ -10,6 +10,11 @@ public enum SOMAInteractionAuthority: String, Codable, CaseIterable, Sendable {
 
 public enum SOMASessionCapabilityScope: Equatable, Sendable {
     case personContext(UUID)
+    /// A bounded projection of the people SOMA currently recognizes and the
+    /// administrator's registered-person memory. This never includes face
+    /// embeddings, raw frames, or transcript text.
+    case identityRoster
+    case identityManagement
     case embodimentControl
 }
 
@@ -18,6 +23,8 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
     case invalid
     case expired
     case personContextDenied
+    case identityRosterDenied
+    case identityManagementDenied
     case embodimentDenied
 
     public var errorDescription: String? {
@@ -26,6 +33,8 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
         case .invalid: "The SOMA interaction capability is invalid"
         case .expired: "The SOMA interaction capability has expired"
         case .personContextDenied: "This session may access only its own person context"
+        case .identityRosterDenied: "Only the local administrator may read the identity roster"
+        case .identityManagementDenied: "Only the local administrator may enroll or remove local identities"
         case .embodimentDenied: "Only the local administrator may control SOMA embodiment"
         }
     }
@@ -100,9 +109,17 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
         }
         switch scope {
         case let .personContext(personEntityID):
-            return grant.personEntityID == personEntityID
+            return grant.authority == .administrator || grant.personEntityID == personEntityID
                 ? .success(())
                 : .failure(.personContextDenied)
+        case .identityRoster:
+            return grant.authority == .administrator
+                ? .success(())
+                : .failure(.identityRosterDenied)
+        case .identityManagement:
+            return grant.authority == .administrator
+                ? .success(())
+                : .failure(.identityManagementDenied)
         case .embodimentControl:
             // Looking, tracking, exploring, and brief expression are SOMA's
             // ordinary embodied conversation, not administrator-only work.

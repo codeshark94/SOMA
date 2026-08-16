@@ -195,6 +195,28 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertNotNil(context.sessionCapability)
     }
 
+    func testUnrecognizedLiveSpeakerKeepsEmbodimentAuthorityWithoutPersonMemory() throws {
+        let context = try CodexInteractionContext(
+            personEntityID: UUID(),
+            personContextAvailable: false,
+            sessionCapability: UUID().uuidString.lowercased(),
+            interactionAuthority: .participant,
+            personMemoryMission: PersonContextMission(
+                requiredKeys: ["preferred_name"],
+                missingRequiredKeys: ["preferred_name"],
+                recommendedKeys: []
+            )
+        )
+        XCTAssertFalse(context.personContextAvailable)
+        XCTAssertNil(context.personMemoryMission)
+
+        let restored = try JSONDecoder().decode(
+            CodexInteractionContext.self,
+            from: JSONEncoder().encode(context)
+        )
+        XCTAssertEqual(restored, context)
+    }
+
     func testCodexAccountBridgeRejectsAnInvalidDecodedTurn() throws {
         let json = """
         {"schemaVersion":1,"turn":{"interactionID":"interaction","turnID":"turn","transcript":"   ","speechStartedAtNS":20,"transcriptFinalizedAtNS":10,"evidenceIDs":[]},"context":{"activeTaskSummaries":[],"memorySummaries":[],"privacyScope":"interaction_scoped"}}
@@ -385,25 +407,28 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(SubconsciousIndicatorState.contactReady.humanMeaning, "ready_speak_now")
         XCTAssertEqual(SubconsciousIndicatorState.conversation.humanMeaning, "conversation_active")
         XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "please_wait_preparing_reply")
+        let blueSteady = SOMALEDDeviceRendering(stateID: 57, specialPatternEnabled: false)
+        let blueBlink = SOMALEDDeviceRendering(stateID: 57, specialPatternEnabled: true)
+        let yellowSteady = SOMALEDDeviceRendering(stateID: 16, specialPatternEnabled: false)
         XCTAssertEqual(
-            SOMALEDHardwareTransition.commands(previousStateID: nil, nextStateID: 18),
-            [.set(stateID: 18)]
+            SOMALEDHardwareTransition.commands(previous: nil, next: blueBlink),
+            [.specialPattern(enabled: true), .set(stateID: 57)]
         )
         XCTAssertEqual(
-            SOMALEDHardwareTransition.commands(previousStateID: 18, nextStateID: 57),
-            [.clear(stateID: 18), .set(stateID: 57)]
+            SOMALEDHardwareTransition.commands(previous: blueBlink, next: blueSteady),
+            [.specialPattern(enabled: false)]
         )
         XCTAssertEqual(
-            SOMALEDHardwareTransition.commands(previousStateID: 57, nextStateID: 57),
-            []
+            SOMALEDHardwareTransition.commands(previous: yellowSteady, next: blueBlink),
+            [.specialPattern(enabled: true), .clear(stateID: 16), .set(stateID: 57)]
         )
         XCTAssertEqual(
             SOMALEDHardwareTransition.commands(
-                previousStateID: 18,
-                nextStateID: 18,
+                previous: blueBlink,
+                next: blueBlink,
                 forceReassertion: true
             ),
-            [.clear(stateID: 18), .set(stateID: 18)]
+            [.specialPattern(enabled: true), .clear(stateID: 57), .set(stateID: 57)]
         )
     }
 

@@ -624,17 +624,12 @@ bool requestNativeHumanTracking(
     const std::string &commandID,
     const std::string &cleanupCommandID
 ) noexcept {
-    // The Tiny's indicator-state colors depend on this device-wide mode.
-    // Keep the mode open for native human tracking; closing it after a human
-    // acquisition changes the physical rendering of the same state IDs.
-    int indicatorModeResult = RM_RET_ERR;
-    try { indicatorModeResult = device->cameraSetLedCtrlU(true); } catch (...) {}
     trace.event(
         "camera.command",
         "native_ai",
         "human_normal_sent",
         0,
-        "Tiny 2 Lite; vertical_tracking_mode=motion; indicator_mode=enabled",
+        "Tiny 2 Lite; vertical_tracking_mode=motion",
         commandID
     );
     int startResult = RM_RET_ERR;
@@ -656,7 +651,6 @@ bool requestNativeHumanTracking(
         activated ? "human_normal_active" : "start_unconfirmed",
         activated ? RM_RET_OK : RM_RET_ERR,
         "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device))
-            + "; indicator_mode_enable_result=" + std::to_string(indicatorModeResult)
             + "; tracking_mode_set_result=" + std::to_string(trackingModeResult)
             + "; camera_status_vertical_tracking_mode=" + std::to_string(confirmedTrackingMode),
         commandID
@@ -685,6 +679,7 @@ enum class BridgeCommandType {
     indicatorClear,
     indicatorBrightness,
     indicatorEnabled,
+    indicatorSpecialPattern,
     shutdown,
     invalid
 };
@@ -770,6 +765,15 @@ BridgeCommand parseBridgeCommand(const std::string &line) {
         command.value = enabled;
         return command;
     }
+    if (verb == "indicator_special_pattern") {
+        int enabled = -1;
+        if (!(input >> enabled) || (input >> extra) || (enabled != 0 && enabled != 1)) return {};
+        BridgeCommand command;
+        command.type = BridgeCommandType::indicatorSpecialPattern;
+        command.commandID = commandID;
+        command.value = enabled;
+        return command;
+    }
     if (input >> extra) return {};
     if (verb == "native_start") return {BridgeCommandType::nativeStart, commandID};
     if (verb == "heartbeat") return {BridgeCommandType::heartbeat, commandID};
@@ -850,6 +854,27 @@ public:
             "indicator.ack",
             result == RM_RET_OK ? "soma" : "fault",
             result == RM_RET_OK ? "enabled_active" : "enabled_rejected",
+            result,
+            std::string("enabled=") + (enabled ? "true" : "false"),
+            commandID
+        );
+    }
+
+    void setSpecialPattern(bool enabled, const std::string &commandID) noexcept {
+        trace_.event(
+            "indicator.command",
+            "soma",
+            "set_special_pattern",
+            0,
+            std::string("enabled=") + (enabled ? "true" : "false"),
+            commandID
+        );
+        int result = RM_RET_ERR;
+        try { result = device_->cameraSetLedCtrlU(enabled); } catch (...) {}
+        trace_.event(
+            "indicator.ack",
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "special_pattern_updated" : "special_pattern_rejected",
             result,
             std::string("enabled=") + (enabled ? "true" : "false"),
             commandID
@@ -1151,6 +1176,9 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                 break;
             case BridgeCommandType::indicatorEnabled:
                 indicator.setEnabled(command.value == 1, command.commandID);
+                break;
+            case BridgeCommandType::indicatorSpecialPattern:
+                indicator.setSpecialPattern(command.value == 1, command.commandID);
                 break;
             case BridgeCommandType::shutdown:
                 if (nativeTracking || externalControl) {

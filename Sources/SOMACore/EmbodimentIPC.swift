@@ -6,6 +6,8 @@ public enum EmbodimentIPCCommandKind: String, Codable, Sendable {
     case snapshot
     case captureResult = "capture_result"
     case personContext = "person_context"
+    case identityRoster = "identity_roster"
+    case identityEnrollment = "identity_enrollment"
     case indicatorCalibration = "indicator_calibration"
 }
 
@@ -59,11 +61,75 @@ public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
     }
 }
 
+public enum IdentityRosterQuery: String, Codable, Equatable, Sendable {
+    /// Persons positively recognized in the recent camera observation window.
+    case present
+    /// The administrator-visible registry of named/person-context records.
+    case registered
+}
+
+/// A non-biometric, interaction-safe identity projection. The entity ID is a
+/// local reference used by the existing person-context tools; display fields
+/// come exclusively from explicitly stored person context.
+public struct IdentityRosterEntry: Codable, Equatable, Sendable {
+    public let personEntityID: UUID
+    public let recognitionKind: String
+    public let confidence: Double?
+    public let lastSeenMillisecondsAgo: UInt64?
+    public let personContext: PersonContextSnapshot?
+
+    public init(
+        personEntityID: UUID,
+        recognitionKind: String,
+        confidence: Double? = nil,
+        lastSeenMillisecondsAgo: UInt64? = nil,
+        personContext: PersonContextSnapshot? = nil
+    ) {
+        self.personEntityID = personEntityID
+        self.recognitionKind = String(recognitionKind.prefix(32))
+        self.confidence = confidence.map { min(max($0, 0), 1) }
+        self.lastSeenMillisecondsAgo = lastSeenMillisecondsAgo
+        self.personContext = personContext
+    }
+}
+
+public struct IdentityRosterSnapshot: Codable, Equatable, Sendable {
+    public let query: IdentityRosterQuery
+    public let entries: [IdentityRosterEntry]
+
+    public init(query: IdentityRosterQuery, entries: [IdentityRosterEntry]) {
+        self.query = query
+        self.entries = Array(entries.prefix(64))
+    }
+}
+
+public struct IdentityEnrollmentIPCRequest: Codable, Equatable, Sendable {
+    public let personEntityID: UUID
+    public let confirmedByUser: Bool
+
+    public init(personEntityID: UUID, confirmedByUser: Bool) {
+        self.personEntityID = personEntityID
+        self.confirmedByUser = confirmedByUser
+    }
+}
+
+public struct IdentityEnrollmentResult: Codable, Equatable, Sendable {
+    public let personEntityID: UUID
+    public let referenceCount: Int
+
+    public init(personEntityID: UUID, referenceCount: Int) {
+        self.personEntityID = personEntityID
+        self.referenceCount = max(0, referenceCount)
+    }
+}
+
 public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
     public let kind: EmbodimentIPCCommandKind
     public let request: CognitiveEmbodimentRequest?
     public let requestID: String?
     public let personContext: PersonContextIPCRequest?
+    public let identityRosterQuery: IdentityRosterQuery?
+    public let identityEnrollment: IdentityEnrollmentIPCRequest?
     /// An opaque capability issued by the owning L0 process for one live
     /// participant. It is checked locally and never persists in memory/trace.
     public let sessionAuthorization: String?
@@ -76,6 +142,8 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         request: CognitiveEmbodimentRequest? = nil,
         requestID: String? = nil,
         personContext: PersonContextIPCRequest? = nil,
+        identityRosterQuery: IdentityRosterQuery? = nil,
+        identityEnrollment: IdentityEnrollmentIPCRequest? = nil,
         sessionAuthorization: String? = nil,
         indicatorPreset: SOMALEDFirmwarePreset? = nil
     ) {
@@ -83,6 +151,8 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         self.request = request
         self.requestID = requestID.map { String($0.prefix(96)) }
         self.personContext = personContext
+        self.identityRosterQuery = identityRosterQuery
+        self.identityEnrollment = identityEnrollment
         self.sessionAuthorization = sessionAuthorization.map { String($0.prefix(128)) }
         self.indicatorPreset = indicatorPreset
     }
@@ -95,6 +165,8 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
     public let snapshot: EmbodimentShadowSnapshot?
     public let viewResource: EmbodimentViewResource?
     public let personContext: PersonContextSnapshot?
+    public let identityRoster: IdentityRosterSnapshot?
+    public let identityEnrollment: IdentityEnrollmentResult?
 
     public init(
         ok: Bool,
@@ -102,7 +174,9 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         decision: EmbodimentShadowDecision? = nil,
         snapshot: EmbodimentShadowSnapshot? = nil,
         viewResource: EmbodimentViewResource? = nil,
-        personContext: PersonContextSnapshot? = nil
+        personContext: PersonContextSnapshot? = nil,
+        identityRoster: IdentityRosterSnapshot? = nil,
+        identityEnrollment: IdentityEnrollmentResult? = nil
     ) {
         self.ok = ok
         self.error = error.map { String($0.prefix(240)) }
@@ -110,6 +184,8 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         self.snapshot = snapshot
         self.viewResource = viewResource
         self.personContext = personContext
+        self.identityRoster = identityRoster
+        self.identityEnrollment = identityEnrollment
     }
 }
 
@@ -150,6 +226,12 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     public typealias PersonContextProvider = @Sendable (
         _ request: PersonContextIPCRequest
     ) -> Result<PersonContextSnapshot, Error>
+    public typealias IdentityRosterProvider = @Sendable (
+        _ query: IdentityRosterQuery
+    ) -> Result<IdentityRosterSnapshot, Error>
+    public typealias IdentityEnrollmentProvider = @Sendable (
+        _ request: IdentityEnrollmentIPCRequest
+    ) -> Result<IdentityEnrollmentResult, Error>
     public typealias IndicatorCalibrationHandler = @Sendable (
         _ preset: SOMALEDFirmwarePreset?
     ) -> Result<Void, Error>
@@ -164,6 +246,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let onHealth: HealthHandler
     private let captureResultProvider: CaptureResultProvider
     private let personContextProvider: PersonContextProvider
+    private let identityRosterProvider: IdentityRosterProvider
+    private let identityEnrollmentProvider: IdentityEnrollmentProvider
     private let indicatorCalibrationHandler: IndicatorCalibrationHandler
     private let sessionAuthorizationProvider: SessionAuthorizationProvider
     private let queue = DispatchQueue(label: "soma.embodiment.shadow.socket")
@@ -181,6 +265,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         onDecision: @escaping DecisionHandler = { _, _ in },
         captureResultProvider: @escaping CaptureResultProvider = { _, _ in nil },
         personContextProvider: @escaping PersonContextProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
+        identityRosterProvider: @escaping IdentityRosterProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
+        identityEnrollmentProvider: @escaping IdentityEnrollmentProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
         sessionAuthorizationProvider: @escaping SessionAuthorizationProvider = { _, _ in .success(()) },
         onHealth: @escaping HealthHandler = { _, _ in }
@@ -190,6 +276,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.onDecision = onDecision
         self.captureResultProvider = captureResultProvider
         self.personContextProvider = personContextProvider
+        self.identityRosterProvider = identityRosterProvider
+        self.identityEnrollmentProvider = identityEnrollmentProvider
         self.indicatorCalibrationHandler = indicatorCalibrationHandler
         self.sessionAuthorizationProvider = sessionAuthorizationProvider
         self.onHealth = onHealth
@@ -284,6 +372,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 guard command.request == nil,
                       command.requestID == nil,
                       command.personContext == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
                       command.indicatorPreset == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
@@ -294,6 +384,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 guard let request = command.request,
                       command.requestID == nil,
                       command.personContext == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
                       command.indicatorPreset == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
@@ -309,6 +401,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             case .captureResult:
                 guard command.request == nil,
                       command.personContext == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
                       command.indicatorPreset == nil,
                       let requestID = command.requestID,
                       !requestID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -334,6 +428,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             case .personContext:
                 guard command.request == nil,
                       command.requestID == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
                       command.indicatorPreset == nil,
                       let request = command.personContext else {
                     throw EmbodimentIPCError.malformedMessage
@@ -345,10 +441,45 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 case let .failure(error):
                     writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
                 }
+            case .identityRoster:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.indicatorPreset == nil,
+                      command.identityEnrollment == nil,
+                      let query = command.identityRosterQuery else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .identityRoster)
+                switch identityRosterProvider(query) {
+                case let .success(roster):
+                    writeReply(.init(ok: true, identityRoster: roster), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
+            case .identityEnrollment:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.identityRosterQuery == nil,
+                      command.indicatorPreset == nil,
+                      let request = command.identityEnrollment,
+                      request.confirmedByUser else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .identityManagement)
+                switch identityEnrollmentProvider(request) {
+                case let .success(result):
+                    writeReply(.init(ok: true, identityEnrollment: result), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
             case .indicatorCalibration:
                 guard command.request == nil,
                       command.requestID == nil,
-                      command.personContext == nil else {
+                      command.personContext == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil else {
                     throw EmbodimentIPCError.malformedMessage
                 }
                 try authorize(command.sessionAuthorization, scope: .embodimentControl)

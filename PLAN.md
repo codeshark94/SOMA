@@ -461,8 +461,14 @@ SOMA-initiated greeting pulse. A successful L2 handoff opens a bounded follow-up
 conversation lease. The authorized C3 wake becomes a bounded
 utterance and consumes one second of memory-only PCM pre-roll. The primary path
 starts an account-authenticated Codex app-server V3 WebRTC session, supplies the
-opening context through `initialItems`, batches PCM into a continuous Web Audio
-worklet, and admits changed ephemeral E2B camera summaries through `appendText`.
+opening context through `initialItems`, verifies the local embodiment MCP at
+session start, batches PCM into a continuous Web Audio worklet, and injects a
+camera JPEG no older than two seconds with each user speech onset through
+`thread/injectItems`. That JPEG is never persisted. L2 first uses the injected
+current view; `capture_view` remains the separate bounded motor request for an
+intentional reframe or target-specific view. Changed ephemeral E2B camera
+summaries remain available through
+`appendText`.
 The local CLI/Apple-ASR/AVSpeechSynthesizer bridge remains a
 diagnostic fallback only. A labelled directed/non-directed speech set must
 still measure false wakes, missed wakes, speech-start-to-transcript latency,
@@ -476,6 +482,15 @@ leased embodiment action rather than SDK access. Extend the labelled L0 corpus
 with directed and non-directed speech, gaze/contact bids, people, ordinary
 objects, empty wall, reflections, and occlusion so false interaction wakes and
 missed contacts remain measurable.
+
+An unrecognized speaker receives a short-lived interaction capability for the
+same leased embodiment tools as a recognized participant, without a
+person-context reference or permission to create durable person memory. Once a
+recurring anonymous local face has been explicitly enrolled, an administrator
+session may use the identity roster and person-context MCP tools to add only
+explicitly stated facts, language, and rapport. Administrator visibility covers
+the non-biometric roster and registered contexts; no MCP response exposes a
+face embedding, raw frame, or raw transcript.
 
 The C2 core is now implemented as a typed, encrypted local journal with
 provenance, consent, tier retention, promotion, correction, deletion, and

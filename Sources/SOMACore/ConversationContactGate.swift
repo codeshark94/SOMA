@@ -179,7 +179,7 @@ public extension SubconsciousIndicatorState {
     var humanMeaning: String {
         switch self {
         case .exploring: return "not_ready_looking_for_contact"
-        case .humanDetected: return "noticed_you_make_eye_contact"
+        case .humanDetected: return "person_visible"
         case .contactReady: return "ready_speak_now"
         case .conversation, .listening, .speaking: return "conversation_active"
         case .working: return "please_wait_preparing_reply"

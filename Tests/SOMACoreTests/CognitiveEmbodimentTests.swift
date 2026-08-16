@@ -29,6 +29,43 @@ final class CognitiveEmbodimentTests: XCTestCase {
         }
     }
 
+    func testAdministratorCanManageIdentityRosterAndRegisteredContexts() {
+        let store = SOMASessionCapabilityStore(lifetimeSeconds: 60)
+        let administrator = UUID()
+        let registeredPerson = UUID()
+        let administratorToken = store.issue(
+            personEntityID: administrator,
+            authority: .administrator,
+            at: 1_000_000_000
+        )
+        let participantToken = store.issue(
+            personEntityID: registeredPerson,
+            authority: .participant,
+            at: 1_000_000_000
+        )
+
+        for scope in [
+            SOMASessionCapabilityScope.personContext(registeredPerson),
+            .identityRoster,
+            .identityManagement,
+        ] {
+            switch store.authorize(token: administratorToken, scope: scope, at: 1_000_000_001) {
+            case .success: break
+            case let .failure(error): XCTFail("administrator unexpectedly denied: \(error)")
+            }
+        }
+        switch store.authorize(token: participantToken, scope: .identityRoster, at: 1_000_000_001) {
+        case .success: XCTFail("participant accessed the identity roster")
+        case .failure(.identityRosterDenied): break
+        case let .failure(error): XCTFail("wrong roster error: \(error)")
+        }
+        switch store.authorize(token: participantToken, scope: .identityManagement, at: 1_000_000_001) {
+        case .success: XCTFail("participant managed a persistent identity")
+        case .failure(.identityManagementDenied): break
+        case let .failure(error): XCTFail("wrong identity-management error: \(error)")
+        }
+    }
+
     func testEveryCognitiveLayerCanIssueTheSameLeasedTrackingGoal() throws {
         for layer in CognitiveControlLayer.allCases {
             let request = makeRequest(

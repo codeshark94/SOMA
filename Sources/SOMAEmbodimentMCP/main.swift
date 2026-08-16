@@ -111,6 +111,11 @@ private struct ViewResultArguments: Codable {
     let requestId: String
 }
 
+private struct EnrollPresentIdentityArguments: Codable {
+    let personEntityId: UUID
+    let confirmedByUser: Bool
+}
+
 private struct PersonContextArguments: Codable {
     let personEntityId: UUID
     let languageTag: String?
@@ -281,6 +286,37 @@ private final class EmbodimentMCPServer {
                 .init(
                     kind: .captureResult,
                     requestID: value.requestId,
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        }
+        if name == "list_present_people" || name == "list_identity_registry" {
+            guard toolArguments.isEmpty else {
+                throw ServerFailure.invalidArguments("\(name) takes no arguments")
+            }
+            let query: IdentityRosterQuery = name == "list_present_people" ? .present : .registered
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .identityRoster,
+                    identityRosterQuery: query,
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        }
+        if name == "enroll_present_identity" {
+            let value: EnrollPresentIdentityArguments = try decode(toolArguments)
+            guard value.confirmedByUser else {
+                throw ServerFailure.invalidArguments("enroll_present_identity requires confirmed_by_user=true")
+            }
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .identityEnrollment,
+                    identityEnrollment: .init(
+                        personEntityID: value.personEntityId,
+                        confirmedByUser: true
+                    ),
                     sessionAuthorization: sessionAuthorization
                 ),
                 socketURL: socketURL
@@ -534,6 +570,9 @@ private final class EmbodimentMCPServer {
             "list_scene_entities",
             "get_spatial_map",
             "get_view_capture",
+            "list_present_people",
+            "list_identity_registry",
+            "enroll_present_identity",
             "register_semantic_target",
             "remove_semantic_target",
             "set_attention_policy",
@@ -566,7 +605,13 @@ private final class EmbodimentMCPServer {
             tool("get_view_capture", "Read one short-lived capture result by request ID.", objectSchema([
                 "request_id": stringSchema(maxLength: 96),
             ], required: ["request_id"]), readOnly: true),
-            tool("get_person_context", "Read the current participant's remote-shareable language, contact, rapport, and factual context. The session token must match this exact opaque local person reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
+            tool("list_present_people", "Administrator-only: compare recently observed faces with local registered identities and return the current non-biometric presence projection. Unknown people remain unnamed.", objectSchema([:], required: []), readOnly: true),
+            tool("list_identity_registry", "Administrator-only: list locally registered person-context records, including explicit name, language, rapport, and facts but never face embeddings or raw transcripts.", objectSchema([:], required: []), readOnly: true),
+            tool("enroll_present_identity", "Administrator-only: promote one currently present, already-confirmed anonymous identity into a persistent local face-recognition profile. Call only after explicit consent or confirmation from the person; then store their explicitly stated name/language with the person-context tools.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "confirmed_by_user": ["type": "boolean", "const": true],
+            ], required: ["person_entity_id", "confirmed_by_user"])),
+            tool("get_person_context", "Read the current participant's remote-shareable language, contact, rapport, and factual context. Administrator sessions may read an explicitly supplied registered identity from list_identity_registry; participant sessions remain limited to their own reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
                 "person_entity_id": uuidSchema(),
             ], required: ["person_entity_id"]), readOnly: true),
             tool("set_preferred_language", "Persist a person's stated BCP-47 language preference. Call only after the person explicitly states or confirms it.", objectSchema([

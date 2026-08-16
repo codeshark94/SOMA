@@ -218,7 +218,7 @@ final class FaceIdentityRuntime: @unchecked Sendable {
 
     private struct WorkItem {
         let pixelBuffer: CVPixelBuffer
-        let alignment: FaceAlignmentEvidence
+        let alignments: [FaceAlignmentEvidence]
         let monotonicNS: UInt64
     }
 
@@ -228,7 +228,7 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     private let profileStore: FaceIdentityProfileStore
     private let anonymousRegistry: AnonymousFaceRegistry
     private let onHealth: @Sendable (String, String) -> Void
-    private let onDecision: @Sendable (FaceIdentityRuntimeDecision, UInt64, Double) -> Void
+    private let onDecision: @Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64, Double) -> Void
     private var profileSnapshot: [LocalFaceIdentityProfile] = []
     private var matcher: FaceIdentityMatcher
     private var pending: WorkItem?
@@ -240,7 +240,7 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         modelURL: URL = FaceIdentityRuntime.defaultModelURL(),
         dataDirectoryURL: URL = FaceIdentityRuntime.defaultDataDirectoryURL(),
         onHealth: @escaping @Sendable (String, String) -> Void,
-        onDecision: @escaping @Sendable (FaceIdentityRuntimeDecision, UInt64, Double) -> Void
+        onDecision: @escaping @Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64, Double) -> Void
     ) throws {
         let key = try OwnerOnlyInstallationSecret.loadOrCreate(
             in: dataDirectoryURL,
@@ -278,16 +278,18 @@ final class FaceIdentityRuntime: @unchecked Sendable {
 
     func submit(
         pixelBuffer: CVPixelBuffer,
-        alignment: FaceAlignmentEvidence,
+        alignments: [FaceAlignmentEvidence],
         at monotonicNS: UInt64
     ) {
+        let boundedAlignments = Array(alignments.prefix(3))
+        guard !boundedAlignments.isEmpty else { return }
         lock.lock()
         guard !stopped, monotonicNS >= nextAcceptedNS else {
             lock.unlock()
             return
         }
         nextAcceptedNS = monotonicNS + 200_000_000
-        pending = WorkItem(pixelBuffer: pixelBuffer, alignment: alignment, monotonicNS: monotonicNS)
+        pending = WorkItem(pixelBuffer: pixelBuffer, alignments: boundedAlignments, monotonicNS: monotonicNS)
         let shouldStart = !running
         if shouldStart { running = true }
         lock.unlock()
@@ -317,21 +319,49 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     }
 
     private func process(_ item: WorkItem) {
+        for (index, alignment) in item.alignments.enumerated() {
+            process(
+                pixelBuffer: item.pixelBuffer,
+                alignment: alignment,
+                isPrimaryFace: index == 0,
+                at: item.monotonicNS
+            )
+        }
+    }
+
+    private func process(
+        pixelBuffer: CVPixelBuffer,
+        alignment: FaceAlignmentEvidence,
+        isPrimaryFace: Bool,
+        at monotonicNS: UInt64
+    ) {
         let started = DispatchTime.now().uptimeNanoseconds
         do {
-            let embedding = try embedder.embed(pixelBuffer: item.pixelBuffer, alignment: item.alignment)
-            let known = matcher.match(embedding, profiles: profileSnapshot, at: item.monotonicNS)
+            let embedding = try embedder.embed(pixelBuffer: pixelBuffer, alignment: alignment)
+            let known = matcher.match(embedding, profiles: profileSnapshot, at: monotonicNS)
             let inferenceMS = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
             switch known {
             case let .recognized(entityID, similarity, _, confirmations):
-                onDecision(.known(entityID: entityID, similarity: similarity, confirmations: confirmations), item.monotonicNS, inferenceMS)
+                onDecision(
+                    .known(entityID: entityID, similarity: similarity, confirmations: confirmations),
+                    alignment.rect,
+                    isPrimaryFace,
+                    monotonicNS,
+                    inferenceMS
+                )
                 retainKnownView(entityID: entityID, embedding: embedding)
             case let .candidate(entityID, similarity, _):
-                onDecision(.knownCandidate(entityID: entityID, similarity: similarity), item.monotonicNS, inferenceMS)
+                onDecision(
+                    .knownCandidate(entityID: entityID, similarity: similarity),
+                    alignment.rect,
+                    isPrimaryFace,
+                    monotonicNS,
+                    inferenceMS
+                )
             case .unknown:
                 let semaphore = DispatchSemaphore(value: 0)
                 let resultBox = SynchronousResultBox<Result<AnonymousFaceDecision, Error>>()
-                let observedNS = item.monotonicNS
+                let observedNS = monotonicNS
                 Task { [anonymousRegistry] in
                     do {
                         resultBox.set(.success(try await anonymousRegistry.observe(
@@ -346,7 +376,13 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                 semaphore.wait()
                 switch resultBox.get() {
                 case let .success(.candidate(handle, confirmations)):
-                    onDecision(.unknownCandidate(handle: handle, confirmations: confirmations), item.monotonicNS, inferenceMS)
+                    onDecision(
+                        .unknownCandidate(handle: handle, confirmations: confirmations),
+                        alignment.rect,
+                        isPrimaryFace,
+                        monotonicNS,
+                        inferenceMS
+                    )
                 case let .success(.recognized(handle, similarity, observations)):
                     onDecision(
                         .anonymous(
@@ -355,7 +391,9 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                             similarity: similarity,
                             observations: observations
                         ),
-                        item.monotonicNS,
+                        alignment.rect,
+                        isPrimaryFace,
+                        monotonicNS,
                         inferenceMS
                     )
                 case .success(.rejected):

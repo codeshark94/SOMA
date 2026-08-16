@@ -8,6 +8,9 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
     /// Opaque local person reference used only as a parameter to SOMA's
     /// person-context MCP tools. It is not a name or biometric identifier.
     public let personEntityID: UUID?
+    /// An unrecognized speaker can receive interaction-scoped embodiment
+    /// authority without gaining a persistent person-memory record.
+    public let personContextAvailable: Bool
     /// A short-lived local MCP capability for this interaction. It never
     /// leaves developer context, trace output, or persistent memory.
     public let sessionCapability: String?
@@ -27,6 +30,7 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
         situationSummary: String? = nil,
         identityReference: String? = nil,
         personEntityID: UUID? = nil,
+        personContextAvailable: Bool? = nil,
         sessionCapability: String? = nil,
         interactionAuthority: SOMAInteractionAuthority? = nil,
         personMemoryMission: PersonContextMission? = nil,
@@ -41,6 +45,7 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
         self.situationSummary = try Self.optional(situationSummary, maximumCount: 8_192)
         self.identityReference = try Self.optional(identityReference, maximumCount: 128)
         self.personEntityID = personEntityID
+        self.personContextAvailable = personContextAvailable ?? (personEntityID != nil)
         if let sessionCapability {
             guard sessionCapability.count == 36,
                   sessionCapability.unicodeScalars.allSatisfy({
@@ -55,11 +60,14 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
         guard (personEntityID == nil) == (self.sessionCapability == nil) else {
             throw CodexAccountBridgeError.invalidContext
         }
+        guard !self.personContextAvailable || personEntityID != nil else {
+            throw CodexAccountBridgeError.invalidContext
+        }
         guard self.sessionCapability == nil || interactionAuthority != nil else {
             throw CodexAccountBridgeError.invalidContext
         }
         self.interactionAuthority = interactionAuthority
-        self.personMemoryMission = personMemoryMission?.isSatisfied == false
+        self.personMemoryMission = self.personContextAvailable && personMemoryMission?.isSatisfied == false
             ? personMemoryMission
             : nil
         self.preferredLanguageTag = try Self.optional(preferredLanguageTag, maximumCount: 35)
@@ -72,6 +80,46 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
             throw CodexAccountBridgeError.invalidContext
         }
         self.privacyScope = privacyScope
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case situationSummary
+        case identityReference
+        case personEntityID
+        case personContextAvailable
+        case sessionCapability
+        case interactionAuthority
+        case personMemoryMission
+        case preferredLanguageTag
+        case languageStartInstruction
+        case rapportSummary
+        case activeTaskSummaries
+        case memorySummaries
+        case embodimentSummary
+        case privacyScope
+    }
+
+    /// Older locally persisted bridge requests did not carry the
+    /// person-context availability bit. Their previous meaning was exactly
+    /// the default: a supplied person reference has person-context access.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            situationSummary: try values.decodeIfPresent(String.self, forKey: .situationSummary),
+            identityReference: try values.decodeIfPresent(String.self, forKey: .identityReference),
+            personEntityID: try values.decodeIfPresent(UUID.self, forKey: .personEntityID),
+            personContextAvailable: try values.decodeIfPresent(Bool.self, forKey: .personContextAvailable),
+            sessionCapability: try values.decodeIfPresent(String.self, forKey: .sessionCapability),
+            interactionAuthority: try values.decodeIfPresent(SOMAInteractionAuthority.self, forKey: .interactionAuthority),
+            personMemoryMission: try values.decodeIfPresent(PersonContextMission.self, forKey: .personMemoryMission),
+            preferredLanguageTag: try values.decodeIfPresent(String.self, forKey: .preferredLanguageTag),
+            languageStartInstruction: try values.decodeIfPresent(String.self, forKey: .languageStartInstruction),
+            rapportSummary: try values.decodeIfPresent(String.self, forKey: .rapportSummary),
+            activeTaskSummaries: try values.decodeIfPresent([String].self, forKey: .activeTaskSummaries) ?? [],
+            memorySummaries: try values.decodeIfPresent([String].self, forKey: .memorySummaries) ?? [],
+            embodimentSummary: try values.decodeIfPresent(String.self, forKey: .embodimentSummary),
+            privacyScope: try values.decodeIfPresent(String.self, forKey: .privacyScope) ?? "interaction_scoped"
+        )
     }
 
     private static func optional(_ value: String?, maximumCount: Int) throws -> String? {

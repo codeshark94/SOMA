@@ -10,6 +10,10 @@ enum AppServerLiveVoiceEvent: Sendable {
     case hearingUser
     case contextAppended
     case contextRejected(reason: String)
+    case visualContextAttached
+    case visualContextRejected(reason: String)
+    case embodimentMCPReady
+    case embodimentMCPUnavailable(reason: String)
     case inputAccepted(characters: Int)
     case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
     case preparingResponse
@@ -48,6 +52,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "soma.live-voice.app-server", qos: .userInitiated)
     private let projectDirectory: String
     private let voice: SOMARealtimeVoice
+    private let currentCameraImageDataURI: (@Sendable () -> String?)?
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
     private var gate = LiveVoiceLaunchGate()
     private var inactivityGate = LiveVoiceSessionInactivityGate()
@@ -65,14 +70,17 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var stopped = false
     private var generation: UInt64 = 0
     private var activePersonEntityID: UUID?
+    private var lastVisualContextNS: UInt64 = 0
 
     init(
         projectDirectory: String = "/Users/seungyeop/workspace/Research/SOMA",
         voice: SOMARealtimeVoice = .maple,
+        currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         onEvent: @escaping @Sendable (AppServerLiveVoiceEvent) -> Void
     ) {
         self.projectDirectory = projectDirectory
         self.voice = voice
+        self.currentCameraImageDataURI = currentCameraImageDataURI
         self.onEvent = onEvent
     }
 
@@ -331,6 +339,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         "role": pendingContext.role,
                     ])
                 }
+                enqueueCurrentCameraImage(force: true)
                 onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
             case "audio_input_progress":
                 guard !inputTransportReported else { continue }
@@ -342,11 +351,20 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.proactiveOpeningTriggered)
             case "input_speech_started":
                 recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
+                enqueueCurrentCameraImage(force: true)
                 onEvent(.hearingUser)
             case "context_appended":
                 onEvent(.contextAppended)
             case "context_rejected":
                 onEvent(.contextRejected(reason: String((event.reason ?? "unknown").prefix(192))))
+            case "visual_context_attached":
+                onEvent(.visualContextAttached)
+            case "visual_context_rejected":
+                onEvent(.visualContextRejected(reason: String((event.reason ?? "unknown").prefix(192))))
+            case "embodiment_mcp_ready":
+                onEvent(.embodimentMCPReady)
+            case "embodiment_mcp_unavailable":
+                onEvent(.embodimentMCPUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
             case "input_transcript_ready":
                 recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.inputAccepted(characters: max(0, event.characters ?? 0)))
@@ -445,6 +463,24 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ])
     }
 
+    /// A camera frame is transient input for the active turn, never a trace
+    /// artifact or person-memory record. The relay already bounds the JPEG
+    /// cadence; this guard prevents an audio transport retry from duplicating
+    /// the same visual item in one instant.
+    private func enqueueCurrentCameraImage(force: Bool) {
+        guard active,
+              let currentCameraImageDataURI,
+              let dataURI = currentCameraImageDataURI(),
+              dataURI.utf8.count <= 4 * 1_048_576 else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard force || now >= lastVisualContextNS + 500_000_000 else { return }
+        lastVisualContextNS = now
+        send([
+            "type": "append_image",
+            "data": dataURI,
+        ])
+    }
+
     private func send(_ object: [String: Any]) {
         guard let input,
               JSONSerialization.isValidJSONObject(object),
@@ -484,7 +520,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ]
         if let value = context.situationSummary { lines.append("situation: \(value)") }
         if let value = context.identityReference { lines.append("identity: \(value)") }
-        if let value = context.personEntityID { lines.append("person_context_reference: \(value.uuidString.lowercased())") }
+        if context.personContextAvailable, let value = context.personEntityID {
+            lines.append("person_context_reference: \(value.uuidString.lowercased())")
+        }
         if let value = context.sessionCapability { lines.append("soma_session_token: \(value)") }
         if let value = context.interactionAuthority { lines.append("interaction_authority: \(value.rawValue)") }
         if let value = context.personMemoryMission {
@@ -568,7 +606,8 @@ func testAppServerLiveVoiceLauncher() -> String {
             result.set("failed:\(reason)")
             semaphore.signal()
         case .launchRequested, .inputTransportStarted, .outputPlaybackReady, .proactiveOpeningTriggered, .hearingUser,
-             .contextAppended, .contextRejected, .inputAccepted,
+             .contextAppended, .contextRejected, .visualContextAttached, .visualContextRejected,
+             .embodimentMCPReady, .embodimentMCPUnavailable, .inputAccepted,
              .transcriptFinalized, .preparingResponse, .responding, .responseCompleted, .ended:
             break
         }

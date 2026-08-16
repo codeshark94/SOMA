@@ -1365,6 +1365,34 @@ public actor CognitiveMemoryStore {
         )
     }
 
+    /// Returns the bounded, remotely-shareable person contexts known to the
+    /// local memory store. This intentionally projects only explicit facts
+    /// and rapport; identity embeddings, transcripts, and local-only records
+    /// remain inaccessible through this API.
+    public func personContexts(at date: Date = Date()) throws -> [PersonContextSnapshot] {
+        try ensureOpen()
+        let personIDs = Set(current.values.compactMap { record -> UUID? in
+            guard record.updatedAt <= date,
+                  !record.isExpired(at: date),
+                  record.disclosure == .remoteSummaryAllowed else {
+                return nil
+            }
+            switch record.payload {
+            case let .personFact(value): return value.personEntityID
+            case let .relationship(value): return value.personEntityID
+            default: return nil
+            }
+        })
+        return try personIDs
+            .map { try personContext(for: $0, at: date) }
+            .sorted { lhs, rhs in
+                let lhsName = lhs.facts["preferred_name"] ?? ""
+                let rhsName = rhs.facts["preferred_name"] ?? ""
+                if lhsName != rhsName { return lhsName.localizedCaseInsensitiveCompare(rhsName) == .orderedAscending }
+                return lhs.personEntityID.uuidString < rhs.personEntityID.uuidString
+            }
+    }
+
     /// Writes an explicit user preference as a long-term, encrypted person
     /// fact. Replacing the same key preserves a revision trail instead of
     /// accumulating contradictory values.

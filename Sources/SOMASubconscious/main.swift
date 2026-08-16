@@ -1011,6 +1011,83 @@ private final class IdentityPresenceCoordinator: @unchecked Sendable {
     }
 }
 
+/// Maintains a short, multi-person recognition window separately from the
+/// single social participant stream. A speaker/interaction handoff remains a
+/// deliberate one-person decision, while administrator MCP queries can still
+/// report everyone independently recognized in the current view.
+private final class PresentIdentityRoster: @unchecked Sendable {
+    private struct Entry: Sendable {
+        let identity: IdentityPresenceIdentity
+        let confidence: Double
+        let lastSeenNS: UInt64
+        let anonymousHandle: AnonymousFaceHandle?
+    }
+
+    private let lock = NSLock()
+    private let retentionNS: UInt64 = 3_000_000_000
+    private var entries: [UUID: Entry] = [:]
+
+    func record(_ decision: FaceIdentityRuntimeDecision, at monotonicNS: UInt64) {
+        let identity: IdentityPresenceIdentity
+        let anonymousHandle: AnonymousFaceHandle?
+        switch decision {
+        case let .known(entityID, _, _):
+            identity = .init(entityID: entityID, kind: .enrolled)
+            anonymousHandle = nil
+        case let .anonymous(entityID, handle, _, _):
+            identity = .init(entityID: entityID, kind: .pseudonymous)
+            anonymousHandle = handle
+        case .unknownCandidate, .knownCandidate:
+            return
+        }
+        lock.lock()
+        prune(at: monotonicNS)
+        entries[identity.entityID] = Entry(
+            identity: identity,
+            confidence: decision.confidence,
+            lastSeenNS: monotonicNS,
+            anonymousHandle: anonymousHandle
+        )
+        lock.unlock()
+    }
+
+    func promoteableAnonymousHandle(
+        for personEntityID: UUID,
+        at monotonicNS: UInt64
+    ) -> AnonymousFaceHandle? {
+        lock.lock()
+        defer { lock.unlock() }
+        prune(at: monotonicNS)
+        return entries[personEntityID]?.anonymousHandle
+    }
+
+    func entries(at monotonicNS: UInt64) -> [(identity: IdentityPresenceIdentity, confidence: Double, ageMS: UInt64)] {
+        lock.lock()
+        defer { lock.unlock() }
+        prune(at: monotonicNS)
+        return entries.values
+            .map { entry in
+                (
+                    identity: entry.identity,
+                    confidence: entry.confidence,
+                    ageMS: monotonicNS >= entry.lastSeenNS
+                        ? (monotonicNS - entry.lastSeenNS) / 1_000_000
+                        : 0
+                )
+            }
+            .sorted {
+                if $0.ageMS != $1.ageMS { return $0.ageMS < $1.ageMS }
+                return $0.identity.entityID.uuidString < $1.identity.entityID.uuidString
+            }
+    }
+
+    private func prune(at monotonicNS: UInt64) {
+        entries = entries.filter { _, entry in
+            monotonicNS >= entry.lastSeenNS && monotonicNS - entry.lastSeenNS < retentionNS
+        }
+    }
+}
+
 private func identityPresenceRuntimeEvent(
     for transition: IdentityPresenceTransition,
     at monotonicNS: UInt64
@@ -2259,6 +2336,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var liveVoiceUserSpeaking = false
     private var liveVoiceResponsePending = false
     private var activeIndicatorState: SubconsciousIndicatorState?
+    private var activeIndicatorRendering: SOMALEDDeviceRendering?
     private var indicatorIlluminated = false
     private var indicatorCalibrationPreset: SOMALEDFirmwarePreset?
     private var indicatorCalibrationStateID: Int?
@@ -5017,11 +5095,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let next = indicatorInputs.resolvedState
         guard ledSettings.responseMode.permits(next) else {
             guard helperReady, process.isRunning, next != activeIndicatorState || indicatorIlluminated else { return }
+            if activeIndicatorRendering?.specialPatternEnabled == true {
+                let commandID = nextCommandID(prefix: "indicator-special")
+                send("indicator_special_pattern \(commandID) 0")
+            }
             if indicatorIlluminated, let previous = activeIndicatorState {
                 let commandID = nextCommandID(prefix: "indicator-policy-clear")
                 send("indicator_clear \(commandID) \(indicatorFirmwareStateID(previous))")
             }
             activeIndicatorState = next
+            activeIndicatorRendering = nil
             indicatorIlluminated = false
             writer.write(RuntimeEvent(
                 event: "source.health",
@@ -5034,21 +5117,21 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         guard helperReady,
               process.isRunning,
-              forceHardwareReassertion || next != activeIndicatorState else { return }
-        let previous = activeIndicatorState
+              forceHardwareReassertion || next != activeIndicatorState || activeIndicatorRendering != indicatorRendering(next) else { return }
         let previousWasIlluminated = indicatorIlluminated
         activeIndicatorState = next
         let nextSignal = ledSettings.signal(for: next)
-        let nextStateID = indicatorFirmwareStateID(next)
-        let previousStateID = previousWasIlluminated
-            ? previous.map(indicatorFirmwareStateID)
-            : nil
+        let nextRendering = nextSignal.deviceRendering
+        let previousRendering = previousWasIlluminated ? activeIndicatorRendering : nil
         for command in SOMALEDHardwareTransition.commands(
-            previousStateID: previousStateID,
-            nextStateID: nextStateID,
+            previous: previousRendering,
+            next: nextRendering,
             forceReassertion: forceHardwareReassertion
         ) {
             switch command {
+            case let .specialPattern(enabled):
+                let commandID = nextCommandID(prefix: "indicator-special")
+                send("indicator_special_pattern \(commandID) \(enabled ? 1 : 0)")
             case let .clear(stateID):
                 let commandID = nextCommandID(prefix: "indicator-clear")
                 send("indicator_clear \(commandID) \(stateID)")
@@ -5057,14 +5140,19 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 send("indicator_set \(commandID) \(stateID)")
             }
         }
+        activeIndicatorRendering = nextRendering
         indicatorIlluminated = true
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNS,
             source: "social_indicator",
             state: next.rawValue,
-            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextStateID); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); rgb_palette=true; arbitrary_rgb=false"
+            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); special_pattern=\(nextRendering.specialPatternEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); rgb_palette=true; arbitrary_rgb=false"
         ))
+    }
+
+    private func indicatorRendering(_ state: SubconsciousIndicatorState) -> SOMALEDDeviceRendering {
+        ledSettings.signal(for: state).deviceRendering
     }
 
     private func indicatorFirmwareStateID(_ state: SubconsciousIndicatorState) -> Int {
@@ -5081,6 +5169,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             let commandID = nextCommandID(prefix: "indicator-calibration")
             let nextStateID = preset?.firmwareStateID
 
+            send("indicator_special_pattern \(commandID)-special 0")
             if indicatorIlluminated,
                let activeIndicatorState,
                indicatorFirmwareStateID(activeIndicatorState) != nextStateID {
@@ -5094,6 +5183,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             indicatorCalibrationPreset = preset
             indicatorCalibrationStateID = nextStateID
             activeIndicatorState = nil
+            activeIndicatorRendering = nil
             indicatorIlluminated = nextStateID != nil
 
             if let preset, let nextStateID {
@@ -5871,6 +5961,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         // the user stare at one exact pixel.
         return normalizedX <= 0.72 && normalizedY <= 0.90
     }
+
 }
 
 private final class DiagnosticPixelBuffer: @unchecked Sendable {
@@ -6044,6 +6135,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let neuralObjectDetector: ANEObjectDetector?
     private let neuralFaceDetector: ANEFaceDetector?
     private let faceIdentityRuntime: FaceIdentityRuntime?
+    private let onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)?
     private let onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)?
     private let systemSaliencyDetector = SystemSaliencyDetector()
     private let systemFaceVerifier = SystemFaceVerifier()
@@ -6097,7 +6189,8 @@ private final class VisionWorker: @unchecked Sendable {
         panoramaCompositor: RollingPanoramaCompositor? = nil,
         onSceneCandidates: (([SceneCandidate], UInt64) -> Void)? = nil,
         onCoverage: ((GimbalPose, Double, GimbalPoseProjection, CameraProjectionModel, UInt64) -> Void)? = nil,
-        onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, UInt64) -> Void)? = nil,
+        onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)? = nil,
+        onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64) -> Void)? = nil,
         onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)? = nil,
         onFatalVisionFailure: (() -> Void)? = nil
     ) {
@@ -6111,6 +6204,7 @@ private final class VisionWorker: @unchecked Sendable {
         self.panoramaCompositor = panoramaCompositor
         self.onSceneCandidates = onSceneCandidates
         self.onCoverage = onCoverage
+        self.onCameraFrame = onCameraFrame
         self.onFatalVisionFailure = onFatalVisionFailure
         self.onIdentityPresenceEvidence = onIdentityPresenceEvidence
         do {
@@ -6165,7 +6259,7 @@ private final class VisionWorker: @unchecked Sendable {
                         message: message
                     ))
                 },
-                onDecision: { decision, observedNS, inferenceMS in
+                onDecision: { decision, rect, isPrimaryFace, observedNS, inferenceMS in
                     writer.write(FaceIdentityEvent(
                         monotonicNS: observedNS,
                         state: decision.state,
@@ -6173,7 +6267,7 @@ private final class VisionWorker: @unchecked Sendable {
                         confidence: decision.confidence,
                         inferenceMS: inferenceMS
                     ))
-                    onIdentityDecision?(decision, observedNS)
+                    onIdentityDecision?(decision, rect, isPrimaryFace, observedNS)
                 }
             )
         } catch {
@@ -6208,6 +6302,7 @@ private final class VisionWorker: @unchecked Sendable {
 
     func submit(pixelBuffer: CVPixelBuffer, captureNS: UInt64, exposureNS: UInt64) {
         guard !isStopped else { return }
+        onCameraFrame?(pixelBuffer, captureNS)
         let result = mailbox.publish(VideoFrame(
             pixelBuffer: pixelBuffer,
             captureNS: captureNS,
@@ -6578,19 +6673,28 @@ private final class VisionWorker: @unchecked Sendable {
         sceneField.invalidateUnverifiedFaceTracks(matching: rejectedFaceRects)
         let verifiedFaceCount = candidates.filter { isFaceCandidate($0) && $0.isFaceVerified }.count
         onIdentityPresenceEvidence?(verifiedFaceCount > 0, faceVerificationNow)
-        if let identityFace = candidates
-            .filter({ isFaceCandidate($0) && $0.isFaceVerified })
-            .max(by: { $0.confidence < $1.confidence }),
-           let evidence = identityAlignmentEvidence
-            .filter({ evidence in
-                faceVerificationNow >= evidence.observedNS
-                    && faceVerificationNow - evidence.observedNS <= 250_000_000
-                    && Self.faceEvidenceMatches(evidence.evidence.rect, identityFace.rect)
-            })
-            .max(by: { $0.observedNS < $1.observedNS }) {
+        let identityAlignments = candidates
+            .filter { isFaceCandidate($0) && $0.isFaceVerified }
+            .sorted {
+                let lhsArea = $0.rect.width * $0.rect.height
+                let rhsArea = $1.rect.width * $1.rect.height
+                if lhsArea != rhsArea { return lhsArea > rhsArea }
+                return $0.confidence > $1.confidence
+            }
+            .compactMap { identityFace -> FaceAlignmentEvidence? in
+                identityAlignmentEvidence
+                    .filter { evidence in
+                        faceVerificationNow >= evidence.observedNS
+                            && faceVerificationNow - evidence.observedNS <= 250_000_000
+                            && Self.faceEvidenceMatches(evidence.evidence.rect, identityFace.rect)
+                    }
+                    .max(by: { $0.observedNS < $1.observedNS })?
+                    .evidence.alignment
+            }
+        if !identityAlignments.isEmpty {
             faceIdentityRuntime?.submit(
                 pixelBuffer: pixelBuffer,
-                alignment: evidence.evidence.alignment,
+                alignments: identityAlignments,
                 at: faceVerificationNow
             )
         }
@@ -7035,6 +7139,7 @@ private func run(_ options: Options) throws {
     let identityPresence = IdentityPresenceCoordinator(
         administrator: controlSettings.administrator
     )
+    let presentIdentityRoster = PresentIdentityRoster()
     let liveSessionCapabilities = SOMASessionCapabilityStore()
     let spatialAtlas = SphericalSceneAtlasStore()
     let placeEmbeddingEncoder = PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder
@@ -7059,6 +7164,9 @@ private func run(_ options: Options) throws {
     placeMemoryPersistence?.restore()
     let panoramaStatus = PanoramaMapStatusStore()
     let liveVisualContextRelay = LiveVisualContextRelay()
+    let liveCameraFrameRelay = options.l2LiveVoice && controlSettings.realtimeVoiceEnabled
+        ? LiveCameraFrameRelay()
+        : nil
     let embodimentArbiter = options.embodimentShadowSocketURL.map { _ in
         ShadowEmbodimentArbiter(
             spatialAtlas: spatialAtlas,
@@ -7312,10 +7420,16 @@ private func run(_ options: Options) throws {
     let l1ThoughtRelay = L1ThoughtStreamRelay()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
-        let launcher = AppServerLiveVoiceLauncher(voice: controlSettings.realtimeVoice) { event in
+        let launcher = AppServerLiveVoiceLauncher(
+            voice: controlSettings.realtimeVoice,
+            currentCameraImageDataURI: {
+                liveCameraFrameRelay?.currentImageDataURI(at: monotonicNanoseconds())
+            }
+        ) { event in
             let eventNS = monotonicNanoseconds()
             switch event {
             case let .launchRequested(authorization):
+                liveCameraFrameRelay?.setEnabled(true)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
@@ -7377,6 +7491,38 @@ private func run(_ options: Options) throws {
                     state: "context_appended",
                     message: nil
                 ))
+            case .visualContextAttached:
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "visual_context_attached",
+                    message: "source=current_camera_frame; retention=live_turn_only"
+                ))
+            case let .visualContextRejected(reason):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "visual_context_rejected",
+                    message: String(reason.prefix(192))
+                ))
+            case .embodimentMCPReady:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "embodiment_mcp_ready",
+                    message: "capture_view_and_identity_tools_available"
+                ))
+            case let .embodimentMCPUnavailable(reason):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "embodiment_mcp_unavailable",
+                    message: String(reason.prefix(192))
+                ))
             case let .contextRejected(reason):
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -7419,6 +7565,7 @@ private func run(_ options: Options) throws {
                 conversationContact.recordConversationActivity(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
             case let .ended(reason):
+                liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
                 writer.write(RuntimeEvent(
@@ -7429,6 +7576,7 @@ private func run(_ options: Options) throws {
                     message: reason
                 ))
             case let .failed(reason):
+                liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
                 writer.write(RuntimeEvent(
@@ -7450,7 +7598,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=eye_contact_plus_voice_or_social_pulse; user_silence_timeout_seconds=60; visual_context=l1_ephemeral_summary; text_context=initial_items_plus_append_text"
+            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=eye_contact_plus_voice_or_social_pulse; user_silence_timeout_seconds=60; visual_context=l1_summary_plus_current_camera_jpeg_per_live_turn; mcp_status_checked=on_session_start; text_context=initial_items_plus_append_text"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -7677,6 +7825,91 @@ private func run(_ options: Options) throws {
                 }
                 return result
             },
+            identityRosterProvider: { query in
+                let now = monotonicNanoseconds()
+                let presence = presentIdentityRoster.entries(at: now)
+                let semaphore = DispatchSemaphore(value: 0)
+                let resultBox = SynchronousResultBox<[PersonContextSnapshot]>()
+                Task {
+                    do {
+                        let values = try await l1MemoryContext.registeredPersonContexts()
+                        resultBox.set(.success(values))
+                    } catch {
+                        resultBox.set(.failure(error))
+                    }
+                    semaphore.signal()
+                }
+                semaphore.wait()
+                let contexts: [UUID: PersonContextSnapshot]
+                switch resultBox.get() ?? .failure(EmbodimentIPCError.timeout) {
+                case let .success(values):
+                    contexts = Dictionary(uniqueKeysWithValues: values.map { ($0.personEntityID, $0) })
+                case let .failure(error):
+                    return .failure(error)
+                }
+                let entries: [IdentityRosterEntry]
+                switch query {
+                case .present:
+                    entries = presence.map { entry in
+                        IdentityRosterEntry(
+                            personEntityID: entry.identity.entityID,
+                            recognitionKind: entry.identity.kind.rawValue,
+                            confidence: entry.confidence,
+                            lastSeenMillisecondsAgo: entry.ageMS,
+                            personContext: contexts[entry.identity.entityID]
+                        )
+                    }
+                case .registered:
+                    entries = contexts.values.map { context in
+                        IdentityRosterEntry(
+                            personEntityID: context.personEntityID,
+                            recognitionKind: "registered",
+                            personContext: context
+                        )
+                    }.sorted { $0.personEntityID.uuidString < $1.personEntityID.uuidString }
+                }
+                return .success(.init(query: query, entries: entries))
+            },
+            identityEnrollmentProvider: { request in
+                guard request.confirmedByUser,
+                      let handle = presentIdentityRoster.promoteableAnonymousHandle(
+                          for: request.personEntityID,
+                          at: monotonicNanoseconds()
+                      ) else {
+                    return .failure(RuntimeError.unavailable("present_anonymous_identity_not_available"))
+                }
+                let semaphore = DispatchSemaphore(value: 0)
+                let resultBox = SynchronousResultBox<(entityID: UUID, referenceCount: Int)>()
+                Task {
+                    do {
+                        let result = try await FaceIdentityRuntime.promoteAnonymousIdentity(handle: handle)
+                        resultBox.set(.success(result))
+                    } catch {
+                        resultBox.set(.failure(error))
+                    }
+                    semaphore.signal()
+                }
+                semaphore.wait()
+                switch resultBox.get() ?? .failure(EmbodimentIPCError.timeout) {
+                case let .success(result):
+                    guard result.entityID == request.personEntityID else {
+                        return .failure(RuntimeError.unavailable("identity_enrollment_reference_mismatch"))
+                    }
+                    writer.write(RuntimeEvent(
+                        event: "identity.enrollment",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "person_identity_mcp",
+                        state: "persistent_profile_created",
+                        message: "references=\(result.referenceCount); metadata_disclosure=person_context_only"
+                    ))
+                    return .success(.init(
+                        personEntityID: result.entityID,
+                        referenceCount: result.referenceCount
+                    ))
+                case let .failure(error):
+                    return .failure(error)
+                }
+            },
             indicatorCalibrationHandler: { preset in
                 guard let attentionGimbalBridge else {
                     return .failure(RuntimeError.unavailable("The local LED bridge is unavailable"))
@@ -7745,7 +7978,12 @@ private func run(_ options: Options) throws {
                 at: monotonicNS
             )
         },
-        onIdentityDecision: { decision, monotonicNS in
+        onCameraFrame: { pixelBuffer, captureNS in
+            liveCameraFrameRelay?.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
+        },
+        onIdentityDecision: { decision, _, isPrimaryFace, monotonicNS in
+            presentIdentityRoster.record(decision, at: monotonicNS)
+            guard isPrimaryFace else { return }
             for update in identityPresence.observe(decision, at: monotonicNS) {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .departed(identity) = update.transition {
@@ -7840,25 +8078,29 @@ private func run(_ options: Options) throws {
             if evidence.changed, options.l2LiveVoice {
                 attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
             }
-            let interactionParticipant = identityPresence.currentParticipant()
-            let recognizedPersonEntityID = interactionParticipant?.entityID
+            let recognizedParticipant = identityPresence.currentParticipant()
+            let interactionParticipant = recognizedParticipant ?? InteractionParticipant(
+                entityID: UUID(),
+                authority: .participant
+            )
+            let personContextAvailable = recognizedParticipant != nil
+            let recognizedPersonEntityID = recognizedParticipant?.entityID
             let preferredLanguageTag = recognizedPersonEntityID.flatMap {
                 l1MemoryContext.cachedPreferredLanguage(for: $0)
             }
             let languageStartInstruction = l1LanguageInstructions.directive(for: preferredLanguageTag)
             if let openingAuthorization {
-                let sessionCapability = interactionParticipant.map {
-                    liveSessionCapabilities.issue(
-                        personEntityID: $0.entityID,
-                        authority: $0.authority,
-                        at: completedNS
-                    )
-                }
+                let sessionCapability = liveSessionCapabilities.issue(
+                    personEntityID: interactionParticipant.entityID,
+                    authority: interactionParticipant.authority,
+                    at: completedNS
+                )
                 let context = speechInteractionContext(
                     from: belief,
                     visualSummary: liveVisualContextRelay.latestSummary,
-                    identityReference: identityPresence.interactionReference(),
+                    identityReference: personContextAvailable ? identityPresence.interactionReference() : nil,
                     participant: interactionParticipant,
+                    personContextAvailable: personContextAvailable,
                     sessionCapability: sessionCapability,
                     personMemoryMission: recognizedPersonEntityID.flatMap {
                         l1MemoryContext.cachedPersonMemoryMission(for: $0)
@@ -7869,23 +8111,22 @@ private func run(_ options: Options) throws {
                 liveVoiceLauncher?.startIfNeeded(
                     authorization: openingAuthorization.rawValue,
                     context: context,
-                    personEntityID: recognizedPersonEntityID,
+                    personEntityID: interactionParticipant.entityID,
                     at: completedNS
                 )
             }
             if let speechInteraction {
-                let sessionCapability = interactionParticipant.map {
-                    liveSessionCapabilities.issue(
-                        personEntityID: $0.entityID,
-                        authority: $0.authority,
-                        at: completedNS
-                    )
-                }
+                let sessionCapability = liveSessionCapabilities.issue(
+                    personEntityID: interactionParticipant.entityID,
+                    authority: interactionParticipant.authority,
+                    at: completedNS
+                )
                 guard let context = speechInteractionContext(
                     from: belief,
                     visualSummary: liveVisualContextRelay.latestSummary,
-                    identityReference: identityPresence.interactionReference(),
+                    identityReference: personContextAvailable ? identityPresence.interactionReference() : nil,
                     participant: interactionParticipant,
+                    personContextAvailable: personContextAvailable,
                     sessionCapability: sessionCapability,
                     personMemoryMission: recognizedPersonEntityID.flatMap {
                         l1MemoryContext.cachedPersonMemoryMission(for: $0)
@@ -8265,6 +8506,7 @@ private func speechInteractionContext(
     visualSummary: String? = nil,
     identityReference: String? = nil,
     participant: InteractionParticipant? = nil,
+    personContextAvailable: Bool? = nil,
     sessionCapability: String? = nil,
     personMemoryMission: PersonContextMission? = nil,
     preferredLanguageTag: String? = nil,
@@ -8283,6 +8525,7 @@ private func speechInteractionContext(
         situationSummary: situationSummary,
         identityReference: identityReference,
         personEntityID: participant?.entityID,
+        personContextAvailable: personContextAvailable,
         sessionCapability: sessionCapability,
         interactionAuthority: participant?.authority,
         personMemoryMission: personMemoryMission,

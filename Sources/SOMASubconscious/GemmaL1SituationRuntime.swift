@@ -338,6 +338,15 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         Task { _ = await context(for: personEntityID) }
     }
 
+    /// Administrator-only callers use this through the capability-gated MCP
+    /// endpoint. The store supplies an explicitly shareable projection only.
+    func registeredPersonContexts() async throws -> [PersonContextSnapshot] {
+        guard let store else { throw GemmaL1SituationRuntimeError.memoryUnavailable }
+        let contexts = try await store.personContexts()
+        contexts.forEach(cachePersonContext)
+        return contexts
+    }
+
     /// Executes an L2 person-context request in the owning L0 process. The MCP
     /// child only forwards this request over the current-user socket and never
     /// opens the encrypted journal itself.

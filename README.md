@@ -40,6 +40,13 @@ context, curiosity, and goal-level attention—never SDK velocity.
 **L2 · Interaction** owns account-backed live conversation and user-requested
 work, while using the same leased embodiment boundary as L1.
 
+While Live Voice is active, L0 keeps only one recent downscaled camera JPEG in
+memory. A frame no older than two seconds is injected into the L2 turn when the
+person begins speaking, so a request to look at the current view has fresh
+sensor evidence rather than a textual scene guess. The frame is never written
+to a trace, report, person memory, or disk. `capture_view` remains the separate
+MCP path for a deliberate reframe or target-specific view.
+
 Read the complete authority model in
 [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md).
 
@@ -69,7 +76,11 @@ create a new physical permission.
 **Administrator identity** — explicitly enroll the face currently in view, set
 a display name or preferred address, inspect local verification, or delete the
 enrollment. Facial templates remain encrypted on this Mac and never enter the
-activity trace or L2 context.
+activity trace or L2 context. An administrator L2 session can compare the
+current non-biometric presence roster with registered identities and update
+their explicit language, rapport, and factual context. An unregistered speaker
+can still use interaction-scoped embodiment tools, but cannot create a
+persistent person record until explicit enrollment.
 
 **Runtime** — see the current Vision, Voice, Identity, Embodiment, and
 indicator state without exposing raw camera or microphone media.
