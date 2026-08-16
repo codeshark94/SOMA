@@ -120,6 +120,53 @@ public struct ConversationContactGate: Sendable {
     }
 }
 
+/// Keeps the LED invitation stable across brief landmark-gaze dropouts without
+/// changing the much shorter eye-contact requirement for opening a voice turn.
+/// The owner clears this lease when visual contact is conclusively lost.
+public struct EyeContactIndicatorLease: Sendable {
+    private let holdNS: UInt64
+    private var observedNS: UInt64?
+    private var sceneID: String?
+
+    public init(holdMilliseconds: UInt64 = 3_000) {
+        precondition(holdMilliseconds > 0)
+        holdNS = holdMilliseconds * 1_000_000
+    }
+
+    public mutating func observe(at monotonicNS: UInt64) {
+        observedNS = monotonicNS
+        sceneID = nil
+    }
+
+    /// Starts a contact-ready indication for a particular face reference.
+    /// Subsequent current observations of that same reference may maintain the
+    /// indication even when the landmark gaze classifier momentarily drops.
+    public mutating func observe(sceneID: String, at monotonicNS: UInt64) {
+        self.sceneID = sceneID
+        observedNS = monotonicNS
+    }
+
+    /// Extends an already-established social contact only for the same locked
+    /// face. This intentionally does not affect the separate fresh-gaze gate
+    /// required to authorize a spoken opening.
+    @discardableResult
+    public mutating func maintain(sceneID: String, at monotonicNS: UInt64) -> Bool {
+        guard self.sceneID == sceneID else { return false }
+        observedNS = monotonicNS
+        return true
+    }
+
+    public mutating func clear() {
+        observedNS = nil
+        sceneID = nil
+    }
+
+    public func isActive(at monotonicNS: UInt64) -> Bool {
+        guard let observedNS, monotonicNS >= observedNS else { return false }
+        return monotonicNS - observedNS <= holdNS
+    }
+}
+
 public enum SubconsciousIndicatorState: String, CaseIterable, Codable, Hashable, Sendable {
     case exploring
     case humanDetected = "human_detected"
@@ -226,6 +273,15 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
     ) {
         self.visualState = visualState
         self.interactionState = interactionState
+    }
+
+    /// A fresh human observation is sufficient to communicate that SOMA has
+    /// noticed someone. Face lock, motor motion, and conversation admission
+    /// each retain their own stricter evidence requirements.
+    public mutating func observeHumanVisualPresence() {
+        if visualState == .none {
+            visualState = .humanDetected
+        }
     }
 
     public var humanDetected: Bool {

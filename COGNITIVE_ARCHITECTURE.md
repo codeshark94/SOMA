@@ -29,12 +29,13 @@ receives only the minimum context projection allowed for that cycle. Raw
 biometric templates, unrestricted memory rows, and continuous camera media
 remain local by default.
 
-An ordinary L1 cycle carries no image. It starts from scalar scene, spatial,
-memory, task, and social evidence. A current-view crop or change overlay is
-attached only for an admitted active-view request. The rolling spherical atlas
-remains local by default and may expose one expiring low-resolution sector only
-for a place-level discrepancy or route-planning question; the full panorama is
-not routine conversational context.
+An ordinary L1 cycle carries no pixels. It starts from scalar scene, spatial,
+memory, task, and social evidence. The runtime may offer an expiring visual
+resource, but L1 must explicitly request it and receives at most one immediate
+follow-up image; it cannot request another image from that follow-up. The
+rolling spherical atlas remains local by default. Its current low-resolution
+render can be offered for a place-level discrepancy or route-planning question,
+but it is never routine conversational context.
 
 ```mermaid
 flowchart LR
@@ -63,8 +64,8 @@ L1 runs event-driven situation cycles rather than continuously regenerating a
 description of every frame. A cycle combines:
 
 - the latest L0 belief and interaction-readiness evidence;
-- a current high-resolution view and, when useful, a low-resolution spatial
-  atlas with change overlays;
+- scalar spatial-atlas coverage, revisits, and scene-entity context, with one
+  explicitly requested expiring visual resource only when it is necessary;
 - stable scene entities and their spatial bearings;
 - retrieved person, space, task, and recent episode context;
 - unresolved questions and the previous L1 situation state; and
@@ -96,8 +97,8 @@ therefore needs one of two causes:
 
 1. an explicit human contact signal satisfying that first-turn rule, or SOMA's
    own still-active greeting invitation; or
-2. a grounded L1 social decision that passes relevance, confidence, cooldown,
-   interruption-cost, and social-appropriateness policy. A useful open question
+2. a grounded L1 social decision that passes relevance, confidence, temporal
+   contact-history, interruption-cost, and social-appropriateness policy. A useful open question
    may supply its content, but curiosity is not mandatory: L1 may conclude that
    a plain greeting is appropriate, or that silence is preferable.
 
@@ -110,8 +111,28 @@ latest-value cancellation still bound cadence; L0 never waits for it.
 
 Curiosity is represented as a bounded information gap with supporting memory
 and evidence. It is not an unconstrained instruction to ask questions. Repeated
-or rejected questions receive a cooldown, and a quiet or do-not-disturb state
-suppresses proactive contact.
+or rejected contact is recorded in that person's temporal history, and L1
+decides whether a new purpose and the present situation justify another attempt.
+A quiet or do-not-disturb state still suppresses proactive contact immediately.
+
+### Local time and daily public-world memory
+
+SOMA has a local-calendar day concept (`yyyy-MM-dd` in the machine's current
+time zone). Public-world research is a separate, deliberately sparse input to
+the situation stream: it is attempted at most once per local day, not once per
+person, thought cycle, or conversation. The first attempt claims an encrypted
+local daily slot, so restarting the service cannot create repeated requests on
+the same day. A successful three-topic brief is retained as medium-term memory
+for seven days; the slot itself expires after two days.
+
+The collector uses an ephemeral, read-only Codex App Server Luna session with
+web access. It receives no camera pixels, person identifiers, person memories,
+conversation turns, local files, or MCP context. It returns only three short
+public topics with HTTPS provenance. L1 performs all person-specific relevance
+and interest reasoning locally: a headline never by itself authorizes an
+interruption or a conversational opening. Missing interest context may create a
+low-pressure information motive when the social situation already supports it;
+it is never a questionnaire trigger.
 
 ### Current social thought path
 
@@ -129,11 +150,18 @@ precedence. A late frame is discarded if the person is no longer current.
 greeting overlay: a small down-and-return bow that releases its lease as soon
 as it completes, rather than a side-to-side sweep or a timeout-held pose. The
 face-lock state survives the overlay and resumes fixation immediately after the
-return. The invitation is recorded separately from spoken interaction, so the
-same recognized person cannot be greeted again during the social repeat
-cooldown while L1 may still decide to make a grounded spoken opening. The
-acknowledgement is retained as a short-lived encrypted social fact, so a
-runtime restart cannot erase it before the cooldown ends. A spoken opening transfers directly
+return. Invitations, proactive openings, a finalized participant reply, and
+normal or interrupted session closure are recorded as a per-person encrypted
+contact timeline. The next L1 packet includes that timeline, so a restart
+cannot erase an earlier acknowledgement and a model must reason from its
+temporal context rather than a fixed social cooldown. The lifecycle records
+observable facts only: an unanswered session is not relabelled as a rejection,
+and any later social interpretation remains an explicit L1 consolidation task.
+Writing one of these events invalidates the affected person's L1 memory
+projection only after the encrypted record succeeds. A Live session also
+publishes a process-local availability state: it suppresses new L1 social
+opportunities and discards a late L1 social decision until that session ends.
+A spoken opening transfers directly
 from L1 to the account-backed Live session only when it is a question bound to
 one current information motive; the same packet carries the motive's explicit
 completion condition. The motive is private L2 orientation, not an opening
@@ -180,7 +208,7 @@ silently overwriting history.
 - `task_state`: objective, owner, progress, blockers, next action, artifacts,
   and last verified state.
 - `open_question`: the information gap, expected value, evidence, target person,
-  social cost, cooldown, and resolution.
+  social cost, follow-up conditions, and resolution.
 - `memory_link`: typed relationship among canonical records.
 - `conversation_turn`: exact user or assistant transcript text, Codex thread and
   interaction IDs, opaque local participant references, ordered turn sequence,
@@ -286,7 +314,7 @@ Important features are:
 - uncertainty and expected information gain;
 - persistence and cross-modal corroboration;
 - urgency and local safety state; and
-- recent wake frequency, interruption cost, and cooldown.
+- recent wake frequency, interruption cost, and temporal contact context.
 
 Explicit directed human contact opens L2 immediately while also creating an L1
 context packet in parallel. It does not wait for L1 admission or a 31B response.
@@ -316,7 +344,7 @@ gate because its latency and calibration are not part of L0.
 a versioned bootstrap parameter set, numerically stable softmax distribution,
 and a separate transition policy. The policy keeps immediate physical
 protection in L0, masks human interaction unless directed contact or an accepted memory
-curiosity is present with a human, and does not let optional-wake cooldown
+curiosity is present with a human, and does not let optional-wake rate control
 suppress strong explicit contact. The result records the model version, all
 three route probabilities, bounded evidence IDs, the recommended route, and the
 policy reason. Its dispatch contract independently states whether to open L2 interaction,
@@ -658,9 +686,10 @@ worklet on that peer connection, including a bounded one-second memory-only
 pre-roll. There is no Accessibility shortcut and no second microphone capture.
 The remote WebRTC audio track is played directly. GPT-Live owns multilingual recognition,
 interruption handling, spoken output, and Codex response handoff. SOMA does not
-persist raw audio. The encrypted short-term transcript journal and its exact
-turn contract are implemented, but Live transcript ingestion is not yet wired;
-no transcript is claimed persisted until that adapter reports it.
+persist raw audio. Each finalized Live transcript turn is written into the
+encrypted short-term local journal; no raw transcript enters the scalar trace
+or remote L1 packet. L1 consolidation of those local turns into durable typed
+memories remains a separate pending pass.
 The installed realtime start path currently selects the `maple` voice and does
 not send a model override; the Codex app-server therefore owns the realtime
 model choice. `maple` is a voice, not a reasoning-model identifier.
@@ -679,11 +708,11 @@ therefore returns its bounded settled JPEG as an MCP image block and 60-second
 resource link to a Codex tool turn; the grounded result can be appended back to
 Live as text. Direct image injection into the realtime session remains
 unclaimed.
-Closing an interaction releases embodiment leases and finalizes the interaction
-state. Once the pending Live transcript adapter is wired, its raw turns will be
-queued for the same `gemma4:31b-cloud` consolidation stream. Structured output
-will remain a proposal: L1 reconciles it with current memory and the
-deterministic validator owns the commit.
+Closing an interaction releases embodiment leases, persists its observed social
+outcome, and finalizes the interaction state. Its raw local turns are ready for
+the same `gemma4:31b-cloud` consolidation stream when that pass is enabled.
+Structured output will remain a proposal: L1 reconciles it with current memory
+and the deterministic validator owns the commit.
 
 Official implementation references:
 
@@ -701,7 +730,7 @@ Official implementation references:
 | --- | --- | --- |
 | C0 L0 embodied baseline | Implemented; physical behaviour tuning continues | Bounded local perception/control traces, owner arbitration, and existing core checks |
 | C1 E2B L1 visual helper | Worker implemented; opt-in for visual audit | Direct-MLX bounded worker is advisory, consumes substantial unified memory, and has no independent layer or motor lease |
-| C2 Memory contracts and store | Core, encrypted runtime store, and L1 read projection implemented; Live transcript ingestion and consolidation wiring planned | Versioned schemas, exact encrypted local L2 turns, L1 consolidation links, provenance/consent validator, encrypted short/medium/long store, correction, deletion, policy-filtered remote projection, and replay checks |
+| C2 Memory contracts and store | Core, encrypted runtime store, L1 read projection, and finalized Live-turn ingestion implemented; consolidation remains pending | Versioned schemas, exact encrypted local L2 turns, L1 consolidation links, provenance/consent validator, encrypted short/medium/long store, correction, deletion, policy-filtered remote projection, and replay checks |
 | C3 Event-importance router | Core implemented; deployment labels and shadow integration pending | Versioned route probabilities, direct L2 interaction dispatch plus parallel L1 context, interaction/safety policy masks, 32-row bootstrap contract, calibration and false/missed-wake report; real labelled corpus still required |
 | C4 31B L1 conscious stream | Event-driven local-person situation runtime and policy-filtered memory retrieval implemented; consolidation remains pending | One Gemma 31B stream, structured `SituationFrame`, bounded current-presence check, explicit silence/nonverbal/speech decisions, allowed memory summaries, rapport, and information motives naturalized at decision time, then asynchronous memory consolidation |
 | C5 Local embodiment MCP | Shadow transport implemented and deployed | MCP lifecycle plus thirteen schema-described tools; stdio to owner-only Unix socket; live L0 scene/atlas/state reply and scalar audit trace; no actuator writes |

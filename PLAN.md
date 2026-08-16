@@ -498,8 +498,9 @@ remote-summary projection boundaries. It now includes exact local-only L2
 conversation turns, ordered pending/consolidated state, and links to the typed
 memories derived by L1. The L1 read path now provisions an owner-only local key
 and retrieves only policy-approved summaries, rapport context, and information
-motives, which it may naturalize into a context-appropriate opening. Live
-transcript ingestion and consolidation remain runtime work. The default curator is L1; L2 may explicitly flag direct
+motives, which it may naturalize into a context-appropriate opening. Finalized
+Live transcript ingestion is implemented; consolidation remains runtime work.
+The default curator is L1; L2 may explicitly flag direct
 user facts, corrections, and memory requests, but cannot bypass validation.
 The same `gemma4:31b-cloud` L1 stream is the intended consolidation route; no
 second L1 model or shadow route participates in memory decisions. The C3 core
@@ -511,6 +512,15 @@ bootstrap corpus is only an executable contract. The next C3 gate is a
 time-aligned, labelled deployment corpus from real camera, audio, memory, and
 task events, followed by out-of-sample calibration and a shadow-mode latency
 test before the router can schedule L1 or open L2 interaction.
+
+L1 now has a separate daily public-world input: an ephemeral read-only Codex
+App Server Luna session may collect three HTTPS-provenanced topics once per
+local calendar day. The encrypted local scheduler records the attempt before
+launch, so a service restart cannot repeat that day's collection. No identity,
+memory, transcript, camera media, local file, or MCP context is passed to that
+session. The resulting seven-day medium-term brief is only background for L1;
+local memory and current social evidence must establish any personal relevance
+or interest-discovery motive before it can affect an opening.
 
 The leased physical embodiment gate is complete. SceneField projection and
 semantic binding feed a separately enabled L0 motor adapter: explicit scene
@@ -526,8 +536,8 @@ MCP image resource, and releases only its one-shot motor goal. Live checks
 returned a sharp 640x360 frame in 1.6 s at -0.35/-0.05 degrees for a 0/0-degree
 request. A registered `bicycle` bound to `scene-10`, reacquired fresh visual
 evidence, physically tracked to hold, and released at the 20-second deadline.
-The next implementation gate is C4: ingest Live transcript turns and consolidate
-them through the primary 31B stream, using C6 tools for active observation
+The next implementation gate is C4: consolidate already-ingested Live transcript
+turns through the primary 31B stream, using C6 tools for active observation
 rather than adding another actuator path.
 
 ## P4 audiovisual attention field

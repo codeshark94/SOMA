@@ -37,6 +37,22 @@ exec >>"$soma_launcher_log" 2>&1
 # and speech-recognition TCC grants share a stable signed identity.
 "$soma_root/scripts/install-soma-subconscious-app.zsh" >/dev/null
 
+# Load the SOMA layer (.env) configuration managed by the Control Center. It
+# is sourced so OLLAMA_API_KEY and the layer toggles become process env for the
+# runtime below. Owner-only perms are enforced by the Control Center on save.
+soma_env_file="$HOME/Library/Application Support/SOMA/.env"
+if [[ -f "$soma_env_file" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$soma_env_file"
+  set +a
+fi
+# Derive the L1 /api/chat endpoint from the configured host unless it was set
+# explicitly (SOMA_L1_OLLAMA_ENDPOINT already resolves in the binary too).
+if [[ -n "${OLLAMA_HOST:-}" && -z "${SOMA_L1_OLLAMA_ENDPOINT:-}" ]]; then
+  export SOMA_L1_OLLAMA_ENDPOINT="${OLLAMA_HOST%/}/api/chat"
+fi
+
 # The local E2B worker is a visual audit tool. It is intentionally opt-in:
 # continuous inference adds multi-gigabyte unified-memory pressure without
 # participating in L0 fixation, social decisions, or the L2 conversation path.

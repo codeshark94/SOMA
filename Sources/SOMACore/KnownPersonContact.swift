@@ -377,13 +377,19 @@ public struct FaceIdentityCalibration: Equatable, Sendable {
     public let minimumObservationQuality: Double
     public let confirmationsRequired: Int
     public let evidenceWindowMilliseconds: UInt64
+    /// A face whose best match to a known identity is at or above this floor is
+    /// treated as a known candidate (never anonymous), even when it is below
+    /// `minimumCosineSimilarity`. Anonymous registration is reserved for faces
+    /// clearly uncorrelated with every known identity.
+    public let minimumCorrelationFloor: Double
 
     public init(
         minimumCosineSimilarity: Double,
         minimumBestAlternativeMargin: Double,
         minimumObservationQuality: Double,
         confirmationsRequired: Int = 3,
-        evidenceWindowMilliseconds: UInt64 = 700
+        evidenceWindowMilliseconds: UInt64 = 700,
+        minimumCorrelationFloor: Double = 0.55
     ) throws {
         guard minimumCosineSimilarity.isFinite,
               (-1 ... 1).contains(minimumCosineSimilarity),
@@ -392,7 +398,9 @@ public struct FaceIdentityCalibration: Equatable, Sendable {
               minimumObservationQuality.isFinite,
               (0 ... 1).contains(minimumObservationQuality),
               (2 ... 12).contains(confirmationsRequired),
-              evidenceWindowMilliseconds > 0 else {
+              evidenceWindowMilliseconds > 0,
+              minimumCorrelationFloor.isFinite,
+              (-1 ... 1).contains(minimumCorrelationFloor) else {
             throw FaceIdentityError.invalidCalibration
         }
         self.minimumCosineSimilarity = minimumCosineSimilarity
@@ -400,6 +408,7 @@ public struct FaceIdentityCalibration: Equatable, Sendable {
         self.minimumObservationQuality = minimumObservationQuality
         self.confirmationsRequired = confirmationsRequired
         self.evidenceWindowMilliseconds = evidenceWindowMilliseconds
+        self.minimumCorrelationFloor = minimumCorrelationFloor
     }
 }
 
@@ -457,7 +466,11 @@ public struct FaceIdentityMatcher: Sendable {
         let margin = best.1 - alternative
         guard best.1 >= calibration.minimumCosineSimilarity,
               margin >= calibration.minimumBestAlternativeMargin else {
-            return .unknown
+            // Still correlated with a known identity (above the floor): treat it
+            // as a known candidate rather than falling through to anonymous.
+            // Anonymous is reserved for faces clearly uncorrelated with knowns.
+            guard best.1 >= calibration.minimumCorrelationFloor else { return .unknown }
+            return .candidate(entityID: best.0, similarity: best.1, alternativeMargin: margin)
         }
         if let previous = evidence.last, previous.entityID != best.0 {
             evidence.removeAll(keepingCapacity: true)
@@ -504,24 +517,20 @@ public struct KnownPersonContactTiming: Equatable, Sendable {
     public let minimumOpeningDelayMilliseconds: UInt64
     public let maximumOpeningDelayMilliseconds: UInt64
     public let absenceResetsPresenceMilliseconds: UInt64
-    public let repeatCooldownMilliseconds: UInt64
 
     public init(
         identityStabilityMilliseconds: UInt64 = 600,
         minimumOpeningDelayMilliseconds: UInt64 = 500,
         maximumOpeningDelayMilliseconds: UInt64 = 2_400,
-        absenceResetsPresenceMilliseconds: UInt64 = 2_000,
-        repeatCooldownMilliseconds: UInt64 = 300_000
+        absenceResetsPresenceMilliseconds: UInt64 = 2_000
     ) {
         precondition(identityStabilityMilliseconds > 0)
         precondition(minimumOpeningDelayMilliseconds <= maximumOpeningDelayMilliseconds)
         precondition(absenceResetsPresenceMilliseconds > 0)
-        precondition(repeatCooldownMilliseconds > 0)
         self.identityStabilityMilliseconds = identityStabilityMilliseconds
         self.minimumOpeningDelayMilliseconds = minimumOpeningDelayMilliseconds
         self.maximumOpeningDelayMilliseconds = maximumOpeningDelayMilliseconds
         self.absenceResetsPresenceMilliseconds = absenceResetsPresenceMilliseconds
-        self.repeatCooldownMilliseconds = repeatCooldownMilliseconds
     }
 }
 
@@ -562,10 +571,6 @@ public struct L1SocialOpportunity: Codable, Equatable, Sendable {
     public let observedAtNS: UInt64
     public let recognitionConfidence: Double
     public let availableActions: Set<L1SocialAction>
-    /// Whether SOMA has already offered a nonverbal invitation during the
-    /// current social cooldown. This is explicit prompt context, rather than
-    /// asking the model to infer an omitted action from the action list.
-    public let recentNonverbalInvitation: Bool
 
     public init(
         id: UUID = UUID(),
@@ -573,8 +578,7 @@ public struct L1SocialOpportunity: Codable, Equatable, Sendable {
         entityID: UUID,
         observedAtNS: UInt64,
         recognitionConfidence: Double,
-        availableActions: Set<L1SocialAction>,
-        recentNonverbalInvitation: Bool = false
+        availableActions: Set<L1SocialAction>
     ) {
         precondition(availableActions.contains(.remainSilent))
         self.id = id
@@ -583,7 +587,6 @@ public struct L1SocialOpportunity: Codable, Equatable, Sendable {
         self.observedAtNS = observedAtNS
         self.recognitionConfidence = recognitionConfidence
         self.availableActions = availableActions
-        self.recentNonverbalInvitation = recentNonverbalInvitation
     }
 }
 
@@ -743,8 +746,6 @@ public struct KnownPersonSocialOpportunityScheduler: Sendable {
     private var lastSeenNS: UInt64?
     private var scheduledAtNS: UInt64?
     private var lastOpportunityNS: UInt64?
-    private var lastInteractionByEntity: [UUID: UInt64] = [:]
-    private var lastNonverbalInvitationByEntity: [UUID: UInt64] = [:]
 
     public init(timing: KnownPersonContactTiming = .init()) {
         self.timing = timing
@@ -773,18 +774,16 @@ public struct KnownPersonSocialOpportunityScheduler: Sendable {
             beginPresence(for: presence.entityID, at: monotonicNS)
         }
         lastSeenNS = monotonicNS
-        guard presence.recognitionConfidence >= 0.70,
+        // Align with the known-person matcher's .recognized threshold (0.62 in
+        // FaceIdentityRuntime). 0.70 was higher than the recognition threshold,
+        // so a legitimately recognized person (0.62-0.69) could never wake L1.
+        guard presence.recognitionConfidence >= 0.60,
               !presence.doNotDisturb,
               !presence.isSpeaking,
               !presence.conversationActive,
               presence.proactiveContactPreference != .avoid,
               let firstSeenNS,
               monotonicNS >= firstSeenNS + nanoseconds(timing.identityStabilityMilliseconds) else {
-            return nil
-        }
-        if let lastInteraction = lastInteractionByEntity[presence.entityID],
-           monotonicNS >= lastInteraction,
-           monotonicNS - lastInteraction < nanoseconds(timing.repeatCooldownMilliseconds) {
             return nil
         }
         if scheduledAtNS == nil {
@@ -800,39 +799,17 @@ public struct KnownPersonSocialOpportunityScheduler: Sendable {
             return nil
         }
         lastOpportunityNS = monotonicNS
-        var actions: Set<L1SocialAction> = presence.proactiveContactPreference == .askFirst
+        let actions: Set<L1SocialAction> = presence.proactiveContactPreference == .askFirst
             ? [.remainSilent, .nonverbalInvitation]
             : [.remainSilent, .nonverbalInvitation, .spokenOpening]
-        let hasRecentNonverbalInvitation: Bool
-        if let lastInvitation = lastNonverbalInvitationByEntity[presence.entityID],
-           monotonicNS >= lastInvitation,
-           monotonicNS - lastInvitation < nanoseconds(timing.repeatCooldownMilliseconds) {
-            hasRecentNonverbalInvitation = true
-            actions.remove(.nonverbalInvitation)
-        } else {
-            hasRecentNonverbalInvitation = false
-        }
-        // For an ask-first contact, a recent nonverbal invitation exhausts the
-        // only proactive action. Do not spend another L1 cycle merely to pick
-        // silence. A person who permits spoken openings remains deliberable.
-        guard actions.count > 1 else { return nil }
         guard let presenceID else { return nil }
         return L1SocialOpportunity(
             presenceID: presenceID,
             entityID: presence.entityID,
             observedAtNS: monotonicNS,
             recognitionConfidence: presence.recognitionConfidence,
-            availableActions: actions,
-            recentNonverbalInvitation: hasRecentNonverbalInvitation
+            availableActions: actions
         )
-    }
-
-    public mutating func recordInteraction(with entityID: UUID, at monotonicNS: UInt64) {
-        lastInteractionByEntity[entityID] = monotonicNS
-    }
-
-    public mutating func recordNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64) {
-        lastNonverbalInvitationByEntity[entityID] = monotonicNS
     }
 
     /// Ends the active social presence immediately after the perception layer
@@ -842,15 +819,6 @@ public struct KnownPersonSocialOpportunityScheduler: Sendable {
     public mutating func endPresence(for entityID: UUID) {
         guard activeEntityID == entityID else { return }
         clearPresence()
-    }
-
-    /// Rehydrates the short social cooldown after a process restart. The
-    /// supplied timestamp stays in the monotonic clock used by this scheduler.
-    public mutating func restoreNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64) {
-        if let current = lastNonverbalInvitationByEntity[entityID], current >= monotonicNS {
-            return
-        }
-        lastNonverbalInvitationByEntity[entityID] = monotonicNS
     }
 
     private mutating func beginPresence(for entityID: UUID, at monotonicNS: UInt64) {

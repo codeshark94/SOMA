@@ -403,33 +403,47 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(inputs.resolvedState, .exploring)
     }
 
-    func testIndicatorHardwareTransitionsClearBeforeSetting() {
+    func testHumanPresenceIndicatorIsIndependentOfMotorOrConversationGates() {
+        var inputs = SubconsciousIndicatorInputs()
+        inputs.observeHumanVisualPresence()
+        XCTAssertEqual(inputs.visualState, .humanDetected)
+        XCTAssertEqual(inputs.interactionState, .idle)
+
+        inputs.visualState = .eyeContact
+        inputs.observeHumanVisualPresence()
+        XCTAssertEqual(inputs.visualState, .eyeContact)
+    }
+
+    func testIndicatorSignalsResolveToFixedDeviceRenderings() {
         XCTAssertEqual(SubconsciousIndicatorState.contactReady.humanMeaning, "ready_speak_now")
         XCTAssertEqual(SubconsciousIndicatorState.conversation.humanMeaning, "conversation_active")
         XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "please_wait_preparing_reply")
         let blueSteady = SOMALEDDeviceRendering(stateID: 57, specialPatternEnabled: false)
         let blueBlink = SOMALEDDeviceRendering(stateID: 57, specialPatternEnabled: true)
         let yellowSteady = SOMALEDDeviceRendering(stateID: 16, specialPatternEnabled: false)
-        XCTAssertEqual(
-            SOMALEDHardwareTransition.commands(previous: nil, next: blueBlink),
-            [.specialPattern(enabled: true), .set(stateID: 57)]
-        )
-        XCTAssertEqual(
-            SOMALEDHardwareTransition.commands(previous: blueBlink, next: blueSteady),
-            [.specialPattern(enabled: false)]
-        )
-        XCTAssertEqual(
-            SOMALEDHardwareTransition.commands(previous: yellowSteady, next: blueBlink),
-            [.specialPattern(enabled: true), .clear(stateID: 16), .set(stateID: 57)]
-        )
-        XCTAssertEqual(
-            SOMALEDHardwareTransition.commands(
-                previous: blueBlink,
-                next: blueBlink,
-                forceReassertion: true
-            ),
-            [.specialPattern(enabled: true), .clear(stateID: 57), .set(stateID: 57)]
-        )
+        XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, blueSteady.stateID)
+        XCTAssertEqual(SOMALEDColor.yellow.firmwareStateID, yellowSteady.stateID)
+        XCTAssertTrue(blueBlink.specialPatternEnabled)
+        XCTAssertFalse(blueSteady.specialPatternEnabled)
+    }
+
+    func testEyeContactIndicatorLeaseBridgesBriefGazeDropoutsOnly() {
+        let start: UInt64 = 9_000_000_000
+        var lease = EyeContactIndicatorLease(holdMilliseconds: 3_000)
+
+        lease.observe(at: start)
+        XCTAssertTrue(lease.isActive(at: start + 2_999_000_000))
+        XCTAssertTrue(lease.isActive(at: start + 3_000_000_000))
+        XCTAssertFalse(lease.isActive(at: start + 3_001_000_000))
+
+        lease.observe(at: start + 4_000_000_000)
+        lease.clear()
+        XCTAssertFalse(lease.isActive(at: start + 4_001_000_000))
+
+        lease.observe(sceneID: "face-a", at: start)
+        XCTAssertTrue(lease.maintain(sceneID: "face-a", at: start + 10_000_000_000))
+        XCTAssertTrue(lease.isActive(at: start + 12_999_000_000))
+        XCTAssertFalse(lease.maintain(sceneID: "face-b", at: start + 13_000_000_000))
     }
 
     func testLiveVoiceLaunchGateDebouncesAndHasBoundedRetry() {

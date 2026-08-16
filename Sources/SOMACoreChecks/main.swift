@@ -70,17 +70,71 @@ indicatorInputs.interactionState = .conversation
 require(indicatorInputs.resolvedState == .conversation, "conversation LED priority is wrong")
 indicatorInputs.interactionState = .preparingReply
 require(indicatorInputs.resolvedState == .working, "working LED priority is wrong")
+let contactReadyRendering = SOMALEDSettings().signal(for: .contactReady).deviceRendering
+let humanDetectedRendering = SOMALEDSettings().signal(for: .humanDetected).deviceRendering
 require(
-    SOMALEDHardwareTransition.commands(
-        previous: .init(stateID: 57, specialPatternEnabled: true),
-        next: .init(stateID: 57, specialPatternEnabled: false)
-    ) == [.specialPattern(enabled: false)],
-    "LED state transition did not restore the steady rendering"
+    contactReadyRendering == .init(stateID: 57, specialPatternEnabled: true)
+        && humanDetectedRendering == .init(stateID: 57, specialPatternEnabled: false),
+    "LED state does not resolve to the verified physical rendering"
 )
 require(
     SubconsciousIndicatorState.contactReady.humanMeaning == "ready_speak_now"
         && SubconsciousIndicatorState.working.humanMeaning == "please_wait_preparing_reply",
     "LED state does not expose a human-readable interaction affordance"
+)
+var indicatorLease = EyeContactIndicatorLease(holdMilliseconds: 3_000)
+indicatorLease.observe(at: start)
+require(
+    indicatorLease.isActive(at: start + 2_999_000_000),
+    "indicator eye-contact lease ended during the dropout tolerance"
+)
+require(
+    indicatorLease.isActive(at: start + 3_000_000_000),
+    "indicator eye-contact lease excluded its configured boundary"
+)
+require(
+    !indicatorLease.isActive(at: start + 3_001_000_000),
+    "indicator eye-contact lease outlived its configured hold"
+)
+indicatorLease.clear()
+require(
+    !indicatorLease.isActive(at: start + 3_001_000_000),
+    "indicator eye-contact lease did not clear"
+)
+indicatorLease.observe(sceneID: "face-a", at: start)
+require(
+    indicatorLease.maintain(sceneID: "face-a", at: start + 10_000_000_000)
+        && indicatorLease.isActive(at: start + 12_999_000_000),
+    "current locked face did not sustain the contact-ready indicator"
+)
+require(
+    !indicatorLease.maintain(sceneID: "face-b", at: start + 13_000_000_000),
+    "different face identity extended the contact-ready indicator"
+)
+var indicatorPresence = SubconsciousIndicatorInputs()
+indicatorPresence.observeHumanVisualPresence()
+require(
+    indicatorPresence.visualState == .humanDetected,
+    "fresh human presence did not immediately become a human-detected indicator"
+)
+indicatorPresence.visualState = .eyeContact
+indicatorPresence.observeHumanVisualPresence()
+require(
+    indicatorPresence.visualState == .eyeContact,
+    "ordinary human presence downgraded an active eye-contact indicator"
+)
+var contactEpisode = L1ConversationContactEpisode()
+require(
+    !contactEpisode.observeFinalizedTurn(role: .assistant)
+        && contactEpisode.closureKind(interrupted: false) == .conversationEndedWithoutParticipantTurn,
+    "assistant output was mistaken for a participant response"
+)
+require(
+    contactEpisode.observeFinalizedTurn(role: .user)
+        && !contactEpisode.observeFinalizedTurn(role: .user)
+        && contactEpisode.closureKind(interrupted: false) == .conversationEnded
+        && contactEpisode.closureKind(interrupted: true) == .conversationInterrupted,
+    "voice contact episode did not preserve response and closure facts"
 )
 var liveVoiceGate = LiveVoiceLaunchGate()
 require(liveVoiceGate.beginLaunch(at: start), "app-server Live launch did not arm")

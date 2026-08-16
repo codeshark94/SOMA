@@ -261,8 +261,7 @@ final class KnownPersonContactTests: XCTestCase {
             identityStabilityMilliseconds: 600,
             minimumOpeningDelayMilliseconds: 500,
             maximumOpeningDelayMilliseconds: 2_500,
-            absenceResetsPresenceMilliseconds: 2_000,
-            repeatCooldownMilliseconds: 5_000
+            absenceResetsPresenceMilliseconds: 2_000
         ))
         let presence = KnownPersonPresence(entityID: person, recognitionConfidence: 0.92)
         XCTAssertNil(scheduler.observe(presence, at: 0, unitIntervalDraw: 0.5))
@@ -277,30 +276,20 @@ final class KnownPersonContactTests: XCTestCase {
         XCTAssertNotNil(scheduler.observe(presence, at: 2_800_000_000, unitIntervalDraw: 0))
     }
 
-    func testNonverbalInvitationCooldownPreservesSpokenDeliberation() {
+    func testSchedulerLeavesRepeatedContactChoiceToL1Context() {
         let person = UUID()
         var scheduler = KnownPersonSocialOpportunityScheduler(timing: .init(
             identityStabilityMilliseconds: 100,
             minimumOpeningDelayMilliseconds: 0,
             maximumOpeningDelayMilliseconds: 0,
-            absenceResetsPresenceMilliseconds: 2_000,
-            repeatCooldownMilliseconds: 5_000
+            absenceResetsPresenceMilliseconds: 2_000
         ))
         let presence = KnownPersonPresence(entityID: person, recognitionConfidence: 0.92)
 
         XCTAssertNil(scheduler.observe(presence, at: 0, unitIntervalDraw: 0))
         XCTAssertNotNil(scheduler.observe(presence, at: 100_000_000, unitIntervalDraw: 0))
-        scheduler.recordNonverbalInvitation(with: person, at: 100_000_000)
         let afterGreeting = scheduler.observe(presence, at: 1_000_000_000, unitIntervalDraw: 0)
-        XCTAssertEqual(afterGreeting?.availableActions, [.remainSilent, .spokenOpening])
-        XCTAssertEqual(afterGreeting?.recentNonverbalInvitation, true)
-
-        var restored = KnownPersonSocialOpportunityScheduler(timing: scheduler.timing)
-        XCTAssertNil(restored.observe(presence, at: 0, unitIntervalDraw: 0))
-        restored.restoreNonverbalInvitation(with: person, at: 100_000_000)
-        let afterRestart = restored.observe(presence, at: 1_000_000_000, unitIntervalDraw: 0)
-        XCTAssertEqual(afterRestart?.availableActions, [.remainSilent, .spokenOpening])
-        XCTAssertEqual(afterRestart?.recentNonverbalInvitation, true)
+        XCTAssertEqual(afterGreeting?.availableActions, [.remainSilent, .nonverbalInvitation, .spokenOpening])
     }
 
     func testShortDetectorGapDoesNotCreateANewArrival() {
@@ -309,8 +298,7 @@ final class KnownPersonContactTests: XCTestCase {
             identityStabilityMilliseconds: 100,
             minimumOpeningDelayMilliseconds: 0,
             maximumOpeningDelayMilliseconds: 0,
-            absenceResetsPresenceMilliseconds: 2_000,
-            repeatCooldownMilliseconds: 1_000
+            absenceResetsPresenceMilliseconds: 2_000
         ))
         let presence = KnownPersonPresence(entityID: person, recognitionConfidence: 0.95)
         XCTAssertNil(scheduler.observe(presence, at: 0, unitIntervalDraw: 0))
@@ -332,8 +320,7 @@ final class KnownPersonContactTests: XCTestCase {
             identityStabilityMilliseconds: 100,
             minimumOpeningDelayMilliseconds: 0,
             maximumOpeningDelayMilliseconds: 0,
-            absenceResetsPresenceMilliseconds: 500,
-            repeatCooldownMilliseconds: 500
+            absenceResetsPresenceMilliseconds: 500
         ))
         let presence = KnownPersonPresence(entityID: person, recognitionConfidence: 0.95)
         XCTAssertNil(scheduler.observe(presence, at: 0, unitIntervalDraw: 0))
@@ -351,8 +338,7 @@ final class KnownPersonContactTests: XCTestCase {
             identityStabilityMilliseconds: 100,
             minimumOpeningDelayMilliseconds: 0,
             maximumOpeningDelayMilliseconds: 0,
-            absenceResetsPresenceMilliseconds: 500,
-            repeatCooldownMilliseconds: 100
+            absenceResetsPresenceMilliseconds: 500
         )
         var scheduler = KnownPersonSocialOpportunityScheduler(timing: timing)
         XCTAssertNil(scheduler.observe(.init(

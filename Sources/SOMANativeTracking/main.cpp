@@ -680,6 +680,8 @@ enum class BridgeCommandType {
     indicatorBrightness,
     indicatorEnabled,
     indicatorSpecialPattern,
+    indicatorEnforce,
+    indicatorReconcile,
     shutdown,
     invalid
 };
@@ -691,6 +693,7 @@ struct BridgeCommand {
     double pan = 0;
     int durationMilliseconds = 0;
     int value = 0;
+    bool specialPatternEnabled = false;
 };
 
 bool validCommandID(const std::string &value) {
@@ -699,6 +702,11 @@ bool validCommandID(const std::string &value) {
         && std::all_of(value.begin(), value.end(), [](unsigned char character) {
             return std::isalnum(character) || character == '-' || character == '_';
         });
+}
+
+bool validIndicatorStateID(int stateID) {
+    return stateID == 16 || stateID == 17 || stateID == 18
+        || stateID == 54 || stateID == 57;
 }
 
 BridgeCommand parseBridgeCommand(const std::string &line) {
@@ -736,9 +744,7 @@ BridgeCommand parseBridgeCommand(const std::string &line) {
         if (!(input >> stateID) || (input >> extra)) return {};
         // These are non-error firmware palette entries verified on Tiny 2
         // Lite. Raw state IDs are deliberately not a general command surface.
-        const bool allowed = stateID == 16 || stateID == 17 || stateID == 18
-            || stateID == 54 || stateID == 57;
-        if (!allowed) return {};
+        if (!validIndicatorStateID(stateID)) return {};
         BridgeCommand command;
         command.type = verb == "indicator_set"
             ? BridgeCommandType::indicatorSet
@@ -774,6 +780,32 @@ BridgeCommand parseBridgeCommand(const std::string &line) {
         command.value = enabled;
         return command;
     }
+    if (verb == "indicator_enforce") {
+        int stateID = -1;
+        int specialPatternEnabled = -1;
+        if (!(input >> stateID >> specialPatternEnabled) || (input >> extra)
+            || (specialPatternEnabled != 0 && specialPatternEnabled != 1)) return {};
+        if (!validIndicatorStateID(stateID)) return {};
+        BridgeCommand command;
+        command.type = BridgeCommandType::indicatorEnforce;
+        command.commandID = commandID;
+        command.value = stateID;
+        command.specialPatternEnabled = specialPatternEnabled == 1;
+        return command;
+    }
+    if (verb == "indicator_reconcile") {
+        int stateID = -1;
+        int specialPatternEnabled = -1;
+        if (!(input >> stateID >> specialPatternEnabled) || (input >> extra)
+            || !validIndicatorStateID(stateID)
+            || (specialPatternEnabled != 0 && specialPatternEnabled != 1)) return {};
+        BridgeCommand command;
+        command.type = BridgeCommandType::indicatorReconcile;
+        command.commandID = commandID;
+        command.value = stateID;
+        command.specialPatternEnabled = specialPatternEnabled == 1;
+        return command;
+    }
     if (input >> extra) return {};
     if (verb == "native_start") return {BridgeCommandType::nativeStart, commandID};
     if (verb == "heartbeat") return {BridgeCommandType::heartbeat, commandID};
@@ -789,6 +821,7 @@ public:
     IndicatorSession(std::shared_ptr<Device> device, Trace &trace)
         : device_(std::move(device)), trace_(trace) {
         readBaseline();
+        clearResidualPalette();
     }
 
     ~IndicatorSession() {
@@ -871,12 +904,104 @@ public:
         );
         int result = RM_RET_ERR;
         try { result = device_->cameraSetLedCtrlU(enabled); } catch (...) {}
+        specialPatternActive_ = enabled;
         trace_.event(
             "indicator.ack",
             result == RM_RET_OK ? "soma" : "fault",
             result == RM_RET_OK ? "special_pattern_updated" : "special_pattern_rejected",
             result,
             std::string("enabled=") + (enabled ? "true" : "false"),
+            commandID
+        );
+    }
+
+    void enforce(int stateID, bool specialPatternEnabled, const std::string &commandID) noexcept {
+        trace_.event(
+            "indicator.command",
+            "soma",
+            "enforce_palette",
+            0,
+            "target_state_id=" + std::to_string(stateID)
+                + "; special_pattern=" + (specialPatternEnabled ? "true" : "false"),
+            commandID
+        );
+
+        bool clearSucceeded = true;
+        for (const int candidate : kPaletteStateIDs) {
+            if (candidate == stateID) continue;
+            int result = RM_RET_ERR;
+            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(candidate)); } catch (...) {}
+            clearSucceeded = clearSucceeded && result == RM_RET_OK;
+            if (result == RM_RET_OK) activeStates_.erase(candidate);
+        }
+
+        int specialResult = RM_RET_ERR;
+        try { specialResult = device_->cameraSetLedCtrlU(specialPatternEnabled); } catch (...) {}
+        specialPatternActive_ = specialPatternEnabled;
+        int setResult = RM_RET_ERR;
+        try { setResult = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+        if (setResult == RM_RET_OK) activeStates_.insert(stateID);
+
+        const bool succeeded = clearSucceeded && specialResult == RM_RET_OK && setResult == RM_RET_OK;
+        trace_.event(
+            "indicator.ack",
+            succeeded ? "soma" : "fault",
+            succeeded ? "palette_enforced" : "palette_enforcement_incomplete",
+            succeeded ? RM_RET_OK : RM_RET_ERR,
+            "target_state_id=" + std::to_string(stateID)
+                + "; special_pattern=" + (specialPatternEnabled ? "true" : "false")
+                + "; non_target_states_cleared=" + (clearSucceeded ? "true" : "false"),
+            commandID
+        );
+    }
+
+    void reconcile(int stateID, bool specialPatternEnabled, const std::string &commandID) noexcept {
+        trace_.event(
+            "indicator.command",
+            "soma",
+            "reconcile_palette",
+            0,
+            "target_state_id=" + std::to_string(stateID)
+                + "; special_pattern=" + (specialPatternEnabled ? "true" : "false"),
+            commandID
+        );
+
+        bool clearSucceeded = true;
+        for (const int candidate : kPaletteStateIDs) {
+            if (candidate == stateID) continue;
+            int result = RM_RET_ERR;
+            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(candidate)); } catch (...) {}
+            clearSucceeded = clearSucceeded && result == RM_RET_OK;
+            if (result == RM_RET_OK) activeStates_.erase(candidate);
+        }
+
+        // Recover the colour by clearing any wrong palette states and
+        // re-asserting the target state id. But do NOT re-trigger the
+        // special-pattern blink gate when it already equals the desired value:
+        // re-calling cameraSetLedCtrlU(true) restarts the firmware blink
+        // cadence and produces "one blink, long off-gap" instead of continuous
+        // blinking. The blink gate is only (re)armed when its desired value
+        // actually differs (a genuine colour/blink-mode transition).
+        bool specialResultOK = true;
+        if (specialPatternActive_ != specialPatternEnabled) {
+            int specialResult = RM_RET_ERR;
+            try { specialResult = device_->cameraSetLedCtrlU(specialPatternEnabled); } catch (...) {}
+            specialResultOK = specialResult == RM_RET_OK;
+            if (specialResult == RM_RET_OK) specialPatternActive_ = specialPatternEnabled;
+        }
+        int setResult = RM_RET_ERR;
+        try { setResult = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+        if (setResult == RM_RET_OK) activeStates_.insert(stateID);
+        const bool succeeded = clearSucceeded && specialResultOK && setResult == RM_RET_OK;
+
+        trace_.event(
+            "indicator.ack",
+            succeeded ? "soma" : "fault",
+            succeeded ? "palette_reasserted" : "palette_reassertion_incomplete",
+            succeeded ? RM_RET_OK : RM_RET_ERR,
+            "target_state_id=" + std::to_string(stateID)
+                + "; special_pattern=" + (specialPatternEnabled ? "true" : "false")
+                + "; non_target_states_cleared=" + (clearSucceeded ? "true" : "false"),
             commandID
         );
     }
@@ -909,6 +1034,8 @@ public:
     }
 
 private:
+    static constexpr int kPaletteStateIDs[] = {16, 17, 18, 54, 57};
+
     using GetEnabled = int (*)(Device *, bool &);
     using SetEnabled = int (*)(Device *, bool);
     using GetBrightness = int (*)(Device *, uint8_t &);
@@ -940,6 +1067,31 @@ private:
         );
     }
 
+    // Indicator states live in device firmware, not in this helper process.
+    // A helper restart after a forced service restart therefore cannot infer
+    // which of the limited palette states the prior process left active.
+    // Clear the whole supported palette once before accepting commands so each
+    // subsequent rendering has exactly one firmware state as its owner.
+    void clearResidualPalette() noexcept {
+        bool cleared = true;
+        for (const int stateID : kPaletteStateIDs) {
+            int result = RM_RET_ERR;
+            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+            cleared = cleared && result == RM_RET_OK;
+        }
+        int specialResult = RM_RET_ERR;
+        try { specialResult = device_->cameraSetLedCtrlU(false); } catch (...) {}
+        specialPatternActive_ = false;
+        trace_.event(
+            "indicator.ack",
+            cleared && specialResult == RM_RET_OK ? "firmware" : "fault",
+            cleared && specialResult == RM_RET_OK ? "palette_reset" : "palette_reset_incomplete",
+            cleared && specialResult == RM_RET_OK ? RM_RET_OK : RM_RET_ERR,
+            std::string("states=16,17,18,54,57; special_pattern=false")
+        );
+    }
+
+
     int callSetEnabled(bool enabled) noexcept {
         const auto function = symbol<SetEnabled>("_ZN6Device19sysMgSetLedEnabledREb");
         if (!function) return RM_RET_ERR;
@@ -955,6 +1107,11 @@ private:
     std::shared_ptr<Device> device_;
     Trace &trace_;
     std::set<int> activeStates_;
+    // Desired special-pattern (blink gate) state, used so the periodic reconcile
+    // re-asserts the colour (state id) without re-triggering an already-running
+    // blink cadence: re-calling cameraSetLedCtrlU(true) restarts the firmware
+    // blink and yields "one blink, long off-gap" instead of continuous blinking.
+    bool specialPatternActive_ = false;
     std::optional<bool> baselineEnabled_;
     std::optional<uint8_t> baselineBrightness_;
     bool brightnessChanged_ = false;
@@ -1179,6 +1336,12 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                 break;
             case BridgeCommandType::indicatorSpecialPattern:
                 indicator.setSpecialPattern(command.value == 1, command.commandID);
+                break;
+            case BridgeCommandType::indicatorEnforce:
+                indicator.enforce(command.value, command.specialPatternEnabled, command.commandID);
+                break;
+            case BridgeCommandType::indicatorReconcile:
+                indicator.reconcile(command.value, command.specialPatternEnabled, command.commandID);
                 break;
             case BridgeCommandType::shutdown:
                 if (nativeTracking || externalControl) {

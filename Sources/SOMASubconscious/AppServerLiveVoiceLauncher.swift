@@ -2,7 +2,7 @@ import Foundation
 import SOMACore
 
 enum AppServerLiveVoiceEvent: Sendable {
-    case launchRequested(authorization: String)
+    case launchRequested(authorization: String, personEntityID: UUID?)
     case active(threadID: String?, personEntityID: UUID?)
     case inputTransportStarted
     case outputPlaybackReady
@@ -19,8 +19,8 @@ enum AppServerLiveVoiceEvent: Sendable {
     case preparingResponse
     case responding
     case responseCompleted
-    case ended(reason: String)
-    case failed(reason: String)
+    case ended(threadID: String?, personEntityID: UUID?, reason: String)
+    case failed(threadID: String?, personEntityID: UUID?, reason: String)
 }
 
 private struct LiveVoiceHelperEvent: Decodable, Sendable {
@@ -70,6 +70,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var stopped = false
     private var generation: UInt64 = 0
     private var activePersonEntityID: UUID?
+    private var activeThreadID: String?
     private var lastVisualContextNS: UInt64 = 0
 
     init(
@@ -223,13 +224,19 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     func stop() {
         queue.sync {
             guard !stopped else { return }
+            let lifecycle: (threadID: String?, personEntityID: UUID?)? =
+                active || activeThreadID != nil || activePersonEntityID != nil
+                ? (activeThreadID, activePersonEntityID)
+                : nil
             stopped = true
             generation &+= 1
-            send(["type": "stop"])
+            _ = send(["type": "stop"], reportFailure: false)
             input = nil
             if let process, process.isRunning { process.terminate() }
             self.process = nil
             active = false
+            activeThreadID = nil
+            activePersonEntityID = nil
             preRoll.removeAll(keepingCapacity: false)
             preRollDurationNS = 0
             audioAccumulator.removeAll(keepingCapacity: false)
@@ -238,6 +245,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             inactivityTimer?.cancel()
             inactivityTimer = nil
             inactivityGate.close()
+            if let lifecycle {
+                onEvent(.failed(
+                    threadID: lifecycle.threadID,
+                    personEntityID: lifecycle.personEntityID,
+                    reason: "service_shutdown"
+                ))
+            }
         }
     }
 
@@ -253,7 +267,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         inputTransportReported = false
         guard let helperURL = helperURL() else {
             gate.fail(at: monotonicNS)
-            onEvent(.failed(reason: "live_voice_helper_not_found"))
+            onEvent(.failed(
+                threadID: nil,
+                personEntityID: personEntityID,
+                reason: "live_voice_helper_not_found"
+            ))
             return
         }
         let process = Process()
@@ -281,14 +299,26 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 self.input = nil
                 self.active = false
                 self.gate.fail(at: DispatchTime.now().uptimeNanoseconds)
-                self.onEvent(.failed(reason: "live_voice_helper_exited_\(process.terminationStatus)"))
+                let threadID = self.activeThreadID
+                let personEntityID = self.activePersonEntityID
+                self.activeThreadID = nil
+                self.activePersonEntityID = nil
+                self.onEvent(.failed(
+                    threadID: threadID,
+                    personEntityID: personEntityID,
+                    reason: "live_voice_helper_exited_\(process.terminationStatus)"
+                ))
             }
         }
         do {
             try process.run()
         } catch {
             gate.fail(at: monotonicNS)
-            onEvent(.failed(reason: String(error.localizedDescription.prefix(192))))
+            onEvent(.failed(
+                threadID: nil,
+                personEntityID: personEntityID,
+                reason: String(error.localizedDescription.prefix(192))
+            ))
             return
         }
         self.process = process
@@ -296,14 +326,17 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activePersonEntityID = personEntityID
         generation &+= 1
         let launchGeneration = generation
-        send([
+        guard send([
             "type": "start",
             "initialContext": String(initialContext.prefix(24_000)),
             "preferredLanguageTag": preferredLanguageTag ?? "",
             "languageStartInstruction": languageStartInstruction ?? "",
             "proactiveOpeningTrigger": proactiveOpeningTrigger ?? "",
-        ])
-        onEvent(.launchRequested(authorization: authorization))
+        ], reportFailure: false) else {
+            failCurrent(reason: "live_voice_start_transport_failed")
+            return
+        }
+        onEvent(.launchRequested(authorization: authorization, personEntityID: personEntityID))
         queue.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self,
                   generation == launchGeneration,
@@ -325,6 +358,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             case "active":
                 guard !active else { continue }
                 active = true
+                activeThreadID = event.threadID
                 gate.observeActive()
                 armInactivityTimeout(at: DispatchTime.now().uptimeNanoseconds)
                 let buffered = preRoll
@@ -390,6 +424,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.responseCompleted)
             case "ended":
                 guard active || gate.phase == .starting else { continue }
+                let threadID = event.threadID ?? activeThreadID
+                let personEntityID = activePersonEntityID
                 active = false
                 gate.observeEnded()
                 inactivityTimer?.cancel()
@@ -397,8 +433,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 inactivityGate.close()
                 process = nil
                 input = nil
+                activeThreadID = nil
                 activePersonEntityID = nil
-                onEvent(.ended(reason: String((event.reason ?? "session_ended").prefix(128))))
+                onEvent(.ended(
+                    threadID: threadID,
+                    personEntityID: personEntityID,
+                    reason: String((event.reason ?? "session_ended").prefix(128))
+                ))
             case "failed", "audio_rejected":
                 failCurrent(reason: event.reason ?? event.event)
             default:
@@ -408,17 +449,24 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     }
 
     private func failCurrent(reason: String) {
+        let threadID = activeThreadID
+        let personEntityID = activePersonEntityID
         active = false
         gate.fail(at: DispatchTime.now().uptimeNanoseconds)
         inactivityTimer?.cancel()
         inactivityTimer = nil
         inactivityGate.close()
-        send(["type": "stop"])
+        _ = send(["type": "stop"], reportFailure: false)
         if let process, process.isRunning { process.terminate() }
         self.process = nil
         input = nil
+        activeThreadID = nil
         activePersonEntityID = nil
-        onEvent(.failed(reason: String(reason.prefix(192))))
+        onEvent(.failed(
+            threadID: threadID,
+            personEntityID: personEntityID,
+            reason: String(reason.prefix(192))
+        ))
     }
 
     private func recordUserActivity(at monotonicNS: UInt64) {
@@ -442,20 +490,28 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 
     private func closeForUserSilence(at monotonicNS: UInt64) {
         guard active, inactivityGate.shouldClose(at: monotonicNS) else { return }
+        let threadID = activeThreadID
+        let personEntityID = activePersonEntityID
         active = false
         gate.observeEnded()
         inactivityGate.close()
         inactivityTimer?.cancel()
         inactivityTimer = nil
-        send(["type": "stop"])
+        _ = send(["type": "stop"], reportFailure: false)
         input = nil
         if let process, process.isRunning { process.terminate() }
         process = nil
-        onEvent(.ended(reason: "user_silence_timeout"))
+        activeThreadID = nil
+        activePersonEntityID = nil
+        onEvent(.ended(
+            threadID: threadID,
+            personEntityID: personEntityID,
+            reason: "user_silence_timeout"
+        ))
     }
 
     private func send(_ chunk: BufferedLiveAudio) {
-        send([
+        _ = send([
             "type": "append_audio",
             "data": chunk.data,
             "sampleRate": chunk.sampleRate,
@@ -481,20 +537,34 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ])
     }
 
-    private func send(_ object: [String: Any]) {
+    @discardableResult
+    private func send(_ object: [String: Any], reportFailure: Bool = true) -> Bool {
         guard let input,
               JSONSerialization.isValidJSONObject(object),
-              let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+              let data = try? JSONSerialization.data(withJSONObject: object) else { return false }
         do {
             try input.write(contentsOf: data)
             try input.write(contentsOf: Data([0x0A]))
+            return true
         } catch {
+            guard reportFailure else { return false }
+            let threadID = activeThreadID
+            let personEntityID = activePersonEntityID
             self.input = nil
             active = false
             gate.fail(at: DispatchTime.now().uptimeNanoseconds)
             if let process, process.isRunning { process.terminate() }
             self.process = nil
-            onEvent(.failed(reason: "live_voice_control_pipe_failed"))
+            activeThreadID = nil
+            activePersonEntityID = nil
+            if !stopped {
+                onEvent(.failed(
+                    threadID: threadID,
+                    personEntityID: personEntityID,
+                    reason: "live_voice_control_pipe_failed"
+                ))
+            }
+            return false
         }
     }
 
@@ -602,7 +672,7 @@ func testAppServerLiveVoiceLauncher() -> String {
         case .active:
             result.set("active")
             semaphore.signal()
-        case let .failed(reason):
+        case let .failed(_, _, reason):
             result.set("failed:\(reason)")
             semaphore.signal()
         case .launchRequested, .inputTransportStarted, .outputPlaybackReady, .proactiveOpeningTriggered, .hearingUser,

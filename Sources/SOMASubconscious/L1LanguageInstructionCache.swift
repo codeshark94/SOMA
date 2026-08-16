@@ -100,6 +100,7 @@ final class L1LanguageInstructionCache: @unchecked Sendable {
             prompt: prompt,
             format: "json",
             stream: false,
+            images: nil,
             options: .init(temperature: 0, numPredict: 120)
         )
         guard let data = try? JSONEncoder().encode(payload) else {

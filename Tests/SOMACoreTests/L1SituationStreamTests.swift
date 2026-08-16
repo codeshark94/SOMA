@@ -4,6 +4,21 @@ import XCTest
 @testable import SOMACore
 
 final class L1SituationStreamTests: XCTestCase {
+    func testContactEpisodeRecordsObservedResponseAndClosureWithoutInventingIntent() {
+        var episode = L1ConversationContactEpisode()
+        XCTAssertFalse(episode.observeFinalizedTurn(role: .assistant))
+        XCTAssertFalse(episode.participantResponded)
+        XCTAssertTrue(episode.observeFinalizedTurn(role: .user))
+        XCTAssertFalse(episode.observeFinalizedTurn(role: .user))
+        XCTAssertEqual(episode.closureKind(interrupted: false), .conversationEnded)
+        XCTAssertEqual(episode.closureKind(interrupted: true), .conversationInterrupted)
+
+        XCTAssertEqual(
+            L1ConversationContactEpisode().closureKind(interrupted: false),
+            .conversationEndedWithoutParticipantTurn
+        )
+    }
+
     func testGemmaOwnsBothL1WorkloadsWithoutChangingTheirContract() throws {
         let configuration = L1ModelConfiguration.gemma31
         XCTAssertEqual(configuration.model, "gemma4:31b-cloud")
@@ -19,6 +34,96 @@ final class L1SituationStreamTests: XCTestCase {
             evidenceIDs: request.evidenceIDs
         )
         XCTAssertNoThrow(try L1SituationFrameValidator().validate(frame, for: request))
+    }
+
+    func testDailyWorldMemoryIsBoundedAndRequiresHTTPSProvenance() {
+        let memory = L1DailyWorldMemory(
+            localDay: "2026-08-16",
+            collectedAt: Date(timeIntervalSince1970: 10),
+            topics: [
+                L1DailyWorldTopic(
+                    title: "A current science development",
+                    summary: "A concise sourced factual summary.",
+                    sourceURL: "https://example.com/news",
+                    tags: ["science", "research"]
+                ),
+                L1DailyWorldTopic(
+                    title: "Unsourced topic",
+                    summary: "This must not enter the L1 packet.",
+                    sourceURL: "http://example.com/news",
+                    tags: []
+                ),
+            ]
+        )
+        XCTAssertEqual(memory.topics.count, 1)
+        XCTAssertEqual(memory.topics.first?.tags, ["science", "research"])
+    }
+
+    func testContactHistoryIsBoundedAndNewestFirstForL1() {
+        let first = Date(timeIntervalSince1970: 10)
+        let latest = Date(timeIntervalSince1970: 20)
+        let request = L1SituationRequest(
+            observedAt: latest,
+            evidenceIDs: ["identity:1"],
+            beliefSummary: "A recognized person is present.",
+            contactHistory: [
+                L1SocialContactEvent(
+                    kind: .nonverbalInvitation,
+                    occurredAt: first,
+                    purpose: "A brief acknowledgement."
+                ),
+                L1SocialContactEvent(
+                    kind: .conversationOpened,
+                    occurredAt: latest,
+                    purpose: "A Live voice conversation became active."
+                ),
+            ]
+        )
+        XCTAssertEqual(request.contactHistory.map(\.kind), [.conversationOpened, .nonverbalInvitation])
+        XCTAssertEqual(request.contactHistory.first?.purpose, "A Live voice conversation became active.")
+    }
+
+    func testVisualFollowupMayOnlyRequestAnOfferedResourceOnce() throws {
+        let request = L1SituationRequest(
+            observedAt: Date(timeIntervalSince1970: 10),
+            evidenceIDs: ["identity:1"],
+            beliefSummary: "A recognized person is present.",
+            visualResourceOffers: [
+                L1VisualResourceOffer(
+                    resourceID: "spherical_atlas_current",
+                    projection: .sphericalAtlas,
+                    description: "Current panorama.",
+                    expiresAt: Date(timeIntervalSince1970: 60)
+                ),
+            ]
+        )
+        let requestVisual = L1SituationFrame(
+            cycleID: request.cycleID,
+            summary: "A panorama would clarify the scene.",
+            uncertainty: 0.4,
+            evidenceIDs: request.evidenceIDs,
+            requestedVisualResourceIDs: ["spherical_atlas_current"]
+        )
+        XCTAssertNoThrow(try L1SituationFrameValidator().validate(requestVisual, for: request))
+
+        let unavailable = L1SituationFrame(
+            cycleID: request.cycleID,
+            summary: "An unavailable view is needed.",
+            uncertainty: 0.4,
+            evidenceIDs: request.evidenceIDs,
+            requestedVisualResourceIDs: ["invented"]
+        )
+        XCTAssertThrowsError(try L1SituationFrameValidator().validate(unavailable, for: request))
+
+        let continued = request.continuing(with: [
+            L1VisualResource(
+                resourceID: "spherical_atlas_current",
+                projection: .sphericalAtlas,
+                localPath: "/private/tmp/panorama.jpg",
+                expiresAt: Date(timeIntervalSince1970: 60)
+            ),
+        ])
+        XCTAssertThrowsError(try L1SituationFrameValidator().validate(requestVisual, for: continued))
     }
 
     func testModelOutputCannotInventMemoryEvidenceOrConversationTurns() {

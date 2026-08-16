@@ -83,9 +83,27 @@ public enum ProbabilisticAttentionSelector {
             })
             .max(by: { probabilities[$0] < probabilities[$1] }),
            probabilities[retained] >= 0.18,
-           probabilities[retained] >= maximumCandidateProbability,
            probabilities[retained] > noTargetProbability {
-            selectedIndex = retained
+            // A previously-selected face is the social target. Its enclosing
+            // full-body "person" box belongs to the same physical person and
+            // must not displace the face, or the LED/contact-ready flickers
+            // between fixation and retention while the person stands and looks
+            // at the camera. Retain the face when it is close to the strongest
+            // candidate (not just strictly the maximum).
+            let retainedIsPriorFace = previousTarget.kind == .human
+                && previousTarget.label == "face"
+                && candidates[retained].kind == .human
+                && candidates[retained].label == "face"
+            let faceRetainedOverEnclosingBody = retainedIsPriorFace
+                && probabilities[retained] >= maximumCandidateProbability - 0.15
+            if probabilities[retained] >= maximumCandidateProbability || faceRetainedOverEnclosingBody {
+                selectedIndex = retained
+            } else if let strongest = probabilities.indices.max(by: { probabilities[$0] < probabilities[$1] }),
+                      probabilities[strongest] > noTargetProbability {
+                selectedIndex = strongest
+            } else {
+                selectedIndex = nil
+            }
         } else if let strongest = probabilities.indices.max(by: { probabilities[$0] < probabilities[$1] }),
                   probabilities[strongest] > noTargetProbability {
             selectedIndex = strongest

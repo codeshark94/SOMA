@@ -396,7 +396,11 @@ public enum CognitiveExplorationPlanner {
             }
             let clearance = min(route.panClearanceDegrees / 20, route.pitchClearanceDegrees / 12)
             let boundaryComfort = 0.55 + 0.45 * min(max(clearance, 0), 1)
+            // Keep a person-facing scan near eye level instead of diving to low
+            // cells and sweeping nose-down (reads as "bobbing while turning").
+            let elevationComfort = exp(-abs(cell.bearing.elevationDegrees) / 20)
             let mass = max(0.000_001, epistemic * continuity * boundaryComfort
+                * elevationComfort
                 * (0.25 + 0.75 * modeMass)
                 * (1 + regionMass)
                 * (1 + directionMass))

@@ -141,7 +141,7 @@ public struct SubconsciousAttentionController: Sendable {
                     && target.posteriorProbability >= 0.18
                 state = target.isFaceMotorTarget
                     ? .socialFixation
-                    : (canReframe ? .socialReframing : .socialRetention)
+                    : (canReframe ? .socialReframing : .exploration)
                 return decision(
                     state: state,
                     target: target,
@@ -158,7 +158,7 @@ public struct SubconsciousAttentionController: Sendable {
                     && target.label != "face"
                     && target.confidence >= 0.60
                     && target.posteriorProbability >= 0.18
-                state = canReframe ? .socialReframing : .socialRetention
+                state = canReframe ? .socialReframing : .exploration
                 return decision(
                     state: state,
                     target: target,

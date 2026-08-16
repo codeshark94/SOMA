@@ -1,11 +1,17 @@
 import AppKit
 import Foundation
+import LocalAuthentication
 import SOMACore
 import SwiftUI
 
 private enum SOMAPaths {
     static let runtimeRoot = URL(fileURLWithPath: "/Users/seungyeop/workspace/Research/SOMA/artifacts/subconscious/runtime", isDirectory: true)
     static let serviceLabel = "com.soma.reactive-l0"
+    static let servicePlist = URL(fileURLWithPath: "/Users/seungyeop/workspace/Research/SOMA/LaunchAgents/com.soma.reactive-l0.plist")
+
+    static var serviceTarget: String {
+        "gui/\(getuid())/\(serviceLabel)"
+    }
 
     static var subconsciousExecutable: URL {
         URL(fileURLWithPath: CommandLine.arguments[0])
@@ -119,17 +125,30 @@ private struct SOMARuntimeSnapshot: Equatable {
 @MainActor
 private final class SOMAControlModel: ObservableObject {
     @Published var settings: SOMAControlSettings
+    @Published var envSettings: SOMAEnvSettings
     @Published private(set) var runtime = SOMARuntimeSnapshot.empty
     @Published private(set) var message: String?
+    // Administrator identity fields stay locked until the Mac login password
+    // (or Touch ID) unlocks them, so changing or removing the owner is not a
+    // silent, unauthenticated action.
+    @Published var administratorProfileUnlocked = false
 
     private let store: SOMAControlSettingsStore
+    private let envStore: SOMAEnvStore
     init(store: SOMAControlSettingsStore = .init()) {
         self.store = store
+        self.envStore = .init()
         do {
             settings = try store.load()
         } catch {
             settings = .init()
             message = error.localizedDescription
+        }
+        do {
+            envSettings = try envStore.load()
+        } catch {
+            envSettings = .init()
+            message = message ?? error.localizedDescription
         }
         refresh()
         _ = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -138,19 +157,62 @@ private final class SOMAControlModel: ObservableObject {
     }
 
     var latestAnonymousFace: String? {
+        // Prefer the dedicated always-current identity file the runtime writes;
+        // it is not subject to the trace-tail read window that sparse
+        // identity.observation events scroll out of. Accept both a stabilized
+        // anonymous face and an in-progress anonymous candidate so a person can
+        // enroll without waiting for full recognition confirmation.
+        if let file = Self.readIdentityFile(),
+           file.subject.hasPrefix("anon_"),
+           file.state == "anonymous_recognized" || file.state == "unknown_candidate" {
+            return file.subject
+        }
         guard let identity = runtime.identity,
-              identity.state == "anonymous_recognized",
+              identity.state == "anonymous_recognized" || identity.state == "unknown_candidate",
               identity.subject.hasPrefix("anon_") else { return nil }
         return identity.subject
+    }
+
+    static func readIdentityFile() -> (state: String, subject: String)? {
+        let url = SOMAPaths.runtimeRoot.appendingPathComponent("identity-current.json")
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let state = object["state"] as? String,
+              let subject = object["subject"] as? String else { return nil }
+        return (state, subject)
     }
 
     func refresh() {
         runtime = SOMARuntimeSnapshot.read(settings: settings)
     }
 
+    /// Prompts for the Mac login password / Touch ID (system dialog) and
+    /// returns true only on success. Fully asynchronous so the main thread is
+    /// never blocked while the system dialog is up.
+    @discardableResult
+    func authenticateMacLogin(reason: String) async -> Bool {
+        let context = LAContext()
+        var policyError: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError) else {
+            message = "Mac login authentication unavailable: \(policyError?.localizedDescription ?? "unknown")"
+            return false
+        }
+        do {
+            return try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
+        } catch {
+            message = error.localizedDescription
+            return false
+        }
+    }
+
+    var isSOMARunning: Bool {
+        isSOMALoaded()
+    }
+
     func save() {
         do {
             try store.save(settings)
+            try envStore.save(envSettings)
             message = "Saved locally. Restart SOMA to apply runtime changes."
             refresh()
         } catch {
@@ -161,47 +223,113 @@ private final class SOMAControlModel: ObservableObject {
     func saveAndRestart() {
         save()
         guard message?.hasPrefix("Saved locally") == true else { return }
-        let result = runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(SOMAPaths.serviceLabel)"])
+        let result = startSOMA(restart: true)
         message = result.status == 0
             ? "Saved and SOMA is restarting."
             : (result.output.isEmpty ? "Could not restart SOMA." : result.output)
     }
 
-    func enrollLatestFace() {
+    func startSOMA(restart: Bool = false) -> (status: Int32, output: String) {
+        if !isSOMALoaded() {
+            guard FileManager.default.fileExists(atPath: SOMAPaths.servicePlist.path) else {
+                return (1, "SOMA service definition is unavailable.")
+            }
+            return runLaunchctl([
+                "bootstrap",
+                "gui/\(getuid())",
+                SOMAPaths.servicePlist.path,
+            ])
+        }
+        guard restart else {
+            return (0, "SOMA is already running.")
+        }
+        return runLaunchctl(["kickstart", "-k", SOMAPaths.serviceTarget])
+    }
+
+    func stopSOMA() -> (status: Int32, output: String) {
+        guard isSOMALoaded() else {
+            runtime = .empty
+            return (0, "SOMA is already stopped.")
+        }
+        let result = runLaunchctl([
+            "bootout",
+            "gui/\(getuid())",
+            SOMAPaths.servicePlist.path,
+        ])
+        if result.status == 0 {
+            runtime = .empty
+        }
+        return result
+    }
+
+    private func isSOMALoaded() -> Bool {
+        let result = runLaunchctl(["print", SOMAPaths.serviceTarget])
+        return result.status == 0 && result.output.contains("\(SOMAPaths.serviceTarget) = {")
+    }
+
+    func enrollLatestFace() async {
         guard let handle = latestAnonymousFace else {
             message = "Stand in view until SOMA shows a recognized local face."
             return
         }
+        // Enrolling a new face replaces the administrator mapping, so it is
+        // also gated behind the Mac login password when a profile exists.
+        if settings.administrator != nil {
+            guard await authenticateMacLogin(
+                reason: "Replacing the SOMA administrator enrollment requires your Mac login password."
+            ) else { return }
+        }
         let confirmation = NSAlert()
         confirmation.messageText = "Enroll administrator face?"
-        confirmation.informativeText = "SOMA will save an encrypted local face template for the currently recognized face. It stays on this Mac and can be removed from this panel."
-        confirmation.addButton(withTitle: "Enroll")
+        confirmation.informativeText = "SOMA will capture several different views of your face so it recognizes you reliably. Stay facing the camera."
+        confirmation.addButton(withTitle: "Start")
         confirmation.addButton(withTitle: "Cancel")
         guard confirmation.runModal() == .alertFirstButtonReturn else { return }
 
-        let result = runSubconscious(["--promote-anonymous-face", handle])
-        guard result.status == 0,
-              let entityID = parseValue("entity_id", from: result.output).flatMap(UUID.init(uuidString:)) else {
-            message = result.output.isEmpty ? "Could not enroll this face." : result.output
-            return
-        }
-        let name = settings.administrator?.displayName ?? "Administrator"
-        let address = settings.administrator?.preferredAddress
-        settings.administrator = SOMAAdministratorIdentity(
-            entityID: entityID,
-            displayName: name,
-            preferredAddress: address
-        )
-        do {
-            try store.save(settings)
-            message = "Administrator enrolled. Restart SOMA to load the profile."
-        } catch {
-            message = error.localizedDescription
+        // Guided multi-pose capture: while this progress panel is up the running
+        // SOMA process is already watching the camera and accumulating distinct
+        // face samples into the anonymous cluster, so we let the person turn
+        // their head for a few seconds, then promote the enriched cluster.
+        GuidedEnrollmentPanel.present(
+            handle: handle,
+            guide: "Move your head slowly — turn left, right, up, and down — until progress finishes.",
+            sampleWindowSeconds: 6
+        ) { [weak self] in
+            guard let self else { return (false, "SOMA is unavailable.") }
+            let result = self.runSubconscious(["--promote-anonymous-face", handle])
+            guard result.status == 0,
+                  let entityID = parseValue("entity_id", from: result.output).flatMap(UUID.init(uuidString:)) else {
+                return (false, result.output.isEmpty ? "Could not enroll this face." : result.output)
+            }
+            let references = Int(parseValue("references", from: result.output) ?? "?") ?? 0
+            let name = settings.administrator?.displayName ?? "Administrator"
+            let address = settings.administrator?.preferredAddress
+            settings.administrator = SOMAAdministratorIdentity(
+                entityID: entityID,
+                displayName: name,
+                preferredAddress: address
+            )
+            do {
+                try store.save(settings)
+                return (true, "Enrolled with \(references) samples. Restart SOMA to load the profile.")
+            } catch {
+                return (false, error.localizedDescription)
+            }
         }
     }
 
     func removeAdministrator() {
         guard let administrator = settings.administrator else { return }
+        Task {
+            guard await authenticateMacLogin(
+                reason: "Removing the SOMA administrator enrollment requires your Mac login password."
+            ) else { return }
+            await self.finishRemoveAdministrator(administrator)
+        }
+    }
+
+    @MainActor
+    private func finishRemoveAdministrator(_ administrator: SOMAAdministratorIdentity) {
         let confirmation = NSAlert()
         confirmation.messageText = "Remove administrator enrollment?"
         confirmation.informativeText = "This permanently removes the encrypted local face template and its administrator mapping from this Mac."
@@ -273,7 +401,7 @@ private final class SOMAControlModel: ObservableObject {
 
 private enum SOMASettingsSection: String, CaseIterable, Identifiable {
     case experience = "Experience"
-    case embodiment = "Embodiment"
+    case layers = "Layers"
     case administrator = "Administrator"
     case system = "System"
 
@@ -282,7 +410,7 @@ private enum SOMASettingsSection: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .experience: "waveform"
-        case .embodiment: "camera.metering.center.weighted"
+        case .layers: "square.stack.3d.up"
         case .administrator: "person.crop.circle.badge.checkmark"
         case .system: "heart.text.square"
         }
@@ -370,9 +498,20 @@ private struct StateDot: View {
     }
 }
 
+private enum SOMASettingsSidebarLayout {
+    static let headerHorizontalInset: CGFloat = 14
+    static let headerTopInset: CGFloat = 16
+    static let navigationHorizontalInset: CGFloat = 8
+    static let rowHorizontalInset: CGFloat = 12
+    static let navigationSpacing: CGFloat = 6
+    static let statusVerticalInset: CGFloat = 2
+}
+
 private struct SOMASettingsView: View {
     @ObservedObject var model: SOMAControlModel
+    var onOpenDiagnostics: () -> Void = {}
     @State private var selection: SOMASettingsSection = .experience
+    @State private var revealAPIKey = false
 
     private var selectedSection: SOMASettingsSection { selection }
 
@@ -380,27 +519,35 @@ private struct SOMASettingsView: View {
         HStack(spacing: 0) {
             sidebar
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+            VStack(spacing: 0) {
+                HStack(alignment: .center, spacing: 20) {
                     heading
-                    sectionContent
-                    if let message = model.message {
-                        Label(message, systemImage: "info.circle.fill")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 2)
-                    }
-                    HStack {
-                        Button("Open runtime") { model.revealRuntime() }
-                        Spacer()
+                    Spacer(minLength: 20)
+                    HStack(spacing: 10) {
                         Button("Save") { model.save() }
                         Button("Save & restart SOMA") { model.saveAndRestart() }
                             .buttonStyle(.borderedProminent)
                     }
-                    .padding(.top, 2)
+                    .controlSize(.large)
                 }
-                .padding(24)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+                .padding(.bottom, 16)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        sectionContent
+                        if let message = model.message {
+                            Label(message, systemImage: "info.circle.fill")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 2)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         }
         .frame(minWidth: 770, idealWidth: 820, minHeight: 580, idealHeight: 620)
@@ -408,26 +555,34 @@ private struct SOMASettingsView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Image(nsImage: SOMAMascot.image(size: 34, template: false))
                     .resizable().frame(width: 34, height: 34)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("SOMA").font(.headline)
-                    Text(model.runtime.isLive ? "Running locally" : "Waiting for runtime")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                Text("SOMA").font(.headline)
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 16)
-            VStack(spacing: 3) {
+            .padding(.horizontal, SOMASettingsSidebarLayout.headerHorizontalInset)
+            .padding(.top, SOMASettingsSidebarLayout.headerTopInset)
+
+            VStack(spacing: SOMASettingsSidebarLayout.navigationSpacing) {
+                HStack(spacing: 8) {
+                    StateDot(active: model.runtime.isLive, color: .green)
+                    Text(model.runtime.isLive ? "Running locally" : "Waiting for runtime")
+                    Spacer(minLength: 0)
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(model.runtime.isLive ? .primary : .secondary)
+                .padding(.horizontal, SOMASettingsSidebarLayout.rowHorizontalInset)
+                .padding(.vertical, SOMASettingsSidebarLayout.statusVerticalInset)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
                 ForEach(SOMASettingsSection.allCases) { item in
                     Button {
                         selection = item
                     } label: {
                         Label(item.rawValue, systemImage: item.symbol)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12)
+                            .padding(.horizontal, SOMASettingsSidebarLayout.rowHorizontalInset)
                             .padding(.vertical, 8)
                             .background(
                                 selection == item ? Color.primary.opacity(0.12) : .clear,
@@ -437,8 +592,25 @@ private struct SOMASettingsView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel(item.rawValue)
                 }
+
+                Divider().padding(.vertical, 4)
+
+                Button {
+                    onOpenDiagnostics()
+                } label: {
+                    Label("Diagnostic", systemImage: "waveform.path.ecg")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, SOMASettingsSidebarLayout.rowHorizontalInset)
+                        .padding(.vertical, 8)
+                        .background(
+                            Color.pink.opacity(0.15),
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open diagnostic panel")
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, SOMASettingsSidebarLayout.navigationHorizontalInset)
             Spacer(minLength: 0)
         }
         .frame(width: 190)
@@ -453,15 +625,13 @@ private struct SOMASettingsView: View {
                 Text(model.runtime.isLive ? "Live settings for your local companion." : "Settings are ready; SOMA will apply them after launch.")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
-            Spacer()
-            StateDot(active: model.runtime.isLive, color: .green)
         }
     }
 
     @ViewBuilder private var sectionContent: some View {
         switch selectedSection {
         case .experience: experience
-        case .embodiment: embodiment
+        case .layers: layers
         case .administrator: administrator
         case .system: system
         }
@@ -502,17 +672,71 @@ private struct SOMASettingsView: View {
         }
     }
 
-    private var embodiment: some View {
+    private var layers: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SettingsCard(title: "Attention movement", subtitle: "These controls can only restrict the safety-approved motion capabilities of the active service.") {
-                Toggle("Track a verified human face", isOn: binding(\.nativeHumanTrackingEnabled))
-                Toggle("Explore when no verified target is present", isOn: binding(\.autonomousExplorationEnabled))
+            SettingsCard(title: "Ollama", subtitle: "The local server and the model L1 uses. The API key enables hosted web search.") {
+                HStack {
+                    Text("Host")
+                    TextField("http://127.0.0.1:11434", text: ollamaHostBinding)
+                        .textFieldStyle(.roundedBorder)
+                }
+                HStack {
+                    Text("L1 model")
+                    TextField("gemma4:31b-cloud", text: l1ModelBinding)
+                        .textFieldStyle(.roundedBorder)
+                }
+                HStack(spacing: 8) {
+                    Group {
+                        if revealAPIKey {
+                            TextField("Ollama API key", text: ollamaAPIKeyBinding)
+                        } else {
+                            SecureField("Ollama API key", text: ollamaAPIKeyBinding)
+                        }
+                    }
+                    .textFieldStyle(.roundedBorder)
+                    Button(action: { revealAPIKey.toggle() }) {
+                        Image(systemName: revealAPIKey ? "eye.slash.fill" : "eye.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .help(revealAPIKey ? "Hide API key" : "Show API key")
+                }
+                Text("Paste your key into the field, then Save. It is only needed for the hosted web_search / web_fetch tools. Create one at ollama.com/settings/keys; without it those tools stay disabled.")
+                    .font(.caption).foregroundStyle(.secondary)            }
+            SettingsCard(title: "L0 — Perception & attention", subtitle: "What autonomous motion the attention controller may perform. These govern the gimbal and coverage scan.") {
+                Toggle("Track a verified human face", isOn: l0TrackingBinding)
+                Toggle("Explore when no verified target is present", isOn: l0ExploreBinding)
             }
-            SettingsCard(title: "Current activity", subtitle: "A compact readout from the local runtime trace.") {
-                ActivityRow(name: "Vision", state: model.runtime.sources["face_neural_engine"] ?? "waiting", active: model.runtime.isLive)
-                ActivityRow(name: "Voice", state: model.settings.realtimeVoiceEnabled ? (model.runtime.sources["l2_live_voice"] ?? "armed") : "off", active: model.runtime.isLive && model.settings.realtimeVoiceEnabled)
-                ActivityRow(name: "Identity", state: identityState, active: model.runtime.identity != nil)
-                ActivityRow(name: "Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.isLive)
+            SettingsCard(title: "L1 — Conscious stream", subtitle: "How often L1 reasons, and whether it collects the topics it is curious about.") {
+                HStack {
+                    Text("Reasoning cadence")
+                    Spacer()
+                    Stepper("Person present: \(Int(model.envSettings.l1ActiveCadenceSeconds)) s", value: l1ActiveCadenceBinding, in: 5...300, step: 5)
+                }
+                HStack {
+                    Text("Idle cadence")
+                    Spacer()
+                    Stepper("No person: \(Int(model.envSettings.l1IdleCadenceSeconds)) s", value: l1IdleCadenceBinding, in: 30...600, step: 15)
+                }
+                Divider()
+                Toggle("Web curiosity collection", isOn: l1CuriosityEnabledBinding)
+                HStack {
+                    Text("Collect every")
+                    Picker("", selection: l1CollectionIntervalBinding) {
+                        ForEach(SOMAEnvCollectionInterval.allCases, id: \.self) { interval in
+                            Text(interval.label).tag(interval.hours)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 110)
+                    Text("hours")
+                }
+                .disabled(!model.envSettings.l1CuriosityCollectionEnabled)
+            }
+            SettingsCard(title: "L2 — Conversation & interaction", subtitle: "Whether SOMA may start a spoken conversation on its own. The live-voice voice itself is set under Experience.") {
+                Toggle("Allow proactive spoken openings", isOn: l2ProactiveOpeningsBinding)
+                Text("When on, L1 can hand a purposeful opening to the live-voice conversation runtime instead of staying silent.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -523,7 +747,7 @@ private struct SOMASettingsView: View {
                 if model.settings.administrator == nil {
                     Label("No administrator face enrolled", systemImage: "person.crop.circle.badge.exclamationmark")
                         .foregroundStyle(.secondary)
-                    Button("Enroll face currently in view") { model.enrollLatestFace() }
+                    Button("Enroll face currently in view") { Task { await model.enrollLatestFace() } }
                         .disabled(model.latestAnonymousFace == nil)
                     if model.latestAnonymousFace == nil {
                         Text("Keep your face visible until Identity changes from waiting to a recognized local face.")
@@ -534,8 +758,30 @@ private struct SOMASettingsView: View {
                         get: { model.settings.administrator != nil },
                         set: { enabled in if !enabled { model.removeAdministrator() } }
                     ))
-                    TextField("Display name", text: administratorNameBinding)
-                    TextField("Preferred address", text: administratorAddressBinding)
+                    if model.administratorProfileUnlocked {
+                        TextField("Display name", text: administratorNameBinding)
+                        TextField("Preferred address", text: administratorAddressBinding)
+                        HStack(spacing: 8) {
+                            Button("Lock profile", role: .cancel) {
+                                model.administratorProfileUnlocked = false
+                            }
+                            Text("Edits are applied as you type.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Label("Profile locked", systemImage: "lock.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.callout)
+                        Button("Unlock to edit name & address") {
+                            Task {
+                                if await model.authenticateMacLogin(
+                                    reason: "Editing the SOMA administrator profile requires your Mac login password."
+                                ) {
+                                    model.administratorProfileUnlocked = true
+                                }
+                            }
+                        }
+                    }
                     HStack {
                         StateDot(active: model.runtime.administratorVerified, color: .green)
                         Text(model.runtime.administratorVerified ? "Administrator face verified" : "Waiting for a verified administrator face")
@@ -558,8 +804,14 @@ private struct SOMASettingsView: View {
                 ActivityRow(name: "Settings", state: model.runtime.sources["control_settings"] ?? "not loaded", active: model.runtime.sources["control_settings"] == "loaded")
                 ActivityRow(name: "Identity engine", state: model.runtime.sources["face_identity"] ?? "waiting", active: model.runtime.sources["face_identity"] == "configured")
             }
+            SettingsCard(title: "Current activity", subtitle: "A compact readout from the local runtime trace.") {
+                ActivityRow(name: "Vision", state: model.runtime.sources["face_neural_engine"] ?? "waiting", active: model.runtime.isLive)
+                ActivityRow(name: "Voice", state: model.settings.realtimeVoiceEnabled ? (model.runtime.sources["l2_live_voice"] ?? "armed") : "off", active: model.runtime.isLive && model.settings.realtimeVoiceEnabled)
+                ActivityRow(name: "Identity", state: identityState, active: model.runtime.identity != nil)
+                ActivityRow(name: "Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.isLive)
+            }
             SettingsCard(title: "Apply changes", subtitle: "Runtime settings are read at startup to keep L0 deterministic.") {
-                Text("Save writes only to ~/Library/Application Support/SOMA/settings.json with owner-only permissions. Save & restart relaunches the existing local SOMA service.")
+                Text("Save writes settings to ~/Library/Application Support/SOMA/settings.json and layer/Ollama values to the owner-only .env beside it. Save & restart relaunches the existing local SOMA service so the layer values take effect.")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
         }
@@ -621,6 +873,107 @@ private struct SOMASettingsView: View {
                 model.settings.administrator = administrator
             }
         )
+    }
+
+    private var ollamaAPIKeyBinding: Binding<String> {
+        Binding(
+            get: { model.envSettings.ollamaAPIKey },
+            set: { model.envSettings.ollamaAPIKey = $0 }
+        )
+    }
+
+    private var ollamaHostBinding: Binding<String> {
+        Binding(
+            get: { model.envSettings.ollamaHost },
+            set: { model.envSettings.ollamaHost = normalizeHost($0) }
+        )
+    }
+
+    private var l0TrackingBinding: Binding<Bool> {
+        Binding(
+            get: { model.envSettings.l0TrackingEnabled },
+            set: { model.envSettings.l0TrackingEnabled = $0 }
+        )
+    }
+
+    private var l0ExploreBinding: Binding<Bool> {
+        Binding(
+            get: { model.envSettings.l0ExploreEnabled },
+            set: { model.envSettings.l0ExploreEnabled = $0 }
+        )
+    }
+
+    private var l2ProactiveOpeningsBinding: Binding<Bool> {
+        Binding(
+            get: { model.envSettings.l2ProactiveOpeningsEnabled },
+            set: { model.envSettings.l2ProactiveOpeningsEnabled = $0 }
+        )
+    }
+
+    private var l1ModelBinding: Binding<String> {
+        Binding(
+            get: { model.envSettings.l1Model },
+            set: { model.envSettings.l1Model = String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(96)) }
+        )
+    }
+
+    private var l1ActiveCadenceBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l1ActiveCadenceSeconds },
+            set: { model.envSettings.l1ActiveCadenceSeconds = max(5, $0) }
+        )
+    }
+
+    private var l1IdleCadenceBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l1IdleCadenceSeconds },
+            set: { model.envSettings.l1IdleCadenceSeconds = max(30, $0) }
+        )
+    }
+
+    private var l1CuriosityEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { model.envSettings.l1CuriosityCollectionEnabled },
+            set: { model.envSettings.l1CuriosityCollectionEnabled = $0 }
+        )
+    }
+
+    private var l1CollectionIntervalBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l1CollectionIntervalHours },
+            set: { model.envSettings.l1CollectionIntervalHours = $0 }
+        )
+    }
+
+    private func normalizeHost(_ value: String) -> String {
+        var host = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !host.hasPrefix("http://"), !host.hasPrefix("https://") {
+            host = "http://\(host)"
+        }
+        if host.hasSuffix("/") { host.removeLast() }
+        return String(host.prefix(256))
+    }
+}
+
+private enum SOMAEnvCollectionInterval: CaseIterable {
+    case hourly6, hourly12, daily, weekly
+
+    var hours: Double {
+        switch self {
+        case .hourly6: 6
+        case .hourly12: 12
+        case .daily: 24
+        case .weekly: 168
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .hourly6: "6"
+        case .hourly12: "12"
+        case .daily: "24"
+        case .weekly: "168"
+        }
     }
 }
 
@@ -756,23 +1109,25 @@ private final class SOMAStatusMenuHeader: NSView {
     private let dotView = NSView()
 
     init(runtime: SOMARuntimeSnapshot, voice: SOMARealtimeVoice) {
-        super.init(frame: NSRect(x: 0, y: 0, width: SOMAStatusMenuLayout.width, height: 58))
+        super.init(frame: NSRect(x: 0, y: 0, width: SOMAStatusMenuLayout.width, height: 50))
         iconView.image = SOMAMascot.image(size: 34, template: false)
         iconView.imageScaling = .scaleProportionallyUpOrDown
-        iconView.frame = NSRect(x: 16, y: 10, width: 34, height: 34)
+        iconView.frame = NSRect(x: 16, y: 8, width: 34, height: 34)
         addSubview(iconView)
         dotView.wantsLayer = true
         dotView.layer?.backgroundColor = (runtime.isLive ? NSColor.systemGreen : NSColor.systemOrange).cgColor
         dotView.layer?.cornerRadius = 4
-        dotView.frame = NSRect(x: 59, y: 33, width: 8, height: 8)
+        dotView.frame = NSRect(x: 59, y: 28, width: 8, height: 8)
         addSubview(dotView)
         titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
-        titleLabel.frame = NSRect(x: 74, y: 28, width: 208, height: 18)
+        titleLabel.alignment = .left
+        titleLabel.frame = NSRect(x: 74, y: 24, width: 208, height: 17)
         addSubview(titleLabel)
         detailLabel.stringValue = runtime.isLive ? "Live · Voice \(voice.displayName)" : "Waiting for the local runtime"
-        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.font = .systemFont(ofSize: 11, weight: .regular)
         detailLabel.textColor = .secondaryLabelColor
-        detailLabel.frame = NSRect(x: 74, y: 11, width: 208, height: 16)
+        detailLabel.alignment = .left
+        detailLabel.frame = NSRect(x: 74, y: 8, width: 208, height: 15)
         addSubview(detailLabel)
     }
 
@@ -785,6 +1140,7 @@ private final class SOMAStatusMenuSection: NSView {
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 10, weight: .semibold)
         label.textColor = .secondaryLabelColor
+        label.alignment = .left
         label.frame = NSRect(x: SOMAStatusMenuLayout.inset, y: 6, width: 220, height: 14)
         addSubview(label)
     }
@@ -802,14 +1158,16 @@ private final class SOMAStatusMenuActivityRow: NSView {
         addSubview(dot)
 
         let nameLabel = NSTextField(labelWithString: name)
-        nameLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
         nameLabel.textColor = active ? .labelColor : .secondaryLabelColor
+        nameLabel.alignment = .left
         nameLabel.frame = NSRect(x: 36, y: 6, width: 84, height: 16)
         addSubview(nameLabel)
 
         let stateLabel = NSTextField(labelWithString: state.replacingOccurrences(of: "_", with: " "))
-        stateLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        stateLabel.font = .systemFont(ofSize: 12, weight: .regular)
         stateLabel.textColor = active ? .labelColor : .secondaryLabelColor
+        stateLabel.alignment = .left
         stateLabel.lineBreakMode = .byTruncatingTail
         stateLabel.frame = NSRect(x: 124, y: 6, width: 166, height: 16)
         addSubview(stateLabel)
@@ -830,6 +1188,117 @@ private final class SOMAStatusMenuDivider: NSView {
     required init?(coder: NSCoder) { nil }
 }
 
+/// Non-modal progress panel for guided multi-pose face enrollment. Shows the
+/// pose guidance and a live countdown while the running SOMA process (which
+/// owns the camera) accumulates distinct face samples, then runs the blocking
+/// promotion and reports the outcome.
+@MainActor
+private final class GuidedEnrollmentPanel: NSObject {
+    private let panel = NSPanel(
+        contentRect: NSRect(x: 0, y: 0, width: 420, height: 190),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    private let guideLabel = NSTextField(wrappingLabelWithString: "")
+    private let progress = NSProgressIndicator()
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let totalSeconds: Double
+    private let onEnroll: @MainActor () -> (Bool, String)
+    private var timer: Timer?
+    private var elapsed = 0.0
+    private var finished = false
+    private static var live: GuidedEnrollmentPanel?
+
+    private init(
+        totalSeconds: Double,
+        onEnroll: @escaping @MainActor () -> (Bool, String)
+    ) {
+        self.totalSeconds = max(totalSeconds, 1)
+        self.onEnroll = onEnroll
+        super.init()
+        build()
+    }
+
+    private func build() {
+        panel.title = "Enroll Administrator Face"
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.center()
+
+        progress.style = .bar
+        progress.isIndeterminate = false
+        progress.minValue = 0
+        progress.maxValue = totalSeconds
+        progress.doubleValue = 0
+
+        guideLabel.font = .systemFont(ofSize: 13)
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [guideLabel, progress, statusLabel])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        panel.contentView = stack
+    }
+
+    static func present(
+        handle: String,
+        guide: String,
+        sampleWindowSeconds: Double,
+        onEnroll: @escaping @MainActor () -> (Bool, String)
+    ) {
+        let controller = GuidedEnrollmentPanel(totalSeconds: sampleWindowSeconds, onEnroll: onEnroll)
+        GuidedEnrollmentPanel.live = controller
+        controller.guideLabel.stringValue = guide
+        controller.statusLabel.stringValue = "Capturing samples…"
+        controller.panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.start()
+    }
+
+    private func start() {
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.tick() }
+        }
+    }
+
+    private func tick() {
+        guard !finished else { return }
+        elapsed += 0.1
+        let remaining = max(totalSeconds - elapsed, 0)
+        progress.doubleValue = min(elapsed, totalSeconds)
+        if remaining > 0 {
+            statusLabel.stringValue = String(format: "%.0f s remaining — keep turning your head", remaining)
+        } else {
+            finished = true
+            progress.isIndeterminate = true
+            progress.startAnimation(nil)
+            statusLabel.stringValue = "Enrolling samples…"
+            // The promotion subprocess is short; run it here so we can update
+            // the panel with the final result and keep self alive via `live`.
+            let outcome = onEnroll()
+            finish(success: outcome.0, message: outcome.1)
+        }
+    }
+
+    private func finish(success: Bool, message: String) {
+        finished = true
+        timer?.invalidate()
+        timer = nil
+        progress.stopAnimation(nil)
+        statusLabel.stringValue = message
+        guideLabel.stringValue = success ? "Administrator face enrolled." : "Enrollment failed."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.panel.orderOut(nil)
+            self?.panel.close()
+            GuidedEnrollmentPanel.live = nil
+        }
+    }
+}
+
 @MainActor
 private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: 28)
@@ -837,6 +1306,7 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
     private let model = SOMAControlModel()
     private let opensSettingsOnLaunch: Bool
     private var settingsPanel: NSPanel?
+    private var diagnosticsPanel: NSPanel?
 
     init(opensSettingsOnLaunch: Bool) {
         self.opensSettingsOnLaunch = opensSettingsOnLaunch
@@ -873,6 +1343,12 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
         addStatus("Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.isLive, to: menu)
         addDivider(to: menu)
         menu.addItem(item("Settings…", action: #selector(openSettings)))
+        menu.addItem(item("Diagnostic panel…", action: #selector(openDiagnostics)))
+        if model.isSOMARunning {
+            menu.addItem(item("Stop SOMA", action: #selector(stopSOMA)))
+        } else {
+            menu.addItem(item("Start SOMA", action: #selector(startSOMA)))
+        }
         menu.addItem(item("Restart SOMA", action: #selector(restartSOMA)))
         menu.addItem(item("Open runtime folder", action: #selector(openRuntime)))
         addDivider(to: menu)
@@ -920,11 +1396,64 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.delegate = self
-        panel.contentViewController = NSHostingController(rootView: SOMASettingsView(model: model))
+        panel.contentViewController = NSHostingController(rootView: SOMASettingsView(
+            model: model,
+            onOpenDiagnostics: { [weak self] in self?.openDiagnostics() }
+        ))
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         settingsPanel = panel
+    }
+
+    @objc private func openDiagnostics() {
+        if let diagnosticsPanel {
+            diagnosticsPanel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        // Ask the runtime to start writing live diagnostic files.
+        let flagURL = SOMAPaths.runtimeRoot.appendingPathComponent("live-diagnostics.enabled")
+        try? Data().write(to: flagURL, options: .atomic)
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 660),
+            styleMask: [.titled, .closable, .utilityWindow, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "SOMA Diagnostic"
+        panel.minSize = NSSize(width: 700, height: 560)
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.delegate = self
+        let diagnosticsModel = SOMADiagnosticsModel(runtimeRoot: SOMAPaths.runtimeRoot)
+        panel.contentViewController = NSHostingController(rootView: SOMADiagnosticsView(model: diagnosticsModel))
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        diagnosticsPanel = panel
+    }
+
+    @objc private func startSOMA() {
+        let result = model.startSOMA()
+        model.refresh()
+        guard result.status != 0 else { return }
+        NSAlert(error: NSError(
+            domain: "SOMAControl",
+            code: Int(result.status),
+            userInfo: [NSLocalizedDescriptionKey: result.output.isEmpty ? "Could not start SOMA." : result.output]
+        )).runModal()
+    }
+
+    @objc private func stopSOMA() {
+        let result = model.stopSOMA()
+        guard result.status != 0 else { return }
+        NSAlert(error: NSError(
+            domain: "SOMAControl",
+            code: Int(result.status),
+            userInfo: [NSLocalizedDescriptionKey: result.output.isEmpty ? "Could not stop SOMA." : result.output]
+        )).runModal()
     }
 
     @objc private func restartSOMA() { model.saveAndRestart() }
@@ -935,7 +1464,15 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     func windowWillClose(_ notification: Notification) {
-        if notification.object as? NSWindow === settingsPanel { settingsPanel = nil }
+        if notification.object as? NSWindow === settingsPanel {
+            settingsPanel = nil
+        }
+        if notification.object as? NSWindow === diagnosticsPanel {
+            // Stop the runtime's live-diagnostic writer.
+            let flagURL = SOMAPaths.runtimeRoot.appendingPathComponent("live-diagnostics.enabled")
+            try? FileManager.default.removeItem(at: flagURL)
+            diagnosticsPanel = nil
+        }
     }
 }
 

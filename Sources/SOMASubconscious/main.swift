@@ -9,6 +9,346 @@ import SOMACore
 import SOMAVADModel
 @preconcurrency import Vision
 
+// MARK: - SOMA .env layer configuration helpers
+/// Reads a boolean from a `SOMA_*` / `OLLAMA_*` environment variable that the
+/// Control Center manages through `~/Library/Application Support/SOMA/.env`.
+func somaEnvBool(_ key: String, default defaultValue: Bool) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[key] else { return defaultValue }
+    switch raw.lowercased() {
+    case "true", "1", "yes", "on": return true
+    case "false", "0", "no", "off": return false
+    default: return defaultValue
+    }
+}
+
+func somaEnvDouble(_ key: String, default defaultValue: Double) -> Double {
+    guard let raw = ProcessInfo.processInfo.environment[key],
+          let value = Double(raw), value > 0 else { return defaultValue }
+    return value
+}
+
+/// The base host of the local Ollama server (from `.env` `OLLAMA_HOST`).
+func somaOllamaHost() -> String {
+    let raw = ProcessInfo.processInfo.environment["OLLAMA_HOST"] ?? "http://127.0.0.1:11434"
+    return raw.replacingOccurrences(of: "/$", with: "", options: .regularExpression)
+}
+
+/// Mutable holder for the anonymous-registration review gate. The FaceIdentity
+/// runtime consults `approve()` before surfacing a new anonymous identity; the
+/// reviewer is installed once L1 setup is ready and otherwise defaults to allow.
+final class AnonymousReviewBox: @unchecked Sendable {
+    var reviewer: @Sendable () -> Bool = { true }
+    func approve() -> Bool { reviewer() }
+}
+
+/// Accumulates L1's model-driven curiosity (information needs / topic goals)
+/// about the interaction target and broader context, periodically collects
+/// current web material on those topics via Ollama's hosted web_search, and
+/// exposes the collected context so L1 can craft richer conversational openers.
+final class L1CuriosityCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "soma.l1.curiosity")
+    private let onHealth: @Sendable (String, String) -> Void
+    private var topics: [String: Double] = [:]
+    private var collected: [String: [CuriosityItem]] = [:]
+    private var timer: DispatchSourceTimer?
+
+    struct CuriosityItem {
+        let title: String
+        let url: String
+        let snippet: String
+    }
+
+    init(onHealth: @escaping @Sendable (String, String) -> Void) {
+        self.onHealth = onHealth
+    }
+
+    /// Accumulate curiosity topics from an L1 frame's information needs.
+    /// Weighted by expected information gain, capped to the most valuable 24.
+    func registerTopics(from needs: [L1InformationNeed]) {
+        lock.lock()
+        for need in needs {
+            let topic = need.informationGoal.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !topic.isEmpty else { continue }
+            topics[topic, default: 0] = max(topics[topic] ?? 0, need.expectedInformationGain)
+        }
+        if topics.count > 24 {
+            let sorted = topics.sorted { $0.value > $1.value }.prefix(24).map { ($0.key, $0.value) }
+            topics = Dictionary(uniqueKeysWithValues: sorted)
+        }
+        lock.unlock()
+        onHealth("curiosity_topics", "count=\(topics.count)")
+    }
+
+    /// Kick off collection: an initial pass shortly after start, then repeat
+    /// on the configured cadence. Honors SOMA_L1_CURIOSITY_ENABLED and
+    /// SOMA_L1_CURIOSITY_INTERVAL_HOURS from the managed .env.
+    func start() {
+        guard somaEnvBool("SOMA_L1_CURIOSITY_ENABLED", default: true) else {
+            onHealth("curiosity_collect", "state=disabled; reason=SOMA_L1_CURIOSITY_ENABLED")
+            return
+        }
+        let intervalSeconds = Int(somaEnvDouble("SOMA_L1_CURIOSITY_INTERVAL_HOURS", default: 24) * 3600)
+        queue.asyncAfter(deadline: .now() + .seconds(60)) { [weak self] in
+            self?.collectAll()
+        }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + .seconds(intervalSeconds), repeating: .seconds(intervalSeconds))
+        t.setEventHandler { [weak self] in
+            self?.collectAll()
+        }
+        t.resume()
+        timer = t
+    }
+
+    private func collectAll() {
+        lock.lock()
+        let snapshot = Array(topics.keys)
+        lock.unlock()
+        guard !snapshot.isEmpty else {
+            onHealth("curiosity_collect", "state=idle; topics=0")
+            return
+        }
+        var collectedThisRun = 0
+        var failed = 0
+        for topic in snapshot {
+            let raw = performL1WebSearch(query: topic, maxResults: 4)
+            guard let data = raw.data(using: .utf8),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  obj["ok"] as? Bool == true,
+                  let results = obj["results"] as? [[String: Any]] else {
+                failed += 1
+                continue
+            }
+            let items = results.compactMap { r -> CuriosityItem? in
+                guard let title = r["title"] as? String else { return nil }
+                return CuriosityItem(
+                    title: title,
+                    url: r["url"] as? String ?? "",
+                    snippet: r["snippet"] as? String ?? ""
+                )
+            }
+            lock.lock()
+            collected[topic] = items
+            lock.unlock()
+            collectedThisRun += items.count
+        }
+        onHealth("curiosity_collect", "state=done; topics=\(snapshot.count); results=\(collectedThisRun); failed=\(failed)")
+    }
+
+    /// A compact summary of collected material, used to inform L1 openers.
+    /// Returns an empty string when nothing has been collected yet.
+    func contextSummary(limit: Int = 4) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !collected.isEmpty else { return "" }
+        var lines: [String] = []
+        let ordered = collected.keys.sorted { collected[$0]?.count ?? 0 > collected[$1]?.count ?? 0 }
+        for topic in ordered.prefix(limit) {
+            let items = collected[topic] ?? []
+            guard !items.isEmpty else { continue }
+            let head = items.prefix(2).map { "\($0.title): \($0.snippet)" }.joined(separator: " | ")
+            lines.append("[\(topic)] \(head)")
+        }
+        return lines.isEmpty ? "" : lines.joined(separator: "\n")
+    }
+}
+
+/// Synchronous L1 review of the current frame: asks the local Gemma model
+/// whether the primary face is a real human worth tracking as an anonymous
+/// identity. Runs only when a brand-new anonymous identity is about to be
+/// created, so the blocking wait is rare and acceptable.
+func l1PersonContextSummary(_ provider: L1MemoryContextProvider, for entityID: UUID) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<String>()
+    Task { [provider] in
+        let ctx = await provider.context(for: entityID)
+        var facts: [String] = ctx.projections.map { $0.summary }
+        if let rapport = ctx.rapport {
+            facts.append("familiarity=\(rapport.familiarity)")
+        }
+        if !ctx.informationNeeds.isEmpty {
+            facts.append("open_information_needs=\(ctx.informationNeeds.count)")
+        }
+        let joined = facts.prefix(12).joined(separator: " | ")
+            .replacingOccurrences(of: "\"", with: "'")
+        box.set(.success(#"{"ok":true,"projections":\#(facts.count),"summary":"\#(joined)"}"#))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(summary)? = box.get() {
+        return summary
+    }
+    return #"{"ok":false,"error":"no_context"}"#
+}
+
+func l1StorePersonFact(_ provider: L1MemoryContextProvider, for entityID: UUID, fact: String) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<Bool>()
+    Task { [provider] in
+        let stored = await provider.storePersonFact(fact, for: entityID)
+        box.set(.success(stored))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(stored)? = box.get() {
+        return stored ? #"{"ok":true,"stored":true}"# : #"{"ok":false,"error":"store_unavailable"}"#
+    }
+    return #"{"ok":false,"error":"store_unavailable"}"#
+}
+
+private struct L1WebSearchResult: Decodable {
+    let results: [ResultItem]?
+    struct ResultItem: Decodable {
+        let title: String?
+        let url: String?
+        let content: String?
+    }
+}
+
+private struct L1WebFetchResult: Decodable {
+    let title: String?
+    let content: String?
+}
+
+/// Calls Ollama's hosted web_search API. Requires OLLAMA_API_KEY.
+func performL1WebSearch(query: String, maxResults: Int = 5) -> String {
+    guard let key = ProcessInfo.processInfo.environment["OLLAMA_API_KEY"], !key.isEmpty else {
+        return #"{"ok":false,"error":"OLLAMA_API_KEY not set; hosted web_search requires an Ollama API key"}"#
+    }
+    guard let url = URL(string: "https://ollama.com/api/web_search") else {
+        return #"{"ok":false,"error":"bad_url"}"#
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+    let body = ["query": query, "max_results": maxResults] as [String: Any]
+    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    request.timeoutInterval = 20
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<String>()
+    URLSession.shared.dataTask(with: request) { data, response, error in
+        defer { semaphore.signal() }
+        guard error == nil,
+              let data,
+              let decoded = try? JSONDecoder().decode(L1WebSearchResult.self, from: data),
+              let results = decoded.results, !results.isEmpty else {
+            let raw = data.flatMap { String(data: $0, encoding: .utf8) } ?? "no_data"
+            box.set(.success(#"{"ok":false,"error":"search_failed","detail":"\#(String(raw.prefix(160)).replacingOccurrences(of: "\"", with: "'"))"}"#))
+            return
+        }
+        let items = results.prefix(maxResults).map { item -> [String: String] in
+            [
+                "title": item.title ?? "",
+                "url": item.url ?? "",
+                "snippet": (item.content ?? "").prefix(400).replacingOccurrences(of: "\"", with: "'")
+            ]
+        }
+        let payload = ["ok": true, "query": query, "results": items] as [String: Any]
+        let encoded = (try? JSONSerialization.data(withJSONObject: payload)).flatMap { String(data: $0, encoding: .utf8) } ?? #"{"ok":false}"#
+        box.set(.success(encoded))
+    }.resume()
+    semaphore.wait()
+    if case let .success(value)? = box.get() { return value }
+    return #"{"ok":false}"#
+}
+
+/// Calls Ollama's hosted web_fetch API. Requires OLLAMA_API_KEY.
+func performL1WebFetch(url: String) -> String {
+    guard let key = ProcessInfo.processInfo.environment["OLLAMA_API_KEY"], !key.isEmpty else {
+        return #"{"ok":false,"error":"OLLAMA_API_KEY not set; hosted web_fetch requires an Ollama API key"}"#
+    }
+    guard let endpoint = URL(string: "https://ollama.com/api/web_fetch") else {
+        return #"{"ok":false,"error":"bad_url"}"#
+    }
+    var request = URLRequest(url: endpoint)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["url": url])
+    request.timeoutInterval = 20
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<String>()
+    URLSession.shared.dataTask(with: request) { data, response, error in
+        defer { semaphore.signal() }
+        guard error == nil, let data,
+              let decoded = try? JSONDecoder().decode(L1WebFetchResult.self, from: data),
+              let content = decoded.content, !content.isEmpty else {
+            let raw = data.flatMap { String(data: $0, encoding: .utf8) } ?? "no_data"
+            box.set(.success(#"{"ok":false,"error":"fetch_failed","detail":"\#(String(raw.prefix(160)).replacingOccurrences(of: "\"", with: "'"))"}"#))
+            return
+        }
+        let payload: [String: Any] = [
+            "ok": true,
+            "title": decoded.title ?? "",
+            "content": String(content.prefix(2000)).replacingOccurrences(of: "\"", with: "'")
+        ]
+        let encoded = (try? JSONSerialization.data(withJSONObject: payload)).flatMap { String(data: $0, encoding: .utf8) } ?? #"{"ok":false}"#
+        box.set(.success(encoded))
+    }.resume()
+    semaphore.wait()
+    if case let .success(value)? = box.get() { return value }
+    return #"{"ok":false}"#
+}
+
+func performL1AnonymousReview(
+    frameURL: URL,
+    onHealth: @escaping (String, String) -> Void
+) -> Bool {
+    guard FileManager.default.isReadableFile(atPath: frameURL.path),
+          let imageData = try? Data(contentsOf: frameURL),
+          imageData.count > 0,
+          imageData.count <= 2 * 1_024 * 1_024 else {
+        // No frame to review: fall back to allowing the identity.
+        return true
+    }
+    let prompt = """
+    Look at this current camera frame. Is the primary face a real human person who should be \
+    tracked as an anonymous identity — not a photograph, screen, reflection, or non-human object? \
+    If it is clearly a real person, set register_anonymous_identity to true. If it is noise, \
+    ambiguous, or not clearly a real living person, set it to false. \
+    Reply with strict JSON only: {"register_anonymous_identity":true} or {"register_anonymous_identity":false}.
+    """
+    let body: [String: Any] = [
+        "model": "gemma4:31b-cloud",
+        "prompt": prompt,
+        "images": [imageData.base64EncodedString()],
+        "stream": false,
+        "format": "json",
+        "options": ["temperature": 0.2, "num_predict": 32]
+    ]
+    guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return true }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.timeoutInterval = 20
+    guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return true }
+    request.httpBody = payload
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var decision = true
+    var healthMessage = "unavailable"
+    URLSession.shared.dataTask(with: request) { data, response, error in
+        defer { semaphore.signal() }
+        guard error == nil,
+              let data,
+              let outer = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = outer["response"] as? String,
+              let contentData = content.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: contentData) as? [String: Any],
+              let register = parsed["register_anonymous_identity"] as? Bool else {
+            healthMessage = error?.localizedDescription ?? "malformed_response"
+            return
+        }
+        decision = register
+        healthMessage = register ? "approved" : "declined"
+    }.resume()
+    semaphore.wait()
+    onHealth("reviewed", "decision=\(healthMessage)")
+    return decision
+}
+
 private enum RuntimeError: LocalizedError {
     case invalidArgument(String)
     case unavailable(String)
@@ -882,6 +1222,85 @@ private struct IdentityPresenceRuntimeEvent: Encodable, Sendable {
     let reason: String
 }
 
+/// Holds the most recent primary-face identity decision so a periodic trace
+/// heartbeat can re-emit it. The menu bar only reads the tail of the trace, so
+/// a sparse identity.observation (emitted only on state transitions) scrolls
+/// out of its read window within seconds. Re-emitting the current state keeps a
+/// fresh copy available while the face is still present; it is cleared on
+/// departure so a stale identity is never replayed after the person leaves.
+private final class LatestIdentityBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: String?
+    private var subject: String?
+    private var label: String?
+    private var confidence: Double = 0
+    private var observedNS: UInt64 = 0
+
+    func update(state: String, subject: String, label: String, confidence: Double, observedNS: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        self.state = state
+        self.subject = subject
+        self.label = label
+        self.confidence = confidence
+        self.observedNS = observedNS
+    }
+
+    func clear() {
+        lock.lock(); defer { lock.unlock() }
+        state = nil
+        subject = nil
+        label = nil
+        confidence = 0
+        observedNS = 0
+    }
+
+    func snapshot() -> (state: String, subject: String, label: String?, confidence: Double, observedNS: UInt64)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let state, let subject else { return nil }
+        return (state, subject, label, confidence, observedNS)
+    }
+}
+
+/// Writes the current primary-face identity to a small always-current JSON file
+/// that the menu bar reads directly (instead of scanning a huge trace tail).
+private func writeIdentityState(
+    state: String,
+    subject: String,
+    confidence: Double,
+    to url: URL
+) {
+    let json = "{\"state\":\(JSONString(state)),\"subject\":\(JSONString(subject)),\"confidence\":\(confidence)}\n"
+    try? json.write(to: url, atomically: true, encoding: .utf8)
+}
+
+private func clearIdentityState(at url: URL) {
+    try? FileManager.default.removeItem(at: url)
+}
+
+/// Minimal JSON string literal escaping for the identity file payload. (A bare
+/// Swift String is not a valid top-level NSJSONSerialization type, so the
+/// escaping must be done by hand.)
+private func JSONString(_ s: String) -> String {
+    var out = "\""
+    for scalar in s.unicodeScalars {
+        switch scalar.value {
+        case 0x22: out += "\\\""       // "
+        case 0x5C: out += "\\\\"       // backslash
+        case 0x08: out += "\\b"
+        case 0x0C: out += "\\f"
+        case 0x0A: out += "\\n"
+        case 0x0D: out += "\\r"
+        case 0x09: out += "\\t"
+        case 0x00...0x1F:
+            out += String(format: "\\u%04x", scalar.value)
+        default:
+            out.append(Character(scalar))
+        }
+    }
+    out += "\""
+    return out
+}
+
 private struct IdentityPresenceUpdate: Sendable {
     let transition: IdentityPresenceTransition
     let participant: InteractionParticipant?
@@ -1085,6 +1504,54 @@ private final class PresentIdentityRoster: @unchecked Sendable {
         entries = entries.filter { _, entry in
             monotonicNS >= entry.lastSeenNS && monotonicNS - entry.lastSeenNS < retentionNS
         }
+    }
+}
+
+/// Composes the natural-language L1 thought for the diagnostic thought log:
+/// the situation summary, the social-decision rationale, the working
+/// hypothesis, and any spoken-opening text the model chose.
+private func l1ThoughtStreamMessage(
+    for frame: L1SituationFrame,
+    action: String
+) -> String {
+    var parts: [String] = ["action=\(action)"]
+    if !frame.summary.isEmpty {
+        parts.append(frame.summary)
+    }
+    if let hypothesis = frame.thoughtState?.workingHypothesis, !hypothesis.isEmpty {
+        parts.append("hypothesis: \(hypothesis)")
+    }
+    if let rationale = frame.socialDecision?.rationale, !rationale.isEmpty {
+        parts.append("rationale: \(rationale)")
+    }
+    switch frame.socialDecision?.openingContent {
+    case .greeting:
+        parts.append("opening: greeting")
+    case let .question(_, text):
+        parts.append("opening: \(text)")
+    case nil:
+        break
+    }
+    return parts.joined(separator: " · ")
+}
+
+private func identityDiagnosticLabel(
+    for decision: FaceIdentityRuntimeDecision,
+    administrator: SOMAAdministratorIdentity?
+) -> String {
+    switch decision {
+    case let .known(entityID, similarity, _):
+        if entityID == administrator?.entityID {
+            let name = administrator?.preferredAddress ?? administrator?.displayName ?? "Administrator"
+            return "\(name) · known \(String(format: "%.2f", similarity))"
+        }
+        return "known \(entityID.uuidString.prefix(8)) \(String(format: "%.2f", similarity))"
+    case let .knownCandidate(entityID, similarity):
+        return "candidate \(entityID.uuidString.prefix(8)) \(String(format: "%.2f", similarity))"
+    case let .anonymous(entityID, _, similarity, _):
+        return "anonymous \(entityID.uuidString.prefix(8)) \(String(format: "%.2f", similarity))"
+    case .unknownCandidate:
+        return "unknown"
     }
 }
 
@@ -2304,8 +2771,25 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var explorationRandomState: UInt64 = 0x9E37_79B9_7F4A_7C15
     private var attentionController = SubconsciousAttentionController()
     private var lastAttentionDecisionSignature: String?
+    /// Snapshot of the current L0 attention state for the periodic L1
+    /// behavior-awareness pass (which the social gate otherwise never sees).
+    private var behaviorAttentionState = "idle"
+    private var behaviorTargetLabel: String?
+    private var behaviorTargetConfidence = 0.0
+    private var behaviorIsFaceTarget = false
+    private var behaviorChangedAtNS: UInt64 = 0
+    private var recentAttentionStates: [String] = []
+    /// Supplies the currently recognized identity label (e.g. the administrator's
+    /// name) so the behavior-awareness pass knows who it is looking at.
+    var recognizedIdentityProvider: (() -> String?)?
     private var actionableVisualContinuity = VisualEvidenceContinuity()
     private var socialTrackingContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 1_200)
+    /// While native AI owns the live visual loop the device itself is tracking
+    /// the person, and the app's ANE face detector can drop out for a second or
+    /// more while the gimbal moves. This longer window trusts device-confirmed
+    /// native tracking across those dropouts, releasing only after a sustained
+    /// absence that a genuine departure would produce.
+    private var nativeTrustContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 5_000)
     private var faceLock = FaceLockLease()
     private var activeSpatialFaceReacquisition: (id: String, deadlineNS: UInt64)?
     private var attemptedSpatialFaceReacquisitionIDs: Set<String> = []
@@ -2340,11 +2824,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var indicatorIlluminated = false
     private var indicatorCalibrationPreset: SOMALEDFirmwarePreset?
     private var indicatorCalibrationStateID: Int?
-    private var lastEyeContactNS: UInt64?
-    /// Landmark gaze can miss individual frames. This debounce applies only
-    /// while L0 still has a current face lock; confirmed visual loss clears it
-    /// immediately before any re-acquisition motion begins.
-    private let eyeContactDebounceNS: UInt64 = 500_000_000
+    private var indicatorReassertionGeneration = 0
+    /// The visual invitation stays legible through brief gaze-estimator
+    /// dropouts. Voice admission deliberately remains governed by its own,
+    /// shorter fresh-eye-contact window.
+    private var eyeContactIndicatorLease = EyeContactIndicatorLease(holdMilliseconds: 2_000)
+    private let indicatorReassertionIntervalMilliseconds = 1_000
 
     init(
         helperURL: URL,
@@ -2467,7 +2952,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             if cameraGeometryCalibrationMode || panoramaStripScanMode {
                 startSmoothExploration(initialPan: 0)
             }
-            refreshIndicator(at: monotonicNanoseconds())
+            refreshIndicator(
+                at: monotonicNanoseconds(),
+                forceHardwareReassertion: true
+            )
+            startIndicatorReassertionLoop()
             return
         }
         if line.hasPrefix("SOMA_NATIVE_TRACKING ") {
@@ -2649,6 +3138,31 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         queue.async { [weak self] in self?.applyEmbodimentIntent(intent) }
     }
 
+    private var lastBehaviorAcknowledgmentNS: UInt64 = 0
+    /// The periodic L1 behavior pass has no contact history, so it would
+    /// re-acknowledge a sustained person every tick. Gate the greeting to at
+    /// most once per window; a re-arriving person re-arms naturally because
+    /// this clock only advances when a greeting actually fires.
+    private let behaviorAcknowledgmentCooldownNS: UInt64 = 90_000_000_000
+
+    /// L1 behavior `acknowledge_person` entry point with a hard cooldown so the
+    /// 30s situation-awareness pass cannot spam greetings at one present face.
+    func acknowledgePersonIfEligible(at monotonicNS: UInt64) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard monotonicNS >= self.lastBehaviorAcknowledgmentNS,
+                  monotonicNS - self.lastBehaviorAcknowledgmentNS >= self.behaviorAcknowledgmentCooldownNS else {
+                return
+            }
+            self.lastBehaviorAcknowledgmentNS = monotonicNS
+            self.applyEmbodimentIntent(.express(
+                requestID: "l1-behavior-\(monotonicNS)",
+                expression: .greeting,
+                expiresAtNS: monotonicNS + 600_000_000
+            ))
+        }
+    }
+
     func stop() {
         queue.sync {
             if case .stopped = state { return }
@@ -2722,16 +3236,27 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // result must not interrupt an active face correction.
             guard actionableVisualContinuity.confirmsLoss(at: now) else { return }
             let nativeOwnsSocialTracking = nativeTrackingActive || nativeTrackingStartPending
+            // A device-confirmed native AI lock owns its own live visual loop
+            // (the OBSBOT tracks the person independently of this app's ANE
+            // detector). While the device-confirmed native lock is held, an
+            // app-detector gap is a perception dropout, not a physical
+            // departure, and must not tear the native lock down: the longer
+            // native-trust window releases it only on a sustained absence. A
+            // pending, not-yet-device-confirmed start still yields to the
+            // shorter social gap so a false start cannot hold the gimbal
+            // forever.
             let retainNativeThroughDetectorGap = faceLock.permitsMotor(at: now)
                 && nativeOwnsSocialTracking
-                && !socialTrackingContinuity.confirmsLoss(at: now)
+                && (nativeTrackingActive
+                    ? !nativeTrustContinuity.confirmsLoss(at: now)
+                    : !socialTrackingContinuity.confirmsLoss(at: now))
             let decision = attentionController.advance(
                 belief: belief,
                 evidence: .visualLoss,
                 socialFixationPermitted: faceLock.permitsMotor(at: now),
                 nativeSocialTrackingActive: retainNativeThroughDetectorGap
             )
-            recordAttentionDecision(decision, at: now)
+            recordAttentionDecision(decision, target: belief.target, at: now)
             if decision.suppressesExploration {
                 // Only a verified face lock is allowed a short detector gap.
                 // A raw model candidate must never freeze exploration when it
@@ -2763,7 +3288,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             nativeSocialTrackingPermitted: faceLock.permitsInitialMotor(at: now),
             nativeSocialTrackingActive: nativeTrackingActive || nativeTrackingStartPending
         )
-        recordAttentionDecision(decision, at: now)
+        recordAttentionDecision(decision, target: belief.target, at: now)
         switch decision.state {
         case .sceneObservation:
             // Objects and saliency remain genuine attention hypotheses. They
@@ -2856,12 +3381,26 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             verifiedCurrentFaceLock = false
         }
         let immediateNativeAcquisition = verifiedCurrentFaceLock
-        let nativeAction = nativeHumanTrackingEnabled && faceLock.permitsMotor(at: now)
-            ? gate.update(
-                belief,
-                immediateAcquisitionPermitted: immediateNativeAcquisition
-            )
-            : gate.invalidate()
+        let nativeAction: NativeHumanTrackingAction
+        if nativeHumanTrackingEnabled && faceLock.permitsMotor(at: now) {
+            // Retain a device-confirmed native lock through a short detector
+            // blip: the current frame briefly lost its face target (nil, a
+            // body/saliency candidate taking precedence, or a fast head move)
+            // while the verified face lock still holds. Only a sustained
+            // absence confirmed by the 5 s native-trust continuity should tear
+            // the native lock down — the same principle as the vision_miss
+            // retention above.
+            if gate.isActive, !verifiedCurrentFaceLock, !nativeTrustContinuity.confirmsLoss(at: now) {
+                nativeAction = gate.heartbeatIfActive(at: now)
+            } else {
+                nativeAction = gate.update(
+                    belief,
+                    immediateAcquisitionPermitted: immediateNativeAcquisition
+                )
+            }
+        } else {
+            nativeAction = gate.invalidate()
+        }
         let externalAction: ExternalGimbalAttentionAction
         if var externalGate {
             // Keep the visual servo alive while a fresh face earns the native
@@ -2911,10 +3450,24 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
-    private func recordAttentionDecision(_ decision: SubconsciousAttentionDecision, at monotonicNS: UInt64) {
+    private func recordAttentionDecision(
+        _ decision: SubconsciousAttentionDecision,
+        target: AttentionTarget?,
+        at monotonicNS: UInt64
+    ) {
         let signature = "\(decision.state.rawValue)|\(decision.permitsNativeSocialTracking)|\(decision.permitsExternalSocialReframing)"
-        guard signature != lastAttentionDecisionSignature else { return }
-        lastAttentionDecisionSignature = signature
+        if signature != lastAttentionDecisionSignature {
+            lastAttentionDecisionSignature = signature
+            behaviorAttentionState = decision.state.rawValue
+            behaviorTargetLabel = target?.label
+            behaviorTargetConfidence = target?.confidence ?? 0
+            behaviorIsFaceTarget = target?.isFaceMotorTarget ?? false
+            behaviorChangedAtNS = monotonicNS
+            recentAttentionStates.append(decision.state.rawValue)
+            if recentAttentionStates.count > 16 {
+                recentAttentionStates.removeFirst(recentAttentionStates.count - 16)
+            }
+        }
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNS,
@@ -2927,6 +3480,21 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 decision.permitsNativeSocialTracking ? "eligible" : (decision.permitsExternalSocialReframing ? "social_reframe" : "not_eligible")
             )
         ))
+    }
+
+    func makeBehaviorContext(at nowNS: UInt64) -> L1BehaviorContext {
+        let fixationSeconds = behaviorChangedAtNS == 0 ? 0 : Double(nowNS - behaviorChangedAtNS) / 1_000_000_000
+        return L1BehaviorContext(
+            attentionState: behaviorAttentionState,
+            targetLabel: behaviorTargetLabel,
+            targetConfidence: behaviorTargetConfidence,
+            isFaceTarget: behaviorIsFaceTarget,
+            fixationSeconds: fixationSeconds,
+            scanActive: scanRunning,
+            idleSeconds: fixationSeconds,
+            recentStates: recentAttentionStates,
+            recognizedIdentity: recognizedIdentityProvider?()
+        )
     }
 
     private func recordCurrentVisualAttention(at monotonicNS: UInt64) {
@@ -2983,7 +3551,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         guard !hasRecentObservedFace(at: now) else { return }
         if indicatorInputs.visualState != .none {
             indicatorInputs.visualState = .none
-            lastEyeContactNS = nil
+            eyeContactIndicatorLease.clear()
             refreshIndicator(at: now)
         }
         // Keep the first confirmed-loss time. Replacing it on every empty
@@ -3265,6 +3833,34 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             applyCalibrationCandidates(candidates, at: monotonicNS)
             return
         }
+        // Social signalling follows fresh human perception, not the later
+        // face-lock/motor decision. A person at the frame edge or awaiting
+        // landmark corroboration is still someone SOMA has noticed.
+        if candidates.contains(where: {
+            $0.observedThisFrame && $0.observation.kind == .human
+        }) {
+            let priorVisualState = indicatorInputs.visualState
+            indicatorInputs.observeHumanVisualPresence()
+            // A person is in view but the ready-to-speak blink must still
+            // fall back to human_detected once the eye-contact lease expires,
+            // even on frames that yield no fresh face observation (face briefly
+            // undetected or the person has stopped looking). Without this, the
+            // blink can stay asserted while the user looks away.
+            let hasFreshEyeContactThisFrame = candidates.contains {
+                $0.observedThisFrame
+                    && $0.observation.kind == .human
+                    && $0.observation.label == "face"
+                    && $0.eyeContactEligible
+            }
+            if indicatorInputs.visualState == .eyeContact,
+               !hasFreshEyeContactThisFrame,
+               !eyeContactIndicatorLease.isActive(at: monotonicNS) {
+                indicatorInputs.visualState = .humanDetected
+            }
+            if indicatorInputs.visualState != priorVisualState {
+                refreshIndicator(at: monotonicNS)
+            }
+        }
         guard process.isRunning,
               helperReady,
               !explorationRecentering else {
@@ -3290,8 +3886,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         // an active exploration pulse that activity cannot be measured, so a
         // repeated high-confidence face may only open the provisional external
         // re-centering path; native authority still requires verification.
+        // A landmark-verified face is a real person (the verifier rules out
+        // static face-shaped distractors), so it may interrupt the coverage
+        // scan even while it is near an edge. Requiring a foveal frame here let
+        // the scan sweep past the user and keep running, destabilizing the
+        // person's identity because the gimbal never stopped to face them.
         let verifiedFace = observedFaces
-            .filter { $0.faceVerificationEligible && isFaceAcquisitionFramed($0.observation.rect) }
+            .filter { $0.faceVerificationEligible }
             .max { $0.observation.confidence < $1.observation.confidence }
         let heldFace = observedFaces.first(where: {
             faceLock.permitsMotor(at: monotonicNS)
@@ -3347,14 +3948,36 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 let preemptedExploration = scanRunning || activeSpatialFaceReacquisition != nil
                 lastObservedFaceNS = monotonicNS
                 if faceLock.permitsMotor(at: monotonicNS) {
-                    if observedFace.eyeContactEligible {
-                        lastEyeContactNS = monotonicNS
+                    // The ready-to-speak invitation must be earned by the
+                    // camera actually following the person (device-confirmed
+                    // native tracking). A locked face with eye contact but no
+                    // live tracking is "person visible", not "ready to talk":
+                    // the two states rise and fall together so the blinking
+                    // blue indicator never claims a tracking SOMA is not doing.
+                    if nativeTrackingActive, observedFace.eyeContactEligible {
+                        eyeContactIndicatorLease.observe(
+                            sceneID: observedFace.id,
+                            at: monotonicNS
+                        )
                         indicatorInputs.visualState = .eyeContact
-                    } else if !hasRecentEyeContact(at: monotonicNS) {
+                    } else if nativeTrackingActive,
+                              eyeContactIndicatorLease.isActive(at: monotonicNS) {
+                        // Bridge a brief gaze dropout (and a SceneField track-ID
+                        // reassignment of the same face) while the camera is
+                        // still following the person. We intentionally use the
+                        // non-refreshing isActive() hold here rather than
+                        // maintain(sceneID:), which refreshes the lease on every
+                        // same-face observation and would keep the blink asserted
+                        // indefinitely once eye contact drops. This expires ~3s
+                        // after the last real eye contact, so looking away
+                        // releases the blink instead of holding it.
+                        indicatorInputs.visualState = .eyeContact
+                    } else {
                         indicatorInputs.visualState = .humanDetected
                     }
                     refreshIndicator(at: monotonicNS)
                     socialTrackingContinuity.recordObservation(at: monotonicNS)
+                    nativeTrustContinuity.recordObservation(at: monotonicNS)
                 }
                 // Invalidate any absence callback that was queued before this
                 // frame. It must not revive a search pulse after preemption.
@@ -4453,6 +5076,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         scheduleScanControlTick(initialPan: initialPan, generation: scanGeneration)
     }
 
+    /// L1 behavior directive entry point: resume the coverage scan. The guards
+    /// inside `startSmoothExploration` still yield to a recently observed face,
+    /// so this never tears a confirmed face lock away.
+    func resumeCoverageScan() {
+        startSmoothExploration(initialPan: 0)
+    }
+
     private func cancelScan() {
         scanGeneration += 1
         scanRunning = false
@@ -4472,12 +5102,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         guard let lastObservedFaceNS else { return false }
         guard monotonicNS >= lastObservedFaceNS else { return true }
         return monotonicNS - lastObservedFaceNS <= 600_000_000
-    }
-
-    private func hasRecentEyeContact(at monotonicNS: UInt64) -> Bool {
-        guard let lastEyeContactNS else { return false }
-        guard monotonicNS >= lastEyeContactNS else { return true }
-        return monotonicNS - lastEyeContactNS <= eyeContactDebounceNS
     }
 
     private func scheduleScanControlTick(
@@ -5087,6 +5711,24 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         return "\(prefix)-\(commandSequence)"
     }
 
+    private func startIndicatorReassertionLoop() {
+        indicatorReassertionGeneration += 1
+        scheduleIndicatorReassertion(generation: indicatorReassertionGeneration)
+    }
+
+    private func scheduleIndicatorReassertion(generation: Int) {
+        queue.asyncAfter(
+            deadline: .now() + .milliseconds(indicatorReassertionIntervalMilliseconds)
+        ) { [weak self] in
+            guard let self,
+                  generation == self.indicatorReassertionGeneration,
+                  case .running = self.state,
+                  self.helperReady else { return }
+            self.reconcileIndicatorPalette(at: monotonicNanoseconds())
+            self.scheduleIndicatorReassertion(generation: generation)
+        }
+    }
+
     private func refreshIndicator(
         at monotonicNS: UInt64,
         forceHardwareReassertion: Bool = false
@@ -5118,28 +5760,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         guard helperReady,
               process.isRunning,
               forceHardwareReassertion || next != activeIndicatorState || activeIndicatorRendering != indicatorRendering(next) else { return }
-        let previousWasIlluminated = indicatorIlluminated
         activeIndicatorState = next
         let nextSignal = ledSettings.signal(for: next)
         let nextRendering = nextSignal.deviceRendering
-        let previousRendering = previousWasIlluminated ? activeIndicatorRendering : nil
-        for command in SOMALEDHardwareTransition.commands(
-            previous: previousRendering,
-            next: nextRendering,
-            forceReassertion: forceHardwareReassertion
-        ) {
-            switch command {
-            case let .specialPattern(enabled):
-                let commandID = nextCommandID(prefix: "indicator-special")
-                send("indicator_special_pattern \(commandID) \(enabled ? 1 : 0)")
-            case let .clear(stateID):
-                let commandID = nextCommandID(prefix: "indicator-clear")
-                send("indicator_clear \(commandID) \(stateID)")
-            case let .set(stateID):
-                let commandID = nextCommandID(prefix: "indicator-set")
-                send("indicator_set \(commandID) \(stateID)")
-            }
-        }
+        let commandID = nextCommandID(prefix: "indicator-enforce")
+        send(
+            "indicator_enforce \(commandID) \(nextRendering.stateID) \(nextRendering.specialPatternEnabled ? 1 : 0)"
+        )
         activeIndicatorRendering = nextRendering
         indicatorIlluminated = true
         writer.write(RuntimeEvent(
@@ -5147,8 +5774,34 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNS,
             source: "social_indicator",
             state: next.rawValue,
-            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); special_pattern=\(nextRendering.specialPatternEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); rgb_palette=true; arbitrary_rgb=false"
+            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); special_pattern=\(nextRendering.specialPatternEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); enforced=true; rgb_palette=true; arbitrary_rgb=false"
         ))
+    }
+
+    private func reconcileIndicatorPalette(at monotonicNS: UInt64) {
+        guard indicatorCalibrationPreset == nil else { return }
+        let next = indicatorInputs.resolvedState
+        guard ledSettings.responseMode.permits(next),
+              helperReady,
+              process.isRunning,
+              indicatorIlluminated,
+              next == activeIndicatorState,
+              let activeIndicatorRendering,
+              activeIndicatorRendering == indicatorRendering(next),
+              // Do not run the blind periodic re-assertion while the LED is in
+              // a firmware blink (special pattern): re-setting the state id /
+              // clearing the palette every second resets the blink phase and
+              // produces "one blink, long off-gap" instead of continuous
+              // blinking. During a blink the rendering is left undisturbed and
+              // colour recovery happens on the next state transition (enforce).
+              activeIndicatorRendering.specialPatternEnabled == false else {
+            refreshIndicator(at: monotonicNS)
+            return
+        }
+        let commandID = nextCommandID(prefix: "indicator-reconcile")
+        send(
+            "indicator_reconcile \(commandID) \(activeIndicatorRendering.stateID) \(activeIndicatorRendering.specialPatternEnabled ? 1 : 0)"
+        )
     }
 
     private func indicatorRendering(_ state: SubconsciousIndicatorState) -> SOMALEDDeviceRendering {
@@ -5826,6 +6479,13 @@ private final class SystemSaliencyDetector: @unchecked Sendable {
 private struct SystemFaceEvidence: Sendable {
     let rect: SOMACore.NormalizedRect
     let directedEyeContact: Bool
+    /// Raw Vision gaze features for diagnostics. Kept separate from the boolean
+    /// so the live trace can reveal why a face is (or is not) contact-ready
+    /// without re-deriving them.
+    let yaw: Double?
+    let pitch: Double?
+    let pupilOffsetX: Double?
+    let pupilOffsetY: Double?
     let alignment: FaceAlignmentEvidence
 }
 
@@ -5843,13 +6503,18 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             guard let alignment = alignmentEvidence(landmarks: landmarks, rect: rect) else {
                 return nil
             }
+            let gaze = gazeAssessment(
+                observation: observation,
+                landmarks: landmarks,
+                rect: rect
+            )
             return SystemFaceEvidence(
                 rect: rect,
-                directedEyeContact: hasDirectedEyeContact(
-                    observation: observation,
-                    landmarks: landmarks,
-                    rect: rect
-                ),
+                directedEyeContact: gaze.directed,
+                yaw: gaze.yaw,
+                pitch: gaze.pitch,
+                pupilOffsetX: gaze.pupilOffsetX,
+                pupilOffsetY: gaze.pupilOffsetY,
                 alignment: alignment
             )
         }
@@ -5914,24 +6579,54 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         return eyes && nose && mouth
     }
 
-    private func hasDirectedEyeContact(
+    private func gazeAssessment(
         observation: VNFaceObservation,
         landmarks: VNFaceLandmarks2D,
         rect: SOMACore.NormalizedRect
-    ) -> Bool {
-        guard rect.centerX >= 0.27, rect.centerX <= 0.73,
-              rect.centerY >= 0.14, rect.centerY <= 0.90,
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, directed: Bool) {
+        let yaw = observation.yaw?.doubleValue
+        let pitch = observation.pitch?.doubleValue
+        guard rect.centerX >= 0.26, rect.centerX <= 0.74,
+              rect.centerY >= 0.13, rect.centerY <= 0.89,
               rect.width * rect.height >= 0.008,
-              let yaw = observation.yaw?.doubleValue,
-              abs(yaw) <= 0.42,
+              let yaw, abs(yaw) <= 0.50,
               let leftEye = landmarks.leftEye,
               let rightEye = landmarks.rightEye,
               let leftPupil = landmarks.leftPupil,
               let rightPupil = landmarks.rightPupil else {
-            return false
+            return (yaw, pitch, nil, nil, false)
         }
-        return pupilIsCentered(leftPupil, in: leftEye)
+        let left = pupilOffset(leftPupil, in: leftEye)
+        let right = pupilOffset(rightPupil, in: rightEye)
+        let directed = pupilIsCentered(leftPupil, in: leftEye)
             && pupilIsCentered(rightPupil, in: rightEye)
+        return (yaw, pitch, max(left?.x ?? 0, right?.x ?? 0), max(left?.y ?? 0, right?.y ?? 0), directed)
+    }
+
+    private func pupilOffset(
+        _ pupil: VNFaceLandmarkRegion2D,
+        in eye: VNFaceLandmarkRegion2D
+    ) -> (x: Double, y: Double)? {
+        guard pupil.pointCount > 0, eye.pointCount >= 2 else { return nil }
+        let pupilPoint = pupil.normalizedPoints[0]
+        var minimumX = Double.greatestFiniteMagnitude
+        var maximumX = -Double.greatestFiniteMagnitude
+        var minimumY = Double.greatestFiniteMagnitude
+        var maximumY = -Double.greatestFiniteMagnitude
+        for index in 0..<eye.pointCount {
+            let point = eye.normalizedPoints[index]
+            minimumX = min(minimumX, Double(point.x))
+            maximumX = max(maximumX, Double(point.x))
+            minimumY = min(minimumY, Double(point.y))
+            maximumY = max(maximumY, Double(point.y))
+        }
+        let width = maximumX - minimumX
+        let height = maximumY - minimumY
+        guard width > 0.001, height > 0.001 else { return nil }
+        return (
+            x: abs(Double(pupilPoint.x) - (minimumX + maximumX) / 2) / (width / 2),
+            y: abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2)
+        )
     }
 
     private func pupilIsCentered(
@@ -5956,10 +6651,13 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         guard width > 0.001, height > 0.001 else { return false }
         let normalizedX = abs(Double(pupilPoint.x) - (minimumX + maximumX) / 2) / (width / 2)
         let normalizedY = abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2)
-        // Vision documents pupil points as approximate. This is intentionally
-        // tolerant: it rejects a clearly averted gaze without demanding that
-        // the user stare at one exact pixel.
-        return normalizedX <= 0.72 && normalizedY <= 0.90
+        // Vision reports the pupil near the eye centre regardless of gaze on
+        // this camera (yaw is quantized to 0 / +/-45 / +/-90 and pitch is nil),
+        // so the pupil offset cannot discriminate a subtle averted gaze. Keep a
+        // permissive threshold so a direct stare — and a slightly turned head
+        // that is still making eye contact — is accepted; a clear head turn is
+        // rejected by the yaw guard in gazeAssessment instead.
+        return normalizedX <= 0.68 && normalizedY <= 0.82
     }
 
 }
@@ -6192,7 +6890,8 @@ private final class VisionWorker: @unchecked Sendable {
         onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)? = nil,
         onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64) -> Void)? = nil,
         onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)? = nil,
-        onFatalVisionFailure: (() -> Void)? = nil
+        onFatalVisionFailure: (() -> Void)? = nil,
+        anonymousReviewProvider: @escaping @Sendable () -> Bool = { true }
     ) {
         self.worldModel = worldModel
         self.publisher = publisher
@@ -6268,7 +6967,8 @@ private final class VisionWorker: @unchecked Sendable {
                         inferenceMS: inferenceMS
                     ))
                     onIdentityDecision?(decision, rect, isPrimaryFace, observedNS)
-                }
+                },
+                anonymousReviewProvider: anonymousReviewProvider
             )
         } catch {
             faceIdentityRuntime = nil
@@ -6673,24 +7373,50 @@ private final class VisionWorker: @unchecked Sendable {
         sceneField.invalidateUnverifiedFaceTracks(matching: rejectedFaceRects)
         let verifiedFaceCount = candidates.filter { isFaceCandidate($0) && $0.isFaceVerified }.count
         onIdentityPresenceEvidence?(verifiedFaceCount > 0, faceVerificationNow)
-        let identityAlignments = candidates
-            .filter { isFaceCandidate($0) && $0.isFaceVerified }
-            .sorted {
-                let lhsArea = $0.rect.width * $0.rect.height
-                let rhsArea = $1.rect.width * $1.rect.height
-                if lhsArea != rhsArea { return lhsArea > rhsArea }
-                return $0.confidence > $1.confidence
-            }
-            .compactMap { identityFace -> FaceAlignmentEvidence? in
-                identityAlignmentEvidence
-                    .filter { evidence in
-                        faceVerificationNow >= evidence.observedNS
-                            && faceVerificationNow - evidence.observedNS <= 250_000_000
-                            && Self.faceEvidenceMatches(evidence.evidence.rect, identityFace.rect)
-                    }
-                    .max(by: { $0.observedNS < $1.observedNS })?
-                    .evidence.alignment
-            }
+        let verifiedNeuralFaces = candidates.filter { isFaceCandidate($0) && $0.isFaceVerified }
+        let identityAlignments: [FaceAlignmentEvidence]
+        if verifiedNeuralFaces.isEmpty {
+            // BlazeFace (short-range, 0.75 threshold) missed the face this frame,
+            // but System Vision independently verified one with landmarks. Feed
+            // those alignments straight to identity so a visible person still
+            // gets recognized even when the lighter ANE detector cannot confirm
+            // a "face" candidate.
+            // Person-corroboration gate: only feed System Vision faces to
+            // identity when they sit on an actual human body box. This stops
+            // face-like objects (e.g. a Dyson purifier) — which systemVision
+            // may flag with landmarks but which have no matching "person"
+            // detection — from being registered as anonymous identities.
+            let humanBodyRects = candidates
+                .filter { $0.kind == .human && $0.label != "face" }
+                .map(\.rect)
+            identityAlignments = identityAlignmentEvidence
+                .filter { evidence in
+                    faceVerificationNow >= evidence.observedNS
+                        && faceVerificationNow - evidence.observedNS <= 250_000_000
+                        && humanBodyRects.contains {
+                            Self.faceEvidenceMatches(evidence.evidence.rect, $0)
+                        }
+                }
+                .map { $0.evidence.alignment }
+        } else {
+            identityAlignments = verifiedNeuralFaces
+                .sorted {
+                    let lhsArea = $0.rect.width * $0.rect.height
+                    let rhsArea = $1.rect.width * $1.rect.height
+                    if lhsArea != rhsArea { return lhsArea > rhsArea }
+                    return $0.confidence > $1.confidence
+                }
+                .compactMap { identityFace -> FaceAlignmentEvidence? in
+                    identityAlignmentEvidence
+                        .filter { evidence in
+                            faceVerificationNow >= evidence.observedNS
+                                && faceVerificationNow - evidence.observedNS <= 250_000_000
+                                && Self.faceEvidenceMatches(evidence.evidence.rect, identityFace.rect)
+                        }
+                        .max(by: { $0.observedNS < $1.observedNS })?
+                        .evidence.alignment
+                }
+        }
         if !identityAlignments.isEmpty {
             faceIdentityRuntime?.submit(
                 pixelBuffer: pixelBuffer,
@@ -7116,6 +7842,9 @@ private func run(_ options: Options) throws {
         importantRotationPolicy: options.importantRotationPolicy
     )
     defer { writer.close() }
+    let liveDiagnostics = LiveDiagnosticsWriter(
+        rootURL: options.outputURL.deletingLastPathComponent().deletingLastPathComponent()
+    )
     let controlSettings: SOMAControlSettings
     do {
         controlSettings = try SOMAControlSettingsStore(fileURL: options.controlSettingsURL).load()
@@ -7140,6 +7869,14 @@ private func run(_ options: Options) throws {
         administrator: controlSettings.administrator
     )
     let presentIdentityRoster = PresentIdentityRoster()
+    let latestPrimaryIdentity = LatestIdentityBox()
+    // A dedicated always-current identity file lets the menu bar read the
+    // present face without scanning a huge trace tail. The trace detail path is
+    // <runtime>/detail/<prefix>; the runtime root is two levels up.
+    let identityStateURL = options.outputURL
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("identity-current.json")
     let liveSessionCapabilities = SOMASessionCapabilityStore()
     let spatialAtlas = SphericalSceneAtlasStore()
     let placeEmbeddingEncoder = PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder
@@ -7357,7 +8094,7 @@ private func run(_ options: Options) throws {
         // coverage controller available for the genuine no-human state.
         let autonomousExplorationEnabled = options.allowAutonomousScan
             && options.allowCameraMotion
-            && controlSettings.autonomousExplorationEnabled
+            && somaEnvBool("SOMA_L0_EXPLORE_ENABLED", default: controlSettings.autonomousExplorationEnabled)
         attentionGimbalBridge = try AttentionGimbalBridge(
             helperURL: helperURL,
             outputURL: gimbalOutputURL,
@@ -7367,7 +8104,7 @@ private func run(_ options: Options) throws {
             autonomousScanEnabled: autonomousExplorationEnabled,
             idleExplorationEnabled: autonomousExplorationEnabled,
             nativeHumanTrackingEnabled: options.allowNativeHumanTracking
-                && controlSettings.nativeHumanTrackingEnabled,
+                && somaEnvBool("SOMA_L0_TRACKING_ENABLED", default: controlSettings.nativeHumanTrackingEnabled),
             ledSettings: controlSettings.led,
             calibrationOutputURL: options.externalGimbalCalibrationOutputURL,
             cameraGeometryCalibrationMode: options.cameraGeometryCaptureDirectoryURL != nil,
@@ -7381,6 +8118,9 @@ private func run(_ options: Options) throws {
             },
             writer: writer
         )
+        attentionGimbalBridge?.recognizedIdentityProvider = {
+            latestPrimaryIdentity.snapshot()?.label
+        }
     } else {
         attentionGimbalBridge = nil
     }
@@ -7400,6 +8140,8 @@ private func run(_ options: Options) throws {
             liveVoiceLanguageRelay.publish(directive)
         }
     )
+    let l1ThoughtRelay = L1ThoughtStreamRelay()
+    let l1LiveConversationState = L1LiveConversationStateRelay()
     let l1MemoryContext = L1MemoryContextProvider(
         onHealth: { state, message in
             writer.write(RuntimeEvent(
@@ -7412,12 +8154,48 @@ private func run(_ options: Options) throws {
         },
         onPreferredLanguageChanged: { _, languageTag in
             l1LanguageInstructions.prepare(for: languageTag)
+        },
+        onSocialContactPersisted: { personEntityID in
+            l1ThoughtRelay.invalidateMemoryContext(for: personEntityID)
         }
     )
     if let administratorID = controlSettings.administrator?.entityID {
         l1MemoryContext.warmContext(for: administratorID)
+        Task {
+            await l1MemoryContext.seedAdministratorContext(
+                entityID: administratorID,
+                preferredAddress: controlSettings.administrator?.preferredAddress
+            )
+        }
     }
-    let l1ThoughtRelay = L1ThoughtStreamRelay()
+    let dailyWorldMemoryRelay = L1DailyWorldMemoryRelay()
+    let dailyWorldMemoryCollector = AppServerDailyWorldMemoryCollector(
+        onWorldMemory: { memory in
+            dailyWorldMemoryRelay.publish(memory)
+            Task {
+                await l1MemoryContext.storeDailyWorldMemory(memory)
+            }
+        },
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "daily_world_memory",
+                state: state,
+                message: message
+            ))
+        }
+    )
+    Task {
+        let current = await l1MemoryContext.currentDailyWorldMemory()
+        dailyWorldMemoryRelay.publish(current)
+        guard current == nil,
+              await l1MemoryContext.claimDailyWorldMemoryCollectionSlot() else {
+            return
+        }
+        dailyWorldMemoryCollector.collectIfNeeded(current: current)
+    }
+    defer { dailyWorldMemoryCollector.stop() }
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(
@@ -7428,7 +8206,8 @@ private func run(_ options: Options) throws {
         ) { event in
             let eventNS = monotonicNanoseconds()
             switch event {
-            case let .launchRequested(authorization):
+            case let .launchRequested(authorization, _):
+                l1LiveConversationState.begin()
                 liveCameraFrameRelay?.setEnabled(true)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 writer.write(RuntimeEvent(
@@ -7439,10 +8218,17 @@ private func run(_ options: Options) throws {
                     message: "authorization=\(authorization)"
                 ))
             case let .active(threadID, personEntityID):
+                l1LiveConversationState.begin()
                 conversationContact.markConversationOpened(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 if let personEntityID {
-                    l1ThoughtRelay.recordInteraction(with: personEntityID, at: eventNS)
+                    Task {
+                        await l1MemoryContext.recordSocialContact(
+                            .conversationOpened,
+                            with: personEntityID,
+                            purpose: "A Live voice conversation became active."
+                        )
+                    }
                 }
                 if let threadID {
                     l1MemoryContext.beginConversation(
@@ -7482,6 +8268,7 @@ private func run(_ options: Options) throws {
                     message: "origin=controller_not_user_speech"
                 ))
             case .hearingUser:
+                l1LiveConversationState.setParticipantSpeaking(true)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.hearingUser)
             case .contextAppended:
                 writer.write(RuntimeEvent(
@@ -7550,8 +8337,10 @@ private func run(_ options: Options) throws {
                     )
                 }
             case .preparingResponse:
+                l1LiveConversationState.setParticipantSpeaking(false)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.preparingResponse)
             case .responding:
+                l1LiveConversationState.setParticipantSpeaking(false)
                 conversationContact.recordConversationActivity(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.responding)
                 writer.write(RuntimeEvent(
@@ -7562,12 +8351,22 @@ private func run(_ options: Options) throws {
                     message: "output_audio=true"
                 ))
             case .responseCompleted:
+                l1LiveConversationState.setParticipantSpeaking(false)
                 conversationContact.recordConversationActivity(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
-            case let .ended(reason):
+            case let .ended(threadID, personEntityID, reason):
+                l1LiveConversationState.end()
                 liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
+                Task {
+                    await l1MemoryContext.endConversation(
+                        threadID: threadID,
+                        personEntityID: personEntityID,
+                        interrupted: false,
+                        reason: reason
+                    )
+                }
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
                     monotonicNS: eventNS,
@@ -7575,10 +8374,27 @@ private func run(_ options: Options) throws {
                     state: "ended",
                     message: reason
                 ))
-            case let .failed(reason):
+            case let .failed(threadID, personEntityID, reason):
+                l1LiveConversationState.end()
                 liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
+                if reason == "service_shutdown" {
+                    _ = l1MemoryContext.endConversationBeforeShutdown(
+                        threadID: threadID,
+                        personEntityID: personEntityID,
+                        reason: reason
+                    )
+                } else {
+                    Task {
+                        await l1MemoryContext.endConversation(
+                            threadID: threadID,
+                            personEntityID: personEntityID,
+                            interrupted: true,
+                            reason: reason
+                        )
+                    }
+                }
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
@@ -7604,9 +8420,174 @@ private func run(_ options: Options) throws {
         liveVoiceLauncher = nil
     }
     defer { liveVoiceLauncher?.stop() }
+    // Gate for promoting a face to a registered anonymous identity: L1 reviews
+    // the current frame and decides whether it is a real person worth tracking.
+    let anonymousReviewBox = AnonymousReviewBox()
+    let liveFrameURL = options.outputURL
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("live-frame.jpg")
+    anonymousReviewBox.reviewer = {
+        performL1AnonymousReview(frameURL: liveFrameURL, onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_anonymous_review",
+                state: state,
+                message: message
+            ))
+        })
+    }
+    let l1ToolDefinitions: [OllamaToolDefinition] = [
+        .init(function: .init(name: "get_person_context", description: "Read the stored context, rapport, and preferences for a person (needs entity_id). Use when you need to recall who this person is before deciding how to engage.", parameters: .init(properties: [
+            "entity_id": .init(type: "string", description: "The person's entity_id from present_entity_ids"),
+            "reason": .init(type: "string", description: "Why you are calling this tool")
+        ], required: ["entity_id", "reason"]))),
+        .init(function: .init(name: "add_memory_fact", description: "Store an observed fact about a person (needs entity_id and fact). Use only for a concrete, new observation worth remembering.", parameters: .init(properties: [
+            "entity_id": .init(type: "string", description: "The person's entity_id"),
+            "fact": .init(type: "string", description: "The observed fact to remember"),
+            "reason": .init(type: "string", description: "Why you are recording this fact")
+        ], required: ["entity_id", "fact", "reason"]))),
+        .init(function: .init(name: "orient_camera", description: "Turn the camera to face a direction. Prefer behavior_directive unless you specifically need to look elsewhere now.", parameters: .init(properties: [
+            "direction": .init(type: "string", description: "Compass direction or target to face"),
+            "reason": .init(type: "string", description: "Why you are reorienting the camera")
+        ], required: ["direction", "reason"]))),
+        .init(function: .init(name: "web_search", description: "Search the web and return recent snippets. Use when you are genuinely curious about a topic or need current information relevant to an opening — not for facts the packet already has.", parameters: .init(properties: [
+            "query": .init(type: "string", description: "The search query"),
+            "max_results": .init(type: "string", description: "Max results (1-10, default 5)"),
+            "reason": .init(type: "string", description: "Why you are searching the web")
+        ], required: ["query", "reason"]))),
+        .init(function: .init(name: "web_fetch", description: "Fetch the main content of a single web page by URL (needs a url from web_search). Use to read deeper into a topic you already found.", parameters: .init(properties: [
+            "url": .init(type: "string", description: "The URL to fetch"),
+            "reason": .init(type: "string", description: "Why you are fetching this page")
+        ], required: ["url", "reason"])))
+    ]
+    let l1ToolExecutor: @Sendable (String, String) -> String = { [weak attentionGimbalBridge] name, arguments in
+        switch name {
+        case "get_person_context":
+            guard let data = arguments.data(using: .utf8),
+                  let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let idString = args["entity_id"] as? String,
+                  let entityID = UUID(uuidString: idString) else {
+                return #"{"ok":false,"error":"missing or invalid entity_id"}"#
+            }
+            return l1PersonContextSummary(l1MemoryContext, for: entityID)
+        case "add_memory_fact":
+            guard let data = arguments.data(using: .utf8),
+                  let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let idString = args["entity_id"] as? String,
+                  let entityID = UUID(uuidString: idString),
+                  let fact = args["fact"] as? String else {
+                return #"{"ok":false,"error":"missing entity_id or fact"}"#
+            }
+            return l1StorePersonFact(l1MemoryContext, for: entityID, fact: fact)
+        case "orient_camera":
+            attentionGimbalBridge?.resumeCoverageScan()
+            return #"{"ok":true,"orient_requested":true}"#
+        case "web_search":
+            guard let data = arguments.data(using: .utf8),
+                  let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let query = args["query"] as? String, !query.isEmpty else {
+                return #"{"ok":false,"error":"missing query"}"#
+            }
+            let maxResults = (args["max_results"] as? String).flatMap(Int.init) ?? 5
+            return performL1WebSearch(query: query, maxResults: max(1, min(10, maxResults)))
+        case "web_fetch":
+            guard let data = arguments.data(using: .utf8),
+                  let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let url = args["url"] as? String, !url.isEmpty else {
+                return #"{"ok":false,"error":"missing url"}"#
+            }
+            return performL1WebFetch(url: url)
+        default:
+            return #"{"ok":false,"error":"unknown_tool"}"#
+        }
+    }
+    let l1CuriosityCollector = L1CuriosityCollector { state, message in
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "l1_curiosity",
+            state: state,
+            message: message
+        ))
+    }
     do {
         let l1ThoughtStream = try L1PresenceThoughtStream(
             memoryContext: l1MemoryContext,
+            runtimeContext: {
+                let nowNS = monotonicNanoseconds()
+                let atlas = spatialAtlas.snapshot(at: nowNS)
+                let panorama = panoramaStatus.snapshot()
+                let expiresAt = Date().addingTimeInterval(60)
+                let visualOffers: [L1VisualResourceOffer]
+                if let panorama,
+                   FileManager.default.fileExists(atPath: panorama.imagePath) {
+                    visualOffers = [L1VisualResourceOffer(
+                        resourceID: "spherical_atlas_current",
+                        projection: .sphericalAtlas,
+                        description: "Current rolling equirectangular panorama of the reachable camera space.",
+                        expiresAt: expiresAt
+                    )]
+                } else {
+                    visualOffers = []
+                }
+                return L1SituationRuntimeContext(
+                    spatialContext: L1SpatialContext(
+                        panoramaAvailable: panorama != nil,
+                        panoramaRevision: panorama?.revision,
+                        reachableCoverageFraction: panorama?.reachableCoverageFraction ?? 0,
+                        reachableQualityCoverageFraction: panorama?.reachableQualityCoverageFraction ?? 0,
+                        placeRevisits: panorama?.placeRevisits ?? 0,
+                        activeSceneEntityCount: atlas.entities.count
+                    ),
+                    dailyWorldMemory: dailyWorldMemoryRelay.snapshot(),
+                    visualResourceOffers: visualOffers
+                )
+            },
+            socialAvailability: {
+                l1LiveConversationState.snapshot()
+            },
+            visualResourceResolver: { requestedIDs in
+                guard requestedIDs == ["spherical_atlas_current"],
+                      let panorama = panoramaStatus.snapshot(),
+                      FileManager.default.isReadableFile(atPath: panorama.imagePath),
+                      let attributes = try? FileManager.default.attributesOfItem(atPath: panorama.imagePath),
+                      let size = attributes[.size] as? NSNumber,
+                      size.intValue > 0,
+                      size.intValue <= 2 * 1_024 * 1_024 else {
+                    return []
+                }
+                return [L1VisualResource(
+                    resourceID: "spherical_atlas_current",
+                    projection: .sphericalAtlas,
+                    localPath: panorama.imagePath,
+                    expiresAt: Date().addingTimeInterval(60)
+                )]
+            },
+            currentFrameProvider: {
+                let frameURL = options.outputURL
+                    .deletingLastPathComponent()
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("live-frame.jpg")
+                guard FileManager.default.isReadableFile(atPath: frameURL.path),
+                      let attributes = try? FileManager.default.attributesOfItem(atPath: frameURL.path),
+                      let size = attributes[.size] as? NSNumber,
+                      size.intValue > 0,
+                      size.intValue <= 2 * 1_024 * 1_024 else {
+                    return nil
+                }
+                return L1VisualResource(
+                    resourceID: "current_frame",
+                    projection: .currentView,
+                    localPath: frameURL.path,
+                    expiresAt: Date().addingTimeInterval(5)
+                )
+            },
+            curiosityContextProvider: {
+                let summary = l1CuriosityCollector.contextSummary(limit: 4)
+                return summary.isEmpty ? nil : summary
+            },
             onHealth: { state, message in
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -7615,6 +8596,11 @@ private func run(_ options: Options) throws {
                     state: state,
                     message: message
                 ))
+                liveDiagnostics.recordL1Event(
+                    state: state,
+                    message: message,
+                    at: monotonicNanoseconds()
+                )
             },
             onFrame: { request, frame, presence, completedNS in
                 let action = frame.socialDecision?.action.rawValue ?? "no_social_action"
@@ -7625,8 +8611,23 @@ private func run(_ options: Options) throws {
                     state: "frame",
                     message: "cycle=\(request.cycleID.uuidString.lowercased()); action=\(action); uncertainty=\(String(format: "%.2f", frame.uncertainty))"
                 ))
+                liveDiagnostics.recordL1Event(
+                    state: "frame",
+                    message: l1ThoughtStreamMessage(for: frame, action: action),
+                    at: completedNS
+                )
                 guard let opportunity = request.socialOpportunity,
                       let decision = frame.socialDecision else { return }
+                guard !l1LiveConversationState.snapshot().conversationActive else {
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: completedNS,
+                        source: "l1_situation",
+                        state: "decision_suppressed",
+                        message: "live_conversation_active"
+                    ))
+                    return
+                }
                 do {
                     try L1SocialDecisionValidator().validate(
                         decision,
@@ -7655,7 +8656,8 @@ private func run(_ options: Options) throws {
                     ))
                     return
                 }
-                if decision.action == .spokenOpening {
+                if decision.action == .spokenOpening,
+                   somaEnvBool("SOMA_L2_PROACTIVE_OPENINGS", default: true) {
                     guard let opening = L1PurposefulOpeningGate.resolve(
                         decision: decision,
                         informationNeeds: request.informationNeeds
@@ -7699,6 +8701,13 @@ private func run(_ options: Options) throws {
                         at: completedNS
                     )
                     conversationContact.issueSocialPulse(at: completedNS)
+                    Task {
+                        await l1MemoryContext.recordSocialContact(
+                            .proactiveOpening,
+                            with: decision.entityID,
+                            purpose: opening.objective
+                        )
+                    }
                 }
                 let requestID = "l1-social-\(decision.opportunityID.uuidString.lowercased())"
                 // A greeting is a short physical overlay, not a long-lived
@@ -7711,19 +8720,62 @@ private func run(_ options: Options) throws {
                     expression: .greeting,
                     expiresAtNS: expiration
                 ))
-                if decision.action == .spokenOpening {
-                    l1ThoughtRelay.recordInteraction(with: decision.entityID, at: completedNS)
-                } else {
-                    // Repeated gestures are suppressed without silencing a
-                    // later L1 decision to open a purposeful conversation.
+                if decision.action != .spokenOpening {
+                    // The durable event becomes L1 context for later social
+                    // judgment; L0 does not impose a relationship cooldown.
                     l1ThoughtRelay.recordNonverbalInvitation(
                         with: decision.entityID,
                         at: completedNS
                     )
                 }
+            },
+            behaviorContextProvider: { [weak attentionGimbalBridge] in
+                attentionGimbalBridge?.makeBehaviorContext(at: monotonicNanoseconds())
+            },
+            personPresentProvider: { [weak attentionGimbalBridge] in
+                guard let ctx = attentionGimbalBridge?.makeBehaviorContext(at: monotonicNanoseconds()) else {
+                    return false
+                }
+                return ctx.isFaceTarget || ctx.recognizedIdentity != nil
+            },
+            onBehaviorDirective: { [weak attentionGimbalBridge] directive, atNS in
+                switch directive.action {
+                case .resumeScanning, .seekPeople:
+                    attentionGimbalBridge?.resumeCoverageScan()
+                case .acknowledgePerson:
+                    attentionGimbalBridge?.acknowledgePersonIfEligible(at: atNS)
+                case .keepObserving, .none:
+                    break
+                }
+            },
+            onBehaviorThought: { frame, atNS in
+                var parts: [String] = ["mode=behavior_awareness"]
+                if !frame.summary.isEmpty {
+                    parts.append(frame.summary)
+                }
+                if let stream = frame.thoughtState?.streamOfConsciousness, !stream.isEmpty {
+                    parts.append("stream: \(stream)")
+                }
+                if let hypothesis = frame.thoughtState?.workingHypothesis, !hypothesis.isEmpty {
+                    parts.append("hypothesis: \(hypothesis)")
+                }
+                if let directive = frame.behaviorDirective {
+                    parts.append("directive: \(directive.action.rawValue)")
+                }
+                liveDiagnostics.recordL1Event(
+                    state: "thought",
+                    message: parts.joined(separator: " · "),
+                    at: atNS
+                )
+            },
+            toolDefinitions: l1ToolDefinitions,
+            toolExecutor: l1ToolExecutor,
+            onCuriosityNeeds: { needs in
+                l1CuriosityCollector.registerTopics(from: needs)
             }
         )
         l1ThoughtRelay.install(l1ThoughtStream)
+        l1CuriosityCollector.start()
     } catch {
         writer.write(RuntimeEvent(
             event: "source.health",
@@ -7968,6 +9020,7 @@ private func run(_ options: Options) throws {
             conversationContact.observe(candidates, at: monotonicNS)
             embodimentSceneBridge?.submit(candidates, at: monotonicNS)
             attentionGimbalBridge?.ingestSceneCandidates(candidates, at: monotonicNS)
+            liveDiagnostics.recordSceneCandidates(candidates, at: monotonicNS)
         },
         onCoverage: { pose, horizontalFieldOfViewDegrees, poseProjection, cameraProjectionModel, monotonicNS in
             attentionGimbalBridge?.ingestCoverage(
@@ -7980,10 +9033,29 @@ private func run(_ options: Options) throws {
         },
         onCameraFrame: { pixelBuffer, captureNS in
             liveCameraFrameRelay?.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
+            liveDiagnostics.recordCameraFrame(pixelBuffer, at: captureNS)
         },
-        onIdentityDecision: { decision, _, isPrimaryFace, monotonicNS in
+        onIdentityDecision: { decision, faceRect, isPrimaryFace, monotonicNS in
             presentIdentityRoster.record(decision, at: monotonicNS)
+            liveDiagnostics.recordIdentity(
+                rect: faceRect,
+                label: identityDiagnosticLabel(for: decision, administrator: controlSettings.administrator),
+                at: monotonicNS
+            )
             guard isPrimaryFace else { return }
+            latestPrimaryIdentity.update(
+                state: decision.state,
+                subject: decision.opaqueSubject,
+                label: identityDiagnosticLabel(for: decision, administrator: controlSettings.administrator),
+                confidence: decision.confidence,
+                observedNS: monotonicNS
+            )
+            writeIdentityState(
+                state: decision.state,
+                subject: decision.opaqueSubject,
+                confidence: decision.confidence,
+                to: identityStateURL
+            )
             for update in identityPresence.observe(decision, at: monotonicNS) {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .departed(identity) = update.transition {
@@ -7999,11 +9071,19 @@ private func run(_ options: Options) throws {
                     ))
                 }
                 if let l1Decision = update.l1Decision {
-                    l1ThoughtRelay.observe(l1Decision, at: monotonicNS)
+                    l1ThoughtRelay.observe(
+                        l1Decision,
+                        label: identityDiagnosticLabel(for: decision, administrator: controlSettings.administrator),
+                        at: monotonicNS
+                    )
                 }
             }
         },
         onIdentityPresenceEvidence: { verifiedFacePresent, monotonicNS in
+            if !verifiedFacePresent {
+                latestPrimaryIdentity.clear()
+                clearIdentityState(at: identityStateURL)
+            }
             for update in identityPresence.observeVerifiedFace(verifiedFacePresent, at: monotonicNS) {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .departed(identity) = update.transition {
@@ -8013,7 +9093,8 @@ private func run(_ options: Options) throws {
         },
         onFatalVisionFailure: {
             complete.signal()
-        }
+        },
+        anonymousReviewProvider: { anonymousReviewBox.approve() }
     )
     let eventImportanceModel = EventImportanceModel()
     let speechInteraction: LocalSpeechInteractionCoordinator?
@@ -8315,6 +9396,17 @@ private func run(_ options: Options) throws {
             nextTDOAPhaseIndex += 1
         }
         writer.write(counters.snapshot(at: now))
+        // Re-emit the current primary-face identity so it never scrolls out of
+        // the menu bar's short trace-tail read window while the face is present.
+        if let identity = latestPrimaryIdentity.snapshot() {
+            writer.write(FaceIdentityEvent(
+                monotonicNS: identity.observedNS,
+                state: identity.state,
+                subject: identity.subject,
+                confidence: identity.confidence,
+                inferenceMS: 0
+            ))
+        }
         publisher.publish(worldModel.snapshot(at: now), reason: "periodic")
         if options.duration > 0, elapsed >= options.duration {
             if options.guidedScenario {
@@ -8342,6 +9434,9 @@ private func run(_ options: Options) throws {
     audioAnalyzer.stop()
     l1AuxiliarySemanticBridge?.stop()
     observer.stop()
+    // Finalize a live conversation while the runtime writer and L1 relay are
+    // still available; the later defer remains the error-path backstop.
+    liveVoiceLauncher?.stop()
     let stoppedNS = monotonicNanoseconds()
     if let calibrationRecorder, let calibrationOutputURL = options.tdoaCalibrationOutputURL {
         let diagnosticSummary = calibrationRecorder.summary()

@@ -560,7 +560,12 @@ public struct SpatialCoverageField: Sendable {
             } ?? 0
             let effectiveFailures = Double(cell.unproductiveVisits) * exp(-failureAgeSeconds / 300)
             let failurePenalty = exp(-0.7 * effectiveFailures)
-            let elevationComfort = exp(-abs(cell.bearing.elevationDegrees) / 75)
+            // Prefer a natural eye-level scan. With a weak divisor the
+            // exploration regularly dives to a low cell and sweeps nose-down,
+            // which reads as "tucking the head and turning". A stronger
+            // horizontal preference keeps the sweep near eye level while still
+            // allowing gentle up/down coverage.
+            let elevationComfort = exp(-abs(cell.bearing.elevationDegrees) / 20)
             let boundaryClearance = min(route.panClearanceDegrees / 20, route.pitchClearanceDegrees / 12)
             let boundaryComfort = 0.55 + 0.45 * min(max(boundaryClearance, 0), 1)
             return pow(

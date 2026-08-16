@@ -255,33 +255,6 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
     }
 }
 
-public enum SOMALEDHardwareCommand: Equatable, Sendable {
-    case specialPattern(enabled: Bool)
-    case clear(stateID: Int)
-    case set(stateID: Int)
-}
-
-/// Produces an atomic rendering transition. The special-pattern gate must be
-/// selected with the state ID because it changes the Tiny's visible palette.
-public enum SOMALEDHardwareTransition {
-    public static func commands(
-        previous: SOMALEDDeviceRendering?,
-        next: SOMALEDDeviceRendering,
-        forceReassertion: Bool = false
-    ) -> [SOMALEDHardwareCommand] {
-        var commands: [SOMALEDHardwareCommand] = []
-        if forceReassertion || previous?.specialPatternEnabled != next.specialPatternEnabled {
-            commands.append(.specialPattern(enabled: next.specialPatternEnabled))
-        }
-        guard forceReassertion || previous?.stateID != next.stateID else { return commands }
-        if let previous {
-            commands.append(.clear(stateID: previous.stateID))
-        }
-        commands.append(.set(stateID: next.stateID))
-        return commands
-    }
-}
-
 public struct SOMALEDSettings: Codable, Equatable, Sendable {
     public var responseMode: SOMALEDResponseMode
     /// OBSBOT exposes four discrete brightness levels, 0 through 3.

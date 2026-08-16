@@ -37,6 +37,12 @@ spatial coverage, and final motor veto close to the device.
 **L1 · Situation stream** turns bounded evidence and permitted memory into
 context, curiosity, and goal-level attention—never SDK velocity.
 
+L1 is time-aware: a public-world brief may be collected through an ephemeral
+Codex App Server session **once per local calendar day**, then kept as encrypted
+daily memory. It never receives person identity, camera media, or conversation
+content during that collection; relevance to a person is judged locally from
+their permitted memory and interests.
+
 **L2 · Interaction** owns account-backed live conversation and user-requested
 work, while using the same leased embodiment boundary as L1.
 

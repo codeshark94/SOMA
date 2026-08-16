@@ -652,9 +652,14 @@ public struct SceneField: Sendable {
                     // provisional lock. Requiring person corroboration here
                     // made the downstream lock unreachable for real faces.
             ))
+        // A verified face is a real person's face (the verifier rules out
+        // static face-shaped objects), so it is motor-eligible even while the
+        // person is still — the motion-based activity lease is only needed to
+        // reject unverified face-shaped distractors. Otherwise a person sitting
+        // still in front of the camera would never stop the coverage scan.
         let faceActivityEligible = isFace
             && actionEligible
-            && (!requiresFaceActivity || hasFreshFaceActivity(track, at: monotonicNS))
+            && (!requiresFaceActivity || track.faceVerified || hasFreshFaceActivity(track, at: monotonicNS))
         let faceVerificationEligible = isFace
             && actionEligible
             && track.faceVerified

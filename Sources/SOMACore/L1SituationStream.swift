@@ -11,12 +11,14 @@ public struct L1ModelConfiguration: Codable, Equatable, Sendable {
     public let consolidationDeadlineMilliseconds: UInt64
 
     public init(
-        situationDeadlineMilliseconds: UInt64 = 8_000,
+        situationDeadlineMilliseconds: UInt64 = 20_000,
         consolidationDeadlineMilliseconds: UInt64 = 60_000
     ) {
         precondition(situationDeadlineMilliseconds > 0)
         precondition(consolidationDeadlineMilliseconds >= situationDeadlineMilliseconds)
-        self.model = "gemma4:31b-cloud"
+        let configuredModel = ProcessInfo.processInfo.environment["SOMA_L1_MODEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.model = (configuredModel?.isEmpty == false ? configuredModel : "gemma4:31b-cloud")!
         self.situationDeadlineMilliseconds = situationDeadlineMilliseconds
         self.consolidationDeadlineMilliseconds = consolidationDeadlineMilliseconds
     }
@@ -53,6 +55,152 @@ public struct L1VisualResource: Codable, Equatable, Sendable {
     }
 }
 
+/// A visual resource L1 may explicitly request for one follow-up inference.
+/// Offers carry no local path or pixel data; the owning runtime resolves an
+/// accepted request against its short-lived local resource registry.
+public struct L1VisualResourceOffer: Codable, Equatable, Sendable {
+    public let resourceID: String
+    public let projection: L1VisualProjection
+    public let description: String
+    public let expiresAt: Date
+
+    public init(
+        resourceID: String,
+        projection: L1VisualProjection,
+        description: String,
+        expiresAt: Date
+    ) {
+        self.resourceID = String(resourceID.prefix(256))
+        self.projection = projection
+        self.description = String(description.prefix(512))
+        self.expiresAt = expiresAt
+    }
+}
+
+/// Scalar spatial context that helps L1 reason about the current place and
+/// coverage without automatically disclosing a camera image or panorama.
+public struct L1SpatialContext: Codable, Equatable, Sendable {
+    public let panoramaAvailable: Bool
+    public let panoramaRevision: UInt64?
+    public let reachableCoverageFraction: Double
+    public let reachableQualityCoverageFraction: Double
+    public let placeRevisits: UInt64
+    public let activeSceneEntityCount: Int
+
+    public init(
+        panoramaAvailable: Bool,
+        panoramaRevision: UInt64? = nil,
+        reachableCoverageFraction: Double = 0,
+        reachableQualityCoverageFraction: Double = 0,
+        placeRevisits: UInt64 = 0,
+        activeSceneEntityCount: Int = 0
+    ) {
+        self.panoramaAvailable = panoramaAvailable
+        self.panoramaRevision = panoramaRevision
+        self.reachableCoverageFraction = Self.unit(reachableCoverageFraction)
+        self.reachableQualityCoverageFraction = Self.unit(reachableQualityCoverageFraction)
+        self.placeRevisits = placeRevisits
+        self.activeSceneEntityCount = min(max(activeSceneEntityCount, 0), 256)
+    }
+
+    private static func unit(_ value: Double) -> Double {
+        value.isFinite ? min(max(value, 0), 1) : 0
+    }
+}
+
+/// A compact public-world observation collected at most once for a local
+/// calendar day. It is intentionally independent of any person identity;
+/// L1 performs the local relevance judgment from a person's stored context.
+public struct L1DailyWorldTopic: Codable, Equatable, Sendable {
+    public let title: String
+    public let summary: String
+    public let sourceURL: String
+    public let tags: [String]
+
+    public init(title: String, summary: String, sourceURL: String, tags: [String]) {
+        self.title = Self.bounded(title.trimmingCharacters(in: .whitespacesAndNewlines), bytes: 120)
+        self.summary = Self.bounded(summary.trimmingCharacters(in: .whitespacesAndNewlines), bytes: 280)
+        self.sourceURL = Self.bounded(sourceURL.trimmingCharacters(in: .whitespacesAndNewlines), bytes: 384)
+        self.tags = Array(tags.prefix(4)).map {
+            Self.bounded($0.trimmingCharacters(in: .whitespacesAndNewlines), bytes: 32)
+        }.filter { !$0.isEmpty }
+    }
+
+    private static func bounded(_ value: String, bytes: Int) -> String {
+        var result = ""
+        result.reserveCapacity(min(value.count, bytes))
+        for character in value {
+            guard result.utf8.count + String(character).utf8.count <= bytes else { break }
+            result.append(character)
+        }
+        return result
+    }
+}
+
+public struct L1DailyWorldMemory: Codable, Equatable, Sendable {
+    public let localDay: String
+    public let collectedAt: Date
+    public let topics: [L1DailyWorldTopic]
+
+    public init(localDay: String, collectedAt: Date, topics: [L1DailyWorldTopic]) {
+        self.localDay = String(localDay.prefix(16))
+        self.collectedAt = collectedAt
+        self.topics = Array(topics.prefix(3)).filter {
+            !$0.title.isEmpty && !$0.summary.isEmpty && URL(string: $0.sourceURL)?.scheme == "https"
+        }
+    }
+}
+
+/// A compact, per-person social-event history. It deliberately records the
+/// shape and timing of contact, not transcript text or biometric data. Raw
+/// turns remain in the local encrypted conversation journal.
+public enum L1SocialContactKind: String, Codable, Equatable, Sendable {
+    case nonverbalInvitation = "nonverbal_invitation"
+    case proactiveOpening = "proactive_opening"
+    case conversationOpened = "conversation_opened"
+    case participantResponded = "participant_responded"
+    case conversationEnded = "conversation_ended"
+    case conversationEndedWithoutParticipantTurn = "conversation_ended_without_participant_turn"
+    case conversationInterrupted = "conversation_interrupted"
+}
+
+/// Local lifecycle state for one voice-contact episode. It deliberately
+/// records only observable turn and transport facts; interpreting intent or
+/// refusal remains an L1 memory-consolidation task.
+public struct L1ConversationContactEpisode: Equatable, Sendable {
+    public private(set) var participantResponded: Bool
+
+    public init(participantResponded: Bool = false) {
+        self.participantResponded = participantResponded
+    }
+
+    /// Returns true exactly once, for the first finalized participant turn.
+    @discardableResult
+    public mutating func observeFinalizedTurn(role: ConversationParticipantRole) -> Bool {
+        guard role == .user, !participantResponded else { return false }
+        participantResponded = true
+        return true
+    }
+
+    public func closureKind(interrupted: Bool) -> L1SocialContactKind {
+        if interrupted { return .conversationInterrupted }
+        return participantResponded ? .conversationEnded : .conversationEndedWithoutParticipantTurn
+    }
+}
+
+public struct L1SocialContactEvent: Codable, Equatable, Sendable {
+    public let kind: L1SocialContactKind
+    public let occurredAt: Date
+    public let purpose: String?
+
+    public init(kind: L1SocialContactKind, occurredAt: Date, purpose: String? = nil) {
+        self.kind = kind
+        self.occurredAt = occurredAt
+        let normalized = purpose?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.purpose = normalized.isEmpty ? nil : String(normalized.prefix(320))
+    }
+}
+
 public struct L1ConversationContext: Codable, Equatable, Sendable {
     public let turnRecordID: UUID
     public let role: ConversationParticipantRole
@@ -68,6 +216,7 @@ public struct L1ConversationContext: Codable, Equatable, Sendable {
 public enum L1InformationMotiveSource: String, Codable, Equatable, Sendable {
     case retainedMemoryGap = "retained_memory_gap"
     case initialSocialOrientation = "initial_social_orientation"
+    case interestDiscovery = "interest_discovery"
 }
 
 /// An information motive for a recognized person. The goal is not a script:
@@ -132,6 +281,10 @@ public struct L1ThoughtState: Codable, Equatable, Sendable {
     public let relationshipUncertainty: Double
     public let activeMotiveIDs: [UUID]
     public let workingHypothesis: String
+    /// A natural-language inner monologue — the stream of consciousness. This
+    /// is the associative, first-person thinking carried forward across cycles
+    /// so L1 reasons continuously like a human rather than as stateless snapshots.
+    public let streamOfConsciousness: String
 
     public init(
         socialAvailability: Double,
@@ -139,7 +292,8 @@ public struct L1ThoughtState: Codable, Equatable, Sendable {
         interruptionCost: Double,
         relationshipUncertainty: Double,
         activeMotiveIDs: [UUID],
-        workingHypothesis: String
+        workingHypothesis: String,
+        streamOfConsciousness: String = ""
     ) {
         self.socialAvailability = Self.unit(socialAvailability)
         self.curiosityPressure = Self.unit(curiosityPressure)
@@ -149,10 +303,74 @@ public struct L1ThoughtState: Codable, Equatable, Sendable {
         self.workingHypothesis = String(
             workingHypothesis.trimmingCharacters(in: .whitespacesAndNewlines).prefix(512)
         )
+        self.streamOfConsciousness = String(
+            streamOfConsciousness.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2_000)
+        )
     }
 
     private static func unit(_ value: Double) -> Double {
         value.isFinite ? min(max(value, 0), 1) : 0
+    }
+}
+
+/// Current L0 behavioral state fed to the periodic L1 situation-awareness pass.
+/// The social-opportunity gate never sees this, so L1 would otherwise be blind
+/// to low-level attention/scan behavior such as a prolonged fixation on a
+/// non-social target.
+public struct L1BehaviorContext: Codable, Equatable, Sendable {
+    public let attentionState: String
+    public let targetLabel: String?
+    public let targetConfidence: Double
+    public let isFaceTarget: Bool
+    public let fixationSeconds: Double
+    public let scanActive: Bool
+    public let idleSeconds: Double
+    public let recentStates: [String]
+    /// The currently recognized identity (e.g. the administrator's name) so the
+    /// behavior-awareness pass knows who it is looking at, not just that it is
+    /// looking at a face.
+    public let recognizedIdentity: String?
+
+    public init(
+        attentionState: String,
+        targetLabel: String?,
+        targetConfidence: Double,
+        isFaceTarget: Bool,
+        fixationSeconds: Double,
+        scanActive: Bool,
+        idleSeconds: Double,
+        recentStates: [String],
+        recognizedIdentity: String? = nil
+    ) {
+        self.attentionState = attentionState
+        self.targetLabel = targetLabel.map { String($0.prefix(96)) }
+        self.targetConfidence = targetConfidence.isFinite ? min(max(targetConfidence, 0), 1) : 0
+        self.isFaceTarget = isFaceTarget
+        self.fixationSeconds = fixationSeconds.isFinite ? max(fixationSeconds, 0) : 0
+        self.scanActive = scanActive
+        self.idleSeconds = idleSeconds.isFinite ? max(idleSeconds, 0) : 0
+        self.recentStates = Array(recentStates.prefix(16))
+        self.recognizedIdentity = recognizedIdentity.map { String($0.prefix(96)) }
+    }
+}
+
+/// A behavioral directive L1 issues from the periodic situation-awareness pass,
+/// independent of any social decision. L0 applies it to attention/scanning.
+public enum L1BehaviorAction: String, Codable, Equatable, Sendable {
+    case keepObserving = "keep_observing"
+    case resumeScanning = "resume_scanning"
+    case seekPeople = "seek_people"
+    case acknowledgePerson = "acknowledge_person"
+    case none
+}
+
+public struct L1BehaviorDirective: Codable, Equatable, Sendable {
+    public let action: L1BehaviorAction
+    public let rationale: String
+
+    public init(action: L1BehaviorAction, rationale: String) {
+        self.action = action
+        self.rationale = String(rationale.trimmingCharacters(in: .whitespacesAndNewlines).prefix(512))
     }
 }
 
@@ -167,9 +385,18 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
     public let rapport: L1RapportContext?
     public let preferredLanguageTag: String?
     public let priorThoughtState: L1ThoughtState?
+    public let priorFrame: L1PriorFrame?
     public let recentConversation: [L1ConversationContext]
+    public let contactHistory: [L1SocialContactEvent]
+    public let spatialContext: L1SpatialContext?
+    public let dailyWorldMemory: L1DailyWorldMemory?
+    public let visualResourceOffers: [L1VisualResourceOffer]
     public let visuals: [L1VisualResource]
     public let socialOpportunity: L1SocialOpportunity?
+    public let behaviorContext: L1BehaviorContext?
+    /// Collected web material on curiosity topics, surfaced so L1 can craft a
+    /// more grounded, topical conversation opener.
+    public let curiosityContext: String?
 
     public init(
         cycleID: UUID = UUID(),
@@ -182,9 +409,16 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         rapport: L1RapportContext? = nil,
         preferredLanguageTag: String? = nil,
         priorThoughtState: L1ThoughtState? = nil,
+        priorFrame: L1PriorFrame? = nil,
         recentConversation: [L1ConversationContext] = [],
+        contactHistory: [L1SocialContactEvent] = [],
+        spatialContext: L1SpatialContext? = nil,
+        dailyWorldMemory: L1DailyWorldMemory? = nil,
+        visualResourceOffers: [L1VisualResourceOffer] = [],
         visuals: [L1VisualResource] = [],
-        socialOpportunity: L1SocialOpportunity? = nil
+        socialOpportunity: L1SocialOpportunity? = nil,
+        behaviorContext: L1BehaviorContext? = nil,
+        curiosityContext: String? = nil
     ) {
         self.cycleID = cycleID
         self.observedAt = observedAt
@@ -196,9 +430,39 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         self.rapport = rapport
         self.preferredLanguageTag = preferredLanguageTag.map { String($0.prefix(35)) }
         self.priorThoughtState = priorThoughtState
+        self.priorFrame = priorFrame
         self.recentConversation = Array(recentConversation.prefix(128))
+        self.contactHistory = Array(contactHistory.sorted { $0.occurredAt > $1.occurredAt }.prefix(16))
+        self.spatialContext = spatialContext
+        self.dailyWorldMemory = dailyWorldMemory
+        self.visualResourceOffers = Array(visualResourceOffers.prefix(8))
         self.visuals = Array(visuals.prefix(8))
         self.socialOpportunity = socialOpportunity
+        self.behaviorContext = behaviorContext
+        self.curiosityContext = curiosityContext.map { String($0.prefix(2_000)) }
+    }
+
+    public func continuing(with visuals: [L1VisualResource]) -> Self {
+        Self(
+            cycleID: cycleID,
+            observedAt: observedAt,
+            evidenceIDs: evidenceIDs,
+            beliefSummary: beliefSummary,
+            presentEntityIDs: presentEntityIDs,
+            memory: memory,
+            informationNeeds: informationNeeds,
+            rapport: rapport,
+            preferredLanguageTag: preferredLanguageTag,
+            priorThoughtState: priorThoughtState,
+            recentConversation: recentConversation,
+            contactHistory: contactHistory,
+            spatialContext: spatialContext,
+            dailyWorldMemory: dailyWorldMemory,
+            visualResourceOffers: visualResourceOffers,
+            visuals: visuals,
+            socialOpportunity: socialOpportunity,
+            curiosityContext: curiosityContext
+        )
     }
 }
 
@@ -244,6 +508,7 @@ public struct L1SituationFrame: Codable, Equatable, Sendable {
     public let thoughtState: L1ThoughtState?
     public let memoryProposals: [L1MemoryProposal]
     public let requestedVisualResourceIDs: [String]
+    public let behaviorDirective: L1BehaviorDirective?
 
     public init(
         cycleID: UUID,
@@ -253,7 +518,8 @@ public struct L1SituationFrame: Codable, Equatable, Sendable {
         socialDecision: L1SocialDecision? = nil,
         thoughtState: L1ThoughtState? = nil,
         memoryProposals: [L1MemoryProposal] = [],
-        requestedVisualResourceIDs: [String] = []
+        requestedVisualResourceIDs: [String] = [],
+        behaviorDirective: L1BehaviorDirective? = nil
     ) {
         self.cycleID = cycleID
         self.summary = String(summary.prefix(8_192))
@@ -263,6 +529,7 @@ public struct L1SituationFrame: Codable, Equatable, Sendable {
         self.thoughtState = thoughtState
         self.memoryProposals = Array(memoryProposals.prefix(128))
         self.requestedVisualResourceIDs = Array(requestedVisualResourceIDs.prefix(8)).map { String($0.prefix(256)) }
+        self.behaviorDirective = behaviorDirective
     }
 }
 
@@ -270,6 +537,31 @@ public enum L1InferenceError: Error, Equatable, Sendable {
     case unavailable
     case deadlineExceeded
     case invalidResponse([String])
+}
+
+/// The decision output of the previous L1 cycle, carried forward so L1 can
+/// reason about its own prior conclusion (what it said, why, and how confident)
+/// rather than only its prior inner monologue.
+public struct L1PriorFrame: Codable, Equatable, Sendable {
+    public let summary: String
+    public let action: String?
+    public let rationale: String?
+    public let opening: String?
+    public let confidence: Double?
+
+    public init(
+        summary: String,
+        action: String? = nil,
+        rationale: String? = nil,
+        opening: String? = nil,
+        confidence: Double? = nil
+    ) {
+        self.summary = String(summary.prefix(2_048))
+        self.action = action.map { String($0.prefix(128)) }
+        self.rationale = rationale.map { String($0.prefix(1_024)) }
+        self.opening = opening.map { String($0.prefix(1_024)) }
+        self.confidence = confidence
+    }
 }
 
 public protocol L1SituationReasoning: Sendable {
@@ -334,6 +626,13 @@ public struct L1SituationFrameValidator: Sendable {
                 failures.append("thought state references an unavailable motive")
             }
         }
+        let offeredVisualIDs = Set(request.visualResourceOffers.map(\.resourceID))
+        if !Set(frame.requestedVisualResourceIDs).isSubset(of: offeredVisualIDs) {
+            failures.append("visual request references an unavailable resource")
+        }
+        if !request.visuals.isEmpty, !frame.requestedVisualResourceIDs.isEmpty {
+            failures.append("visual follow-up may not request another visual resource")
+        }
         if !failures.isEmpty { throw L1InferenceError.invalidResponse(failures) }
     }
 }
@@ -351,6 +650,8 @@ public enum L1SituationResponseDecoder {
         let rationale: String?
         let opening: Opening?
         let thoughtState: ThoughtState?
+        let requestedVisualResourceIDs: [String]?
+        let behaviorDirective: BehaviorDirective?
 
         enum CodingKeys: String, CodingKey {
             case summary
@@ -361,6 +662,18 @@ public enum L1SituationResponseDecoder {
             case rationale
             case opening
             case thoughtState = "thought_state"
+            case requestedVisualResourceIDs = "requested_visual_resource_ids"
+            case behaviorDirective = "behavior_directive"
+        }
+    }
+
+    private struct BehaviorDirective: Decodable {
+        let action: String?
+        let rationale: String?
+
+        enum CodingKeys: String, CodingKey {
+            case action
+            case rationale
         }
     }
 
@@ -371,6 +684,7 @@ public enum L1SituationResponseDecoder {
         let relationshipUncertainty: Double
         let activeMotiveIDs: [UUID]
         let workingHypothesis: String
+        let streamOfConsciousness: String?
 
         enum CodingKeys: String, CodingKey {
             case socialAvailability = "social_availability"
@@ -379,6 +693,7 @@ public enum L1SituationResponseDecoder {
             case relationshipUncertainty = "relationship_uncertainty"
             case activeMotiveIDs = "active_motive_ids"
             case workingHypothesis = "working_hypothesis"
+            case streamOfConsciousness = "stream_of_consciousness"
         }
     }
 
@@ -412,6 +727,7 @@ public enum L1SituationResponseDecoder {
                   !raw.workingHypothesis.isEmpty,
                   raw.workingHypothesis.utf8.count <= 512,
                   !raw.workingHypothesis.contains("\n"),
+                  (raw.streamOfConsciousness?.utf8.count ?? 0) <= 2_000,
                   Set(raw.activeMotiveIDs).isSubset(of: Set(request.informationNeeds.map(\.motiveID))) else {
                 throw L1InferenceError.invalidResponse(["invalid thought state"])
             }
@@ -421,13 +737,19 @@ public enum L1SituationResponseDecoder {
                 interruptionCost: raw.interruptionCost,
                 relationshipUncertainty: raw.relationshipUncertainty,
                 activeMotiveIDs: raw.activeMotiveIDs,
-                workingHypothesis: raw.workingHypothesis
+                workingHypothesis: raw.workingHypothesis,
+                streamOfConsciousness: raw.streamOfConsciousness ?? ""
             )
         } else {
             thoughtState = nil
         }
         let decision: L1SocialDecision?
-        if let action = payload.action {
+        if request.socialOpportunity == nil {
+            // Behavior-awareness pass: any social decision the model emits is
+            // irrelevant (we only consume behaviorDirective) and must not
+            // invalidate the frame.
+            decision = nil
+        } else if let action = payload.action {
             guard let opportunity = request.socialOpportunity,
                   let socialAction = L1SocialAction(rawValue: action),
                   let confidence = payload.confidence,
@@ -468,13 +790,27 @@ public enum L1SituationResponseDecoder {
             }
             decision = nil
         }
+        let behaviorDirective: L1BehaviorDirective?
+        if let raw = payload.behaviorDirective,
+           let actionRaw = raw.action,
+           let action = L1BehaviorAction(rawValue: actionRaw),
+           action != .none {
+            behaviorDirective = L1BehaviorDirective(
+                action: action,
+                rationale: raw.rationale ?? ""
+            )
+        } else {
+            behaviorDirective = nil
+        }
         let frame = L1SituationFrame(
             cycleID: request.cycleID,
             summary: payload.summary,
             uncertainty: payload.uncertainty,
             evidenceIDs: payload.evidenceIDs,
             socialDecision: decision,
-            thoughtState: thoughtState
+            thoughtState: thoughtState,
+            requestedVisualResourceIDs: payload.requestedVisualResourceIDs ?? [],
+            behaviorDirective: behaviorDirective
         )
         try L1SituationFrameValidator().validate(frame, for: request)
         return frame
