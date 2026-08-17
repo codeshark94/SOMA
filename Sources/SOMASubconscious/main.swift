@@ -3651,13 +3651,33 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     /// Enqueue a greeting for a person who has just been recognized/arrived.
     /// The bow is not fired here: it waits until SOMA is actually perceiving
-    /// that person, so a greeting is never aimed at an empty view.
+    /// that person, so a greeting is never aimed at an empty view. L1's
+    /// behavior cycle recommends `acknowledge_person` to fire it; a fallback
+    /// timer (SOMA_L0_ACK_FALLBACK_SECONDS, default 15, 0 disables) fires the
+    /// bow directly if L1 has not recommended it within the window, so an
+    /// arrival is always acknowledged visibly. Both paths drain the same
+    /// pending entry, so they can never double-fire.
     func enqueueAcknowledgment(for entityID: UUID, at monotonicNS: UInt64) {
         queue.async { [weak self] in
             guard let self else { return }
             let key = entityID.uuidString
             guard !self.deliveredAcknowledgmentEntityIDs.contains(key) else { return }
             self.pendingAcknowledgmentEntityIDs[key] = monotonicNS
+            let fallbackSeconds = somaEnvDouble("SOMA_L0_ACK_FALLBACK_SECONDS", default: 15)
+            guard fallbackSeconds > 0 else { return }
+            self.queue.asyncAfter(deadline: .now() + .seconds(Int(fallbackSeconds))) { [weak self] in
+                guard let self else { return }
+                guard let perceived = self.recognizedPersonEntityIDProvider?(),
+                      perceived.uuidString == key,
+                      self.pendingAcknowledgmentEntityIDs.removeValue(forKey: key) != nil else { return }
+                self.deliveredAcknowledgmentEntityIDs.insert(key)
+                let now = monotonicNanoseconds()
+                self.applyEmbodimentIntent(.express(
+                    requestID: "l1-ack-fallback-\(now)",
+                    expression: .acknowledge,
+                    expiresAtNS: now + 1_500_000_000
+                ))
+            }
         }
     }
 
@@ -5539,8 +5559,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         switch expression {
         case .acknowledge:
             // Positive pitch = down (pitchCommand == error with pitchSign -1 and
-            // pitchImageSign -1). A bow must lower the head, so use +5.
-            return [(pitch: 5, pan: 0), (pitch: 0, pan: 0)]
+            // pitchImageSign -1). A bow must lower the head, so use +8: large
+            // enough to be clearly visible as a greeting, small enough to keep
+            // the person in frame.
+            return [(pitch: 8, pan: 0), (pitch: 0, pan: 0)]
         case .nod:
             // Down, up, return.
             return [(pitch: 7, pan: 0), (pitch: -3, pan: 0), (pitch: 0, pan: 0)]

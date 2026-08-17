@@ -1078,14 +1078,20 @@ final class L1MemoryContextProvider: @unchecked Sendable {
 
     /// Puts the given open information needs into a cooldown window so they are
     /// not re-surfaced to L2 until the window passes. Called when the needs are
-    /// actually handed to L2 as a mission.
+    /// actually handed to L2 as a mission. The window is configurable via
+    /// `SOMA_L1_QUESTION_COOLDOWN_SECONDS` and defaults to 0 — no cooldown —
+    /// so open questions stay visible to L1/L2 until they are actually
+    /// answered, instead of vanishing for a day after one surface.
     func markInformationNeedsSurfaced(
         _ needs: [PersistedInformationNeed],
-        cooldown: TimeInterval = 24 * 60 * 60,
+        cooldown: TimeInterval? = nil,
         at date: Date = Date()
     ) async {
         guard let store else { return }
-        let until = date.addingTimeInterval(cooldown)
+        let effectiveCooldown = cooldown
+            ?? somaEnvDouble("SOMA_L1_QUESTION_COOLDOWN_SECONDS", default: 0)
+        guard effectiveCooldown > 0 else { return }
+        let until = date.addingTimeInterval(effectiveCooldown)
         for need in needs {
             do {
                 guard let previous = try await store.record(id: need.motiveID, at: date),
