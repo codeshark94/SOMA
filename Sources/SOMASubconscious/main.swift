@@ -241,6 +241,117 @@ func l1StorePersonFact(_ provider: L1MemoryContextProvider, for entityID: UUID, 
     return #"{"ok":false,"error":"store_unavailable"}"#
 }
 
+func l1StoreSpaceObject(
+    _ provider: L1MemoryContextProvider,
+    name: String,
+    category: String,
+    description: String,
+    spaceID: UUID
+) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<Bool>()
+    Task { [provider] in
+        let stored = await provider.storeSpaceObject(
+            name: name,
+            category: category,
+            description: description,
+            spaceID: spaceID
+        )
+        box.set(.success(stored))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(stored)? = box.get() {
+        return stored ? #"{"ok":true,"stored":true}"# : #"{"ok":false,"error":"store_unavailable"}"#
+    }
+    return #"{"ok":false,"error":"store_unavailable"}"#
+}
+
+func l1SetSpaceOwner(
+    _ provider: L1MemoryContextProvider,
+    for entityID: UUID,
+    spaceID: UUID
+) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<Bool>()
+    Task { [provider] in
+        let stored = await provider.setSpaceOwner(entityID, spaceID: spaceID)
+        box.set(.success(stored))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(stored)? = box.get() {
+        return stored ? #"{"ok":true,"owner_set":true}"# : #"{"ok":false,"error":"store_unavailable"}"#
+    }
+    return #"{"ok":false,"error":"store_unavailable"}"#
+}
+
+func l1SpaceStatus(_ provider: L1MemoryContextProvider, spaceID: UUID) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<String>()
+    Task { [provider] in
+        let owner = (await provider.spaceOwner(spaceID: spaceID))?.uuidString.lowercased() ?? ""
+        let pending = await provider.pendingSpaceObjectCount(spaceID: spaceID)
+        box.set(.success(#"{"ok":true,"space":"\#(spaceID.uuidString.lowercased())","owner":"\#(owner)","pending_space_objects":\#(pending)}"#))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(status)? = box.get() {
+        return status
+    }
+    return #"{"ok":false,"error":"unavailable"}"#
+}
+
+func l1GetInformationNeeds(_ provider: L1MemoryContextProvider, for entityID: UUID?) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<[PersistedInformationNeed]>()
+    Task { [provider] in
+        let needs: [PersistedInformationNeed]
+        if let entityID {
+            needs = await provider.pendingInformationNeeds(for: entityID)
+        } else {
+            needs = await provider.allPendingInformationNeeds()
+        }
+        box.set(.success(needs))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(needs)? = box.get() {
+        let payloads = needs.map { need -> [String: Any] in
+            [
+                "motive_id": need.motiveID.uuidString.lowercased(),
+                "question": need.question,
+                "target_entity_id": need.targetEntityID?.uuidString.lowercased() ?? "",
+                "expected_information_gain": need.expectedInformationGain,
+            ]
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: ["ok": true, "count": needs.count, "needs": payloads]),
+           let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+    }
+    return #"{"ok":false,"error":"unavailable"}"#
+}
+
+func l1ResolveInformationNeed(
+    _ provider: L1MemoryContextProvider,
+    motiveID: UUID,
+    acquiredFact: String?
+) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<Bool>()
+    Task { [provider] in
+        let ok = await provider.resolveInformationNeed(motiveID: motiveID, acquiredFact: acquiredFact)
+        box.set(.success(ok))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(ok)? = box.get() {
+        return ok ? #"{"ok":true,"resolved":true}"# : #"{"ok":false,"error":"not_open_or_unavailable"}"#
+    }
+    return #"{"ok":false,"error":"unavailable"}"#
+}
+
 func l1RecallEpisodes(_ provider: L1MemoryContextProvider, query: String, entityID: UUID?) -> String {
     let semaphore = DispatchSemaphore(value: 0)
     let box = SynchronousResultBox<String>()
@@ -427,6 +538,78 @@ func performL1ObjectIdentification(jpeg: Data) -> String {
             return
         }
         // Fall back to a text description wrapped as JSON.
+        let payloadOut = ["ok": true, "raw": String(clean.prefix(600)).replacingOccurrences(of: "\"", with: "'")]
+        let enc = (try? JSONSerialization.data(withJSONObject: payloadOut))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? #"{"ok":false}"#
+        box.set(.success(enc))
+    }.resume()
+    semaphore.wait()
+    if case let .success(value)? = box.get() { return value }
+    return #"{"ok":false}"#
+}
+
+/// Sends the given background JPEG to the local L1 Gemma model (via Ollama
+/// /api/chat) and asks it to classify the room/space it shows. Used by the
+/// space trigger to decide which space the robot is currently in. Returns a
+/// JSON string describing the room.
+func performL1SpaceClassification(jpeg: Data) -> String {
+    guard !jpeg.isEmpty else {
+        return #"{"ok":false,"error":"empty_image"}"#
+    }
+    let model = ProcessInfo.processInfo.environment["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud"
+    guard let url = URL(string: "\(somaOllamaHost())/api/chat") else {
+        return #"{"ok":false,"error":"bad_endpoint"}"#
+    }
+    let system = (
+        "You are SOMA L1's space-recognition helper. You are shown one camera frame of a room or space. "
+        + "Classify what kind of space this is (for example living room, study/office, bedroom, kitchen, "
+        + "garage, workshop, hallway, balcony). Be concrete about the general character of the room from "
+        + "the visible furniture, layout, and objects. Do not identify people, do not infer private traits, "
+        + "do not issue commands. "
+        + "Reply with exactly one JSON object with keys: label (short room type), description (2-3 sentences)."
+    )
+    let user = "Classify the kind of space shown in this image and return the JSON."
+    let messages: [[String: Any]] = [
+        ["role": "system", "content": system],
+        ["role": "user", "content": user, "images": [jpeg.base64EncodedString()]]
+    ]
+    let payload: [String: Any] = [
+        "model": model,
+        "messages": messages,
+        "stream": false,
+        "options": ["temperature": 0, "num_predict": 384]
+    ]
+    guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+        return #"{"ok":false,"error":"encode_failed"}"#
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = body
+    request.timeoutInterval = 40
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<String>()
+    URLSession.shared.dataTask(with: request) { data, _, error in
+        defer { semaphore.signal() }
+        guard error == nil, let data,
+              let decoded = try? JSONDecoder().decode(L1ObjectIdentificationResponse.self, from: data),
+              let content = decoded.message?.content else {
+            let raw = data.flatMap { String(data: $0, encoding: .utf8) } ?? "no_data"
+            box.set(.success(#"{"ok":false,"error":"ollama_failed","detail":"\#(String(raw.prefix(160)).replacingOccurrences(of: "\"", with: "'"))"}"#))
+            return
+        }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = trimmed
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.hasPrefix("{"), let data = clean.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            let enc = (try? JSONSerialization.data(withJSONObject: obj))
+                .flatMap { String(data: $0, encoding: .utf8) }
+            box.set(.success(enc ?? #"{"ok":false}"#))
+            return
+        }
         let payloadOut = ["ok": true, "raw": String(clean.prefix(600)).replacingOccurrences(of: "\"", with: "'")]
         let enc = (try? JSONSerialization.data(withJSONObject: payloadOut))
             .flatMap { String(data: $0, encoding: .utf8) } ?? #"{"ok":false}"#
@@ -8349,6 +8532,20 @@ private func run(_ options: Options) throws {
     let l1AuxiliaryBridgeBox = L1AuxiliaryBridgeBox()
     let poseStoreBox = PoseStoreBox()
     let memoryContextBox = MemoryContextBox()
+    let spaceCoordinator = SpaceCoordinator(
+        directoryURL: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/SOMA/memory", isDirectory: true),
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "l1.space_trigger",
+                monotonicNS: DispatchTime.now().uptimeNanoseconds,
+                source: "l1_space_trigger",
+                state: state,
+                message: message
+            ))
+        },
+        classifySpace: performL1SpaceClassification
+    )
     let objectKnowledgeStore = ObjectKnowledgeStore()
     let objectRecognitionQueue = ObjectRecognitionQueue(
         maxPending: 4,
@@ -8369,19 +8566,28 @@ private func run(_ options: Options) throws {
                 tiltDegrees: item.tiltDegrees,
                 atNS: atNS
             )
-            // Persist as a durable taste/preference fact tied to the person
-            // present (or the owner), so it accumulates into a long-lived
-            // profile rather than living only in the transient conversation
-            // inventory.
-            var factState = "nobody"
+            // Persist into a durable taste/preference profile. If a person was
+            // present and engaged with the object, attribute it to them
+            // directly; otherwise bind it to the home space, neutral until the
+            // space owner is learned (then promoted to the owner).
+            var factState = "space_bound"
             if let entityID = item.personEntityID {
                 if let provider = memoryContextBox.provider {
                     let fact = "The user has/collects \(name)\(category.isEmpty ? "" : " (\(category))"). Hobby/taste item worth remembering."
                     let stored = l1StorePersonFact(provider, for: entityID, fact: fact)
-                    factState = stored.contains("\"ok\":true") ? "stored" : "store_failed"
+                    factState = stored.contains("\"ok\":true") ? "person_stored" : "store_failed"
                 } else {
                     factState = "provider_unavailable"
                 }
+            } else if let provider = memoryContextBox.provider {
+                let stored = l1StoreSpaceObject(
+                    provider,
+                    name: name,
+                    category: category,
+                    description: description,
+                    spaceID: spaceCoordinator.currentSpaceID
+                )
+                factState = stored.contains("\"ok\":true") ? "space_bound" : "store_failed"
             }
             writer.write(RuntimeEvent(
                 event: "l1.object_recognition",
@@ -8445,6 +8651,13 @@ private func run(_ options: Options) throws {
                     || cue.attentionHint == .object
                 let emptyExploration = cue.socialPresence < 0.3
                     && cue.situation != .socialBid
+                // Feed stable empty-room background to the space trigger so it
+                // can accumulate evidence and, once enough accumulates, ask L1
+                // to classify the current room and detect space transitions.
+                if emptyExploration,
+                   let backgroundJPEG = l1AuxiliaryBridgeBox.bridge?.latestFrameJPEG() {
+                    spaceCoordinator.observeBackground(jpeg: backgroundJPEG, at: Date())
+                }
                 let worthTalkingAbout = cue.conversationValue
                     >= somaEnvDouble("SOMA_OBJECT_CONVERSATION_THRESHOLD", default: 0.55)
                 if (presentedObject || emptyExploration), worthTalkingAbout,
@@ -8459,12 +8672,11 @@ private func run(_ options: Options) throws {
                     )
                     let posePan: Double? = seenPose.flatMap { $0.panDegrees.isFinite ? $0.panDegrees : nil }
                     let poseTilt: Double? = seenPose.flatMap { $0.pitchDegrees.isFinite ? $0.pitchDegrees : nil }
-                    // Attribute to the present person, falling back to the
-                    // enrolled owner (administrator) for objects seen while no
-                    // one is engaged — a personal home robot treats items in its
-                    // own environment as the owner's by default.
+                    // Attribute to the actually-present person only. If no one
+                    // is engaged (empty-exploration object), personEntityID is
+                    // nil and the object is bound to the home space instead of
+                    // being attributed to a person prematurely.
                     let personEntityID = identityPresence.recognizedPersonEntityID()
-                        ?? controlSettings.administrator?.entityID
                     objectRecognitionQueue.enqueue(ObjectRecognitionQueue.Item(
                         jpeg: jpeg,
                         panDegrees: posePan,
@@ -9071,6 +9283,22 @@ private func run(_ options: Options) throws {
             "entity_id": .init(type: "string", description: "Optional person entity ID to scope the recall"),
             "reason": .init(type: "string", description: "Why you are recalling past episodes")
         ], required: ["query", "reason"]))),
+        .init(function: .init(name: "set_space_owner", description: "Declare that the person identified by entity_id is the owner of the current home space. Call when you learn (from conversation or context) who owns this place. This promotes all recognized objects that are currently bound to the home space into that person's durable taste profile.", parameters: .init(properties: [
+            "entity_id": .init(type: "string", description: "The person's entity_id (from present_entity_ids) who owns this space"),
+            "reason": .init(type: "string", description: "Why you are declaring this person as the space owner")
+        ], required: ["entity_id", "reason"]))),
+        .init(function: .init(name: "space_status", description: "Report whether the home space owner has been learned and how many recognized objects are still bound to the space awaiting owner promotion.", parameters: .init(properties: [
+            "reason": .init(type: "string", description: "Why you are checking the space status")
+        ], required: ["reason"]))),
+        .init(function: .init(name: "get_information_needs", description: "List the pending (unresolved) information the robot still wants to acquire — e.g. the person's preferred name or an enduring interest/hobby. Pass entity_id to scope to the current person, or omit to see all. Treat these as an acquisition mission in conversation.", parameters: .init(properties: [
+            "entity_id": .init(type: "string", description: "Optional person entity_id to scope the pending needs"),
+            "reason": .init(type: "string", description: "Why you are fetching pending information needs")
+        ], required: ["reason"]))),
+        .init(function: .init(name: "resolve_information_need", description: "Mark an information need as resolved once you acquire the information in conversation. Optionally supply the acquired fact to persist to the person's durable profile.", parameters: .init(properties: [
+            "motive_id": .init(type: "string", description: "The motive_id returned by get_information_needs"),
+            "acquired_fact": .init(type: "string", description: "Optional: the concrete fact you learned, e.g. their preferred name or a hobby"),
+            "reason": .init(type: "string", description: "Why you are resolving this information need")
+        ], required: ["motive_id", "reason"]))),
         .init(function: .init(name: "orient_camera", description: "Turn the camera to face a direction. Prefer behavior_directive unless you specifically need to look elsewhere now.", parameters: .init(properties: [
             "direction": .init(type: "string", description: "Compass direction or target to face"),
             "reason": .init(type: "string", description: "Why you are reorienting the camera")
@@ -9112,6 +9340,33 @@ private func run(_ options: Options) throws {
             }
             let entityID = (args["entity_id"] as? String).flatMap(UUID.init(uuidString:))
             return l1RecallEpisodes(l1MemoryContext, query: query, entityID: entityID)
+        case "set_space_owner":
+            guard let data = arguments.data(using: .utf8),
+                  let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let idString = args["entity_id"] as? String,
+                  let entityID = UUID(uuidString: idString) else {
+                return #"{"ok":false,"error":"missing or invalid entity_id"}"#
+            }
+            return l1SetSpaceOwner(l1MemoryContext, for: entityID, spaceID: spaceCoordinator.currentSpaceID)
+        case "space_status":
+            return l1SpaceStatus(l1MemoryContext, spaceID: spaceCoordinator.currentSpaceID)
+        case "get_information_needs":
+            let entityID = (arguments.data(using: .utf8).flatMap {
+                (try? JSONSerialization.jsonObject(with: $0) as? [String: Any])?["entity_id"] as? String
+            }).flatMap(UUID.init(uuidString:))
+            return l1GetInformationNeeds(l1MemoryContext, for: entityID)
+        case "resolve_information_need":
+            guard let data = arguments.data(using: .utf8),
+                  let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let idString = args["motive_id"] as? String,
+                  let motiveID = UUID(uuidString: idString) else {
+                return #"{"ok":false,"error":"missing or invalid motive_id"}"#
+            }
+            return l1ResolveInformationNeed(
+                l1MemoryContext,
+                motiveID: motiveID,
+                acquiredFact: args["acquired_fact"] as? String
+            )
         case "orient_camera":
             attentionGimbalBridge?.resumeCoverageScan(priority: .l2)
             return #"{"ok":true,"orient_requested":true}"#
@@ -9858,6 +10113,9 @@ private func run(_ options: Options) throws {
                     objectKnowledge: objectKnowledgeStore.recentSummaries(),
                     memorySummaries: recognizedPersonEntityID.map {
                         l1MemoryContext.cachedPersonMemorySummaries(for: $0)
+                    } ?? [],
+                    pendingInformationNeeds: recognizedPersonEntityID.map {
+                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).map(\.question)
                     } ?? []
                 )
                 liveVoiceLauncher?.startIfNeeded(
@@ -9888,6 +10146,9 @@ private func run(_ options: Options) throws {
                     objectKnowledge: objectKnowledgeStore.recentSummaries(),
                     memorySummaries: recognizedPersonEntityID.map {
                         l1MemoryContext.cachedPersonMemorySummaries(for: $0)
+                    } ?? [],
+                    pendingInformationNeeds: recognizedPersonEntityID.map {
+                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).map(\.question)
                     } ?? []
                 ) else { return }
                 let wake = openingAuthorization.flatMap {
@@ -10282,7 +10543,8 @@ private func speechInteractionContext(
     preferredLanguageTag: String? = nil,
     languageStartInstruction: String? = nil,
     objectKnowledge: [String] = [],
-    memorySummaries: [String] = []
+    memorySummaries: [String] = [],
+    pendingInformationNeeds: [String] = []
 ) -> CodexInteractionContext? {
     let targetSummary: String
     if let target = belief.target {
@@ -10293,6 +10555,8 @@ private func speechInteractionContext(
     let situationSummary = [targetSummary, visualSummary, objectKnowledge.isEmpty ? nil : "Objects the robot has identified recently: \(objectKnowledge.joined(separator: " | "))"]
         .compactMap { $0 }
         .joined(separator: " ")
+    let missionSummaries = pendingInformationNeeds.isEmpty ? nil :
+        "Acquisition mission — gently try to learn in conversation: \(pendingInformationNeeds.joined(separator: " | "))"
     return try? CodexInteractionContext(
         situationSummary: situationSummary,
         identityReference: identityReference,
@@ -10303,6 +10567,7 @@ private func speechInteractionContext(
         personMemoryMission: personMemoryMission,
         preferredLanguageTag: preferredLanguageTag,
         languageStartInstruction: languageStartInstruction,
+        activeTaskSummaries: missionSummaries.map { [$0] } ?? [],
         memorySummaries: memorySummaries,
         embodimentSummary: "Camera policy is \(belief.policy.rawValue); interaction readiness is \(String(format: "%.2f", belief.readyProbability))."
     )
@@ -10364,7 +10629,9 @@ private func l1ProactiveInteractionContext(
         preferredLanguageTag: request.preferredLanguageTag,
         languageStartInstruction: languageStartInstruction,
         rapportSummary: rapport,
-        activeTaskSummaries: [objective, completion] + (language.map { [$0] } ?? []) + (preferences.map { [$0] } ?? []),
+        activeTaskSummaries: [objective, completion] + (language.map { [$0] } ?? []) + (preferences.map { [$0] } ?? []) + (
+            request.informationNeeds.isEmpty ? [] : ["Acquisition mission — gently try to learn: \(request.informationNeeds.map(\.informationGoal).joined(separator: " | "))"]
+        ),
         memorySummaries: request.memory.map(\.summary) + request.recalledEpisodes,
         embodimentSummary: "L0 is maintaining visual attention while L2 leads the interaction. Do not issue camera-control instructions as part of ordinary conversation."
     )

@@ -212,6 +212,29 @@ private final class SynchronousWriteResult: @unchecked Sendable {
 /// Raw conversation, biometric identity material, and local-only records stay
 /// in the encrypted journal; only marked summaries, rapport, and information
 /// motives can become situation context.
+/// A durable, persisted information need (open question) that L2 can resolve
+/// as a mission. Mirrors L1InformationNeed but carries the memory record ID.
+public struct PersistedInformationNeed: Codable, Equatable, Sendable {
+    public let motiveID: UUID
+    public let question: String
+    public let targetEntityID: UUID?
+    public let expectedInformationGain: Double
+    public let createdAt: Date
+
+    public init(
+        motiveID: UUID,
+        question: String,
+        targetEntityID: UUID?,
+        expectedInformationGain: Double,
+        createdAt: Date
+    ) {
+        self.motiveID = motiveID
+        self.question = question
+        self.targetEntityID = targetEntityID
+        self.expectedInformationGain = expectedInformationGain
+        self.createdAt = createdAt
+    }
+}
 final class L1MemoryContextProvider: @unchecked Sendable {
     private struct ActiveConversation {
         let archiver: ConversationTranscriptArchiver
@@ -229,6 +252,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private var preferredLanguageByPersonID: [UUID: String] = [:]
     private var personContextByPersonID: [UUID: PersonContextSnapshot] = [:]
     private var personMemorySummariesByPersonID: [UUID: [String]] = [:]
+    private var personInfoNeedsByPersonID: [UUID: [PersistedInformationNeed]] = [:]
     private let conversationLock = NSLock()
     private var activeConversations: [String: ActiveConversation] = [:]
     /// Every durable consequence of a finalized Live turn joins this group.
@@ -358,10 +382,17 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 return value.personEntityID == entityID && value.key == "preferred_name"
             }
             if !hasPreferredName, needs.isEmpty {
+                let goal = "Learn the person's preferred name or form of address for future respectful interaction."
+                let motiveID = await ensureInformationNeed(
+                    question: goal,
+                    targetEntityID: entityID,
+                    expectedInformationGain: 0.95,
+                    sourceID: "l1_initial_social_orientation"
+                )
                 needs.append(L1InformationNeed(
-                    motiveID: UUID(),
+                    motiveID: motiveID ?? UUID(),
                     source: .initialSocialOrientation,
-                    informationGoal: "Learn the person's preferred name or form of address for future respectful interaction.",
+                    informationGoal: goal,
                     expectedInformationGain: 0.95
                 ))
             }
@@ -376,16 +407,25 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 return value.personEntityID == entityID && interestFactKeys.contains(value.key)
             }
             if !hasInterestProfile {
+                let goal = "When the situation naturally supports it, learn one enduring interest, hobby, or topic this person enjoys discussing."
+                let motiveID = await ensureInformationNeed(
+                    question: goal,
+                    targetEntityID: entityID,
+                    expectedInformationGain: 0.64,
+                    sourceID: "l1_interest_discovery"
+                )
                 needs.append(L1InformationNeed(
-                    motiveID: UUID(),
+                    motiveID: motiveID ?? UUID(),
                     source: .interestDiscovery,
-                    informationGoal: "When the situation naturally supports it, learn one enduring interest, hobby, or topic this person enjoys discussing.",
+                    informationGoal: goal,
                     expectedInformationGain: 0.64
                 ))
             }
             let personContext = try await store.personContext(for: entityID, at: now)
             cachePersonContext(personContext)
             cachePersonMemorySummaries(projections.map(\.summary), for: entityID)
+            let persistedNeeds = await pendingInformationNeeds(for: entityID, at: now)
+            cacheInformationNeeds(persistedNeeds, for: entityID)
             let recalled = await recallEpisodes(
                 entityID: entityID,
                 query: personContext.preferenceDirectives().joined(separator: " "),
@@ -737,6 +777,319 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             return true
         } catch {
             onHealth("person_fact_store_failed", String(error.localizedDescription.prefix(192)))
+            return false
+        }
+    }
+
+    /// A stable neutral entity representing the robot's home space. Recognized
+    /// objects seen while no person is engaged are bound here first; they are
+    /// promoted to a person's taste profile only once the space owner is learned
+    /// (via setSpaceOwner, typically from a conversation).
+    public static let homeSpaceEntityID = UUID(uuidString: "A0A0E5C4-3B8A-4C1D-9E6F-5B7D0A2E8C11")!
+
+    /// Binds a recognized object to a space without attributing it to any
+    /// person yet. Called when the object is seen during empty exploration.
+    @discardableResult
+    func storeSpaceObject(
+        name: String,
+        category: String,
+        description: String,
+        spaceID: UUID,
+        at date: Date = Date()
+    ) async -> Bool {
+        guard let store else { return false }
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedName.isEmpty else { return false }
+        do {
+            _ = try await store.insert(
+                CognitiveMemoryDraft(
+                    tier: .mediumTerm,
+                    summary: "Object in the space \(spaceID.uuidString.lowercased()): \(normalizedName)\(category.isEmpty ? "" : " (\(category))")",
+                    payload: .personFact(PersonFactMemory(
+                        personEntityID: spaceID,
+                        key: "space_object",
+                        value: "\(normalizedName)|\(category)|\(description)"
+                    )),
+                    confidence: 0.7,
+                    provenance: [
+                        MemoryProvenance(
+                            source: .l1Inference,
+                            sourceID: "l1_space_object",
+                            observedAt: date,
+                            evidenceIDs: ["space_object:\(spaceID.uuidString.lowercased())"],
+                            modelID: "gemma4:31b-cloud"
+                        )
+                    ],
+                    sensitivity: .personal,
+                    disclosure: .remoteSummaryAllowed,
+                    expiresAt: date.addingTimeInterval(store.maximumMediumTermLifetime)
+                ),
+                at: date
+            )
+            return true
+        } catch {
+            onHealth("space_object_store_failed", String(error.localizedDescription.prefix(192)))
+            return false
+        }
+    }
+
+    /// Records who owns a space and promotes every un-attributed space-bound
+    /// object to that owner's taste profile. Idempotent: space objects are
+    /// deleted as they are promoted, so a repeat call re-promotes only objects
+    /// added since.
+    @discardableResult
+    func setSpaceOwner(
+        _ ownerEntityID: UUID,
+        spaceID: UUID,
+        at date: Date = Date()
+    ) async -> Bool {
+        guard let store else { return false }
+        do {
+            let current = try await store.personContext(for: spaceID, at: date)
+            if current.facts["space_owner"] != ownerEntityID.uuidString.lowercased() {
+                _ = try await store.insert(
+                    CognitiveMemoryDraft(
+                        tier: .mediumTerm,
+                        summary: "Space \(spaceID.uuidString.lowercased()) owner is \(ownerEntityID.uuidString.lowercased())",
+                        payload: .personFact(PersonFactMemory(
+                            personEntityID: spaceID,
+                            key: "space_owner",
+                            value: ownerEntityID.uuidString.lowercased()
+                        )),
+                        confidence: 0.9,
+                        provenance: [
+                            MemoryProvenance(
+                                source: .l2Interaction,
+                                sourceID: "l2_space_owner",
+                                observedAt: date,
+                                evidenceIDs: ["space_owner:\(spaceID.uuidString.lowercased())"],
+                                modelID: "codex"
+                            )
+                        ],
+                        sensitivity: .personal,
+                        disclosure: .remoteSummaryAllowed,
+                        expiresAt: date.addingTimeInterval(store.maximumMediumTermLifetime)
+                    ),
+                    at: date
+                )
+            }
+            let records = try await store.query(
+                .init(relatedTo: [spaceID], limit: 200),
+                at: date
+            )
+            var promoted = 0
+            for record in records {
+                guard case let .personFact(fact) = record.payload,
+                      fact.personEntityID == spaceID,
+                      fact.key == "space_object" else { continue }
+                let parts = fact.value.split(separator: "|", maxSplits: 2).map(String.init)
+                guard let name = parts.first, !name.isEmpty else { continue }
+                let category = parts.count > 1 ? parts[1] : ""
+                let tasteFact = "The user has/collects \(name)\(category.isEmpty ? "" : " (\(category))"). Hobby/taste item worth remembering."
+                _ = try await store.insert(
+                    CognitiveMemoryDraft(
+                        tier: .mediumTerm,
+                        summary: tasteFact,
+                        payload: .personFact(PersonFactMemory(
+                            personEntityID: ownerEntityID,
+                            key: "observed_fact",
+                            value: tasteFact
+                        )),
+                        confidence: 0.8,
+                        provenance: [
+                            MemoryProvenance(
+                                source: .l1Inference,
+                                sourceID: "l1_space_object_promotion",
+                                observedAt: date,
+                                evidenceIDs: ["space_object:\(record.id.uuidString.lowercased())"],
+                                modelID: "gemma4:31b-cloud"
+                            )
+                        ],
+                        sensitivity: .personal,
+                        disclosure: .remoteSummaryAllowed,
+                        expiresAt: date.addingTimeInterval(store.maximumMediumTermLifetime)
+                    ),
+                    at: date
+                )
+                try await store.delete(id: record.id, reason: "promoted_to_space_owner", at: date)
+                promoted += 1
+            }
+            onHealth("space_owner_set", "owner=\(ownerEntityID.uuidString.lowercased()); space=\(spaceID.uuidString.lowercased()); promoted=\(promoted)")
+            return true
+        } catch {
+            onHealth("space_owner_set_failed", String(error.localizedDescription.prefix(192)))
+            return false
+        }
+    }
+
+    /// The current space owner entity ID, if one has been learned.
+    func spaceOwner(spaceID: UUID, at date: Date = Date()) async -> UUID? {
+        guard let store else { return nil }
+        let snapshot = try? await store.personContext(for: spaceID, at: date)
+        return snapshot?.facts["space_owner"].flatMap(UUID.init(uuidString:))
+    }
+
+    /// Number of recognized objects currently bound to a space and awaiting
+    /// owner promotion.
+    func pendingSpaceObjectCount(spaceID: UUID, at date: Date = Date()) async -> Int {
+        guard let store else { return 0 }
+        let records = (try? await store.query(.init(relatedTo: [spaceID], limit: 200), at: date)) ?? []
+        return records.filter {
+            guard case let .personFact(fact) = $0.payload else { return false }
+            return fact.personEntityID == spaceID && fact.key == "space_object"
+        }.count
+    }
+
+    // MARK: Durable information-need management
+    //
+    // Information the robot wants to acquire about a person or its environment
+    // is persisted as an open question so it survives restarts, can be handed
+    // to L2 as an actionable mission (via get/resolve_information_need MCP
+    // tools), and is tracked until resolved.
+
+    /// Ensures an open information need exists (deduped by target + question +
+    /// open status). Returns its motive ID (the memory record ID).
+    @discardableResult
+    func ensureInformationNeed(
+        question: String,
+        targetEntityID: UUID?,
+        expectedInformationGain: Double,
+        sourceID: String,
+        at date: Date = Date()
+    ) async -> UUID? {
+        guard let store else { return nil }
+        let normalized = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        do {
+            let query: CognitiveMemoryQuery = targetEntityID.map {
+                .init(relatedTo: [$0], limit: 200)
+            } ?? .init(limit: 200)
+            let records = try await store.query(query, at: date)
+            if let existing = records.first(where: { record in
+                guard case let .openQuestion(q) = record.payload else { return false }
+                return q.status == .open
+                    && q.targetEntityID == targetEntityID
+                    && q.question.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalized.lowercased()
+            }) {
+                return existing.id
+            }
+            let id = UUID()
+            _ = try await store.insert(
+                CognitiveMemoryDraft(
+                    tier: .mediumTerm,
+                    summary: "Open information need: \(normalized)",
+                    payload: .openQuestion(OpenQuestionMemory(
+                        question: normalized,
+                        targetEntityID: targetEntityID,
+                        expectedInformationGain: expectedInformationGain,
+                        status: .open
+                    )),
+                    confidence: 0.7,
+                    provenance: [
+                        MemoryProvenance(
+                            source: .l1Inference,
+                            sourceID: sourceID,
+                            observedAt: date,
+                            evidenceIDs: ["info_need:\(targetEntityID?.uuidString.lowercased() ?? "any")"],
+                            modelID: "gemma4:31b-cloud"
+                        )
+                    ],
+                    sensitivity: .personal,
+                    disclosure: .remoteSummaryAllowed,
+                    expiresAt: date.addingTimeInterval(store.maximumMediumTermLifetime)
+                ),
+                id: id,
+                at: date
+            )
+            return id
+        } catch {
+            onHealth("info_need_failed", String(error.localizedDescription.prefix(160)))
+            return nil
+        }
+    }
+
+    /// Pending (open) information needs scoped to a person, newest first.
+    func pendingInformationNeeds(
+        for entityID: UUID,
+        at date: Date = Date()
+    ) async -> [PersistedInformationNeed] {
+        guard let store else { return [] }
+        let records = (try? await store.query(
+            .init(relatedTo: [entityID], limit: 200),
+            at: date
+        )) ?? []
+        return records.compactMap { record -> PersistedInformationNeed? in
+            guard case let .openQuestion(q) = record.payload, q.status == .open else { return nil }
+            return PersistedInformationNeed(
+                motiveID: record.id,
+                question: q.question,
+                targetEntityID: q.targetEntityID,
+                expectedInformationGain: q.expectedInformationGain,
+                createdAt: record.updatedAt
+            )
+        }
+    }
+
+    /// Pending (open) information needs across all people, newest first.
+    func allPendingInformationNeeds(at date: Date = Date()) async -> [PersistedInformationNeed] {
+        guard let store else { return [] }
+        let records = (try? await store.query(.init(limit: 200), at: date)) ?? []
+        return records.compactMap { record -> PersistedInformationNeed? in
+            guard case let .openQuestion(q) = record.payload, q.status == .open else { return nil }
+            return PersistedInformationNeed(
+                motiveID: record.id,
+                question: q.question,
+                targetEntityID: q.targetEntityID,
+                expectedInformationGain: q.expectedInformationGain,
+                createdAt: record.updatedAt
+            )
+        }
+    }
+
+    /// Marks an open information need resolved and, when an acquired fact is
+    /// supplied, persists it to the target person's durable profile.
+    @discardableResult
+    func resolveInformationNeed(
+        motiveID: UUID,
+        acquiredFact: String? = nil,
+        at date: Date = Date()
+    ) async -> Bool {
+        guard let store else { return false }
+        do {
+            guard let previous = try await store.record(id: motiveID, at: date),
+                  case let .openQuestion(q) = previous.payload,
+                  q.status == .open else {
+                return false
+            }
+            _ = try await store.correct(
+                id: motiveID,
+                replacement: CognitiveMemoryDraft(
+                    tier: previous.tier,
+                    summary: "Resolved information need: \(q.question)",
+                    payload: .openQuestion(OpenQuestionMemory(
+                        question: q.question,
+                        targetEntityID: q.targetEntityID,
+                        expectedInformationGain: q.expectedInformationGain,
+                        status: .resolved
+                    )),
+                    confidence: previous.confidence,
+                    provenance: previous.provenance,
+                    sensitivity: previous.sensitivity,
+                    disclosure: previous.disclosure,
+                    expiresAt: previous.expiresAt
+                ),
+                reason: "information_need_resolved",
+                at: date
+            )
+            if let fact = acquiredFact?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !fact.isEmpty,
+               let targetEntityID = q.targetEntityID {
+                _ = await storePersonFact(fact, for: targetEntityID, at: date)
+            }
+            onHealth("info_need_resolved", "motive=\(motiveID.uuidString.lowercased())")
+            return true
+        } catch {
+            onHealth("info_need_resolve_failed", String(error.localizedDescription.prefix(160)))
             return false
         }
     }
@@ -1433,6 +1786,20 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         preferredLanguageLock.lock()
         personMemorySummariesByPersonID[personEntityID] = summaries
         preferredLanguageLock.unlock()
+    }
+
+    private func cacheInformationNeeds(_ needs: [PersistedInformationNeed], for personEntityID: UUID) {
+        preferredLanguageLock.lock()
+        personInfoNeedsByPersonID[personEntityID] = needs
+        preferredLanguageLock.unlock()
+    }
+
+    /// Pending information needs for a person, for handing L2 an actionable
+    /// acquisition mission in reactive speech context.
+    func cachedPendingInformationNeeds(for personEntityID: UUID) -> [PersistedInformationNeed] {
+        preferredLanguageLock.lock()
+        defer { preferredLanguageLock.unlock() }
+        return personInfoNeedsByPersonID[personEntityID] ?? []
     }
 
     private static func localDayKey(for date: Date) -> String {
