@@ -422,6 +422,16 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
     /// Semantically recalled past episodes (narrative summaries) relevant to
     /// the current situation, so L1 can reference shared history.
     public let recalledEpisodes: [String]
+    /// How old (seconds) the visual perception in this request is at the time
+    /// the request is submitted. Perception (frame capture + on-device
+    /// interpretation) happens before cloud reasoning, so L1 must know the gap
+    /// to avoid describing stale observations as happening "now".
+    public let perceptionAgeSeconds: Double
+    /// How long ago (seconds) L1's previous reasoning cycle ran. The
+    /// prior_thought_state and prior_frame are that old, not current; without
+    /// this L1 treats its own last description as "just now" even when the
+    /// cadence gap is minutes.
+    public let priorCycleAgeSeconds: Double
 
     public init(
         cycleID: UUID = UUID(),
@@ -446,7 +456,9 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         curiosityContext: String? = nil,
         personPreferences: String? = nil,
         spokenOpeningTendency: Double = 0.5,
-        recalledEpisodes: [String] = []
+        recalledEpisodes: [String] = [],
+        perceptionAgeSeconds: Double = 0,
+        priorCycleAgeSeconds: Double = 0
     ) {
         self.cycleID = cycleID
         self.observedAt = observedAt
@@ -471,6 +483,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         self.personPreferences = personPreferences.map { String($0.prefix(1_500)) }
         self.spokenOpeningTendency = min(max(spokenOpeningTendency, 0), 1)
         self.recalledEpisodes = Array(recalledEpisodes.prefix(8)).map { String($0.prefix(1_200)) }
+        self.perceptionAgeSeconds = max(perceptionAgeSeconds, 0)
+        self.priorCycleAgeSeconds = max(priorCycleAgeSeconds, 0)
     }
 
     public func continuing(with visuals: [L1VisualResource]) -> Self {
@@ -495,7 +509,9 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
             curiosityContext: curiosityContext,
             personPreferences: personPreferences,
             spokenOpeningTendency: spokenOpeningTendency,
-            recalledEpisodes: recalledEpisodes
+            recalledEpisodes: recalledEpisodes,
+            perceptionAgeSeconds: perceptionAgeSeconds,
+            priorCycleAgeSeconds: priorCycleAgeSeconds
         )
     }
 }

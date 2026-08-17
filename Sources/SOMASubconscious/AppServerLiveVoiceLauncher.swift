@@ -643,25 +643,42 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 final class LiveVisualContextRelay: @unchecked Sendable {
     private let lock = NSLock()
     private var latest: String?
+    private var latestRecordedNS: UInt64 = 0
     private var lastForwarded: String?
     private var sink: (@Sendable (String) -> Void)?
+
+    /// Formats the scene body with an honest age prefix. Perception (frame
+    /// capture + on-device interpretation) happens before the cloud reasoning
+    /// that consumes this context, so the age must be stated rather than
+    /// implying the scene is live.
+    private static func framed(_ body: String, ageSeconds: Double) -> String {
+        String(
+            String(
+                "Camera context from \(String(format: "%.0f", ageSeconds))s ago (L1 visual interpretation, not user speech): \(body)"
+            ).prefix(512)
+        )
+    }
 
     func record(_ cue: L1AuxiliarySemanticCue) {
         let socialPresence = String(format: "%.2f", cue.socialPresence)
         let confidence = String(format: "%.2f", cue.confidence)
-        let text = String(
-            "Current camera context (L1 visual interpretation, not user speech): "
-                + "\(cue.summary) Situation=\(cue.situation.rawValue); "
+        let body = String(
+            "\(cue.summary) Situation=\(cue.situation.rawValue); "
                 + "social_presence=\(socialPresence); confidence=\(confidence)."
         ).prefix(512)
-        let bounded = String(text)
+        let bounded = String(body)
+        let nowNS = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         latest = bounded
+        latestRecordedNS = nowNS
         let shouldForward = bounded != lastForwarded
         if shouldForward { lastForwarded = bounded }
         let activeSink = sink
         lock.unlock()
-        if shouldForward { activeSink?(bounded) }
+        if shouldForward {
+            let ageSeconds = max(0, Double(nowNS - cue.completedNS)) / 1_000_000_000
+            activeSink?(Self.framed(bounded, ageSeconds: ageSeconds))
+        }
     }
 
     func attach(to launcher: AppServerLiveVoiceLauncher) {
@@ -673,7 +690,9 @@ final class LiveVisualContextRelay: @unchecked Sendable {
     var latestSummary: String? {
         lock.lock()
         defer { lock.unlock() }
-        return latest
+        guard let latest else { return nil }
+        let ageSeconds = max(0, Double(DispatchTime.now().uptimeNanoseconds - latestRecordedNS)) / 1_000_000_000
+        return Self.framed(latest, ageSeconds: ageSeconds)
     }
 }
 
