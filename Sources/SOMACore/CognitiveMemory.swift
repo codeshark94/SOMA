@@ -425,19 +425,43 @@ public struct EpisodeMemory: Codable, Equatable, Sendable {
     public let participantEntityIDs: [UUID]
     public let spaceID: UUID?
     public let taskIDs: [UUID]
+    /// Natural-language "what happened" (who, what, outcome). Empty for legacy
+    /// records that predate narrative episodes.
+    public let narrative: String
+    /// Importance 0...1 used by consolidation and recall ranking.
+    public let salience: Double
 
     public init(
         startedAt: Date,
         endedAt: Date,
         participantEntityIDs: [UUID] = [],
         spaceID: UUID? = nil,
-        taskIDs: [UUID] = []
+        taskIDs: [UUID] = [],
+        narrative: String = "",
+        salience: Double = 0.5
     ) {
         self.startedAt = startedAt
         self.endedAt = endedAt
         self.participantEntityIDs = participantEntityIDs
         self.spaceID = spaceID
         self.taskIDs = taskIDs
+        self.narrative = narrative
+        self.salience = min(max(salience, 0), 1)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case startedAt, endedAt, participantEntityIDs, spaceID, taskIDs, narrative, salience
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        endedAt = try container.decode(Date.self, forKey: .endedAt)
+        participantEntityIDs = try container.decodeIfPresent([UUID].self, forKey: .participantEntityIDs) ?? []
+        spaceID = try container.decodeIfPresent(UUID.self, forKey: .spaceID)
+        taskIDs = try container.decodeIfPresent([UUID].self, forKey: .taskIDs) ?? []
+        narrative = try container.decodeIfPresent(String.self, forKey: .narrative) ?? ""
+        salience = min(max(try container.decodeIfPresent(Double.self, forKey: .salience) ?? 0.5, 0), 1)
     }
 }
 

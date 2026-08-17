@@ -188,6 +188,7 @@ struct L1MemoryContext: Sendable {
     let preferredLanguageTag: String?
     let contactHistory: [L1SocialContactEvent]
     let personPreferences: String
+    let recalledEpisodes: [String]
 }
 
 private final class SynchronousWriteResult: @unchecked Sendable {
@@ -232,6 +233,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     /// Shutdown drains it before committing the episode closure, preserving the
     /// event order L1 uses for social continuity.
     private let conversationWriteGroup = DispatchGroup()
+    private let embeddingClient = OllamaEmbeddingClient()
+    private let embeddingCache = EpisodicEmbeddingCache()
 
     init(
         onHealth: @escaping @Sendable (String, String) -> Void,
@@ -268,7 +271,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 proactiveContactPreference: .unknown,
                 preferredLanguageTag: nil,
                 contactHistory: [],
-                personPreferences: ""
+                personPreferences: "",
+                recalledEpisodes: []
             )
         }
         do {
@@ -377,6 +381,11 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             }
             let personContext = try await store.personContext(for: entityID, at: now)
             cachePersonContext(personContext)
+            let recalled = await recallEpisodes(
+                for: entityID,
+                query: personContext.preferenceDirectives().joined(separator: " "),
+                at: now
+            )
             return L1MemoryContext(
                 projections: projections,
                 informationNeeds: needs,
@@ -384,7 +393,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 proactiveContactPreference: relationship?.proactiveContact ?? .unknown,
                 preferredLanguageTag: personContext.preferredLanguageTag,
                 contactHistory: Array(contactHistory.prefix(16)),
-                personPreferences: personContext.preferenceDirectives().joined(separator: " ")
+                personPreferences: personContext.preferenceDirectives().joined(separator: " "),
+                recalledEpisodes: recalled
             )
         } catch {
             onHealth("memory_unavailable", String(error.localizedDescription.prefix(192)))
@@ -395,9 +405,78 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 proactiveContactPreference: .unknown,
                 preferredLanguageTag: nil,
                 contactHistory: [],
-                personPreferences: ""
+                personPreferences: "",
+                recalledEpisodes: []
             )
         }
+    }
+
+    /// Semantically recalls the most relevant past episodes for a person by
+    /// embedding the query and episode narratives and ranking by cosine
+    /// similarity blended with salience and recency. Falls back to recency-only
+    /// ranking when the embedding model is unavailable.
+    private func recallEpisodes(
+        for entityID: UUID,
+        query: String,
+        at date: Date
+    ) async -> [String] {
+        guard let store else { return [] }
+        do {
+            let episodes = try await store.query(
+                .init(kinds: [.episode], relatedTo: [entityID], limit: 200),
+                at: date
+            )
+            guard !episodes.isEmpty else { return [] }
+            let queryText = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "recent meaningful conversation with this person"
+                : "conversation with this person about \(query)"
+            guard let queryEmbedding = await embeddingClient.embed(queryText) else {
+                return episodes
+                    .sorted { $0.updatedAt > $1.updatedAt }
+                    .prefix(4)
+                    .compactMap { episodeNarrative($0) }
+            }
+            var scored: [(narrative: String, similarity: Float, salience: Double, updatedAt: Date)] = []
+            for episode in episodes {
+                guard let narrative = episodeNarrative(episode), !narrative.isEmpty else { continue }
+                let embedding: [Float]?
+                if let cached = embeddingCache.embedding(for: episode.id) {
+                    embedding = cached
+                } else if let fresh = await embeddingClient.embed(narrative) {
+                    embeddingCache.set(fresh, for: episode.id)
+                    embedding = fresh
+                } else {
+                    embedding = nil
+                }
+                guard let embedding, let sim = cosineSimilarity(queryEmbedding, embedding) else { continue }
+                scored.append((narrative, sim, episodeSalience(episode), episode.updatedAt))
+            }
+            let ranked = scored.sorted { lhs, rhs in
+                let l = Double(lhs.similarity) * 0.6 + lhs.salience * 0.3 + recencyScore(lhs.updatedAt, now: date) * 0.1
+                let r = Double(rhs.similarity) * 0.6 + rhs.salience * 0.3 + recencyScore(rhs.updatedAt, now: date) * 0.1
+                return l > r
+            }
+            return ranked.prefix(4).map(\.narrative)
+        } catch {
+            return []
+        }
+    }
+
+    private func episodeNarrative(_ record: CognitiveMemoryRecord) -> String? {
+        guard case let .episode(value) = record.payload else { return nil }
+        let narrative = value.narrative.trimmingCharacters(in: .whitespacesAndNewlines)
+        return narrative.isEmpty ? nil : narrative
+    }
+
+    private func episodeSalience(_ record: CognitiveMemoryRecord) -> Double {
+        guard case let .episode(value) = record.payload else { return 0.5 }
+        return min(max(value.salience, 0), 1)
+    }
+
+    private func recencyScore(_ date: Date, now: Date) -> Double {
+        let age = max(0, now.timeIntervalSince(date))
+        // 0 at 30+ days old, 1 at now, linear in between.
+        return max(0, min(1, 1 - age / (30 * 24 * 60 * 60)))
     }
 
     /// Stores a compact social-contact event independently of the current
@@ -447,6 +526,156 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         } catch {
             onHealth("social_contact_record_failed", String(error.localizedDescription.prefix(192)))
             return false
+        }
+    }
+
+    /// Records a durable narrative episode for a finished conversation. Gathers
+    /// the finalized turns, asks L1 to produce a short "what happened" summary
+    /// plus a salience score, and stores it as an `EpisodeMemory` so later
+    /// semantic recall can reference shared history.
+    @discardableResult
+    func recordEpisode(
+        personEntityID: UUID,
+        interactionID: UUID,
+        startedAt: Date,
+        endedAt: Date,
+        reason: String,
+        at date: Date = Date()
+    ) async -> Bool {
+        guard let store else { return false }
+        do {
+            let turns = try await store.query(
+                .init(kinds: [.conversationTurn], relatedTo: [interactionID], limit: 200),
+                at: date
+            )
+            let transcript = turns
+                .sorted { lhs, rhs in
+                    guard case let .conversationTurn(l) = lhs.payload,
+                          case let .conversationTurn(r) = rhs.payload else { return lhs.id.uuidString < rhs.id.uuidString }
+                    return l.turnSequence < r.turnSequence
+                }
+                .compactMap { record -> String? in
+                    guard case let .conversationTurn(turn) = record.payload else { return nil }
+                    let text = turn.rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return text.isEmpty ? nil : "\(turn.role.rawValue): \(text)"
+                }
+                .joined(separator: "\n")
+            let (narrative, salience) = await summarizeEpisode(
+                transcript: transcript,
+                reason: reason
+            )
+            let boundedNarrative = String(narrative.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1_200))
+            let summary = boundedNarrative.isEmpty
+                ? "Conversation with person \(personEntityID.uuidString.prefix(8))"
+                : boundedNarrative
+            _ = try await store.insert(
+                CognitiveMemoryDraft(
+                    tier: .mediumTerm,
+                    summary: String(summary.prefix(320)),
+                    payload: .episode(EpisodeMemory(
+                        startedAt: startedAt,
+                        endedAt: endedAt,
+                        participantEntityIDs: [personEntityID],
+                        narrative: boundedNarrative,
+                        salience: salience
+                    )),
+                    confidence: 0.8,
+                    provenance: [
+                        MemoryProvenance(
+                            source: .l1Inference,
+                            sourceID: "l1_episode",
+                            observedAt: date,
+                            evidenceIDs: ["episode:\(interactionID.uuidString.lowercased())"],
+                            modelID: "gemma4:31b-cloud"
+                        )
+                    ],
+                    sensitivity: .personal,
+                    disclosure: .localOnly,
+                    expiresAt: date.addingTimeInterval(90 * 24 * 60 * 60)
+                ),
+                at: date
+            )
+            onHealth("episode_recorded", "chars=\(boundedNarrative.count); salience=\(String(format: "%.2f", salience))")
+            return true
+        } catch {
+            onHealth("episode_record_failed", String(error.localizedDescription.prefix(192)))
+            return false
+        }
+    }
+
+    /// Asks L1 to condense a finished conversation into a short narrative and a
+    /// salience score. Returns an empty narrative on any failure so the caller
+    /// can still record a minimal episode.
+    private func summarizeEpisode(transcript: String, reason: String) async -> (narrative: String, salience: Double) {
+        let boundedTranscript = String(transcript.prefix(6_000))
+        guard !boundedTranscript.isEmpty else { return ("", 0.5) }
+        let prompt = """
+        You are SOMA's memory consolidator. Condense the following finished conversation into a short, neutral narrative of what happened (who, what, outcome) in 1-3 sentences. Do not include raw quotes or sensitive identifiers. Also rate its salience (importance for remembering) from 0.0 to 1.0.
+        Closure reason: \(reason.isEmpty ? "conversation ended" : reason)
+        Transcript:
+        \(boundedTranscript)
+        Return strict JSON only: {"narrative":"...","salience":0.7}
+        """
+        guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return ("", 0.5) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": ProcessInfo.processInfo.environment["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud",
+            "prompt": prompt,
+            "stream": false,
+            "format": "json",
+            "options": ["temperature": 0.2, "num_predict": 220],
+        ])
+        request.timeoutInterval = 20
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let outer = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let content = outer["response"] as? String,
+                  let contentData = content.data(using: .utf8),
+                  let parsed = try JSONSerialization.jsonObject(with: contentData) as? [String: Any] else {
+                return ("", 0.5)
+            }
+            let narrative = (parsed["narrative"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let salience = min(max((parsed["salience"] as? Double) ?? 0.5, 0), 1)
+            return (narrative, salience)
+        } catch {
+            return ("", 0.5)
+        }
+    }
+
+    /// Consolidates short-term episodes: promotes high-salience ones to
+    /// long-term so they survive, leaving low-value ones to expire. Runs on a
+    /// slow periodic timer to mimic human memory consolidation.
+    func consolidateEpisodes() async {
+        guard let store else { return }
+        do {
+            let now = Date()
+            let shortTerm = try await store.query(
+                .init(tiers: [.shortTerm], kinds: [.episode], limit: 200),
+                at: now
+            )
+            var promoted = 0
+            for record in shortTerm {
+                let salience = episodeSalience(record)
+                let recency = recencyScore(record.updatedAt, now: now)
+                let score = salience * 0.7 + recency * 0.3
+                guard score >= 0.6 else { continue }
+                _ = try? await store.promote(
+                    id: record.id,
+                    to: .longTerm,
+                    expiresAt: now.addingTimeInterval(365 * 24 * 60 * 60),
+                    provenance: record.provenance,
+                    reason: "consolidation_salience",
+                    at: now
+                )
+                promoted += 1
+            }
+            if promoted > 0 {
+                onHealth("memory_consolidated", "promoted=\(promoted)")
+            }
+        } catch {
+            onHealth("memory_consolidation_failed", String(error.localizedDescription.prefix(192)))
         }
     }
 
@@ -594,12 +823,23 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         let boundedReason = String(reason.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
         let kind = active?.socialEpisode.closureKind(interrupted: interrupted)
             ?? (interrupted ? .conversationInterrupted : .conversationEnded)
-        return await recordSocialContact(
+        let contactRecorded = await recordSocialContact(
             kind,
             with: participantID,
             purpose: boundedReason.isEmpty ? nil : boundedReason,
             at: date
         )
+        if let active {
+            await recordEpisode(
+                personEntityID: participantID,
+                interactionID: active.archiver.interactionID,
+                startedAt: active.startedAt,
+                endedAt: date,
+                reason: boundedReason,
+                at: date
+            )
+        }
+        return contactRecorded
     }
 
     /// The service's synchronous shutdown path must not abandon a recorded
@@ -1348,6 +1588,7 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
 
         If curiosity_context is non-empty, it contains fresh material that was gathered to help you hold a good conversation with the person present — recent, concrete things related to their interests, situation, or open questions. Treat it as conversation preparation, not your own idle curiosity. When the person is present and the moment fits (right rapport, low interruption cost, not a redundant greeting), use a specific, relevant detail from it as a natural spoken opening. Reference a concrete fact so it feels genuinely grounded, and never force it: if the detail is weak or the context is wrong, stay quiet. It never overrides rapport or interruption cost.
         If personPreferences is non-empty, it contains the person's explicitly stated, durable preferences (how to address them, speech register, ongoing requests). Honor them as binding rules in how you engage this person — for example the correct name/address form and whether to use formal or casual speech. They are not optional suggestions.
+        If recalledEpisodes is non-empty, it contains narrative summaries of past conversations with this person that are semantically relevant to the current moment. Use them as genuine shared history: reference a concrete past topic or outcome naturally when it fits the situation, and avoid repeating something already discussed. Never fabricate details beyond what the summaries state; treat them as memory, not as a script to force.
         spokenOpeningTendency (0...1) is a configured dial for how willing you are to open a spoken conversation despite the person appearing busy or focused. Near 1.0, be talkative: initiate a spoken opening when there is a genuine question tied to an information_need even if the person looks occupied. Near 0.0, stay conservative: do not interrupt someone who appears deeply focused. Weigh the value of the question against interruption cost, scaling with this value.
         packet:
         \(requestJSON)
@@ -1524,6 +1765,7 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private var stopped = false
     private var reassessTimer: DispatchSourceTimer?
     private var behaviorAwarenessTimer: DispatchSourceTimer?
+    private var consolidationTimer: DispatchSourceTimer?
     private let memoryContextRefreshNS: UInt64 = 60_000_000_000
     // Situation reasoning is gated by the social-opportunity scheduler, whose
     // opening delay (0.5-2.4s) only elapses if we keep re-polling it. A
@@ -1532,6 +1774,11 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private let reassessIntervalNS: UInt64 = 2_000_000_000
     private let presenceCurrentNS: UInt64 = 3_000_000_000
     private let deliberationIntervalNS: UInt64 = 45_000_000_000
+    /// How often short-term episodes are consolidated (promoted/pruned).
+    /// Configurable via SOMA_L1_CONSOLIDATION_SECONDS.
+    private var consolidationIntervalNS: UInt64 {
+        UInt64(somaEnvDouble("SOMA_L1_CONSOLIDATION_SECONDS", default: 600) * 1_000_000_000)
+    }
     /// The periodic L1 situation-awareness pass runs independently of any
     /// recognized person so L1 can notice and correct low-level fixations that
     /// the social gate never sees. 30s keeps it responsive on the local Ollama
@@ -1590,6 +1837,25 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         )
         startReassessmentTimer()
         startBehaviorAwarenessTimer()
+        startConsolidationTimer()
+    }
+
+    private func startConsolidationTimer() {
+        let seconds = Double(consolidationIntervalNS) / 1_000_000_000
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + seconds, repeating: seconds)
+        timer.setEventHandler { [weak self] in
+            self?.consolidateMemory()
+        }
+        timer.resume()
+        consolidationTimer = timer
+    }
+
+    private func consolidateMemory() {
+        guard !stopped else { return }
+        Task { [weak self] in
+            await self?.memoryContext.consolidateEpisodes()
+        }
     }
 
     private func startBehaviorAwarenessTimer() {
@@ -1857,7 +2123,8 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             socialOpportunity: opportunity,
             curiosityContext: curiosityContextProvider(),
             personPreferences: context.personPreferences,
-            spokenOpeningTendency: min(max(somaEnvDouble("SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.5), 0), 1)
+            spokenOpeningTendency: min(max(somaEnvDouble("SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.5), 0), 1),
+            recalledEpisodes: context.recalledEpisodes
         )
         onHealth(
             "wake",

@@ -413,6 +413,9 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
     /// How readily L1 opens a spoken conversation despite the person appearing
     /// busy/focused. 0 = conservative, 1 = talkative.
     public let spokenOpeningTendency: Double
+    /// Semantically recalled past episodes (narrative summaries) relevant to
+    /// the current situation, so L1 can reference shared history.
+    public let recalledEpisodes: [String]
 
     public init(
         cycleID: UUID = UUID(),
@@ -436,7 +439,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         behaviorContext: L1BehaviorContext? = nil,
         curiosityContext: String? = nil,
         personPreferences: String? = nil,
-        spokenOpeningTendency: Double = 0.5
+        spokenOpeningTendency: Double = 0.5,
+        recalledEpisodes: [String] = []
     ) {
         self.cycleID = cycleID
         self.observedAt = observedAt
@@ -460,6 +464,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         self.curiosityContext = curiosityContext.map { String($0.prefix(2_000)) }
         self.personPreferences = personPreferences.map { String($0.prefix(1_500)) }
         self.spokenOpeningTendency = min(max(spokenOpeningTendency, 0), 1)
+        self.recalledEpisodes = Array(recalledEpisodes.prefix(8)).map { String($0.prefix(1_200)) }
     }
 
     public func continuing(with visuals: [L1VisualResource]) -> Self {
@@ -483,7 +488,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
             socialOpportunity: socialOpportunity,
             curiosityContext: curiosityContext,
             personPreferences: personPreferences,
-            spokenOpeningTendency: spokenOpeningTendency
+            spokenOpeningTendency: spokenOpeningTendency,
+            recalledEpisodes: recalledEpisodes
         )
     }
 }
