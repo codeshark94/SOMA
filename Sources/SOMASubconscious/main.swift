@@ -3788,12 +3788,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 // Bounded recovery: a verified face lock may hold through a
                 // short detector gap, but must not pin the gimbal indefinitely
                 // when the person has actually left. After the window, release
-                // the lock and resume scanning.
+                // the lock and resume scanning. The release is sticky: without
+                // the post-release cooldown a phantom face (verified identity
+                // bound to a static object) re-latches within a second and the
+                // robot oscillates fixation/retention forever.
                 if socialRetentionDeadlineNS == nil {
                     socialRetentionDeadlineNS = now + socialRetentionWindowNS
                 } else if now >= socialRetentionDeadlineNS! {
                     socialRetentionDeadlineNS = nil
                     faceLock.invalidate()
+                    faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
                     lastMotorTarget = nil
                     applyVisualLoss(belief, at: now)
                 }
@@ -3844,12 +3848,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // A verified face lock may hold through a short detector gap, but it
             // must not pin the gimbal indefinitely when the person has actually
             // left. After a bounded recovery window, release the lock and
-            // resume scanning so the robot does not sit still forever.
+            // resume scanning so the robot does not sit still forever. The
+            // release sets the post-release cooldown so a phantom face cannot
+            // instantly re-latch and restart the oscillation.
             if socialRetentionDeadlineNS == nil {
                 socialRetentionDeadlineNS = now + socialRetentionWindowNS
             } else if now >= socialRetentionDeadlineNS! {
                 socialRetentionDeadlineNS = nil
                 faceLock.invalidate()
+                faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
                 lastMotorTarget = nil
                 applyVisualLoss(belief, at: now)
             }
