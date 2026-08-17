@@ -9737,7 +9737,7 @@ private func l1ProactiveInteractionContext(
         languageStartInstruction: languageStartInstruction,
         rapportSummary: rapport,
         activeTaskSummaries: [objective, completion] + (language.map { [$0] } ?? []) + (preferences.map { [$0] } ?? []),
-        memorySummaries: request.memory.map(\.summary),
+        memorySummaries: request.memory.map(\.summary) + request.recalledEpisodes,
         embodimentSummary: "L0 is maintaining visual attention while L2 leads the interaction. Do not issue camera-control instructions as part of ordinary conversation."
     )
 }
