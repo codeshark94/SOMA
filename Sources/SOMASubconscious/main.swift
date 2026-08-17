@@ -4027,6 +4027,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     func makeBehaviorContext(at nowNS: UInt64) -> L1BehaviorContext {
         let fixationSeconds = behaviorChangedAtNS == 0 ? 0 : Double(nowNS - behaviorChangedAtNS) / 1_000_000_000
+        // Only report an acknowledgment as pending while it is still
+        // undelivered, so L1 stops recommending acknowledge_person once the
+        // greeting bow has already been fired for this presence.
+        let pendingAcknowledgment: Bool?
+        if let perceived = recognizedPersonEntityIDProvider?() {
+            pendingAcknowledgment = pendingAcknowledgmentEntityIDs[perceived.uuidString] != nil
+        } else {
+            pendingAcknowledgment = nil
+        }
         return L1BehaviorContext(
             attentionState: behaviorAttentionState,
             targetLabel: behaviorTargetLabel,
@@ -4036,7 +4045,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             scanActive: scanRunning,
             idleSeconds: fixationSeconds,
             recentStates: recentAttentionStates,
-            recognizedIdentity: recognizedIdentityProvider?()
+            recognizedIdentity: recognizedIdentityProvider?(),
+            acknowledgmentPending: pendingAcknowledgment
         )
     }
 

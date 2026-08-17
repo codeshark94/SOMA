@@ -71,6 +71,11 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     private var latestCaptureNS: UInt64 = 0
     private var latestIdentity: IdentityInfo?
     private var thoughts: [Thought] = []
+    /// Set whenever the ring buffer gains events that have not been written to
+    /// the thoughts file yet. The frame path refreshes the file from this flag
+    /// at ~10Hz while the panel is open, so opening the panel shows the full
+    /// buffered history even if no new L1 event fires afterwards.
+    private var thoughtsDirty = false
 
     init(rootURL: URL) {
         self.rootURL = rootURL
@@ -199,14 +204,20 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     }
 
     func recordL1Event(state: String, message: String, at monotonicNS: UInt64) {
-        guard isActive else { return }
+        // Always accumulate into the ring buffer, even while the panel is
+        // closed, so opening the panel later shows the recent history instead
+        // of starting from an empty log. Only the file write is gated on the
+        // flag (the panel being open).
         lock.lock()
         thoughts.append(Thought(monotonicNS: monotonicNS, state: state, message: message))
         if thoughts.count > maxThoughts {
             thoughts.removeFirst(thoughts.count - maxThoughts)
         }
+        thoughtsDirty = true
         let lines = thoughts.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
+        let active = isActive
         lock.unlock()
+        guard active else { return }
         queue.async { [weak self] in self?.writeThoughts(lines) }
     }
 
@@ -262,8 +273,19 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         lock.lock()
         let snapshot = VisionSnapshot(capturedAtNS: latestCaptureNS, candidates: latestCandidates)
         let data = try? encoder.encode(snapshot)
+        let dirtyThoughts: [String]?
+        if thoughtsDirty {
+            dirtyThoughts = thoughts.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
+            thoughtsDirty = false
+        } else {
+            dirtyThoughts = nil
+        }
         lock.unlock()
         guard let data else { return }
         try? data.write(to: visionURL, options: .atomic)
+        // Runs on the same serial queue as writeThoughts, so ordering is safe.
+        if let dirtyThoughts {
+            writeThoughts(dirtyThoughts)
+        }
     }
 }
