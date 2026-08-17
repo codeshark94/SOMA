@@ -50,6 +50,8 @@ private struct L1AuxiliaryWorkerEnvelope: Decodable {
     let gesture: L1AuxiliaryGesture?
     let approach: L1AuxiliaryApproach?
     let reaction: L1AuxiliaryReaction?
+    let conversationValue: Double?
+    let objectLabel: String?
     let inferenceMS: Double?
 }
 
@@ -82,6 +84,16 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private var stderrBuffer = ""
     private var supersededFrames = 0
     private var intentionallyStopped = false
+    private let frameLock = NSLock()
+    private var lastJPEG: Data?
+
+    /// The most recently JPEG-encoded frame sent to the worker. Used by L1's
+    /// object-recognition path to reverse-image-search a presented object.
+    func latestFrameJPEG() -> Data? {
+        frameLock.lock()
+        defer { frameLock.unlock() }
+        return lastJPEG
+    }
 
     init(
         pythonURL: URL,
@@ -203,6 +215,9 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             pump()
             return
         }
+        frameLock.lock()
+        lastJPEG = jpeg
+        frameLock.unlock()
         let request = L1AuxiliaryWorkerRequest(
             requestID: requestID,
             context: pending.context,
@@ -286,6 +301,8 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
                 gesture: envelope.gesture ?? .none,
                 approach: envelope.approach ?? .none,
                 reaction: envelope.reaction ?? .none,
+                conversationValue: envelope.conversationValue ?? 0,
+                objectLabel: envelope.objectLabel ?? "",
                 inferenceMS: inferenceMS
             )
             onCue(cue)

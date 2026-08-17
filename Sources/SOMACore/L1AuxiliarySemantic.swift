@@ -132,6 +132,8 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
     public let gesture: L1AuxiliaryGesture
     public let approach: L1AuxiliaryApproach
     public let reaction: L1AuxiliaryReaction
+    public let conversationValue: Double
+    public let objectLabel: String
     public let inferenceMS: Double
 
     public init(
@@ -153,6 +155,8 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
         gesture: L1AuxiliaryGesture = .none,
         approach: L1AuxiliaryApproach = .none,
         reaction: L1AuxiliaryReaction = .none,
+        conversationValue: Double = 0,
+        objectLabel: String = "",
         inferenceMS: Double
     ) {
         self.requestID = requestID
@@ -173,6 +177,8 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
         self.gesture = gesture
         self.approach = approach
         self.reaction = reaction
+        self.conversationValue = min(max(conversationValue, 0), 1)
+        self.objectLabel = String(objectLabel.prefix(60))
         self.inferenceMS = max(0, inferenceMS)
     }
 }

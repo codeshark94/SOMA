@@ -104,13 +104,22 @@ def main() -> int:
                 "body_language (open|closed|turned_away|leaning_in|none), "
                 "gesture (waving|pointing|nodding|none), "
                 "approach (approaching|stationary|leaving|none), "
-                "reaction (engage|orient|observe|none). "
+                "reaction (engage|orient|observe|none), "
+                "conversation_value (0..1), object_label (a short noun naming the most prominent "
+                "object, or empty string if there is no notable object). "
                 "Every textual value, including every enum value, must be enclosed in JSON double quotes. "
                 "Use attention_hint=person whenever any human, face, or body is visible; use object only "
                 "when no human is visible. social_presence is the probability that a human is visible. "
                 "A quiet static background is ambient with wake_reason=none and low wake_score. "
                 "A social bid requires visible evidence that a person is addressing the camera; merely "
                 "being visible is not enough. "
+                "conversation_value rates how much this visible object or scene would fuel a conversation "
+                "about the person's hobbies, tastes, or interests. Score high (>=0.7) for distinctive, "
+                "discussable objects like collectibles, figurines, toys, model kits, gadgets, cameras, "
+                "books, art, decorations, sports gear, or anything with a story to tell. Score low (<0.3) "
+                "for bland everyday background like plain walls, floors, generic office supplies, or "
+                "unremarkable furniture. Set object_label to a short noun for the most prominent object "
+                "(e.g. figurine, bicycle, guitar, camera, book) or empty when there is no notable object. "
                 "When a human is visible, also judge: eye_contact is the probability the person is looking "
                 "at the camera; engagement is how available/attentive they are (low if busy, on a phone, "
                 "or turned away); body_language describes their posture; gesture is any clear hand/head "
@@ -195,6 +204,8 @@ def main() -> int:
                 "gesture": gesture,
                 "approach": approach,
                 "reaction": reaction,
+                "conversationValue": bounded_probability(parsed.get("conversation_value")),
+                "objectLabel": str(parsed.get("object_label", ""))[:60],
                 "inferenceMS": inference_ms,
                 "promptTokens": getattr(generated, "prompt_tokens", 0),
                 "generationTokens": getattr(generated, "generation_tokens", 0),

@@ -271,6 +271,15 @@ private struct L1WebFetchResult: Decodable {
     let content: String?
 }
 
+/// Minimal Ollama /api/chat response decoder for the parallel object
+/// identification call (image-based).
+private struct L1ObjectIdentificationResponse: Decodable {
+    let message: Message?
+    struct Message: Decodable {
+        let content: String?
+    }
+}
+
 /// Calls Ollama's hosted web_search API. Requires OLLAMA_API_KEY.
 func performL1WebSearch(query: String, maxResults: Int = 5) -> String {
     guard let key = ProcessInfo.processInfo.environment["OLLAMA_API_KEY"], !key.isEmpty else {
@@ -346,6 +355,82 @@ func performL1WebFetch(url: String) -> String {
         ]
         let encoded = (try? JSONSerialization.data(withJSONObject: payload)).flatMap { String(data: $0, encoding: .utf8) } ?? #"{"ok":false}"#
         box.set(.success(encoded))
+    }.resume()
+    semaphore.wait()
+    if case let .success(value)? = box.get() { return value }
+    return #"{"ok":false}"#
+}
+
+/// Sends the given JPEG to the local L1 Gemma model (via Ollama /api/chat,
+/// which accepts image input) and asks it to identify the object shown. Runs
+/// as an independent inference, parallel to the conscious-stream cycle, and is
+/// not part of the L1 situation workload. Returns a JSON string describing the
+/// object.
+func performL1ObjectIdentification(jpeg: Data) -> String {
+    guard !jpeg.isEmpty else {
+        return #"{"ok":false,"error":"empty_image"}"#
+    }
+    let model = ProcessInfo.processInfo.environment["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud"
+    guard let url = URL(string: "\(somaOllamaHost())/api/chat") else {
+        return #"{"ok":false,"error":"bad_endpoint"}"#
+    }
+    let system = (
+        "You are SOMA L1's object recognition helper. You are shown one camera frame. "
+        + "Identify the single most prominent object in the frame (for example a specific "
+        + "figurine, a bicycle, a book, a collectible). Be concrete and specific about what it "
+        + "is, using general knowledge. Do not identify a person, do not infer private traits, "
+        + "do not issue commands. "
+        + "Reply with exactly one JSON object with keys: name (short noun), category, "
+        + "description (2-3 sentences)."
+    )
+    let user = "Identify the most prominent object in this image and return the JSON."
+    let messages: [[String: Any]] = [
+        ["role": "system", "content": system],
+        ["role": "user", "content": user, "images": [jpeg.base64EncodedString()]]
+    ]
+    let payload: [String: Any] = [
+        "model": model,
+        "messages": messages,
+        "stream": false,
+        "options": ["temperature": 0, "num_predict": 384]
+    ]
+    guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+        return #"{"ok":false,"error":"encode_failed"}"#
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = body
+    request.timeoutInterval = 40
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<String>()
+    URLSession.shared.dataTask(with: request) { data, _, error in
+        defer { semaphore.signal() }
+        guard error == nil, let data,
+              let decoded = try? JSONDecoder().decode(L1ObjectIdentificationResponse.self, from: data),
+              let content = decoded.message?.content else {
+            let raw = data.flatMap { String(data: $0, encoding: .utf8) } ?? "no_data"
+            box.set(.success(#"{"ok":false,"error":"ollama_failed","detail":"\#(String(raw.prefix(160)).replacingOccurrences(of: "\"", with: "'"))"}"#))
+            return
+        }
+        // Best-effort: the model was asked for JSON; try to normalize the text.
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = trimmed
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.hasPrefix("{"), let data = clean.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            let enc = (try? JSONSerialization.data(withJSONObject: obj))
+                .flatMap { String(data: $0, encoding: .utf8) }
+            box.set(.success(enc ?? #"{"ok":false}"#))
+            return
+        }
+        // Fall back to a text description wrapped as JSON.
+        let payloadOut = ["ok": true, "raw": String(clean.prefix(600)).replacingOccurrences(of: "\"", with: "'")]
+        let enc = (try? JSONSerialization.data(withJSONObject: payloadOut))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? #"{"ok":false}"#
+        box.set(.success(enc))
     }.resume()
     semaphore.wait()
     if case let .success(value)? = box.get() { return value }
@@ -8261,6 +8346,45 @@ private func run(_ options: Options) throws {
     let liveVisualContextRelay = LiveVisualContextRelay()
     let auxiliaryReactionRelay = L1AuxiliaryReactionRelay()
     let auxiliaryWakeRelay = L1AuxiliaryWakeRelay()
+    let l1AuxiliaryBridgeBox = L1AuxiliaryBridgeBox()
+    let poseStoreBox = PoseStoreBox()
+    let objectKnowledgeStore = ObjectKnowledgeStore()
+    let objectRecognitionQueue = ObjectRecognitionQueue(
+        maxPending: 4,
+        cooldownMilliseconds: 20_000
+    ) { item in
+        let result = performL1ObjectIdentification(jpeg: item.jpeg)
+        let atNS = DispatchTime.now().uptimeNanoseconds
+        if let data = result.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let name = obj["name"] as? String {
+            let category = obj["category"] as? String ?? ""
+            let description = obj["description"] as? String ?? obj["raw"] as? String ?? ""
+            objectKnowledgeStore.record(
+                name: name,
+                category: category,
+                description: description,
+                panDegrees: item.panDegrees,
+                tiltDegrees: item.tiltDegrees,
+                atNS: atNS
+            )
+            writer.write(RuntimeEvent(
+                event: "l1.object_recognition",
+                monotonicNS: atNS,
+                source: "l1_object_recognition",
+                state: "recognized",
+                message: "name=\(name); category=\(category)"
+            ))
+        } else {
+            writer.write(RuntimeEvent(
+                event: "l1.object_recognition",
+                monotonicNS: atNS,
+                source: "l1_object_recognition",
+                state: "failed",
+                message: String(result.prefix(200))
+            ))
+        }
+    }
     let liveCameraFrameRelay = options.l2LiveVoice && controlSettings.realtimeVoiceEnabled
         ? LiveCameraFrameRelay()
         : nil
@@ -8295,12 +8419,51 @@ private func run(_ options: Options) throws {
                 liveVisualContextRelay.record(cue)
                 auxiliaryReactionRelay.record(cue.reaction, at: cue.completedNS)
                 writer.write(L1AuxiliarySemanticTraceEvent(cue))
+                // Parallel object recognition: when L1's visual helper flags an
+                // object (presented to the robot, or encountered while scanning
+                // an environment with no dominant person) that is worth talking
+                // about, enqueue it. A bounded worker drains the queue one at a
+                // time with a pacing pause, asking the Gemma model to identify
+                // each object in an independent inference — separate from the
+                // conscious-stream cycle.
+                let presentedObject = cue.situation == .objectPresentation
+                    || cue.attentionHint == .object
+                let emptyExploration = cue.socialPresence < 0.3
+                    && cue.situation != .socialBid
+                let worthTalkingAbout = cue.conversationValue >= 0.55
+                if (presentedObject || emptyExploration), worthTalkingAbout,
+                   let jpeg = l1AuxiliaryBridgeBox.bridge?.latestFrameJPEG() {
+                    // Capture where the camera was looking when this object was
+                    // detected, so the inventory is spatially grounded. Pose is
+                    // read now (not after the async inference) because the scan
+                    // keeps moving while Gemma identifies the object.
+                    let seenPose = poseStoreBox.store?.latest(
+                        at: cue.captureNS,
+                        maximumAgeNS: 250_000_000
+                    )
+                    let posePan: Double? = seenPose.flatMap { $0.panDegrees.isFinite ? $0.panDegrees : nil }
+                    let poseTilt: Double? = seenPose.flatMap { $0.pitchDegrees.isFinite ? $0.pitchDegrees : nil }
+                    objectRecognitionQueue.enqueue(ObjectRecognitionQueue.Item(
+                        jpeg: jpeg,
+                        panDegrees: posePan,
+                        tiltDegrees: poseTilt,
+                        summary: cue.summary
+                    ))
+                    writer.write(RuntimeEvent(
+                        event: "l1.object_recognition",
+                        monotonicNS: cue.completedNS,
+                        source: "l1_object_recognition",
+                        state: "queued",
+                        message: "label=\(cue.objectLabel); conversation_value=\(String(format: "%.2f", cue.conversationValue)); summary=\(String(cue.summary.prefix(80)))"
+                    ))
+                }
             },
             onInterrupt: { interrupt in
                 auxiliaryWakeRelay.record(interrupt)
                 writer.write(L1AuxiliarySemanticInterruptTraceEvent(interrupt))
             }
         )
+        l1AuxiliaryBridgeBox.bridge = l1AuxiliarySemanticBridge
     } else {
         l1AuxiliarySemanticBridge = nil
     }
@@ -8360,6 +8523,7 @@ private func run(_ options: Options) throws {
     let worldModel = PredictiveWorldModel()
     let counters = LatencyCounters()
     let poseStore = GimbalPoseStore(geometryCalibration: cameraGeometryCalibration)
+    poseStoreBox.store = poseStore
     let panoramaPoseProjection: GimbalPoseProjection = externalGimbalCalibration == nil
         ? .identity
         : .obsbotTiny2Lite
@@ -9131,7 +9295,8 @@ private func run(_ options: Options) throws {
                         interactionAuthority: interactionAuthority,
                         personMemoryMission: l1MemoryContext.cachedPersonMemoryMission(
                             for: decision.entityID
-                        )
+                        ),
+                        objectKnowledge: objectKnowledgeStore.recentSummaries()
                     )
                     // L1 owns social initiation and transfers directly to the
                     // conversation runtime. L0 may mirror the outcome through
@@ -9660,7 +9825,8 @@ private func run(_ options: Options) throws {
                         l1MemoryContext.cachedPersonMemoryMission(for: $0)
                     },
                     preferredLanguageTag: preferredLanguageTag,
-                    languageStartInstruction: languageStartInstruction
+                    languageStartInstruction: languageStartInstruction,
+                    objectKnowledge: objectKnowledgeStore.recentSummaries()
                 )
                 liveVoiceLauncher?.startIfNeeded(
                     authorization: openingAuthorization.rawValue,
@@ -9686,7 +9852,8 @@ private func run(_ options: Options) throws {
                         l1MemoryContext.cachedPersonMemoryMission(for: $0)
                     },
                     preferredLanguageTag: preferredLanguageTag,
-                    languageStartInstruction: languageStartInstruction
+                    languageStartInstruction: languageStartInstruction,
+                    objectKnowledge: objectKnowledgeStore.recentSummaries()
                 ) else { return }
                 let wake = openingAuthorization.flatMap {
                     speechInteractionWake(
@@ -10078,7 +10245,8 @@ private func speechInteractionContext(
     sessionCapability: String? = nil,
     personMemoryMission: PersonContextMission? = nil,
     preferredLanguageTag: String? = nil,
-    languageStartInstruction: String? = nil
+    languageStartInstruction: String? = nil,
+    objectKnowledge: [String] = []
 ) -> CodexInteractionContext? {
     let targetSummary: String
     if let target = belief.target {
@@ -10086,7 +10254,7 @@ private func speechInteractionContext(
     } else {
         targetSummary = "L0 has no current visual target."
     }
-    let situationSummary = [targetSummary, visualSummary]
+    let situationSummary = [targetSummary, visualSummary, objectKnowledge.isEmpty ? nil : "Objects the robot has identified recently: \(objectKnowledge.joined(separator: " | "))"]
         .compactMap { $0 }
         .joined(separator: " ")
     return try? CodexInteractionContext(
@@ -10111,7 +10279,8 @@ private func l1ProactiveInteractionContext(
     languageStartInstruction: String?,
     sessionCapability: String?,
     interactionAuthority: SOMAInteractionAuthority,
-    personMemoryMission: PersonContextMission?
+    personMemoryMission: PersonContextMission?,
+    objectKnowledge: [String] = []
 ) -> CodexInteractionContext? {
     let objective = "Conversation objective: \(purpose.objective)"
     let completion = "Conversation completion condition: \(purpose.completionCondition)"
@@ -10124,6 +10293,7 @@ private func l1ProactiveInteractionContext(
         "L1 situation: \(frame.summary)",
         hypothesis,
         "Why L1 opened now: \(rationale)",
+        objectKnowledge.isEmpty ? nil : "Objects the robot has identified recently: \(objectKnowledge.joined(separator: " | "))",
     ].compactMap { $0 }.joined(separator: " ")
     let identityScope = request.beliefSummary.localizedCaseInsensitiveContains("pseudonymous")
         ? "locally pseudonymous recurring person; no name or biometric material is available"
@@ -10172,6 +10342,136 @@ private final class LiveVoiceLauncherBox: @unchecked Sendable {
 
 private final class SpeechInteractionBox: @unchecked Sendable {
     weak var coordinator: LocalSpeechInteractionCoordinator?
+}
+
+private final class L1AuxiliaryBridgeBox: @unchecked Sendable {
+    weak var bridge: L1AuxiliarySemanticBridge?
+}
+
+private final class PoseStoreBox: @unchecked Sendable {
+    weak var store: GimbalPoseStore?
+}
+
+/// Bounded FIFO queue for parallel L1 object identifications. Detections are
+/// enqueued (never dropped by a hard cooldown gate) and drained one at a time
+/// by a single worker with a pacing pause between inferences, so the robot
+/// does not hammer the model but also does not skip a queued object.
+private final class ObjectRecognitionQueue: @unchecked Sendable {
+    struct Item {
+        let jpeg: Data
+        let panDegrees: Double?
+        let tiltDegrees: Double?
+        let summary: String
+    }
+    private let lock = NSLock()
+    private var pending: [Item] = []
+    private var draining = false
+    private let maxPending: Int
+    private let cooldownSeconds: Double
+    private let process: @Sendable (Item) -> Void
+
+    init(
+        maxPending: Int = 4,
+        cooldownMilliseconds: Int = 20_000,
+        process: @escaping @Sendable (Item) -> Void
+    ) {
+        self.maxPending = max(1, maxPending)
+        self.cooldownSeconds = Double(max(1_000, cooldownMilliseconds)) / 1_000.0
+        self.process = process
+    }
+
+    func enqueue(_ item: Item) {
+        lock.lock()
+        guard pending.count < maxPending else { lock.unlock(); return }
+        pending.append(item)
+        lock.unlock()
+        pump()
+    }
+
+    private func pump() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.drain()
+        }
+    }
+
+    private func drain() {
+        lock.lock()
+        guard !draining else { lock.unlock(); return }
+        draining = true
+        lock.unlock()
+        defer {
+            lock.lock()
+            draining = false
+            lock.unlock()
+        }
+        while true {
+            lock.lock()
+            guard !pending.isEmpty else { return }
+            let item = pending.removeFirst()
+            lock.unlock()
+            process(item)
+            if cooldownSeconds > 0 {
+                Thread.sleep(forTimeInterval: cooldownSeconds)
+            }
+        }
+    }
+}
+
+/// Thread-safe store of recently identified objects, injected into the L2
+/// conversation context so Codex can reference objects the robot has seen.
+/// Used by object-based exploration: each identified object is recorded with
+/// the camera pan/tilt it was observed at, building a spatial inventory.
+private final class ObjectKnowledgeStore: @unchecked Sendable {
+    private struct Entry {
+        let name: String
+        let category: String
+        let description: String
+        let panDegrees: Double?
+        let tiltDegrees: Double?
+        let atNS: UInt64
+    }
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+
+    func record(
+        name: String,
+        category: String,
+        description: String,
+        panDegrees: Double?,
+        tiltDegrees: Double?,
+        atNS: UInt64
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // Avoid immediately repeating the same named object.
+        if entries.last?.name.caseInsensitiveCompare(trimmed) == .orderedSame { return }
+        entries.append(Entry(
+            name: trimmed,
+            category: category,
+            description: description,
+            panDegrees: panDegrees,
+            tiltDegrees: tiltDegrees,
+            atNS: atNS
+        ))
+        if entries.count > 16 { entries.removeFirst(entries.count - 16) }
+    }
+
+    func recentSummaries(limit: Int = 6) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.suffix(limit).map { entry in
+            var parts = [entry.name]
+            if !entry.category.isEmpty { parts.append("category: \(entry.category)") }
+            if !entry.description.isEmpty { parts.append(entry.description) }
+            if let pan = entry.panDegrees, let tilt = entry.tiltDegrees,
+               pan.isFinite, tilt.isFinite {
+                parts.append(String(format: "seen at pan %.0f°, tilt %.0f°", pan, tilt))
+            }
+            return parts.joined(separator: "; ")
+        }
+    }
 }
 
 private final class AccessResult: @unchecked Sendable {
