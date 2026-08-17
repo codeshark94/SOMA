@@ -3466,6 +3466,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     cancelExternalStop()
                     sendExternalStop(state: "face_lock_detector_gap", at: now)
                 }
+                // Bounded recovery: a verified face lock may hold through a
+                // short detector gap, but must not pin the gimbal indefinitely
+                // when the person has actually left. After the window, release
+                // the lock and resume scanning.
+                if socialRetentionDeadlineNS == nil {
+                    socialRetentionDeadlineNS = now + socialRetentionWindowNS
+                } else if now >= socialRetentionDeadlineNS! {
+                    socialRetentionDeadlineNS = nil
+                    faceLock.invalidate()
+                    lastMotorTarget = nil
+                    applyVisualLoss(belief, at: now)
+                }
                 return
             }
             applyVisualLoss(belief, at: now)
