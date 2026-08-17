@@ -2957,6 +2957,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// absence that a genuine departure would produce.
     private var nativeTrustContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 5_000)
     private var faceLock = FaceLockLease()
+    /// Bounded recovery window for a verified face lock that has lost its face.
+    /// The lock may hold through a short detector gap, but it must not pin the
+    /// gimbal indefinitely when the person has actually left. After this window
+    /// the lock is released and L0 resumes scanning.
+    private var socialRetentionDeadlineNS: UInt64?
+    private let socialRetentionWindowNS: UInt64 = 5_000_000_000
     /// Consecutive E2B reactions (orient/observe) observed while L0 is face-locked.
     /// When this reaches the threshold, E2B forcibly releases what it judges to be
     /// a wrong fixation and resumes scanning.
@@ -3504,6 +3510,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 cancelExternalStop()
                 sendExternalStop(state: "social_attention_no_fresh_face", at: now)
             }
+            // A verified face lock may hold through a short detector gap, but it
+            // must not pin the gimbal indefinitely when the person has actually
+            // left. After a bounded recovery window, release the lock and
+            // resume scanning so the robot does not sit still forever.
+            if socialRetentionDeadlineNS == nil {
+                socialRetentionDeadlineNS = now + socialRetentionWindowNS
+            } else if now >= socialRetentionDeadlineNS! {
+                socialRetentionDeadlineNS = nil
+                faceLock.invalidate()
+                lastMotorTarget = nil
+                applyVisualLoss(belief, at: now)
+            }
             return
         case .socialReframing:
             recordCurrentVisualAttention(at: now)
@@ -3520,6 +3538,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             applyVisualLoss(belief, at: now)
             return
         case .socialFixation:
+            socialRetentionDeadlineNS = nil
             break
         }
         guard let target = belief.target else { return }
@@ -7569,7 +7588,7 @@ private final class VisionWorker: @unchecked Sendable {
         if let neuralFaceDetector {
             let now = monotonicNanoseconds()
             if now >= nextFaceNS {
-                nextFaceNS = now + 16_666_667
+                nextFaceNS = now + 33_333_333
                 do {
                     let faces = try neuralFaceDetector.detect(in: pixelBuffer)
                     candidates += faces
@@ -7586,7 +7605,7 @@ private final class VisionWorker: @unchecked Sendable {
         // but reserve every available frame for the face path.
         let now = monotonicNanoseconds()
         if let neuralObjectDetector, now >= nextObjectNS {
-            nextObjectNS = now + 83_333_333
+            nextObjectNS = now + 125_000_000
             let startedNS = monotonicNanoseconds()
             do {
                 candidates += try neuralObjectDetector.detect(in: pixelBuffer)
@@ -9936,20 +9955,20 @@ private func requestLowLatencyFormat(on device: AVCaptureDevice) throws -> Video
     let candidates = device.formats.compactMap { format -> (AVCaptureDevice.Format, Int32, Int32, Double)? in
         let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         let maximumFPS = format.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
-        guard dimensions.width == 1280, dimensions.height == 720, maximumFPS >= 60 else { return nil }
+        guard dimensions.width == 1280, dimensions.height == 720, maximumFPS >= 30 else { return nil }
         return (format, dimensions.width, dimensions.height, maximumFPS)
     }
     guard let selected = candidates.max(by: { $0.3 < $1.3 }) else {
-        throw RuntimeError.configuration("The OBSBOT camera does not expose 1280x720 at 60 fps")
+        throw RuntimeError.configuration("The OBSBOT camera does not expose 1280x720 at 30 fps")
     }
-    let requested = "\(selected.1)x\(selected.2)@60fps"
+    let requested = "\(selected.1)x\(selected.2)@30fps"
     do {
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
         device.activeFormat = selected.0
         let frameDuration = selected.0.videoSupportedFrameRateRanges
-            .min(by: { abs($0.maxFrameRate - 60) < abs($1.maxFrameRate - 60) })?
-            .minFrameDuration ?? CMTime(value: 1, timescale: 60)
+            .min(by: { abs($0.maxFrameRate - 30) < abs($1.maxFrameRate - 30) })?
+            .minFrameDuration ?? CMTime(value: 1, timescale: 30)
         device.activeVideoMinFrameDuration = frameDuration
         device.activeVideoMaxFrameDuration = frameDuration
         return VideoConfiguration(requested: requested, applied: true, detail: "active_format_applied")
