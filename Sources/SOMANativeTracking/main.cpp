@@ -1149,10 +1149,38 @@ std::optional<std::string> readBridgeLine() noexcept {
     }
 }
 
+/// The OBSBOT's built-in hand-gesture controls (a raised hand selects a target
+/// and starts its own tracking, gestures also trigger zoom/record) are
+/// independent of SOMA's attention controller and can move the gimbal out from
+/// under the L0 motor authority at any moment. Disable every gesture function
+/// at startup so the camera only moves when SOMA commands it.
+bool disableHandGestures(const std::shared_ptr<Device> &device, Trace &trace) noexcept {
+    // aiSetGestureCtrlIndividualR gesture IDs: 0 target, 1 zoom,
+    // 2 dynamic zoom, 3 dynamic zoom direction, 4 record.
+    const int gestureIDs[] = {0, 1, 2, 3, 4};
+    int failures = 0;
+    for (const int gestureID : gestureIDs) {
+        int result = RM_RET_ERR;
+        try { result = device->aiSetGestureCtrlIndividualR(gestureID, false); } catch (...) {}
+        if (result != RM_RET_OK) ++failures;
+    }
+    const bool confirmed = failures == 0;
+    trace.event(
+        "camera.ack",
+        confirmed ? "manual" : "fault",
+        confirmed ? "gestures_disabled" : "gesture_disable_incomplete",
+        confirmed ? RM_RET_OK : RM_RET_ERR,
+        "disabled_gesture_ids=0,1,2,3,4; failures=" + std::to_string(failures),
+        "startup-gesture-off"
+    );
+    return confirmed;
+}
+
 int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int durationSeconds) {
     constexpr auto nativeWatchdog = std::chrono::milliseconds(750);
     constexpr auto externalWatchdog = std::chrono::milliseconds(700);
     if (!configureFixedCameraZoom(device, trace)) return 5;
+    disableHandGestures(device, trace);
     if (const auto fieldOfView = cameraHorizontalFieldOfViewDegrees(device)) emitHorizontalFieldOfView(*fieldOfView);
     if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
     IndicatorSession indicator(device, trace);
@@ -1164,6 +1192,7 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
     bool externalControl = false;
     auto lastExternalCommand = Clock::now();
     auto nextAttitudeReport = Clock::now();
+    auto nextZoomWatchdog = Clock::now();
     std::optional<Clock::time_point> externalPulseDeadline;
     std::string externalPulseStopCommandID;
     const bool continuous = durationSeconds == 0;
@@ -1401,6 +1430,16 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
         if (Clock::now() >= nextAttitudeReport) {
             if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
             nextAttitudeReport = Clock::now() + std::chrono::milliseconds(20);
+        }
+        if (Clock::now() >= nextZoomWatchdog) {
+            // The OBSBOT's own AI can re-engage auto-zoom (e.g. after a
+            // tracking-mode switch), leaving the lens zoomed in long after the
+            // target is gone. SOMA never commands zoom, so periodically
+            // re-assert the fixed 1x baseline to restore the original
+            // magnification.
+            try { device->aiSetAiAutoZoomR(false); } catch (...) {}
+            try { device->cameraSetZoomAbsoluteR(1.0f); } catch (...) {}
+            nextZoomWatchdog = Clock::now() + std::chrono::seconds(4);
         }
         if (nativeTracking && Clock::now() - lastHeartbeat > nativeWatchdog) {
             const bool stopped = requestManualStop(device, trace, "attention_watchdog_expired", "watchdog-stop-1");
