@@ -8447,7 +8447,8 @@ private func run(_ options: Options) throws {
                         jpeg: jpeg,
                         panDegrees: posePan,
                         tiltDegrees: poseTilt,
-                        summary: cue.summary
+                        summary: cue.summary,
+                        objectLabel: cue.objectLabel
                     ))
                     writer.write(RuntimeEvent(
                         event: "l1.object_recognition",
@@ -10362,26 +10363,47 @@ private final class ObjectRecognitionQueue: @unchecked Sendable {
         let panDegrees: Double?
         let tiltDegrees: Double?
         let summary: String
+        let objectLabel: String
     }
     private let lock = NSLock()
     private var pending: [Item] = []
     private var draining = false
+    private var recentLabels: [(label: String, atNS: UInt64)] = []
     private let maxPending: Int
     private let cooldownSeconds: Double
+    private let dedupSeconds: Double
     private let process: @Sendable (Item) -> Void
 
     init(
         maxPending: Int = 4,
         cooldownMilliseconds: Int = 20_000,
+        dedupMilliseconds: Int = 90_000,
         process: @escaping @Sendable (Item) -> Void
     ) {
         self.maxPending = max(1, maxPending)
         self.cooldownSeconds = Double(max(1_000, cooldownMilliseconds)) / 1_000.0
+        self.dedupSeconds = Double(max(0, dedupMilliseconds)) / 1_000.0
         self.process = process
     }
 
     func enqueue(_ item: Item) {
+        let nowNS = DispatchTime.now().uptimeNanoseconds
+        let label = item.objectLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock()
+        // Skip if the same object label was already enqueued (still pending) or
+        // processed recently — avoids re-identifying the same object on loop.
+        if !label.isEmpty {
+            let isPending = pending.contains { $0.objectLabel.caseInsensitiveCompare(label) == .orderedSame }
+            let recentlyDone = recentLabels.contains { recent in
+                recent.label.caseInsensitiveCompare(label) == .orderedSame
+                    && nowNS >= recent.atNS
+                    && nowNS - recent.atNS < UInt64(dedupSeconds * 1_000_000_000)
+            }
+            if isPending || recentlyDone {
+                lock.unlock()
+                return
+            }
+        }
         guard pending.count < maxPending else { lock.unlock(); return }
         pending.append(item)
         lock.unlock()
@@ -10410,6 +10432,13 @@ private final class ObjectRecognitionQueue: @unchecked Sendable {
             let item = pending.removeFirst()
             lock.unlock()
             process(item)
+            let label = item.objectLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !label.isEmpty {
+                lock.lock()
+                recentLabels.append((label, DispatchTime.now().uptimeNanoseconds))
+                if recentLabels.count > 12 { recentLabels.removeFirst(recentLabels.count - 12) }
+                lock.unlock()
+            }
             if cooldownSeconds > 0 {
                 Thread.sleep(forTimeInterval: cooldownSeconds)
             }
