@@ -8348,6 +8348,7 @@ private func run(_ options: Options) throws {
     let auxiliaryWakeRelay = L1AuxiliaryWakeRelay()
     let l1AuxiliaryBridgeBox = L1AuxiliaryBridgeBox()
     let poseStoreBox = PoseStoreBox()
+    let memoryContextBox = MemoryContextBox()
     let objectKnowledgeStore = ObjectKnowledgeStore()
     let objectRecognitionQueue = ObjectRecognitionQueue(
         maxPending: 4,
@@ -8368,12 +8369,26 @@ private func run(_ options: Options) throws {
                 tiltDegrees: item.tiltDegrees,
                 atNS: atNS
             )
+            // Persist as a durable taste/preference fact tied to the person
+            // present (or the owner), so it accumulates into a long-lived
+            // profile rather than living only in the transient conversation
+            // inventory.
+            var factState = "nobody"
+            if let entityID = item.personEntityID {
+                if let provider = memoryContextBox.provider {
+                    let fact = "The user has/collects \(name)\(category.isEmpty ? "" : " (\(category))"). Hobby/taste item worth remembering."
+                    let stored = l1StorePersonFact(provider, for: entityID, fact: fact)
+                    factState = stored.contains("\"ok\":true") ? "stored" : "store_failed"
+                } else {
+                    factState = "provider_unavailable"
+                }
+            }
             writer.write(RuntimeEvent(
                 event: "l1.object_recognition",
                 monotonicNS: atNS,
                 source: "l1_object_recognition",
                 state: "recognized",
-                message: "name=\(name); category=\(category)"
+                message: "name=\(name); category=\(category); person_fact=\(factState)"
             ))
         } else {
             writer.write(RuntimeEvent(
@@ -8430,7 +8445,8 @@ private func run(_ options: Options) throws {
                     || cue.attentionHint == .object
                 let emptyExploration = cue.socialPresence < 0.3
                     && cue.situation != .socialBid
-                let worthTalkingAbout = cue.conversationValue >= 0.55
+                let worthTalkingAbout = cue.conversationValue
+                    >= somaEnvDouble("SOMA_OBJECT_CONVERSATION_THRESHOLD", default: 0.55)
                 if (presentedObject || emptyExploration), worthTalkingAbout,
                    let jpeg = l1AuxiliaryBridgeBox.bridge?.latestFrameJPEG() {
                     // Capture where the camera was looking when this object was
@@ -8443,12 +8459,19 @@ private func run(_ options: Options) throws {
                     )
                     let posePan: Double? = seenPose.flatMap { $0.panDegrees.isFinite ? $0.panDegrees : nil }
                     let poseTilt: Double? = seenPose.flatMap { $0.pitchDegrees.isFinite ? $0.pitchDegrees : nil }
+                    // Attribute to the present person, falling back to the
+                    // enrolled owner (administrator) for objects seen while no
+                    // one is engaged — a personal home robot treats items in its
+                    // own environment as the owner's by default.
+                    let personEntityID = identityPresence.recognizedPersonEntityID()
+                        ?? controlSettings.administrator?.entityID
                     objectRecognitionQueue.enqueue(ObjectRecognitionQueue.Item(
                         jpeg: jpeg,
                         panDegrees: posePan,
                         tiltDegrees: poseTilt,
                         summary: cue.summary,
-                        objectLabel: cue.objectLabel
+                        objectLabel: cue.objectLabel,
+                        personEntityID: personEntityID
                     ))
                     writer.write(RuntimeEvent(
                         event: "l1.object_recognition",
@@ -8707,6 +8730,7 @@ private func run(_ options: Options) throws {
         },
         transcriptRetentionSeconds: somaEnvDouble("SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS", default: 24) * 60 * 60
     )
+    memoryContextBox.provider = l1MemoryContext
     if let administratorID = controlSettings.administrator?.entityID {
         l1MemoryContext.warmContext(for: administratorID)
         Task {
@@ -10353,6 +10377,10 @@ private final class PoseStoreBox: @unchecked Sendable {
     weak var store: GimbalPoseStore?
 }
 
+private final class MemoryContextBox: @unchecked Sendable {
+    weak var provider: L1MemoryContextProvider?
+}
+
 /// Bounded FIFO queue for parallel L1 object identifications. Detections are
 /// enqueued (never dropped by a hard cooldown gate) and drained one at a time
 /// by a single worker with a pacing pause between inferences, so the robot
@@ -10364,6 +10392,7 @@ private final class ObjectRecognitionQueue: @unchecked Sendable {
         let tiltDegrees: Double?
         let summary: String
         let objectLabel: String
+        let personEntityID: UUID?
     }
     private let lock = NSLock()
     private var pending: [Item] = []

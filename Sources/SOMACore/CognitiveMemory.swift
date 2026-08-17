@@ -1187,6 +1187,12 @@ public actor CognitiveMemoryStore {
         historyByID = opened.historyByID
     }
 
+    /// The longest expiry the validation policy permits for medium-term records.
+    /// Used by memory producers to construct drafts that pass validation.
+    public var maximumMediumTermLifetime: TimeInterval {
+        validator.policy.maximumMediumTermLifetime
+    }
+
     deinit {
         if !closed {
             try? journalHandle.close()

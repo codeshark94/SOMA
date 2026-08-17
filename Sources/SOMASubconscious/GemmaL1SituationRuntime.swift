@@ -726,7 +726,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     ],
                     sensitivity: .personal,
                     disclosure: .remoteSummaryAllowed,
-                    expiresAt: date.addingTimeInterval(365 * 24 * 60 * 60)
+                    expiresAt: date.addingTimeInterval(store.maximumMediumTermLifetime)
                 ),
                 at: date
             )
