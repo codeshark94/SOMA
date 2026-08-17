@@ -6922,9 +6922,11 @@ private final class TDOACalibrationRecorder: @unchecked Sendable {
 private final class ANEObjectDetector: @unchecked Sendable {
     let computeUnits: String
     let warmupMS: Double
+    let confidenceThreshold: Double
     private let model: VNCoreMLModel
 
-    init() throws {
+    init(confidenceThreshold: Double) throws {
+        self.confidenceThreshold = confidenceThreshold
         let modelURL: URL
         if let compiledURL = Bundle.module.url(forResource: "YOLOv3TinyFP16", withExtension: "mlmodelc") {
             modelURL = compiledURL
@@ -6944,7 +6946,7 @@ private final class ANEObjectDetector: @unchecked Sendable {
     }
 
     func detect(in pixelBuffer: CVPixelBuffer) throws -> [VisualObservation] {
-        try Self.detect(in: pixelBuffer, model: model)
+        try Self.detect(in: pixelBuffer, model: model, confidenceThreshold: confidenceThreshold)
     }
 
     private static func warmUp(_ model: VNCoreMLModel) throws {
@@ -6964,10 +6966,14 @@ private final class ANEObjectDetector: @unchecked Sendable {
               let pixelBuffer else {
             throw RuntimeError.configuration("Cannot allocate Core ML warmup frame")
         }
-        _ = try detect(in: pixelBuffer, model: model)
+        _ = try detect(in: pixelBuffer, model: model, confidenceThreshold: 0.5)
     }
 
-    private static func detect(in pixelBuffer: CVPixelBuffer, model: VNCoreMLModel) throws -> [VisualObservation] {
+    private static func detect(
+        in pixelBuffer: CVPixelBuffer,
+        model: VNCoreMLModel,
+        confidenceThreshold: Double
+    ) throws -> [VisualObservation] {
         let request = VNCoreMLRequest(model: model)
         request.imageCropAndScaleOption = .scaleFill
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
@@ -6975,7 +6981,7 @@ private final class ANEObjectDetector: @unchecked Sendable {
         let results = request.results as? [VNRecognizedObjectObservation] ?? []
         return results.compactMap { observation in
             guard let label = observation.labels.max(by: { $0.confidence < $1.confidence }),
-                  label.confidence >= 0.35 else {
+                  Double(label.confidence) >= confidenceThreshold else {
                 return nil
             }
             return VisualObservation(
@@ -7684,14 +7690,15 @@ private final class VisionWorker: @unchecked Sendable {
             pupilCenteringThreshold: pupilCenteringThreshold
         )
         do {
-            let detector = try ANEObjectDetector()
+            let yoloConfidence = somaEnvDouble("SOMA_YOLO_CONFIDENCE_THRESHOLD", default: 0.5)
+            let detector = try ANEObjectDetector(confidenceThreshold: yoloConfidence)
             neuralObjectDetector = detector
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
                 source: "object_neural_engine",
                 state: "configured",
-                message: "model=YOLOv3TinyFP16; compute_units=\(detector.computeUnits); labels=person_and_objects; prewarm_ms=\(detector.warmupMS)"
+                message: "model=YOLOv3TinyFP16; compute_units=\(detector.computeUnits); labels=person_and_objects; confidence_threshold=\(yoloConfidence); prewarm_ms=\(detector.warmupMS)"
             ))
         } catch {
             neuralObjectDetector = nil

@@ -74,6 +74,10 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     /// 1.0 = default (0.68 X / 0.82 Y). Lower = stricter (pupil must be more
     /// centered); higher = more lenient. Defaults to 1.0.
     public var l0EyeContactPupilThreshold: Double
+    /// Minimum confidence (0...1) for the on-device YOLO object detector to
+    /// report an object. Higher = fewer false positives (e.g. phantom
+    /// toothbrushes), lower = more recall. Defaults to 0.5.
+    public var l0YoloConfidenceThreshold: Double
     /// How long (hours) raw short-term conversation transcripts are retained
     /// before L1 consolidation. Defaults to 24.
     public var memoryShortTermRetentionHours: Double
@@ -113,6 +117,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l05Enabled: Bool = true,
         l0EyeContactFreshnessMilliseconds: Double = 450,
         l0EyeContactPupilThreshold: Double = 1.0,
+        l0YoloConfidenceThreshold: Double = 0.5,
         memoryShortTermRetentionHours: Double = 24,
         l2ProactiveOpeningsEnabled: Bool = true,
         l1OpenWithUnknownIdentity: Bool = false,
@@ -138,6 +143,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         self.l05Enabled = l05Enabled
         self.l0EyeContactFreshnessMilliseconds = min(max(l0EyeContactFreshnessMilliseconds, 100), 2_000)
         self.l0EyeContactPupilThreshold = min(max(l0EyeContactPupilThreshold, 0.1), 2.0)
+        self.l0YoloConfidenceThreshold = min(max(l0YoloConfidenceThreshold, 0.1), 0.95)
         self.memoryShortTermRetentionHours = min(max(memoryShortTermRetentionHours, 1), 24)
         self.l2ProactiveOpeningsEnabled = l2ProactiveOpeningsEnabled
         self.l1OpenWithUnknownIdentity = l1OpenWithUnknownIdentity
@@ -171,6 +177,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
             "SOMA_ENABLE_L05_VLM=\(l05Enabled ? "1" : "0")",
             "SOMA_L0_EYE_CONTACT_FRESHNESS_MS=\(String(format: "%g", l0EyeContactFreshnessMilliseconds))",
             "SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD=\(String(format: "%g", l0EyeContactPupilThreshold))",
+            "SOMA_YOLO_CONFIDENCE_THRESHOLD=\(String(format: "%g", l0YoloConfidenceThreshold))",
             "SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS=\(String(format: "%g", memoryShortTermRetentionHours))",
             "SOMA_L2_PROACTIVE_OPENINGS=\(l2ProactiveOpeningsEnabled ? "true" : "false")",
             "SOMA_L1_OPEN_WITH_UNKNOWN=\(l1OpenWithUnknownIdentity ? "true" : "false")",
@@ -199,6 +206,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         case l05Enabled
         case l0EyeContactFreshnessMilliseconds
         case l0EyeContactPupilThreshold
+        case l0YoloConfidenceThreshold
         case memoryShortTermRetentionHours
         case l2ProactiveOpeningsEnabled
         case l1OpenWithUnknownIdentity
@@ -227,6 +235,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l05Enabled = try values.decodeIfPresent(Bool.self, forKey: .l05Enabled) ?? true
         l0EyeContactFreshnessMilliseconds = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactFreshnessMilliseconds) ?? 450, 100), 2_000)
         l0EyeContactPupilThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactPupilThreshold) ?? 1.0, 0.1), 2.0)
+        l0YoloConfidenceThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0YoloConfidenceThreshold) ?? 0.5, 0.1), 0.95)
         memoryShortTermRetentionHours = min(max(try values.decodeIfPresent(Double.self, forKey: .memoryShortTermRetentionHours) ?? 24, 1), 24)
         l2ProactiveOpeningsEnabled = try values.decodeIfPresent(Bool.self, forKey: .l2ProactiveOpeningsEnabled) ?? true
         l1OpenWithUnknownIdentity = try values.decodeIfPresent(Bool.self, forKey: .l1OpenWithUnknownIdentity) ?? false
@@ -309,6 +318,7 @@ public struct SOMAEnvStore: Sendable {
             l05Enabled: boolValue(values["SOMA_ENABLE_L05_VLM"], default: true),
             l0EyeContactFreshnessMilliseconds: doubleValue(values["SOMA_L0_EYE_CONTACT_FRESHNESS_MS"], default: 450),
             l0EyeContactPupilThreshold: doubleValue(values["SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD"], default: 1.0),
+            l0YoloConfidenceThreshold: doubleValue(values["SOMA_YOLO_CONFIDENCE_THRESHOLD"], default: 0.5),
             memoryShortTermRetentionHours: doubleValue(values["SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS"], default: 24),
             l2ProactiveOpeningsEnabled: boolValue(values["SOMA_L2_PROACTIVE_OPENINGS"], default: true),
             l1OpenWithUnknownIdentity: boolValue(values["SOMA_L1_OPEN_WITH_UNKNOWN"], default: false),
