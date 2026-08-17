@@ -2836,6 +2836,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// Supplies the currently recognized identity label (e.g. the administrator's
     /// name) so the behavior-awareness pass knows who it is looking at.
     var recognizedIdentityProvider: (() -> String?)?
+    /// Supplies the currently perceived person's opaque entity ID so the
+    /// acknowledgment queue can match a pending greeting to the person SOMA is
+    /// actually looking at.
+    var recognizedPersonEntityIDProvider: (() -> UUID?)?
+    /// Acknowledgment queue: person entity IDs awaiting a greeting bow, keyed by
+    /// enqueue time. A person is enqueued on arrival and the bow fires only once
+    /// SOMA is perceiving them, so a greeting is never thrown at an empty view.
+    private var pendingAcknowledgmentEntityIDs: [String: UInt64] = [:]
+    /// People whose greeting has already been delivered. Cleared on departure so
+    /// a re-arriving person is greeted again; within one presence it is judged
+    /// from context that the greeting was received and never re-fired.
+    private var deliveredAcknowledgmentEntityIDs: Set<String> = Set()
     private var actionableVisualContinuity = VisualEvidenceContinuity()
     private var socialTrackingContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 1_200)
     /// While native AI owns the live visual loop the device itself is tracking
@@ -3192,26 +3204,42 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         queue.async { [weak self] in self?.applyEmbodimentIntent(intent) }
     }
 
-    private var lastBehaviorAcknowledgmentNS: UInt64 = 0
-    /// The periodic L1 behavior pass has no contact history, so it would
-    /// re-acknowledge a sustained person every tick. Gate the greeting to at
-    /// most once per window; a re-arriving person re-arms naturally because
-    /// this clock only advances when a greeting actually fires.
-    private let behaviorAcknowledgmentCooldownNS: UInt64 = 90_000_000_000
+    /// Enqueue a greeting for a person who has just been recognized/arrived.
+    /// The bow is not fired here: it waits until SOMA is actually perceiving
+    /// that person, so a greeting is never aimed at an empty view.
+    func enqueueAcknowledgment(for entityID: UUID, at monotonicNS: UInt64) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let key = entityID.uuidString
+            guard !self.deliveredAcknowledgmentEntityIDs.contains(key) else { return }
+            self.pendingAcknowledgmentEntityIDs[key] = monotonicNS
+        }
+    }
 
-    /// L1 behavior `acknowledge_person` entry point with a hard cooldown so the
-    /// 30s situation-awareness pass cannot spam greetings at one present face.
+    /// Re-arm a person on departure so a re-arriving person is greeted again.
+    func clearAcknowledgment(for entityID: UUID) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let key = entityID.uuidString
+            self.pendingAcknowledgmentEntityIDs.removeValue(forKey: key)
+            self.deliveredAcknowledgmentEntityIDs.remove(key)
+        }
+    }
+
+    /// L1 behavior `acknowledge_person` entry point. Instead of firing a
+    /// greeting on a fixed cooldown, it drains the acknowledgment queue: if the
+    /// person SOMA is currently perceiving has a pending greeting, fire a quick
+    /// bow and mark it delivered so it is never re-fired within one presence.
     func acknowledgePersonIfEligible(at monotonicNS: UInt64) {
         queue.async { [weak self] in
             guard let self else { return }
-            guard monotonicNS >= self.lastBehaviorAcknowledgmentNS,
-                  monotonicNS - self.lastBehaviorAcknowledgmentNS >= self.behaviorAcknowledgmentCooldownNS else {
-                return
-            }
-            self.lastBehaviorAcknowledgmentNS = monotonicNS
+            guard let perceived = self.recognizedPersonEntityIDProvider?() else { return }
+            let key = perceived.uuidString
+            guard self.pendingAcknowledgmentEntityIDs.removeValue(forKey: key) != nil else { return }
+            self.deliveredAcknowledgmentEntityIDs.insert(key)
             self.applyEmbodimentIntent(.express(
-                requestID: "l1-behavior-\(monotonicNS)",
-                expression: .greeting,
+                requestID: "l1-ack-\(monotonicNS)",
+                expression: .acknowledge,
                 expiresAtNS: monotonicNS + 600_000_000
             ))
         }
@@ -8176,6 +8204,9 @@ private func run(_ options: Options) throws {
         attentionGimbalBridge?.recognizedIdentityProvider = {
             latestPrimaryIdentity.snapshot()?.label
         }
+        attentionGimbalBridge?.recognizedPersonEntityIDProvider = {
+            identityPresence.recognizedPersonEntityID()
+        }
     } else {
         attentionGimbalBridge = nil
     }
@@ -9172,8 +9203,12 @@ private func run(_ options: Options) throws {
             )
             for update in identityPresence.observe(decision, at: monotonicNS) {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
+                if case let .arrived(identity) = update.transition {
+                    attentionGimbalBridge?.enqueueAcknowledgment(for: identity.entityID, at: monotonicNS)
+                }
                 if case let .departed(identity) = update.transition {
                     l1ThoughtRelay.depart(identity.entityID)
+                    attentionGimbalBridge?.clearAcknowledgment(for: identity.entityID)
                 }
                 if update.participant?.authority == .administrator {
                     writer.write(RuntimeEvent(
@@ -9202,6 +9237,7 @@ private func run(_ options: Options) throws {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .departed(identity) = update.transition {
                     l1ThoughtRelay.depart(identity.entityID)
+                    attentionGimbalBridge?.clearAcknowledgment(for: identity.entityID)
                 }
             }
         },

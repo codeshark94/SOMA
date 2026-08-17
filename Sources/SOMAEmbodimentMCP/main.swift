@@ -265,7 +265,7 @@ private final class EmbodimentMCPServer {
             let arguments = parameters["arguments"] as? [String: Any] ?? [:]
             do {
                 let reply = try callTool(name: name, arguments: arguments)
-                write(result: toolResult(reply), id: id)
+                write(result: toolResult(reply, for: name), id: id)
             } catch ServerFailure.invalidArguments(let message) {
                 write(result: toolFailure(message), id: id)
             } catch {
@@ -280,16 +280,16 @@ private final class EmbodimentMCPServer {
         let sessionAuthorization = try sessionAuthorization(for: name, arguments: arguments)
         var toolArguments = arguments
         toolArguments.removeValue(forKey: "session_token")
-        if name == "get_embodiment_state"
-            || name == "list_scene_entities"
-            || name == "get_spatial_map" {
-            guard toolArguments.isEmpty else { throw ServerFailure.invalidArguments("\(name) takes no arguments") }
+        switch name {
+        case "get_embodiment_state", "list_scene_entities", "get_spatial_map":
+            guard toolArguments.isEmpty else {
+                throw ServerFailure.invalidArguments("\(name) takes no arguments")
+            }
             return try EmbodimentShadowSocketClient.send(
                 .init(kind: .snapshot, sessionAuthorization: sessionAuthorization),
                 socketURL: socketURL
             )
-        }
-        if name == "get_view_capture" {
+        case "get_view_capture":
             let value: ViewResultArguments = try decode(toolArguments)
             return try EmbodimentShadowSocketClient.send(
                 .init(
@@ -299,8 +299,7 @@ private final class EmbodimentMCPServer {
                 ),
                 socketURL: socketURL
             )
-        }
-        if name == "list_present_people" || name == "list_identity_registry" {
+        case "list_present_people", "list_identity_registry":
             guard toolArguments.isEmpty else {
                 throw ServerFailure.invalidArguments("\(name) takes no arguments")
             }
@@ -313,8 +312,7 @@ private final class EmbodimentMCPServer {
                 ),
                 socketURL: socketURL
             )
-        }
-        if name == "enroll_present_identity" {
+        case "enroll_present_identity":
             let value: EnrollPresentIdentityArguments = try decode(toolArguments)
             guard value.confirmedByUser else {
                 throw ServerFailure.invalidArguments("enroll_present_identity requires confirmed_by_user=true")
@@ -330,8 +328,12 @@ private final class EmbodimentMCPServer {
                 ),
                 socketURL: socketURL
             )
-        }
-        if let operation = personContextOperation(forTool: name) {
+        case "get_person_context", "set_preferred_language", "clear_preferred_language",
+             "set_contact_preference", "set_person_rapport", "set_person_fact",
+             "remove_person_fact", "recall_episodes":
+            guard let operation = personContextOperation(forTool: name) else {
+                throw ServerFailure.invalidArguments("unknown tool: \(name)")
+            }
             let value: PersonContextArguments = try decode(toolArguments)
             return try EmbodimentShadowSocketClient.send(
                 .init(
@@ -341,62 +343,72 @@ private final class EmbodimentMCPServer {
                 ),
                 socketURL: socketURL
             )
-        }
-
-        let request: CognitiveEmbodimentRequest
-        switch name {
-        case "register_semantic_target":
-            let value: RegisterArguments = try decode(toolArguments)
-            request = value.control.request(operation: .registerTarget(value.registration.value))
-        case "remove_semantic_target":
-            let value: RemoveArguments = try decode(toolArguments)
-            request = value.control.request(operation: .removeTarget(value.targetReference))
-        case "set_attention_policy":
-            let value: AttentionArguments = try decode(toolArguments)
-            request = value.control.request(operation: .setAttentionPolicy(value.policy))
-        case "track_target":
-            let value: TrackArguments = try decode(toolArguments)
-            request = value.control.request(operation: .trackTarget(value.goal))
-        case "orient_to":
-            let value: OrientArguments = try decode(toolArguments)
-            request = value.control.request(operation: .orient(value.goal))
-        case "set_exploration_policy":
-            let value: ExploreArguments = try decode(toolArguments)
-            request = value.control.request(operation: .explore(value.policy))
-        case "capture_view":
-            let value: CaptureArguments = try decode(toolArguments)
-            request = value.control.request(operation: .captureView(value.goal))
-        case "express_gimbal":
-            let value: ExpressionArguments = try decode(toolArguments)
-            request = value.control.request(operation: .express(value.expression))
-        case "release_embodiment":
-            let value: ReleaseArguments = try decode(toolArguments)
-            request = value.control.request(operation: .release)
+        case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
+             "track_target", "orient_to", "set_exploration_policy", "capture_view",
+             "express_gimbal", "release_embodiment":
+            let request = try embodimentRequest(for: name, arguments: toolArguments)
+            let initial = try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .submit,
+                    request: request,
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+            guard name == "capture_view", initial.ok else { return initial }
+            guard initial.snapshot?.physicalActuationEnabled == true else {
+                return EmbodimentIPCReply(
+                    ok: false,
+                    error: "capture_view_requires_physical_l0_adapter",
+                    decision: initial.decision,
+                    snapshot: initial.snapshot
+                )
+            }
+            return try waitForViewCapture(
+                request: request,
+                initial: initial,
+                sessionAuthorization: sessionAuthorization
+            )
         default:
             throw ServerFailure.invalidArguments("unknown tool: \(name)")
         }
-        let initial = try EmbodimentShadowSocketClient.send(
-            .init(
-                kind: .submit,
-                request: request,
-                sessionAuthorization: sessionAuthorization
-            ),
-            socketURL: socketURL
-        )
-        guard name == "capture_view", initial.ok else { return initial }
-        guard initial.snapshot?.physicalActuationEnabled == true else {
-            return EmbodimentIPCReply(
-                ok: false,
-                error: "capture_view_requires_physical_l0_adapter",
-                decision: initial.decision,
-                snapshot: initial.snapshot
-            )
+    }
+
+    private func embodimentRequest(
+        for name: String,
+        arguments: [String: Any]
+    ) throws -> CognitiveEmbodimentRequest {
+        switch name {
+        case "register_semantic_target":
+            let value: RegisterArguments = try decode(arguments)
+            return value.control.request(operation: .registerTarget(value.registration.value))
+        case "remove_semantic_target":
+            let value: RemoveArguments = try decode(arguments)
+            return value.control.request(operation: .removeTarget(value.targetReference))
+        case "set_attention_policy":
+            let value: AttentionArguments = try decode(arguments)
+            return value.control.request(operation: .setAttentionPolicy(value.policy))
+        case "track_target":
+            let value: TrackArguments = try decode(arguments)
+            return value.control.request(operation: .trackTarget(value.goal))
+        case "orient_to":
+            let value: OrientArguments = try decode(arguments)
+            return value.control.request(operation: .orient(value.goal))
+        case "set_exploration_policy":
+            let value: ExploreArguments = try decode(arguments)
+            return value.control.request(operation: .explore(value.policy))
+        case "capture_view":
+            let value: CaptureArguments = try decode(arguments)
+            return value.control.request(operation: .captureView(value.goal))
+        case "express_gimbal":
+            let value: ExpressionArguments = try decode(arguments)
+            return value.control.request(operation: .express(value.expression))
+        case "release_embodiment":
+            let value: ReleaseArguments = try decode(arguments)
+            return value.control.request(operation: .release)
+        default:
+            throw ServerFailure.invalidArguments("unknown tool: \(name)")
         }
-        return try waitForViewCapture(
-            request: request,
-            initial: initial,
-            sessionAuthorization: sessionAuthorization
-        )
     }
 
     private func waitForViewCapture(
@@ -492,12 +504,34 @@ private final class EmbodimentMCPServer {
         }
     }
 
-    private func toolResult(_ reply: EmbodimentIPCReply) -> [String: Any] {
-        guard let structured = try? jsonObject(reply),
-              let textData = try? encoder.encode(reply),
-              let text = String(data: textData, encoding: .utf8) else {
-            return toolFailure("cannot encode L0 reply")
+    /// Projects only the fields a given tool actually returns, so the model
+    /// never sees unrelated L0 internals (e.g. a person-context reply does not
+    /// leak the embodiment snapshot).
+    private func toolResult(_ reply: EmbodimentIPCReply, for toolName: String) -> [String: Any] {
+        var projected: [String: Any] = ["ok": reply.ok]
+        if let error = reply.error { projected["error"] = error }
+        switch toolName {
+        case "get_embodiment_state", "list_scene_entities", "get_spatial_map":
+            if let snapshot = reply.snapshot { projected["snapshot"] = try? jsonObject(snapshot) }
+        case "get_view_capture":
+            if let resource = reply.viewResource { projected["view_resource"] = try? jsonObject(resource) }
+        case "list_present_people", "list_identity_registry":
+            if let roster = reply.identityRoster { projected["identity_roster"] = try? jsonObject(roster) }
+        case "enroll_present_identity":
+            if let enrollment = reply.identityEnrollment { projected["identity_enrollment"] = try? jsonObject(enrollment) }
+        case "get_person_context", "set_preferred_language", "clear_preferred_language",
+             "set_contact_preference", "set_person_rapport", "set_person_fact", "remove_person_fact":
+            if let context = reply.personContext { projected["person_context"] = try? jsonObject(context) }
+        case "recall_episodes":
+            projected["recalled_episodes"] = reply.recalledEpisodes ?? []
+        case "capture_view":
+            if let decision = reply.decision { projected["decision"] = try? jsonObject(decision) }
+            if let resource = reply.viewResource { projected["view_resource"] = try? jsonObject(resource) }
+        default:
+            if let decision = reply.decision { projected["decision"] = try? jsonObject(decision) }
         }
+        let text = (try? JSONSerialization.data(withJSONObject: projected, options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         var content: [[String: Any]] = [["type": "text", "text": text]]
         if let resource = reply.viewResource,
            resource.state == .ready,
@@ -515,7 +549,7 @@ private final class EmbodimentMCPServer {
         }
         return [
             "content": content,
-            "structuredContent": structured,
+            "structuredContent": projected,
             "isError": !reply.ok,
         ]
     }
@@ -608,6 +642,13 @@ private final class EmbodimentMCPServer {
     private var protectedToolNames: Set<String> { knownToolNames }
 
     private func toolDefinitions() -> [[String: Any]] {
+        embodimentStateTools()
+            + identityTools()
+            + personContextTools()
+            + embodimentControlTools()
+    }
+
+    private func embodimentStateTools() -> [[String: Any]] {
         [
             tool("get_embodiment_state", "Read current L0 embodiment lease, target, and policy state for this interaction.", objectSchema([:], required: []), readOnly: true),
             tool("list_scene_entities", "Read the bounded scalar projection of L0's persistent scene entities and semantic bindings for this interaction.", objectSchema([:], required: []), readOnly: true),
@@ -615,12 +656,22 @@ private final class EmbodimentMCPServer {
             tool("get_view_capture", "Read one short-lived capture result by request ID.", objectSchema([
                 "request_id": stringSchema(maxLength: 96),
             ], required: ["request_id"]), readOnly: true),
+        ]
+    }
+
+    private func identityTools() -> [[String: Any]] {
+        [
             tool("list_present_people", "Administrator-only: compare recently observed faces with local registered identities and return the current non-biometric presence projection. Unknown people remain unnamed.", objectSchema([:], required: []), readOnly: true),
             tool("list_identity_registry", "Administrator-only: list locally registered person-context records, including explicit name, language, rapport, and facts but never face embeddings or raw transcripts.", objectSchema([:], required: []), readOnly: true),
             tool("enroll_present_identity", "Administrator-only: promote one currently present, already-confirmed anonymous identity into a persistent local face-recognition profile. Call only after explicit consent or confirmation from the person; then store their explicitly stated name/language with the person-context tools.", objectSchema([
                 "person_entity_id": uuidSchema(),
                 "confirmed_by_user": ["type": "boolean", "const": true],
             ], required: ["person_entity_id", "confirmed_by_user"])),
+        ]
+    }
+
+    private func personContextTools() -> [[String: Any]] {
+        [
             tool("get_person_context", "Read the current participant's remote-shareable language, contact, rapport, and factual context. Administrator sessions may read an explicitly supplied registered identity from list_identity_registry; participant sessions remain limited to their own reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
                 "person_entity_id": uuidSchema(),
             ], required: ["person_entity_id"]), readOnly: true),
@@ -661,6 +712,11 @@ private final class EmbodimentMCPServer {
                 "person_entity_id": uuidSchema(),
                 "query": stringSchema(maxLength: 512),
             ], required: ["query"])),
+        ]
+    }
+
+    private func embodimentControlTools() -> [[String: Any]] {
+        [
             tool("register_semantic_target", "Register a stable semantic target label or visual query with L0.", objectSchema([
                 "control": controlSchema(),
                 "registration": registrationSchema(),
@@ -708,12 +764,14 @@ private final class EmbodimentMCPServer {
     ) -> [String: Any] {
         var schema = inputSchema
         if requiresSessionAuthorization {
+            // session_token is an implementation detail injected by the SOMA
+            // interaction context, not a semantic argument the model must
+            // reason about. It stays in properties (so the client can supply
+            // it) but is not listed as required; L0 still rejects a protected
+            // call that arrives without a valid token.
             var properties = schema["properties"] as? [String: Any] ?? [:]
             properties["session_token"] = stringSchema(maxLength: 128)
             schema["properties"] = properties
-            var required = schema["required"] as? [String] ?? []
-            required.append("session_token")
-            schema["required"] = Array(Set(required)).sorted()
         }
         return [
             "name": name,
