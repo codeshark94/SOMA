@@ -3263,7 +3263,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var faceFixationSceneID: String?
     private var faceFixationStartNS: UInt64?
     private var faceFixationCooldownUntilNS: UInt64 = 0
-    private let faceFixationReleaseWindowNS: UInt64 = 45_000_000_000
+    /// Time window (ns) for the no-response auto-release. Configurable via
+    /// `SOMA_L0_FIXATION_RELEASE_SECONDS`: 0 (default) means keep gazing
+    /// indefinitely — no time-based release, only the judgment-based E2B
+    /// release; a positive value tolerates non-response for that many seconds
+    /// before releasing the face lock and resuming scanning.
+    private var faceFixationReleaseWindowNS: UInt64 {
+        UInt64(somaEnvDouble("SOMA_L0_FIXATION_RELEASE_SECONDS", default: 0) * 1_000_000_000)
+    }
     private let faceFixationReleaseCooldownNS: UInt64 = 30_000_000_000
     /// Consecutive E2B reactions (orient/observe) observed while L0 is face-locked.
     /// When this reaches the threshold, E2B forcibly releases what it judges to be
@@ -4642,6 +4649,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// with L1 authority, which also tears away the reflexive face lock even
     /// while the detector keeps reporting the (possibly false-positive) face.
     private func applyFaceFixationAutoRelease(target: AttentionTarget?, at now: UInt64) {
+        // Time-based release is opt-in via SOMA_L0_FIXATION_RELEASE_SECONDS.
+        // When disabled (0) the robot keeps gazing; only the judgment-based E2B
+        // release (applyAuxiliaryL0Release) may then tear away a wrong lock.
+        guard faceFixationReleaseWindowNS > 0 else {
+            faceFixationSceneID = nil
+            faceFixationStartNS = nil
+            return
+        }
         let conversationActive = liveVoicePresentation == .hearingUser
             || liveVoicePresentation == .responding
         if conversationActive {
