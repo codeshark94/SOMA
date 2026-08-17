@@ -1223,10 +1223,18 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     /// opens the encrypted journal itself.
     func applyPersonContext(_ request: PersonContextIPCRequest) async throws -> PersonContextSnapshot {
         guard let store else { throw GemmaL1SituationRuntimeError.memoryUnavailable }
+        guard request.operation != .recallEpisodes else {
+            // Handled by the dedicated recallEpisodesProvider; not a person-
+            // context mutation.
+            throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+        }
+        guard let personEntityID = request.personEntityID else {
+            throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+        }
         let snapshot: PersonContextSnapshot
         switch request.operation {
         case .get:
-            snapshot = try await store.personContext(for: request.personEntityID)
+            snapshot = try await store.personContext(for: personEntityID)
         case .setPreferredLanguage:
             guard request.confirmedByUser,
                   let rawTag = request.languageTag,
@@ -1234,14 +1242,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.setExplicitPersonFact(
-                personEntityID: request.personEntityID,
+                personEntityID: personEntityID,
                 key: "preferred_language",
                 value: languageTag
             )
         case .clearPreferredLanguage:
             guard request.confirmedByUser else { throw GemmaL1SituationRuntimeError.invalidPersonContextRequest }
             snapshot = try await store.clearExplicitPersonFact(
-                personEntityID: request.personEntityID,
+                personEntityID: personEntityID,
                 key: "preferred_language"
             )
         case .setContactPreference:
@@ -1249,9 +1257,9 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                   let preference = request.proactiveContact else {
                 throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
             }
-            let existing = try await store.personContext(for: request.personEntityID)
+            let existing = try await store.personContext(for: personEntityID)
             snapshot = try await store.setExplicitPersonRapport(
-                personEntityID: request.personEntityID,
+                personEntityID: personEntityID,
                 rapport: RapportProfile(
                     familiarity: existing.rapport?.familiarity ?? 0,
                     interactionComfort: existing.rapport?.interactionComfort ?? 0.5,
@@ -1268,7 +1276,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.setExplicitPersonRapport(
-                personEntityID: request.personEntityID,
+                personEntityID: personEntityID,
                 rapport: RapportProfile(
                     familiarity: familiarity,
                     interactionComfort: interactionComfort,
@@ -1283,7 +1291,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.setExplicitPersonFact(
-                personEntityID: request.personEntityID,
+                personEntityID: personEntityID,
                 key: key,
                 value: value
             )
@@ -1292,7 +1300,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.clearExplicitPersonFact(
-                personEntityID: request.personEntityID,
+                personEntityID: personEntityID,
                 key: key
             )
         case .recallEpisodes:

@@ -8948,8 +8948,9 @@ private func run(_ options: Options) throws {
                         message: "operation=\(request.operation.rawValue); missing_required=\(snapshot.mission.missingRequiredKeys.count); recommended=\(snapshot.mission.recommendedKeys.count)"
                     ))
                 }
-                if request.operation != .get, case let .success(snapshot) = result {
-                    l1ThoughtRelay.invalidateMemoryContext(for: request.personEntityID)
+                if request.operation != .get, case let .success(snapshot) = result,
+                   let personEntityID = request.personEntityID {
+                    l1ThoughtRelay.invalidateMemoryContext(for: personEntityID)
                     writer.write(RuntimeEvent(
                         event: "person_context.updated",
                         monotonicNS: monotonicNanoseconds(),

@@ -117,7 +117,7 @@ private struct EnrollPresentIdentityArguments: Codable {
 }
 
 private struct PersonContextArguments: Codable {
-    let personEntityId: UUID
+    let personEntityId: UUID?
     let languageTag: String?
     let proactiveContact: ProactiveContactPreference?
     let familiarity: Double?
@@ -131,34 +131,37 @@ private struct PersonContextArguments: Codable {
     func request(for operation: PersonContextIPCOperation) throws -> PersonContextIPCRequest {
         switch operation {
         case .get:
-            break
+            guard personEntityId != nil else {
+                throw ServerFailure.invalidArguments("get_person_context requires person_entity_id")
+            }
         case .setPreferredLanguage:
-            guard languageTag != nil, confirmedByUser == true else {
-                throw ServerFailure.invalidArguments("set_preferred_language requires language_tag and confirmed_by_user=true")
+            guard personEntityId != nil, languageTag != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("set_preferred_language requires person_entity_id, language_tag and confirmed_by_user=true")
             }
         case .clearPreferredLanguage:
-            guard confirmedByUser == true else {
-                throw ServerFailure.invalidArguments("clear_preferred_language requires confirmed_by_user=true")
+            guard personEntityId != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("clear_preferred_language requires person_entity_id and confirmed_by_user=true")
             }
         case .setContactPreference:
-            guard proactiveContact != nil, confirmedByUser == true else {
-                throw ServerFailure.invalidArguments("set_contact_preference requires proactive_contact and confirmed_by_user=true")
+            guard personEntityId != nil, proactiveContact != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("set_contact_preference requires person_entity_id, proactive_contact and confirmed_by_user=true")
             }
         case .setRapport:
-            guard familiarity != nil,
+            guard personEntityId != nil,
+                  familiarity != nil,
                   interactionComfort != nil,
                   communicationAlignment != nil,
                   proactiveContact != nil,
                   confirmedByUser == true else {
-                throw ServerFailure.invalidArguments("set_person_rapport requires rapport values, proactive_contact, and confirmed_by_user=true")
+                throw ServerFailure.invalidArguments("set_person_rapport requires person_entity_id, rapport values, proactive_contact, and confirmed_by_user=true")
             }
         case .setFact:
-            guard key != nil, value != nil, confirmedByUser == true else {
-                throw ServerFailure.invalidArguments("set_person_fact requires key, value, and confirmed_by_user=true")
+            guard personEntityId != nil, key != nil, value != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("set_person_fact requires person_entity_id, key, value, and confirmed_by_user=true")
             }
         case .removeFact:
-            guard key != nil, confirmedByUser == true else {
-                throw ServerFailure.invalidArguments("remove_person_fact requires key and confirmed_by_user=true")
+            guard personEntityId != nil, key != nil, confirmedByUser == true else {
+                throw ServerFailure.invalidArguments("remove_person_fact requires person_entity_id, key and confirmed_by_user=true")
             }
         case .recallEpisodes:
             guard let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -654,10 +657,10 @@ private final class EmbodimentMCPServer {
                 "key": stringSchema(maxLength: 64),
                 "confirmed_by_user": ["type": "boolean", "const": true],
             ], required: ["person_entity_id", "key", "confirmed_by_user"])),
-            tool("recall_episodes", "Recall past conversation episodes relevant to a query, scoped to the current participant. Use to remember what was discussed with this person before, or to ground a reply in shared history. Returns narrative summaries only, never raw transcripts.", objectSchema([
+            tool("recall_episodes", "Recall past conversation episodes relevant to a query. This is SOMA's own memory; which person a memory relates to is inferred from context, so person_entity_id is optional (omit to search all of SOMA's memory). Returns narrative summaries only, never raw transcripts.", objectSchema([
                 "person_entity_id": uuidSchema(),
                 "query": stringSchema(maxLength: 512),
-            ], required: ["person_entity_id", "query"])),
+            ], required: ["query"])),
             tool("register_semantic_target", "Register a stable semantic target label or visual query with L0.", objectSchema([
                 "control": controlSchema(),
                 "registration": registrationSchema(),

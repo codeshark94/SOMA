@@ -27,7 +27,8 @@ public enum PersonContextIPCOperation: String, Codable, Sendable {
 
 public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
     public let operation: PersonContextIPCOperation
-    public let personEntityID: UUID
+    /// Optional: recall is context-driven and may span all of SOMA's memory.
+    public let personEntityID: UUID?
     public let languageTag: String?
     public let proactiveContact: ProactiveContactPreference?
     public let familiarity: Double?
@@ -41,7 +42,7 @@ public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
 
     public init(
         operation: PersonContextIPCOperation,
-        personEntityID: UUID,
+        personEntityID: UUID?,
         languageTag: String? = nil,
         proactiveContact: ProactiveContactPreference? = nil,
         familiarity: Double? = nil,
@@ -448,8 +449,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                       let request = command.personContext else {
                     throw EmbodimentIPCError.malformedMessage
                 }
-                try authorize(command.sessionAuthorization, scope: .personContext(request.personEntityID))
                 if request.operation == .recallEpisodes {
+                    try authorize(command.sessionAuthorization, scope: .episodicRecall)
                     switch recallEpisodesProvider(request) {
                     case let .success(episodes):
                         writeReply(.init(ok: true, recalledEpisodes: episodes), to: clientFD)
@@ -458,6 +459,10 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                     }
                     break
                 }
+                guard let personEntityID = request.personEntityID else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .personContext(personEntityID))
                 switch personContextProvider(request) {
                 case let .success(context):
                     writeReply(.init(ok: true, personContext: context), to: clientFD)

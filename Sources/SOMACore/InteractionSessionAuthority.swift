@@ -16,6 +16,10 @@ public enum SOMASessionCapabilityScope: Equatable, Sendable {
     case identityRoster
     case identityManagement
     case embodimentControl
+    /// Recall of SOMA's own episodic memory. It is the owner's memory, so any
+    /// valid session may query it; which person a memory relates to is inferred
+    /// from context rather than required up front.
+    case episodicRecall
 }
 
 public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
@@ -125,6 +129,9 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
             // ordinary embodied conversation, not administrator-only work.
             // L0 still bounds every request through its lease and actuator
             // policy. Administrator-only external work is not exposed here.
+            return .success(())
+        case .episodicRecall:
+            // SOMA's own memory; any valid session may recall shared history.
             return .success(())
         }
     }
