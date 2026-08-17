@@ -10115,7 +10115,7 @@ private func run(_ options: Options) throws {
                         l1MemoryContext.cachedPersonMemorySummaries(for: $0)
                     } ?? [],
                     pendingInformationNeeds: recognizedPersonEntityID.map {
-                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).map(\.question)
+                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(1).map(\.question)
                     } ?? []
                 )
                 liveVoiceLauncher?.startIfNeeded(
@@ -10148,7 +10148,7 @@ private func run(_ options: Options) throws {
                         l1MemoryContext.cachedPersonMemorySummaries(for: $0)
                     } ?? [],
                     pendingInformationNeeds: recognizedPersonEntityID.map {
-                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).map(\.question)
+                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(1).map(\.question)
                     } ?? []
                 ) else { return }
                 let wake = openingAuthorization.flatMap {
@@ -10630,7 +10630,7 @@ private func l1ProactiveInteractionContext(
         languageStartInstruction: languageStartInstruction,
         rapportSummary: rapport,
         activeTaskSummaries: [objective, completion] + (language.map { [$0] } ?? []) + (preferences.map { [$0] } ?? []) + (
-            request.informationNeeds.isEmpty ? [] : ["Acquisition mission — gently try to learn: \(request.informationNeeds.map(\.informationGoal).joined(separator: " | "))"]
+            request.informationNeeds.isEmpty ? [] : ["Acquisition mission — gently try to learn one thing in conversation: \(request.informationNeeds.sorted { $0.expectedInformationGain > $1.expectedInformationGain }.first!.informationGoal)"]
         ),
         memorySummaries: request.memory.map(\.summary) + request.recalledEpisodes,
         embodimentSummary: "L0 is maintaining visual attention while L2 leads the interaction. Do not issue camera-control instructions as part of ordinary conversation."

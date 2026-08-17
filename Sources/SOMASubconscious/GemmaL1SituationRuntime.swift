@@ -421,11 +421,24 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     expectedInformationGain: 0.64
                 ))
             }
+            // Human conversation has balance: do not barrage the person with
+            // every open question at once. Surface only the highest-value needs,
+            // capped, so the robot gently pursues one or two things rather than
+            // interrogating.
+            let maxActiveNeeds = 2
+            needs = needs
+                .sorted { $0.expectedInformationGain > $1.expectedInformationGain }
+                .prefix(maxActiveNeeds)
+                .map { $0 }
             let personContext = try await store.personContext(for: entityID, at: now)
             cachePersonContext(personContext)
             cachePersonMemorySummaries(projections.map(\.summary), for: entityID)
             let persistedNeeds = await pendingInformationNeeds(for: entityID, at: now)
             cacheInformationNeeds(persistedNeeds, for: entityID)
+            // The needs are about to be handed to L1/L2 as a mission; put them
+            // into cooldown so the robot does not re-ask the same thing every
+            // conversation until the window passes.
+            await markInformationNeedsSurfaced(persistedNeeds, at: now)
             let recalled = await recallEpisodes(
                 entityID: entityID,
                 query: personContext.preferenceDirectives().joined(separator: " "),
@@ -1008,7 +1021,9 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
-    /// Pending (open) information needs scoped to a person, newest first.
+    /// Pending (open) information needs scoped to a person, newest first. Needs
+    /// still inside their cooldown window are withheld so the robot does not
+    /// re-ask the same thing every conversation.
     func pendingInformationNeeds(
         for entityID: UUID,
         at date: Date = Date()
@@ -1020,6 +1035,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         )) ?? []
         return records.compactMap { record -> PersistedInformationNeed? in
             guard case let .openQuestion(q) = record.payload, q.status == .open else { return nil }
+            if let cooldown = q.cooldownUntil, cooldown > date { return nil }
             return PersistedInformationNeed(
                 motiveID: record.id,
                 question: q.question,
@@ -1030,12 +1046,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
-    /// Pending (open) information needs across all people, newest first.
+    /// Pending (open) information needs across all people, newest first, with
+    /// cooldown withheld.
     func allPendingInformationNeeds(at date: Date = Date()) async -> [PersistedInformationNeed] {
         guard let store else { return [] }
         let records = (try? await store.query(.init(limit: 200), at: date)) ?? []
         return records.compactMap { record -> PersistedInformationNeed? in
             guard case let .openQuestion(q) = record.payload, q.status == .open else { return nil }
+            if let cooldown = q.cooldownUntil, cooldown > date { return nil }
             return PersistedInformationNeed(
                 motiveID: record.id,
                 question: q.question,
@@ -1043,6 +1061,49 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 expectedInformationGain: q.expectedInformationGain,
                 createdAt: record.updatedAt
             )
+        }
+    }
+
+    /// Puts the given open information needs into a cooldown window so they are
+    /// not re-surfaced to L2 until the window passes. Called when the needs are
+    /// actually handed to L2 as a mission.
+    func markInformationNeedsSurfaced(
+        _ needs: [PersistedInformationNeed],
+        cooldown: TimeInterval = 24 * 60 * 60,
+        at date: Date = Date()
+    ) async {
+        guard let store else { return }
+        let until = date.addingTimeInterval(cooldown)
+        for need in needs {
+            do {
+                guard let previous = try await store.record(id: need.motiveID, at: date),
+                      case let .openQuestion(q) = previous.payload,
+                      q.status == .open else { continue }
+                _ = try await store.correct(
+                    id: need.motiveID,
+                    replacement: CognitiveMemoryDraft(
+                        tier: previous.tier,
+                        summary: previous.summary,
+                        payload: .openQuestion(OpenQuestionMemory(
+                            question: q.question,
+                            targetEntityID: q.targetEntityID,
+                            expectedInformationGain: q.expectedInformationGain,
+                            cooldownUntil: until,
+                            status: .open
+                        )),
+                        confidence: previous.confidence,
+                        provenance: previous.provenance,
+                        sensitivity: previous.sensitivity,
+                        disclosure: previous.disclosure,
+                        expiresAt: previous.expiresAt
+                    ),
+                    reason: "information_need_surfaced",
+                    at: date
+                )
+            } catch {
+                // Non-fatal: a failed cooldown write just means the need may be
+                // surfaced again next cycle.
+            }
         }
     }
 
