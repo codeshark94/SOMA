@@ -228,6 +228,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private let preferredLanguageLock = NSLock()
     private var preferredLanguageByPersonID: [UUID: String] = [:]
     private var personContextByPersonID: [UUID: PersonContextSnapshot] = [:]
+    private var personMemorySummariesByPersonID: [UUID: [String]] = [:]
     private let conversationLock = NSLock()
     private var activeConversations: [String: ActiveConversation] = [:]
     /// Every durable consequence of a finalized Live turn joins this group.
@@ -384,6 +385,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             }
             let personContext = try await store.personContext(for: entityID, at: now)
             cachePersonContext(personContext)
+            cachePersonMemorySummaries(projections.map(\.summary), for: entityID)
             let recalled = await recallEpisodes(
                 entityID: entityID,
                 query: personContext.preferenceDirectives().joined(separator: " "),
@@ -1015,6 +1017,15 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         return personContextByPersonID[personEntityID]?.mission
     }
 
+    /// The most recently recalled durable memory projections for this person
+    /// (including recognized-object taste facts), for surfacing in reactive
+    /// speech context the same way the L1 proactive path does.
+    func cachedPersonMemorySummaries(for personEntityID: UUID) -> [String] {
+        preferredLanguageLock.lock()
+        defer { preferredLanguageLock.unlock() }
+        return personMemorySummariesByPersonID[personEntityID] ?? []
+    }
+
     func warmContext(for personEntityID: UUID) {
         Task { _ = await context(for: personEntityID) }
     }
@@ -1416,6 +1427,12 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         preferredLanguageLock.unlock()
         guard previous != snapshot.preferredLanguageTag else { return }
         onPreferredLanguageChanged(snapshot.personEntityID, snapshot.preferredLanguageTag)
+    }
+
+    private func cachePersonMemorySummaries(_ summaries: [String], for personEntityID: UUID) {
+        preferredLanguageLock.lock()
+        personMemorySummariesByPersonID[personEntityID] = summaries
+        preferredLanguageLock.unlock()
     }
 
     private static func localDayKey(for date: Date) -> String {

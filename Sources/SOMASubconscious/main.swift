@@ -9716,6 +9716,10 @@ private func run(_ options: Options) throws {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .arrived(identity) = update.transition {
                     attentionGimbalBridge?.enqueueAcknowledgment(for: identity.entityID, at: monotonicNS)
+                    // Pre-warm the person's durable memory context so reactive
+                    // speech can surface recalled facts (e.g. recognized-object
+                    // taste profile) even before the first L1 wake cycle.
+                    l1MemoryContext.warmContext(for: identity.entityID)
                 }
                 if case let .departed(identity) = update.transition {
                     l1ThoughtRelay.depart(identity.entityID)
@@ -9851,7 +9855,10 @@ private func run(_ options: Options) throws {
                     },
                     preferredLanguageTag: preferredLanguageTag,
                     languageStartInstruction: languageStartInstruction,
-                    objectKnowledge: objectKnowledgeStore.recentSummaries()
+                    objectKnowledge: objectKnowledgeStore.recentSummaries(),
+                    memorySummaries: recognizedPersonEntityID.map {
+                        l1MemoryContext.cachedPersonMemorySummaries(for: $0)
+                    } ?? []
                 )
                 liveVoiceLauncher?.startIfNeeded(
                     authorization: openingAuthorization.rawValue,
@@ -9878,7 +9885,10 @@ private func run(_ options: Options) throws {
                     },
                     preferredLanguageTag: preferredLanguageTag,
                     languageStartInstruction: languageStartInstruction,
-                    objectKnowledge: objectKnowledgeStore.recentSummaries()
+                    objectKnowledge: objectKnowledgeStore.recentSummaries(),
+                    memorySummaries: recognizedPersonEntityID.map {
+                        l1MemoryContext.cachedPersonMemorySummaries(for: $0)
+                    } ?? []
                 ) else { return }
                 let wake = openingAuthorization.flatMap {
                     speechInteractionWake(
@@ -10271,7 +10281,8 @@ private func speechInteractionContext(
     personMemoryMission: PersonContextMission? = nil,
     preferredLanguageTag: String? = nil,
     languageStartInstruction: String? = nil,
-    objectKnowledge: [String] = []
+    objectKnowledge: [String] = [],
+    memorySummaries: [String] = []
 ) -> CodexInteractionContext? {
     let targetSummary: String
     if let target = belief.target {
@@ -10292,6 +10303,7 @@ private func speechInteractionContext(
         personMemoryMission: personMemoryMission,
         preferredLanguageTag: preferredLanguageTag,
         languageStartInstruction: languageStartInstruction,
+        memorySummaries: memorySummaries,
         embodimentSummary: "Camera policy is \(belief.policy.rawValue); interaction readiness is \(String(format: "%.2f", belief.readyProbability))."
     )
 }
