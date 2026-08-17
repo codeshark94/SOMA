@@ -331,9 +331,11 @@ func l1GetInformationNeeds(_ provider: L1MemoryContextProvider, for entityID: UU
     Task { [provider] in
         let needs: [PersistedInformationNeed]
         if let entityID {
-            needs = await provider.pendingInformationNeeds(for: entityID)
+            // The person explicitly asked: report the real open set, ignoring
+            // the re-ask cooldown that would otherwise answer "none".
+            needs = await provider.pendingInformationNeeds(for: entityID, respectCooldown: false)
         } else {
-            needs = await provider.allPendingInformationNeeds()
+            needs = await provider.allPendingInformationNeeds(respectCooldown: false)
         }
         box.set(.success(needs))
         semaphore.signal()

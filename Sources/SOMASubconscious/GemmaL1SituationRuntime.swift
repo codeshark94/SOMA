@@ -438,7 +438,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             let personContext = try await store.personContext(for: entityID, at: now)
             cachePersonContext(personContext)
             cachePersonMemorySummaries(projections.map(\.summary), for: entityID)
-            let persistedNeeds = await pendingInformationNeeds(for: entityID, at: now)
+            let persistedNeeds = await pendingInformationNeeds(for: entityID, at: now, respectCooldown: false)
             cacheInformationNeeds(persistedNeeds, for: entityID)
             // The needs are about to be handed to L1/L2 as a mission; put them
             // into cooldown so the robot does not re-ask the same thing every
@@ -1028,10 +1028,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
 
     /// Pending (open) information needs scoped to a person, newest first. Needs
     /// still inside their cooldown window are withheld so the robot does not
-    /// re-ask the same thing every conversation.
+    /// re-ask the same thing every conversation. `respectCooldown: false`
+    /// reports the full open set — used when the person explicitly asks what
+    /// the robot still wants to learn, where withholding would answer "none"
+    /// despite open needs existing.
     func pendingInformationNeeds(
         for entityID: UUID,
-        at date: Date = Date()
+        at date: Date = Date(),
+        respectCooldown: Bool = true
     ) async -> [PersistedInformationNeed] {
         guard let store else { return [] }
         let records = (try? await store.query(
@@ -1040,7 +1044,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         )) ?? []
         return records.compactMap { record -> PersistedInformationNeed? in
             guard case let .openQuestion(q) = record.payload, q.status == .open else { return nil }
-            if let cooldown = q.cooldownUntil, cooldown > date { return nil }
+            if respectCooldown, let cooldown = q.cooldownUntil, cooldown > date { return nil }
             return PersistedInformationNeed(
                 motiveID: record.id,
                 question: q.question,
@@ -1053,12 +1057,15 @@ final class L1MemoryContextProvider: @unchecked Sendable {
 
     /// Pending (open) information needs across all people, newest first, with
     /// cooldown withheld.
-    func allPendingInformationNeeds(at date: Date = Date()) async -> [PersistedInformationNeed] {
+    func allPendingInformationNeeds(
+        at date: Date = Date(),
+        respectCooldown: Bool = true
+    ) async -> [PersistedInformationNeed] {
         guard let store else { return [] }
         let records = (try? await store.query(.init(limit: 200), at: date)) ?? []
         return records.compactMap { record -> PersistedInformationNeed? in
             guard case let .openQuestion(q) = record.payload, q.status == .open else { return nil }
-            if let cooldown = q.cooldownUntil, cooldown > date { return nil }
+            if respectCooldown, let cooldown = q.cooldownUntil, cooldown > date { return nil }
             return PersistedInformationNeed(
                 motiveID: record.id,
                 question: q.question,

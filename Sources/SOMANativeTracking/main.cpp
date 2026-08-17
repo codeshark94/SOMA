@@ -1192,7 +1192,6 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
     bool externalControl = false;
     auto lastExternalCommand = Clock::now();
     auto nextAttitudeReport = Clock::now();
-    auto nextZoomWatchdog = Clock::now();
     std::optional<Clock::time_point> externalPulseDeadline;
     std::string externalPulseStopCommandID;
     const bool continuous = durationSeconds == 0;
@@ -1430,16 +1429,6 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
         if (Clock::now() >= nextAttitudeReport) {
             if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
             nextAttitudeReport = Clock::now() + std::chrono::milliseconds(20);
-        }
-        if (Clock::now() >= nextZoomWatchdog) {
-            // The OBSBOT's own AI can re-engage auto-zoom (e.g. after a
-            // tracking-mode switch), leaving the lens zoomed in long after the
-            // target is gone. SOMA never commands zoom, so periodically
-            // re-assert the fixed 1x baseline to restore the original
-            // magnification.
-            try { device->aiSetAiAutoZoomR(false); } catch (...) {}
-            try { device->cameraSetZoomAbsoluteR(1.0f); } catch (...) {}
-            nextZoomWatchdog = Clock::now() + std::chrono::seconds(4);
         }
         if (nativeTracking && Clock::now() - lastHeartbeat > nativeWatchdog) {
             const bool stopped = requestManualStop(device, trace, "attention_watchdog_expired", "watchdog-stop-1");
