@@ -427,6 +427,8 @@ bool listDevices() {
     return false;
 }
 
+void emitNativeTrackingState(const std::string &state, const std::string &commandID) noexcept;
+
 bool requestManualStop(
     const std::shared_ptr<Device> &device,
     Trace &trace,
@@ -451,6 +453,14 @@ bool requestManualStop(
             commandID
         );
     } catch (...) {}
+    // The Swift bridge keeps a native-tracking lease alive with heartbeats.
+    // Whenever the device is actually returned to manual mode — whether by the
+    // owner, the watchdog, an external yield, a recenter, or shutdown — it must
+    // be told so, or it will keep sending heartbeats for a lease the native
+    // side no longer holds (spamming heartbeat_rejected faults).
+    if (deactivated) {
+        emitNativeTrackingState("inactive", commandID);
+    }
     return stopResult == RM_RET_OK && stopMotionResult == RM_RET_OK && deactivated;
 }
 
