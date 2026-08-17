@@ -61,6 +61,11 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     /// Minimum interval (ms) between local-vision (E2B) wake proposals for the
     /// same situation.
     public var l0E2BWakeIntervalMilliseconds: Double
+    /// Whether the local-vision (E2B) layer is launched at all. E2B is a core
+    /// dependency: it supplies the auxiliary semantic cues, low-social-presence
+    /// judgment releases, object recognition, space transitions, and L1 wake
+    /// proposals. Defaults to true.
+    public var l05Enabled: Bool
     /// How long (ms) a fresh directed eye-contact observation remains valid for
     /// authorizing a spoken opening. Lower = stricter (requires very recent
     /// gaze); higher = more lenient. Defaults to 450.
@@ -105,6 +110,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l0E2BWakeScore: Double = 0.65,
         l0E2BWakeConfidence: Double = 0.55,
         l0E2BWakeIntervalMilliseconds: Double = 5_000,
+        l05Enabled: Bool = true,
         l0EyeContactFreshnessMilliseconds: Double = 450,
         l0EyeContactPupilThreshold: Double = 1.0,
         memoryShortTermRetentionHours: Double = 24,
@@ -129,6 +135,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         self.l0E2BWakeScore = min(max(l0E2BWakeScore, 0), 1)
         self.l0E2BWakeConfidence = min(max(l0E2BWakeConfidence, 0), 1)
         self.l0E2BWakeIntervalMilliseconds = max(l0E2BWakeIntervalMilliseconds, 1_000)
+        self.l05Enabled = l05Enabled
         self.l0EyeContactFreshnessMilliseconds = min(max(l0EyeContactFreshnessMilliseconds, 100), 2_000)
         self.l0EyeContactPupilThreshold = min(max(l0EyeContactPupilThreshold, 0.1), 2.0)
         self.memoryShortTermRetentionHours = min(max(memoryShortTermRetentionHours, 1), 24)
@@ -161,6 +168,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
             "SOMA_L0_E2B_WAKE_SCORE=\(String(format: "%g", l0E2BWakeScore))",
             "SOMA_L0_E2B_WAKE_CONFIDENCE=\(String(format: "%g", l0E2BWakeConfidence))",
             "SOMA_L0_E2B_WAKE_INTERVAL_MS=\(String(format: "%g", l0E2BWakeIntervalMilliseconds))",
+            "SOMA_ENABLE_L05_VLM=\(l05Enabled ? "1" : "0")",
             "SOMA_L0_EYE_CONTACT_FRESHNESS_MS=\(String(format: "%g", l0EyeContactFreshnessMilliseconds))",
             "SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD=\(String(format: "%g", l0EyeContactPupilThreshold))",
             "SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS=\(String(format: "%g", memoryShortTermRetentionHours))",
@@ -188,6 +196,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         case l0E2BWakeScore
         case l0E2BWakeConfidence
         case l0E2BWakeIntervalMilliseconds
+        case l05Enabled
         case l0EyeContactFreshnessMilliseconds
         case l0EyeContactPupilThreshold
         case memoryShortTermRetentionHours
@@ -215,6 +224,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l0E2BWakeScore = min(max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeScore) ?? 0.65, 0), 1)
         l0E2BWakeConfidence = min(max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeConfidence) ?? 0.55, 0), 1)
         l0E2BWakeIntervalMilliseconds = max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeIntervalMilliseconds) ?? 5_000, 1_000)
+        l05Enabled = try values.decodeIfPresent(Bool.self, forKey: .l05Enabled) ?? true
         l0EyeContactFreshnessMilliseconds = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactFreshnessMilliseconds) ?? 450, 100), 2_000)
         l0EyeContactPupilThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactPupilThreshold) ?? 1.0, 0.1), 2.0)
         memoryShortTermRetentionHours = min(max(try values.decodeIfPresent(Double.self, forKey: .memoryShortTermRetentionHours) ?? 24, 1), 24)
@@ -296,6 +306,7 @@ public struct SOMAEnvStore: Sendable {
             l0E2BWakeScore: doubleValue(values["SOMA_L0_E2B_WAKE_SCORE"], default: 0.65),
             l0E2BWakeConfidence: doubleValue(values["SOMA_L0_E2B_WAKE_CONFIDENCE"], default: 0.55),
             l0E2BWakeIntervalMilliseconds: doubleValue(values["SOMA_L0_E2B_WAKE_INTERVAL_MS"], default: 5_000),
+            l05Enabled: boolValue(values["SOMA_ENABLE_L05_VLM"], default: true),
             l0EyeContactFreshnessMilliseconds: doubleValue(values["SOMA_L0_EYE_CONTACT_FRESHNESS_MS"], default: 450),
             l0EyeContactPupilThreshold: doubleValue(values["SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD"], default: 1.0),
             memoryShortTermRetentionHours: doubleValue(values["SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS"], default: 24),

@@ -725,6 +725,10 @@ private struct SOMASettingsView: View {
                     )
                 }
                 HStack {
+                    Toggle("On-device vision layer (E2B)", isOn: l05EnabledBinding)
+                        .toggleStyle(.switch)
+                }
+                HStack {
                     Text("Local vision wake sensitivity")
                     Spacer()
                     Stepper("Score ≥ \(String(format: "%.2f", model.envSettings.l0E2BWakeScore))", value: l0E2BWakeScoreBinding, in: 0.1...0.95, step: 0.05)
@@ -1051,6 +1055,12 @@ private struct SOMASettingsView: View {
         Binding(
             get: { model.envSettings.l0E2BWakeScore },
             set: { model.envSettings.l0E2BWakeScore = min(max($0, 0.1), 0.95) }
+        )
+    }
+    private var l05EnabledBinding: Binding<Bool> {
+        Binding(
+            get: { model.envSettings.l05Enabled },
+            set: { model.envSettings.l05Enabled = $0 }
         )
     }
     private var l0FaceFixationReleaseBinding: Binding<Double> {

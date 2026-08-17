@@ -3419,15 +3419,51 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     private func ingestHelperDiagnostics(_ data: Data) {
         guard let chunk = String(data: data, encoding: .utf8) else { return }
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.helperDiagnosticBuffer.append(chunk)
-            while let newline = self.helperDiagnosticBuffer.firstIndex(of: "\n") {
-                let line = String(self.helperDiagnosticBuffer[..<newline])
-                self.helperDiagnosticBuffer.removeSubrange(...newline)
-                self.consumeHelperDiagnostic(line)
+        // Attitude reports arrive every 20 ms and must stay fresher than the
+        // 250 ms pose window the coverage scan relies on. The bridge queue is
+        // busy with attention work (apply, scan ticks, trace writes), so
+        // queuing attitude lines behind it starves the pose stream and the
+        // scan stalls in coverage_pose_wait_curve. Parse attitude lines
+        // directly on the (serialized) pipe-handler thread — GimbalPoseStore
+        // is lock-protected — and dispatch the rare stateful lines (native
+        // tracking transitions, FOV) to the bridge queue as before.
+        helperDiagnosticBuffer.append(chunk)
+        while let newline = helperDiagnosticBuffer.firstIndex(of: "\n") {
+            let line = String(helperDiagnosticBuffer[..<newline])
+            helperDiagnosticBuffer.removeSubrange(...newline)
+            if line.hasPrefix("SOMA_GIMBAL_ATTITUDE ") {
+                consumeAttitudeLine(line)
+            } else {
+                queue.async { [weak self] in self?.consumeHelperDiagnostic(line) }
             }
         }
+    }
+
+    private func consumeAttitudeLine(_ line: String) {
+        let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
+            let pair = part.split(separator: "=", maxSplits: 1)
+            guard pair.count == 2 else { return }
+            result[String(pair[0])] = pair[1]
+        }
+        guard let pitchText = values["pitch"], let pitch = Double(pitchText),
+              let panText = values["pan"], let pan = Double(panText),
+              let sampleText = values["monotonic_ns"], let sampleNS = UInt64(sampleText) else { return }
+        let receivedNS = monotonicNanoseconds()
+        // The SDK helper and DispatchTime can use monotonic clocks with
+        // different sleep epochs. The local scalar pipe's receive timestamp
+        // is therefore the shared clock for capture alignment; helper reports
+        // arrive every 20 ms, below the 50 ms image-pose freshness window.
+        guard sampleNS > 0 else { return }
+        poseStore.update(pitchDegrees: pitch, panDegrees: pan, at: receivedNS)
+        guard !poseAvailabilityReported else { return }
+        poseAvailabilityReported = true
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: receivedNS,
+            source: "gimbal_pose",
+            state: "available",
+            message: "sdk_attitude_feedback"
+        ))
     }
 
     private func consumeHelperDiagnostic(_ line: String) {
@@ -3502,30 +3538,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         }
         guard line.hasPrefix("SOMA_GIMBAL_ATTITUDE ") else { return }
-        let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
-            let pair = part.split(separator: "=", maxSplits: 1)
-            guard pair.count == 2 else { return }
-            result[String(pair[0])] = pair[1]
-        }
-        guard let pitchText = values["pitch"], let pitch = Double(pitchText),
-              let panText = values["pan"], let pan = Double(panText),
-              let sampleText = values["monotonic_ns"], let sampleNS = UInt64(sampleText) else { return }
-        let receivedNS = monotonicNanoseconds()
-        // The SDK helper and DispatchTime can use monotonic clocks with
-        // different sleep epochs. The local scalar pipe's receive timestamp
-        // is therefore the shared clock for capture alignment; helper reports
-        // arrive every 20 ms, below the 50 ms image-pose freshness window.
-        guard sampleNS > 0 else { return }
-        poseStore.update(pitchDegrees: pitch, panDegrees: pan, at: receivedNS)
-        guard !poseAvailabilityReported else { return }
-        poseAvailabilityReported = true
-        writer.write(RuntimeEvent(
-            event: "source.health",
-            monotonicNS: receivedNS,
-            source: "gimbal_pose",
-            state: "available",
-            message: "sdk_attitude_feedback"
-        ))
+        // Attitude lines are consumed on the pipe-handler fast path in
+        // ingestHelperDiagnostics; they never reach this queue.
     }
 
     func ingest(_ belief: BeliefSnapshot, reason: String) {
@@ -5125,7 +5139,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         if case .expression = cognitiveMotionMode {
             pose = poseStore.lastKnown()
         } else {
-            pose = poseStore.current(maximumAgeNS: 250_000_000)
+            // 600ms window: the native attitude reporter emits at ~70-90ms
+            // cadence with occasional gaps during SDK mode switches.
+            pose = poseStore.current(maximumAgeNS: 600_000_000)
         }
         guard let pose else {
             if !cognitiveMotionHolding {
@@ -5865,7 +5881,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         let desired: (pitch: Double, pan: Double, state: String)
         if let calibration = externalCalibration {
-            guard let pose = poseStore.latest(at: now, maximumAgeNS: 250_000_000) else {
+            // The native helper reports attitude on a dedicated thread at a
+            // ~70-90ms cadence (synchronous SDK round-trip), with occasional
+            // multi-hundred-ms gaps while the bridge loop is inside a mode
+            // switch. A 600ms window absorbs those gaps; the gimbal moves
+            // slowly enough that a pose up to 600ms old is still safe for
+            // waypoint tracking.
+            guard let pose = poseStore.latest(at: now, maximumAgeNS: 600_000_000) else {
                 // A transient attitude gap must not silently switch a
                 // calibrated spherical route into the blind fallback scan or
                 // reset its waypoint clock. Decelerate on the existing curve

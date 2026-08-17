@@ -33,6 +33,13 @@ using Clock = std::chrono::steady_clock;
 
 std::atomic_bool interrupted = false;
 
+// The RM SDK serializes commands over one device link and is not internally
+// thread-safe. Every device call takes sdkMutex so the dedicated attitude
+// reporter thread and the bridge loop never issue concurrent SDK
+// transactions. stderrMutex keeps pipe-protocol lines from interleaving.
+std::mutex sdkMutex;
+std::mutex stderrMutex;
+
 void handleSignal(int) {
     interrupted = true;
 }
@@ -327,12 +334,14 @@ DiscoveryResult waitForTiny2Lite() {
 }
 
 int cameraStatusMode(const std::shared_ptr<Device> &device) {
+    std::lock_guard<std::mutex> lock(sdkMutex);
     Device::CameraStatus status{};
     return device->cameraGetCameraStatusU(status) == RM_RET_OK ? status.tiny.ai_mode : -1;
 }
 
 std::optional<int> verticalTrackingMode(const std::shared_ptr<Device> &device) noexcept {
     try {
+        std::lock_guard<std::mutex> lock(sdkMutex);
         Device::AiStatus status{};
         if (device->aiGetAiStatusR(&status) == RM_RET_OK) {
             return static_cast<int>(status.v_track_landscape);
@@ -342,6 +351,7 @@ std::optional<int> verticalTrackingMode(const std::shared_ptr<Device> &device) n
 }
 
 std::optional<int> cameraHorizontalFieldOfViewDegrees(const std::shared_ptr<Device> &device) {
+    std::lock_guard<std::mutex> lock(sdkMutex);
     Device::CameraStatus status{};
     if (device->cameraGetCameraStatusU(status) != RM_RET_OK) return std::nullopt;
     switch (status.tiny.fov) {
@@ -354,6 +364,7 @@ std::optional<int> cameraHorizontalFieldOfViewDegrees(const std::shared_ptr<Devi
 
 std::optional<float> cameraZoomFactor(const std::shared_ptr<Device> &device) noexcept {
     try {
+        std::lock_guard<std::mutex> lock(sdkMutex);
         float zoom = 0;
         if (device->cameraGetZoomAbsoluteR(zoom) == RM_RET_OK && std::isfinite(zoom)) {
             return zoom;
@@ -365,8 +376,11 @@ std::optional<float> cameraZoomFactor(const std::shared_ptr<Device> &device) noe
 bool configureFixedCameraZoom(const std::shared_ptr<Device> &device, Trace &trace) noexcept {
     int autoZoomResult = RM_RET_ERR;
     int zoomResult = RM_RET_ERR;
-    try { autoZoomResult = device->aiSetAiAutoZoomR(false); } catch (...) {}
-    try { zoomResult = device->cameraSetZoomAbsoluteR(1.0f); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        try { autoZoomResult = device->aiSetAiAutoZoomR(false); } catch (...) {}
+        try { zoomResult = device->cameraSetZoomAbsoluteR(1.0f); } catch (...) {}
+    }
     std::optional<float> zoom;
     const auto deadline = Clock::now() + std::chrono::milliseconds(1'500);
     while (Clock::now() < deadline && !interrupted) {
@@ -398,6 +412,9 @@ bool configureFixedCameraZoom(const std::shared_ptr<Device> &device, Trace &trac
 bool waitForMode(const std::shared_ptr<Device> &device, int expectedMode, int timeoutMilliseconds) {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMilliseconds);
     while (Clock::now() < deadline && !interrupted) {
+        // cameraStatusMode takes sdkMutex internally per poll, so the lock is
+        // never held across the 100ms sleep and the attitude reporter is not
+        // starved for the whole mode-switch transaction.
         if (cameraStatusMode(device) == expectedMode) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -440,8 +457,11 @@ bool requestManualStop(
     int stopResult = RM_RET_ERR;
     int stopMotionResult = RM_RET_ERR;
     bool deactivated = false;
-    try { stopResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
-    try { stopMotionResult = device->aiSetGimbalStop(); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        try { stopResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
+        try { stopMotionResult = device->aiSetGimbalStop(); } catch (...) {}
+    }
     try { deactivated = waitForMode(device, Device::AiWorkModeNone, 2'000); } catch (...) {}
     try {
         trace.event(
@@ -471,6 +491,7 @@ struct GimbalAttitude {
 };
 
 std::optional<GimbalAttitude> readGimbalAttitude(const std::shared_ptr<Device> &device) noexcept {
+    std::lock_guard<std::mutex> lock(sdkMutex);
     float xyz[3] = {};
     int result = RM_RET_ERR;
     try { result = device->gimbalGetAttitudeInfoR(xyz); } catch (...) {}
@@ -485,6 +506,7 @@ std::optional<GimbalAttitude> readGimbalAttitude(const std::shared_ptr<Device> &
 
 void emitGimbalAttitude(const GimbalAttitude &attitude) noexcept {
     try {
+        std::lock_guard<std::mutex> lock(stderrMutex);
         std::cerr << "SOMA_GIMBAL_ATTITUDE pitch=" << attitude.pitch
                   << " pan=" << attitude.pan
                   << " monotonic_ns=" << attitude.monotonicNS << "\n" << std::flush;
@@ -492,11 +514,15 @@ void emitGimbalAttitude(const GimbalAttitude &attitude) noexcept {
 }
 
 void emitHorizontalFieldOfView(int degrees) noexcept {
-    try { std::cerr << "SOMA_GIMBAL_FOV degrees=" << degrees << "\n" << std::flush; } catch (...) {}
+    try {
+        std::lock_guard<std::mutex> lock(stderrMutex);
+        std::cerr << "SOMA_GIMBAL_FOV degrees=" << degrees << "\n" << std::flush;
+    } catch (...) {}
 }
 
 void emitNativeTrackingState(const std::string &state, const std::string &commandID) noexcept {
     try {
+        std::lock_guard<std::mutex> lock(stderrMutex);
         std::cerr << "SOMA_NATIVE_TRACKING state=" << state
                   << " command_id=" << commandID << "\n" << std::flush;
     } catch (...) {}
@@ -532,7 +558,10 @@ bool requestExternalVelocity(
     if (!alreadyExternal) {
         int aiResult = RM_RET_ERR;
         bool manual = false;
-        try { aiResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
+        {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            try { aiResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
+        }
         try { manual = waitForMode(device, Device::AiWorkModeNone, 2'000); } catch (...) {}
         if (aiResult != RM_RET_OK || !manual) {
             trace.event("camera.ack", "fault", "external_acquire_unconfirmed", RM_RET_ERR, "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)), commandID);
@@ -541,7 +570,10 @@ bool requestExternalVelocity(
         }
     }
     int speedResult = RM_RET_ERR;
-    try { speedResult = device->aiSetGimbalSpeedCtrlR(pitch, pan); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        try { speedResult = device->aiSetGimbalSpeedCtrlR(pitch, pan); } catch (...) {}
+    }
     trace.event(
         "camera.ack",
         speedResult == RM_RET_OK ? "external" : "fault",
@@ -583,7 +615,10 @@ bool requestExternalPosition(
     if (!alreadyExternal) {
         int aiResult = RM_RET_ERR;
         bool manual = false;
-        try { aiResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
+        {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            try { aiResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
+        }
         try { manual = waitForMode(device, Device::AiWorkModeNone, 2'000); } catch (...) {}
         if (aiResult != RM_RET_OK || !manual) {
             trace.event("camera.ack", "fault", "external_acquire_unconfirmed", RM_RET_ERR, "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)), commandID);
@@ -595,7 +630,10 @@ bool requestExternalPosition(
     // gimbalGetAttitudeInfoR and gimbalSetSpeedPositionR share the same
     // stabilised pose coordinates. aiSetGimbalMotorAngleR instead accepts
     // motor-internal angles, which are not comparable to the reported pose.
-    try { positionResult = device->gimbalSetSpeedPositionR(0, static_cast<float>(pitch), static_cast<float>(pan), 0, 90, 90); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        try { positionResult = device->gimbalSetSpeedPositionR(0, static_cast<float>(pitch), static_cast<float>(pan), 0, 90, 90); } catch (...) {}
+    }
     trace.event(
         "camera.ack",
         positionResult == RM_RET_OK ? "external" : "fault",
@@ -615,8 +653,11 @@ bool requestCenter(const std::shared_ptr<Device> &device, Trace &trace, const st
     trace.event("camera.command", "manual", "center_sent", 0, "pitch_degrees=0; yaw_degrees=0", commandID);
     int disableAIResult = RM_RET_ERR;
     int positionResult = RM_RET_ERR;
-    try { disableAIResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
-    try { positionResult = device->gimbalSetSpeedPositionR(0, 0, 0, 0, 60, 90); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        try { disableAIResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
+        try { positionResult = device->gimbalSetSpeedPositionR(0, 0, 0, 0, 60, 90); } catch (...) {}
+    }
     trace.event(
         "camera.ack",
         disableAIResult == RM_RET_OK && positionResult == RM_RET_OK ? "manual" : "fault",
@@ -643,7 +684,10 @@ bool requestNativeHumanTracking(
         commandID
     );
     int startResult = RM_RET_ERR;
-    try { startResult = device->cameraSetAiModeU(Device::AiWorkModeHuman, Device::AiSubModeNormal); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        try { startResult = device->cameraSetAiModeU(Device::AiWorkModeHuman, Device::AiSubModeNormal); } catch (...) {}
+    }
     if (startResult != RM_RET_OK) {
         trace.event("camera.ack", "fault", "start_rejected", startResult, "SDK rejected native human tracking", commandID);
         requestManualStop(device, trace, "start_rejected", cleanupCommandID);
@@ -651,7 +695,10 @@ bool requestNativeHumanTracking(
         return false;
     }
     int trackingModeResult = RM_RET_ERR;
-    try { trackingModeResult = device->aiSetTrackingModeR(Device::AiVTrackMotion); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        try { trackingModeResult = device->aiSetTrackingModeR(Device::AiVTrackMotion); } catch (...) {}
+    }
     bool activated = false;
     try { activated = waitForMode(device, Device::AiWorkModeHuman, 2'000); } catch (...) {}
     const int confirmedTrackingMode = verticalTrackingMode(device).value_or(-1);
@@ -1159,10 +1206,13 @@ bool disableHandGestures(const std::shared_ptr<Device> &device, Trace &trace) no
     // 2 dynamic zoom, 3 dynamic zoom direction, 4 record.
     const int gestureIDs[] = {0, 1, 2, 3, 4};
     int failures = 0;
-    for (const int gestureID : gestureIDs) {
-        int result = RM_RET_ERR;
-        try { result = device->aiSetGestureCtrlIndividualR(gestureID, false); } catch (...) {}
-        if (result != RM_RET_OK) ++failures;
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        for (const int gestureID : gestureIDs) {
+            int result = RM_RET_ERR;
+            try { result = device->aiSetGestureCtrlIndividualR(gestureID, false); } catch (...) {}
+            if (result != RM_RET_OK) ++failures;
+        }
     }
     const bool confirmed = failures == 0;
     trace.event(
@@ -1176,6 +1226,35 @@ bool disableHandGestures(const std::shared_ptr<Device> &device, Trace &trace) no
     return confirmed;
 }
 
+/// A dedicated thread that keeps the pose stream flowing regardless of what
+/// the bridge loop is doing. The synchronous SDK attitude read takes ~70ms and
+/// bridge work (velocity calls, mode switches, blocking stdin reads) can stall
+/// the loop for far longer; the runtime's coverage scan decelerates whenever
+/// the pose stream goes quiet. The reporter owns no other SDK state and every
+/// device call is serialized by sdkMutex, so it is safe to run concurrently.
+class AttitudeReporter {
+public:
+    explicit AttitudeReporter(std::shared_ptr<Device> device)
+        : device_(std::move(device)), thread_([this] { run(); }) {}
+
+    ~AttitudeReporter() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void run() {
+        while (!stop_) {
+            if (const auto attitude = readGimbalAttitude(device_)) emitGimbalAttitude(*attitude);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    std::shared_ptr<Device> device_;
+    std::atomic_bool stop_ = false;
+    std::thread thread_;
+};
+
 int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int durationSeconds) {
     constexpr auto nativeWatchdog = std::chrono::milliseconds(750);
     constexpr auto externalWatchdog = std::chrono::milliseconds(700);
@@ -1185,13 +1264,18 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
     if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
     IndicatorSession indicator(device, trace);
     trace.event("camera.owner", "manual", "bridge_ready", RM_RET_OK, "awaiting_local_attention_commands");
-    std::cerr << "SOMA_NATIVE_BRIDGE_READY\n" << std::flush;
+    {
+        std::lock_guard<std::mutex> lock(stderrMutex);
+        std::cerr << "SOMA_NATIVE_BRIDGE_READY\n" << std::flush;
+    }
+    // Start the pose reporter after the one-shot startup reads so the first
+    // sample is not duplicated; it runs until this function returns.
+    AttitudeReporter attitudeReporter(device);
     bool nativeTracking = false;
     std::string nativeCommandID;
     auto lastHeartbeat = Clock::now();
     bool externalControl = false;
     auto lastExternalCommand = Clock::now();
-    auto nextAttitudeReport = Clock::now();
     std::optional<Clock::time_point> externalPulseDeadline;
     std::string externalPulseStopCommandID;
     const bool continuous = durationSeconds == 0;
@@ -1204,8 +1288,6 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
             const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(*externalPulseDeadline - Clock::now()).count();
             pollTimeoutMilliseconds = static_cast<int>(std::clamp<int64_t>(remaining, 0, 100));
         }
-        const auto attitudeRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(nextAttitudeReport - Clock::now()).count();
-        pollTimeoutMilliseconds = std::min(pollTimeoutMilliseconds, static_cast<int>(std::clamp<int64_t>(attitudeRemaining, 0, 100)));
         const int polled = ::poll(&descriptor, 1, pollTimeoutMilliseconds);
         if (polled > 0 && (descriptor.revents & POLLIN)) {
             const auto line = readBridgeLine();
@@ -1394,9 +1476,12 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                     // AI tracking rather than continuing to follow people after
                     // SOMA has been stopped.
                     int sleepResult = RM_RET_ERR;
-                    try {
-                        sleepResult = device->cameraSetDevRunStatusR(Device::DevStatusSleep);
-                    } catch (...) {}
+                    {
+                        std::lock_guard<std::mutex> lock(sdkMutex);
+                        try {
+                            sleepResult = device->cameraSetDevRunStatusR(Device::DevStatusSleep);
+                        } catch (...) {}
+                    }
                     trace.event(
                         "camera.ack",
                         sleepResult == RM_RET_OK ? "sleep" : "fault",
@@ -1426,10 +1511,8 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
             externalPulseStopCommandID.clear();
             if (!stopped) return 4;
         }
-        if (Clock::now() >= nextAttitudeReport) {
-            if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
-            nextAttitudeReport = Clock::now() + std::chrono::milliseconds(20);
-        }
+        // Attitude reporting is owned by AttitudeReporter on its own thread;
+        // the bridge loop must never gate the pose stream on its own latency.
         if (nativeTracking && Clock::now() - lastHeartbeat > nativeWatchdog) {
             const bool stopped = requestManualStop(device, trace, "attention_watchdog_expired", "watchdog-stop-1");
             nativeTracking = false;
