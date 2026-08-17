@@ -711,18 +711,72 @@ private struct SOMASettingsView: View {
             SettingsCard(title: "L0 — Perception & attention", subtitle: "What autonomous motion the attention controller may perform. These govern the gimbal and coverage scan.") {
                 Toggle("Track a verified human face", isOn: l0TrackingBinding)
                 Toggle("Explore when no verified target is present", isOn: l0ExploreBinding)
+                Divider()
+                HStack {
+                    Text("Local vision wake sensitivity")
+                    Spacer()
+                    Stepper("Score ≥ \(String(format: "%.2f", model.envSettings.l0E2BWakeScore))", value: l0E2BWakeScoreBinding, in: 0.1...0.95, step: 0.05)
+                }
+                HStack {
+                    Text("Local vision wake confidence")
+                    Spacer()
+                    Stepper("Confidence ≥ \(String(format: "%.2f", model.envSettings.l0E2BWakeConfidence))", value: l0E2BWakeConfidenceBinding, in: 0.1...0.95, step: 0.05)
+                }
+                HStack {
+                    Text("Local vision wake repeat")
+                    Spacer()
+                    Stepper("Every \(Int(model.envSettings.l0E2BWakeIntervalMilliseconds / 1000)) s", value: l0E2BWakeIntervalBinding, in: 2...60, step: 1)
+                }
+                HStack {
+                    Text("Eye-contact sensitivity")
+                    Spacer()
+                    Stepper("\(Int(model.envSettings.l0EyeContactFreshnessMilliseconds)) ms", value: l0EyeContactFreshnessBinding, in: 100...2000, step: 50)
+                }
+                HStack {
+                    Text("Eye-contact pupil threshold")
+                    Spacer()
+                    Picker("", selection: l0EyeContactPupilLevelBinding) {
+                        ForEach(SOMAEyeContactPupilLevel.allCases, id: \.self) { level in
+                            Text(level.label).tag(level)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 130)
+                }
+                Text("The on-device vision layer (E2B) wakes L1 on events. Lower thresholds wake L1 more eagerly; higher ones make it more selective. Eye-contact sensitivity is how long a fresh gaze stays valid for opening a spoken turn — lower is stricter. The pupil threshold scales how centered the pupil must be for a direct gaze — lower is stricter.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             SettingsCard(title: "L1 — Conscious stream", subtitle: "How often L1 reasons, and whether it collects the topics it is curious about.") {
                 HStack {
                     Text("Reasoning cadence")
                     Spacer()
-                    Stepper("Person present: \(Int(model.envSettings.l1ActiveCadenceSeconds)) s", value: l1ActiveCadenceBinding, in: 5...300, step: 5)
+                    Stepper("Every \(Int(model.envSettings.l1IdleCadenceSeconds)) s", value: l1IdleCadenceBinding, in: 30...600, step: 15)
                 }
+                Text("L1 reasons on a single unified cadence; local vision wakes provide the responsive, event-driven path.")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
-                    Text("Idle cadence")
+                    Text("Default language")
                     Spacer()
-                    Stepper("No person: \(Int(model.envSettings.l1IdleCadenceSeconds)) s", value: l1IdleCadenceBinding, in: 30...600, step: 15)
+                    Picker("", selection: l1DefaultLanguageBinding) {
+                        ForEach(SOMADefaultLanguage.allCases, id: \.self) { lang in
+                            Text(lang.label).tag(lang.tag)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 120)
                 }
+                Text("Used to address a person who has no stored preferred language.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
+                HStack {
+                    Text("Short-term memory retention")
+                    Spacer()
+                    Stepper("\(Int(model.envSettings.memoryShortTermRetentionHours)) h", value: memoryRetentionBinding, in: 1...24, step: 1)
+                }
+                Text("How long raw conversation transcripts are kept before L1 consolidation.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Divider()
                 Toggle("Web curiosity collection", isOn: l1CuriosityEnabledBinding)
                 HStack {
@@ -748,10 +802,30 @@ private struct SOMASettingsView: View {
                 Slider(value: l1SpokenOpeningTendencyBinding, in: 0...1, step: 0.1)
                 Text("How readily L1 starts a spoken conversation when you look busy. Low = stays quiet, high = more talkative.")
                     .font(.caption).foregroundStyle(.secondary)
+                Divider()
+                Toggle("Open with unknown identities", isOn: l1OpenWithUnknownBinding)
+                Text("When on, L1 may proactively open a spoken conversation with a person it has not yet recognized, treating them as a pseudonymous participant.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             SettingsCard(title: "L2 — Conversation & interaction", subtitle: "Whether SOMA may start a spoken conversation on its own. The live-voice voice itself is set under Experience.") {
                 Toggle("Allow proactive spoken openings", isOn: l2ProactiveOpeningsBinding)
                 Text("When on, L1 can hand a purposeful opening to the live-voice conversation runtime instead of staying silent.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
+                HStack {
+                    Text("Codex file access")
+                    Spacer()
+                    Picker("", selection: l2CodexSandboxBinding) {
+                        ForEach(SOMACodexSandbox.allCases, id: \.self) { level in
+                            Text(level.label).tag(level.rawValue)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
+                }
+                Toggle("Restrict to administrator", isOn: l2CodexAdminOnlyBinding)
+                Text("The conversation agent's file access. When restricted, only the administrator gets this level; everyone else is read-only.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -926,6 +1000,20 @@ private struct SOMASettingsView: View {
         )
     }
 
+    private var l2CodexSandboxBinding: Binding<String> {
+        Binding(
+            get: { model.envSettings.l2CodexSandbox },
+            set: { model.envSettings.l2CodexSandbox = $0 }
+        )
+    }
+
+    private var l2CodexAdminOnlyBinding: Binding<Bool> {
+        Binding(
+            get: { model.envSettings.l2CodexAdminOnly },
+            set: { model.envSettings.l2CodexAdminOnly = $0 }
+        )
+    }
+
     private var l1ModelBinding: Binding<String> {
         Binding(
             get: { model.envSettings.l1Model },
@@ -933,17 +1021,59 @@ private struct SOMASettingsView: View {
         )
     }
 
-    private var l1ActiveCadenceBinding: Binding<Double> {
-        Binding(
-            get: { model.envSettings.l1ActiveCadenceSeconds },
-            set: { model.envSettings.l1ActiveCadenceSeconds = max(5, $0) }
-        )
-    }
-
     private var l1IdleCadenceBinding: Binding<Double> {
         Binding(
             get: { model.envSettings.l1IdleCadenceSeconds },
             set: { model.envSettings.l1IdleCadenceSeconds = max(30, $0) }
+        )
+    }
+
+    private var l1DefaultLanguageBinding: Binding<String> {
+        Binding(
+            get: { model.envSettings.l1DefaultLanguage },
+            set: { model.envSettings.l1DefaultLanguage = $0 }
+        )
+    }
+
+    private var l0E2BWakeScoreBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l0E2BWakeScore },
+            set: { model.envSettings.l0E2BWakeScore = min(max($0, 0.1), 0.95) }
+        )
+    }
+
+    private var l0E2BWakeConfidenceBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l0E2BWakeConfidence },
+            set: { model.envSettings.l0E2BWakeConfidence = min(max($0, 0.1), 0.95) }
+        )
+    }
+
+    private var l0E2BWakeIntervalBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l0E2BWakeIntervalMilliseconds },
+            set: { model.envSettings.l0E2BWakeIntervalMilliseconds = max($0, 2_000) }
+        )
+    }
+
+    private var l0EyeContactFreshnessBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l0EyeContactFreshnessMilliseconds },
+            set: { model.envSettings.l0EyeContactFreshnessMilliseconds = min(max($0, 100), 2_000) }
+        )
+    }
+
+    private var l0EyeContactPupilLevelBinding: Binding<SOMAEyeContactPupilLevel> {
+        Binding(
+            get: { SOMAEyeContactPupilLevel(threshold: model.envSettings.l0EyeContactPupilThreshold) },
+            set: { model.envSettings.l0EyeContactPupilThreshold = $0.threshold }
+        )
+    }
+
+    private var memoryRetentionBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.memoryShortTermRetentionHours },
+            set: { model.envSettings.memoryShortTermRetentionHours = min(max($0, 1), 24) }
         )
     }
 
@@ -958,6 +1088,13 @@ private struct SOMASettingsView: View {
         Binding(
             get: { model.envSettings.l1SpokenOpeningTendency },
             set: { model.envSettings.l1SpokenOpeningTendency = min(max($0, 0), 1) }
+        )
+    }
+
+    private var l1OpenWithUnknownBinding: Binding<Bool> {
+        Binding(
+            get: { model.envSettings.l1OpenWithUnknownIdentity },
+            set: { model.envSettings.l1OpenWithUnknownIdentity = $0 }
         )
     }
 
@@ -978,9 +1115,58 @@ private struct SOMASettingsView: View {
     }
 }
 
+private enum SOMADefaultLanguage: String, CaseIterable {
+    case korean = "ko"
+    case english = "en"
+    case japanese = "ja"
+    case chinese = "zh"
+    case spanish = "es"
+
+    var tag: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .korean: "한국어 (Korean)"
+        case .english: "English"
+        case .japanese: "日本語 (Japanese)"
+        case .chinese: "中文 (Chinese)"
+        case .spanish: "Español (Spanish)"
+        }
+    }
+}
+
+/// Five preset levels for the eye-contact pupil-centering threshold. Each maps
+/// to a multiplier on the default 0.68 X / 0.82 Y thresholds.
+private enum SOMAEyeContactPupilLevel: CaseIterable {
+    case strict, moderate, balanced, lenient, veryLenient
+
+    var threshold: Double {
+        switch self {
+        case .strict: 0.5
+        case .moderate: 0.75
+        case .balanced: 1.0
+        case .lenient: 1.5
+        case .veryLenient: 2.0
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .strict: "Strict"
+        case .moderate: "Moderate"
+        case .balanced: "Balanced"
+        case .lenient: "Lenient"
+        case .veryLenient: "Very lenient"
+        }
+    }
+
+    init(threshold: Double) {
+        self = Self.allCases.min(by: { abs($0.threshold - threshold) < abs($1.threshold - threshold) }) ?? .balanced
+    }
+}
+
 private enum SOMAEnvCollectionInterval: CaseIterable {
     case hourly6, hourly12, daily, weekly
-
     var hours: Double {
         switch self {
         case .hourly6: 6

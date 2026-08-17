@@ -24,6 +24,39 @@ public enum L1AuxiliaryWakeReason: String, Codable, CaseIterable, Sendable {
     case none
 }
 
+public enum L1AuxiliaryBodyLanguage: String, Codable, CaseIterable, Sendable {
+    case open
+    case closed
+    case turnedAway = "turned_away"
+    case leaningIn = "leaning_in"
+    case none
+}
+
+public enum L1AuxiliaryGesture: String, Codable, CaseIterable, Sendable {
+    case waving
+    case pointing
+    case nodding
+    case none
+}
+
+public enum L1AuxiliaryApproach: String, Codable, CaseIterable, Sendable {
+    case approaching
+    case stationary
+    case leaving
+    case none
+}
+
+/// The proportional response SOMA should take to the current scene. This is the
+/// simple control signal E2B hands to L0: engage for a person socially addressing
+/// the camera, orient for a non-person object/scene change, observe for a mild
+/// ambient change, none for a quiet static scene.
+public enum L1AuxiliaryReaction: String, Codable, CaseIterable, Sendable {
+    case engage
+    case orient
+    case observe
+    case none
+}
+
 /// Scalar context accompanying one in-memory L1 auxiliary keyframe. It deliberately
 /// excludes pixels; the transport owns the ephemeral image payload.
 public struct L1AuxiliaryFrameContext: Codable, Equatable, Sendable {
@@ -93,6 +126,12 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
     public let wakeReason: L1AuxiliaryWakeReason
     public let wakeScore: Double
     public let confidence: Double
+    public let eyeContact: Double
+    public let engagement: Double
+    public let bodyLanguage: L1AuxiliaryBodyLanguage
+    public let gesture: L1AuxiliaryGesture
+    public let approach: L1AuxiliaryApproach
+    public let reaction: L1AuxiliaryReaction
     public let inferenceMS: Double
 
     public init(
@@ -108,6 +147,12 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
         wakeReason: L1AuxiliaryWakeReason,
         wakeScore: Double,
         confidence: Double,
+        eyeContact: Double = 0,
+        engagement: Double = 0,
+        bodyLanguage: L1AuxiliaryBodyLanguage = .none,
+        gesture: L1AuxiliaryGesture = .none,
+        approach: L1AuxiliaryApproach = .none,
+        reaction: L1AuxiliaryReaction = .none,
         inferenceMS: Double
     ) {
         self.requestID = requestID
@@ -122,6 +167,12 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
         self.wakeReason = wakeReason
         self.wakeScore = min(max(wakeScore, 0), 1)
         self.confidence = min(max(confidence, 0), 1)
+        self.eyeContact = min(max(eyeContact, 0), 1)
+        self.engagement = min(max(engagement, 0), 1)
+        self.bodyLanguage = bodyLanguage
+        self.gesture = gesture
+        self.approach = approach
+        self.reaction = reaction
         self.inferenceMS = max(0, inferenceMS)
     }
 }

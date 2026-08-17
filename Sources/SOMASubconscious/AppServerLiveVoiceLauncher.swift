@@ -105,6 +105,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningTrigger: nil,
                 personEntityID: personEntityID,
+                interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
             )
         }
@@ -133,6 +134,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningTrigger: "Controller event, not user speech: L1 has authorized the proactive opening described in the developer context. Speak exactly one brief opening question now, then listen.",
                 personEntityID: personEntityID,
+                interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
             )
         }
@@ -262,6 +264,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         languageStartInstruction: String?,
         proactiveOpeningTrigger: String?,
         personEntityID: UUID?,
+        interactionAuthority: SOMAInteractionAuthority?,
         at monotonicNS: UInt64
     ) {
         inputTransportReported = false
@@ -332,6 +335,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             "preferredLanguageTag": preferredLanguageTag ?? "",
             "languageStartInstruction": languageStartInstruction ?? "",
             "proactiveOpeningTrigger": proactiveOpeningTrigger ?? "",
+            "interactionAuthority": interactionAuthority?.rawValue ?? "",
+            "codexSandbox": somaEnvString("SOMA_L2_CODEX_SANDBOX", default: "danger-full-access"),
+            "codexAdminOnly": somaEnvBool("SOMA_L2_CODEX_ADMIN_ONLY", default: false),
         ], reportFailure: false) else {
             failCurrent(reason: "live_voice_start_transport_failed")
             return

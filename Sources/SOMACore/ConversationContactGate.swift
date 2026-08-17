@@ -252,6 +252,11 @@ public enum SubconsciousIndicatorInteractionState: String, Equatable, Sendable {
 public struct SubconsciousIndicatorInputs: Equatable, Sendable {
     public var visualState: SubconsciousIndicatorVisualState
     public var interactionState: SubconsciousIndicatorInteractionState
+    /// E2B's simple "person present" control signal. It is OR'd with the
+    /// face-detection visualState so E2B can add human detection (e.g. a person
+    /// turned away that the face detector misses) without ever clearing a real
+    /// face observation. E2B sets it on every cue: engage -> true, else false.
+    public var auxiliaryHumanDetected: Bool
 
     public init(
         humanDetected: Bool = false,
@@ -265,6 +270,7 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
         interactionState = working
             ? .preparingReply
             : (conversation ? .conversation : .idle)
+        auxiliaryHumanDetected = false
     }
 
     public init(
@@ -273,6 +279,17 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
     ) {
         self.visualState = visualState
         self.interactionState = interactionState
+        auxiliaryHumanDetected = false
+    }
+
+    /// Apply E2B's proportional reaction as a simple L0 control signal.
+    public mutating func applyAuxiliaryReaction(_ reaction: L1AuxiliaryReaction) {
+        switch reaction {
+        case .engage:
+            auxiliaryHumanDetected = true
+        case .orient, .observe, .none:
+            auxiliaryHumanDetected = false
+        }
     }
 
     /// A fresh human observation is sufficient to communicate that SOMA has
@@ -338,7 +355,7 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
             switch visualState {
             case .eyeContact: return .contactReady
             case .humanDetected: return .humanDetected
-            case .none: return .exploring
+            case .none: return auxiliaryHumanDetected ? .humanDetected : .exploring
             }
         }
     }

@@ -680,6 +680,7 @@ public enum L1SituationResponseDecoder {
         let thoughtState: ThoughtState?
         let requestedVisualResourceIDs: [String]?
         let behaviorDirective: BehaviorDirective?
+        let memoryProposals: [MemoryProposal]?
 
         enum CodingKeys: String, CodingKey {
             case summary
@@ -692,6 +693,23 @@ public enum L1SituationResponseDecoder {
             case thoughtState = "thought_state"
             case requestedVisualResourceIDs = "requested_visual_resource_ids"
             case behaviorDirective = "behavior_directive"
+            case memoryProposals = "memory_proposals"
+        }
+    }
+
+    private struct MemoryProposal: Decodable {
+        let kind: L1MemoryProposalKind
+        let summary: String
+        let confidence: Double?
+        let evidenceIDs: [String]?
+        let sourceTurnRecordIDs: [UUID]?
+
+        enum CodingKeys: String, CodingKey {
+            case kind
+            case summary
+            case confidence
+            case evidenceIDs = "evidence_ids"
+            case sourceTurnRecordIDs = "source_turn_record_ids"
         }
     }
 
@@ -830,6 +848,16 @@ public enum L1SituationResponseDecoder {
         } else {
             behaviorDirective = nil
         }
+        let memoryProposals: [L1MemoryProposal] = (payload.memoryProposals ?? []).compactMap { raw in
+            guard let confidence = raw.confidence, confidence.isFinite else { return nil }
+            return L1MemoryProposal(
+                kind: raw.kind,
+                summary: raw.summary,
+                confidence: confidence,
+                evidenceIDs: raw.evidenceIDs ?? [],
+                sourceTurnRecordIDs: raw.sourceTurnRecordIDs ?? []
+            )
+        }
         let frame = L1SituationFrame(
             cycleID: request.cycleID,
             summary: payload.summary,
@@ -837,6 +865,7 @@ public enum L1SituationResponseDecoder {
             evidenceIDs: payload.evidenceIDs,
             socialDecision: decision,
             thoughtState: thoughtState,
+            memoryProposals: memoryProposals,
             requestedVisualResourceIDs: payload.requestedVisualResourceIDs ?? [],
             behaviorDirective: behaviorDirective
         )

@@ -224,6 +224,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private let onHealth: @Sendable (String, String) -> Void
     private let onPreferredLanguageChanged: @Sendable (UUID, String?) -> Void
     private let onSocialContactPersisted: @Sendable (UUID) -> Void
+    private let transcriptRetentionSeconds: TimeInterval
     private let preferredLanguageLock = NSLock()
     private var preferredLanguageByPersonID: [UUID: String] = [:]
     private var personContextByPersonID: [UUID: PersonContextSnapshot] = [:]
@@ -239,11 +240,13 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     init(
         onHealth: @escaping @Sendable (String, String) -> Void,
         onPreferredLanguageChanged: @escaping @Sendable (UUID, String?) -> Void = { _, _ in },
-        onSocialContactPersisted: @escaping @Sendable (UUID) -> Void = { _ in }
+        onSocialContactPersisted: @escaping @Sendable (UUID) -> Void = { _ in },
+        transcriptRetentionSeconds: TimeInterval = 24 * 60 * 60
     ) {
         self.onHealth = onHealth
         self.onPreferredLanguageChanged = onPreferredLanguageChanged
         self.onSocialContactPersisted = onSocialContactPersisted
+        self.transcriptRetentionSeconds = min(max(transcriptRetentionSeconds, 60 * 60), 24 * 60 * 60)
         do {
             let directory = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/SOMA/memory", isDirectory: true)
@@ -736,6 +739,98 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
+    /// Consume L1's model-proposed memory suggestions and persist those that
+    /// clear the confidence bar. Person-linked kinds are bound to the recognized
+    /// person when one is present; otherwise they degrade to a generic episode.
+    func proposeMemories(
+        _ proposals: [L1MemoryProposal],
+        personEntityID: UUID?,
+        at date: Date = Date()
+    ) async {
+        guard let store else { return }
+        for proposal in proposals where proposal.confidence >= 0.55 {
+            do {
+                _ = try await store.insert(
+                    Self.draft(from: proposal, personEntityID: personEntityID, at: date),
+                    at: date
+                )
+                onHealth("memory_proposal_stored", "kind=\(proposal.kind.rawValue)")
+            } catch {
+                onHealth("memory_proposal_store_failed", String(error.localizedDescription.prefix(192)))
+            }
+        }
+    }
+
+    private static func draft(
+        from proposal: L1MemoryProposal,
+        personEntityID: UUID?,
+        at date: Date
+    ) -> CognitiveMemoryDraft {
+        let summary = proposal.summary
+        let provenance = [MemoryProvenance(
+            source: .l1Inference,
+            sourceID: "l1_memory_proposal:\(proposal.kind.rawValue)",
+            observedAt: date,
+            evidenceIDs: proposal.evidenceIDs,
+            modelID: "gemma4:31b-cloud"
+        )]
+        let payload: CognitiveMemoryPayload
+        let tier: MemoryTier
+        switch proposal.kind {
+        case .personFact:
+            let pid = personEntityID ?? UUID()
+            payload = .personFact(PersonFactMemory(
+                personEntityID: pid,
+                key: "proposed_fact",
+                value: summary
+            ))
+            tier = .mediumTerm
+        case .openQuestion:
+            payload = .openQuestion(OpenQuestionMemory(
+                question: summary,
+                targetEntityID: personEntityID,
+                expectedInformationGain: proposal.confidence
+            ))
+            tier = .shortTerm
+        case .relationship:
+            payload = .relationship(RelationshipMemory(
+                personEntityID: personEntityID ?? UUID(),
+                rapport: RapportProfile(
+                    familiarity: proposal.confidence,
+                    interactionComfort: proposal.confidence,
+                    communicationAlignment: proposal.confidence
+                )
+            ))
+            tier = .mediumTerm
+        case .task:
+            payload = .task(TaskMemory(
+                title: summary,
+                status: .active,
+                ownerEntityID: personEntityID
+            ))
+            tier = .shortTerm
+        default: // episode and correction degrade to a narrative episode
+            payload = .episode(EpisodeMemory(
+                startedAt: date,
+                endedAt: date,
+                participantEntityIDs: personEntityID.map { [$0] } ?? [],
+                narrative: summary,
+                salience: proposal.confidence
+            ))
+            tier = .mediumTerm
+        }
+        return CognitiveMemoryDraft(
+            tier: tier,
+            summary: summary,
+            payload: payload,
+            confidence: proposal.confidence,
+            provenance: provenance,
+            sensitivity: .personal,
+            disclosure: .remoteSummaryAllowed,
+            expiresAt: date.addingTimeInterval(30 * 24 * 60 * 60)
+        )
+    }
+
     /// Keeps exact Live Voice turns on this Mac until a higher-layer memory
     /// pass turns them into typed facts, episodes, tasks, or questions.
     func beginConversation(threadID: String, personEntityID: UUID?) {
@@ -755,7 +850,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     store: store,
                     interactionID: UUID(),
                     threadID: normalized,
-                    participantEntityIDs: personEntityID.map { [$0] } ?? []
+                    participantEntityIDs: personEntityID.map { [$0] } ?? [],
+                    retentionSeconds: transcriptRetentionSeconds
                 ),
                 startedAt: Date(),
                 personEntityID: personEntityID,
@@ -1621,7 +1717,8 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
 
         You have tools available. Call a tool ONLY when it is genuinely necessary to answer a situational question — e.g. you need the person's stored context, you have decided to act on the camera, or you want to record an observation. Never call a tool gratuitously. Every tool call MUST include a "reason" field in its arguments explaining why you are calling it (a short justification). Do not call a tool just because it exists. IMPORTANT: the person's stored context, rapport, and preferences are ALREADY included in the packet you receive (memory projections and rapport are pre-loaded). Do NOT call get_person_context to re-fetch what the packet already provides; only call it when you genuinely need a detail that is absent from the packet. Prefer the final JSON behavior_directive for routine camera/social beats rather than the body tools. After tools, still return the situation JSON.
         Return the situation JSON as your final message: no Markdown, prose, alternate field names, or omitted required fields. Copy at least one supplied evidence ID into evidence_ids; never emit an empty evidence_ids array. Use this exact shape, replacing values only:
-        {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence","stream_of_consciousness":"first-person inner monologue, a few natural sentences"},"action":"remain_silent|nonverbal_invitation|spoken_opening|null","confidence":0.5,"rationale":"short","opening":null,"behavior_directive":{"action":"keep_observing|resume_scanning|seek_people|acknowledge_person|null","rationale":"short or null"},"requested_visual_resource_ids":[]}
+        {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence","stream_of_consciousness":"first-person inner monologue, a few natural sentences"},"action":"remain_silent|nonverbal_invitation|spoken_opening|null","confidence":0.5,"rationale":"short","opening":null,"behavior_directive":{"action":"keep_observing|resume_scanning|seek_people|acknowledge_person|null","rationale":"short or null"},"requested_visual_resource_ids":[],"memory_proposals":[]}
+        memory_proposals is optional and usually empty. Only add a proposal when you have genuinely learned or resolved something durable about the person present or the situation: a stable fact about them, an open question worth following up, a task they asked for, or a notable episode. Each proposal must carry kind (episode|person_fact|relationship|task|open_question|correction), a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never invent a proposal from speculation; prefer an empty array over a weak one.
         When behavior_context is present it is the ONLY basis for behavior_directive, and it is independent of any social decision (which may still be null). If behavior_context.recognized_identity is present, you are looking at that known person; name them in your stream of consciousness. If the camera has been held on a non-face, non-person target for a long time (fixation_seconds high while target is not a verified face, scan inactive), recommend resume_scanning or, if no person is being pursued, seek_people. Acknowledge a present verified face with acknowledge_person. Otherwise recommend keep_observing, or null when no behavioral change is warranted. Never turn a momentary low-confidence object into a directive; only sustained fixation warrants one.
         The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is private reasoning, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. If they contain no new, concrete purpose for this person, do not speak: do not turn an empty relationship field, a known person's presence, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact; prefer it over remain_silent for an available known person. A spoken opening is permitted only as one question that can reduce exactly one supplied information_need. Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
 
@@ -1774,10 +1871,6 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private let onBehaviorDirective: @Sendable (L1BehaviorDirective, UInt64) -> Void
     private let onBehaviorThought: @Sendable (L1SituationFrame, UInt64) -> Void
     private let behaviorContextProvider: @Sendable () -> L1BehaviorContext?
-    /// Whether a person is currently detected. When true the behavior-awareness
-    /// pass runs frequently; when false (no one around) it slows to a long idle
-    /// interval so L1 is not called every 30s on an empty room.
-    private let personPresentProvider: @Sendable () -> Bool
     private let memoryContext: L1MemoryContextProvider
     private let runtimeContext: @Sendable () -> L1SituationRuntimeContext
     private let socialAvailability: @Sendable () -> L1SocialAvailability
@@ -1790,6 +1883,14 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private let curiosityContextProvider: @Sendable () -> String?
     /// Receives the L1 model's curiosity (information needs) on every cycle.
     private let onCuriosityNeeds: @Sendable ([L1InformationNeed]) -> Void
+    /// Receives the L1 model's proposed memories (with the recognized person
+    /// entity, when a person is the subject) so they can be persisted. This is
+    /// the consumption half of L1 memory consolidation.
+    private let onMemoryProposals: @Sendable ([L1MemoryProposal], UUID?) -> Void
+    /// Supplies the language detected from the participant's most recent speech,
+    /// so a person who speaks first in a language is answered in that language
+    /// even without a stored preferred language.
+    private let activeLanguageProvider: @Sendable () -> String?
     private var scheduler = KnownPersonSocialOpportunityScheduler()
     private var presences: [UUID: PresenceState] = [:]
     private var nextDeliberationNS: [UUID: UInt64] = [:]
@@ -1805,6 +1906,9 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private var reassessTimer: DispatchSourceTimer?
     private var behaviorAwarenessTimer: DispatchSourceTimer?
     private var consolidationTimer: DispatchSourceTimer?
+    /// Monotonic time of the last auxiliary-wake-triggered behavior pass, used
+    /// to throttle bursts of E2B wake proposals so they cannot flood the reasoner.
+    private var lastAuxiliaryWakeNS: UInt64?
     private let memoryContextRefreshNS: UInt64 = 60_000_000_000
     // Situation reasoning is gated by the social-opportunity scheduler, whose
     // opening delay (0.5-2.4s) only elapses if we keep re-polling it. A
@@ -1813,22 +1917,18 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private let reassessIntervalNS: UInt64 = 2_000_000_000
     private let presenceCurrentNS: UInt64 = 3_000_000_000
     private let deliberationIntervalNS: UInt64 = 45_000_000_000
+    /// Minimum interval between auxiliary-wake-triggered behavior passes. It
+    /// matches the interrupt gate's 5s debounce so a burst of E2B wake proposals
+    /// cannot flood the reasoner beyond the periodic cadence.
+    private let auxiliaryWakeIntervalNS: UInt64 = 5_000_000_000
     /// How often short-term episodes are consolidated (promoted/pruned).
     /// Configurable via SOMA_L1_CONSOLIDATION_SECONDS.
     private var consolidationIntervalNS: UInt64 {
         UInt64(somaEnvDouble("SOMA_L1_CONSOLIDATION_SECONDS", default: 600) * 1_000_000_000)
     }
-    /// The periodic L1 situation-awareness pass runs independently of any
-    /// recognized person so L1 can notice and correct low-level fixations that
-    /// the social gate never sees. 30s keeps it responsive on the local Ollama
-    /// model without flooding the reasoner. Configurable via
-    /// SOMA_L1_ACTIVE_CADENCE_SECONDS.
-    private var behaviorAwarenessIntervalNS: UInt64 {
-        UInt64(somaEnvDouble("SOMA_L1_ACTIVE_CADENCE_SECONDS", default: 30) * 1_000_000_000)
-    }
-    /// When no person is detected, L1 is called far less often (2.5 min) to
-    /// avoid burning the local model on an empty room. Configurable via
-    /// SOMA_L1_IDLE_CADENCE_SECONDS.
+    /// The periodic L1 baseline awareness pass runs at the idle interval. A
+    /// present person is handled by the E2B auxiliary wake path, not by
+    /// tightening this timer. Configurable via SOMA_L1_IDLE_CADENCE_SECONDS.
     private var idleBehaviorAwarenessIntervalNS: UInt64 {
         UInt64(somaEnvDouble("SOMA_L1_IDLE_CADENCE_SECONDS", default: 150) * 1_000_000_000)
     }
@@ -1843,12 +1943,13 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         onHealth: @escaping @Sendable (String, String) -> Void,
         onFrame: @escaping FrameHandler,
         behaviorContextProvider: @escaping @Sendable () -> L1BehaviorContext? = { nil },
-        personPresentProvider: @escaping @Sendable () -> Bool = { false },
         onBehaviorDirective: @escaping @Sendable (L1BehaviorDirective, UInt64) -> Void = { _, _ in },
         onBehaviorThought: @escaping @Sendable (L1SituationFrame, UInt64) -> Void = { _, _ in },
         toolDefinitions: [OllamaToolDefinition] = [],
         toolExecutor: @escaping @Sendable (String, String) -> String = { _, _ in "{}" },
-        onCuriosityNeeds: @escaping @Sendable ([L1InformationNeed]) -> Void = { _ in }
+        onCuriosityNeeds: @escaping @Sendable ([L1InformationNeed]) -> Void = { _ in },
+        onMemoryProposals: @escaping @Sendable ([L1MemoryProposal], UUID?) -> Void = { _, _ in },
+        activeLanguageProvider: @escaping @Sendable () -> String? = { nil }
     ) throws {
         queue.setSpecific(key: queueKey, value: 1)
         self.memoryContext = memoryContext
@@ -1858,10 +1959,11 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         self.currentFrameProvider = currentFrameProvider
         self.curiosityContextProvider = curiosityContextProvider
         self.onCuriosityNeeds = onCuriosityNeeds
+        self.onMemoryProposals = onMemoryProposals
+        self.activeLanguageProvider = activeLanguageProvider
         self.onHealth = onHealth
         self.onFrame = onFrame
         self.behaviorContextProvider = behaviorContextProvider
-        self.personPresentProvider = personPresentProvider
         self.onBehaviorDirective = onBehaviorDirective
         self.onBehaviorThought = onBehaviorThought
         reasoner = try GemmaL1SituationRuntime(
@@ -1908,13 +2010,13 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         rescheduleBehaviorAwareness(timer)
     }
 
-    /// One-shot rescheduling: run frequently while a person is present, and
-    /// slow to the idle interval when the room is empty.
+    /// One-shot rescheduling. The periodic baseline awareness pass always runs
+    /// at the idle interval; responsiveness to a present person is provided by
+    /// the E2B auxiliary wake path (wakeFromAuxiliary), not by tightening this
+    /// periodic timer. This keeps the local model from being called every 30s
+    /// on a busy room and lets E2B decide when a prompt pass is warranted.
     private func rescheduleBehaviorAwareness(_ timer: DispatchSourceTimer) {
-        let interval = personPresentProvider()
-            ? behaviorAwarenessIntervalNS
-            : idleBehaviorAwarenessIntervalNS
-        let seconds = Double(interval) / 1_000_000_000
+        let seconds = Double(idleBehaviorAwarenessIntervalNS) / 1_000_000_000
         timer.schedule(deadline: .now() + seconds, repeating: .never)
     }
 
@@ -1942,7 +2044,16 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             entityID = id
             similarity = value
             identityKind = .pseudonymous
-        case .unknownCandidate, .knownCandidate:
+        case let .unknownCandidate(handle, confirmations):
+            // When proactive openings with unknown identities are enabled, an
+            // unrecognized face is treated as a pseudonymous participant so L1
+            // may deliberate and open with it. The entityID is derived from the
+            // anonymous handle, matching the participant identity L0 surfaces.
+            guard somaEnvBool("SOMA_L1_OPEN_WITH_UNKNOWN", default: false) else { return }
+            entityID = FaceIdentityRuntime.pseudonymousEntityID(for: handle)
+            similarity = min(Double(confirmations) / 3, 0.99)
+            identityKind = .pseudonymous
+        case .knownCandidate:
             return
         }
         queue.async { [weak self] in
@@ -2151,7 +2262,7 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             memory: context.projections,
             informationNeeds: context.informationNeeds,
             rapport: context.rapport,
-            preferredLanguageTag: context.preferredLanguageTag,
+            preferredLanguageTag: effectiveLanguageTag(for: context),
             priorThoughtState: thoughtStates[entityID],
             priorFrame: priorFrames[entityID],
             contactHistory: context.contactHistory,
@@ -2172,19 +2283,37 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         reasoner.submit(request)
     }
 
+    /// Resolve the language L1 should speak to this person: their stored
+    /// preferred language when present, otherwise the language detected from
+    /// their most recent speech, otherwise the configured default
+    /// (SOMA_L1_DEFAULT_LANGUAGE, default "ko"). This keeps L1's opening and
+    /// L2's response in the same language the participant actually uses.
+    private func effectiveLanguageTag(for context: L1MemoryContext) -> String? {
+        if let tag = context.preferredLanguageTag, !tag.isEmpty { return tag }
+        if let tag = activeLanguageProvider(), !tag.isEmpty { return tag }
+        let configured = somaEnvString("SOMA_L1_DEFAULT_LANGUAGE", default: "ko")
+        return configured.isEmpty ? nil : configured
+    }
+
     /// The periodic situation-awareness inference. It carries the previous
     /// behavior thought state forward so L1 can reason about a trend (e.g. a
     /// fixation that has persisted across several ticks) rather than a single
     /// stateless snapshot. Runs on the L1 queue.
-    private func deliberateBehavior(at monotonicNS: UInt64) {
+    private func deliberateBehavior(
+        at monotonicNS: UInt64,
+        auxiliaryWake: L1AuxiliarySemanticInterrupt? = nil
+    ) {
         guard !stopped else { return }
         guard let behavior = behaviorContextProvider() else { return }
         let evidenceID = "behavior:\(monotonicNS)"
         let identityNote = behavior.recognizedIdentity.map { " Recognized identity: \($0)." } ?? ""
+        let wakeNote = auxiliaryWake.map {
+            " Auxiliary wake: situation=\($0.situation.rawValue); reason=\($0.reason.rawValue); score=\(String(format: "%.2f", $0.score)); evidence=\($0.evidence.prefix(120))."
+        } ?? ""
         let request = L1SituationRequest(
             observedAt: Date(),
-            evidenceIDs: [evidenceID],
-            beliefSummary: "Periodic L0 behavior self-awareness. Attention=\(behavior.attentionState).\(identityNote)",
+            evidenceIDs: [evidenceID] + (auxiliaryWake.map { ["auxiliary_wake:\($0.requestID)"] } ?? []),
+            beliefSummary: "Periodic L0 behavior self-awareness. Attention=\(behavior.attentionState).\(identityNote)\(wakeNote)",
             priorThoughtState: behaviorThoughtState,
             priorFrame: behaviorPriorFrame,
             visuals: [currentFrameProvider()].compactMap { $0 },
@@ -2193,9 +2322,26 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         )
         onHealth(
             "wake",
-            "cause=behavior_awareness; cycle=\(request.cycleID.uuidString.lowercased()); attention=\(behavior.attentionState); fixation=\(String(format: "%.1f", behavior.fixationSeconds))s; scan=\(behavior.scanActive ? "on" : "off"); face=\(behavior.isFaceTarget ? "yes" : "no"); identity=\(behavior.recognizedIdentity ?? "none")"
+            "cause=\(auxiliaryWake == nil ? "behavior_awareness" : "auxiliary_wake"); cycle=\(request.cycleID.uuidString.lowercased()); attention=\(behavior.attentionState); fixation=\(String(format: "%.1f", behavior.fixationSeconds))s; scan=\(behavior.scanActive ? "on" : "off"); face=\(behavior.isFaceTarget ? "yes" : "no"); identity=\(behavior.recognizedIdentity ?? "none")"
         )
         reasoner.submit(request)
+    }
+
+    /// Trigger an immediate behavior-awareness pass in response to an auxiliary
+    /// (E2B) wake proposal. The proposal is folded into the L1 request as
+    /// evidence so the primary L1 cycle can accept or revise it. Throttled to
+    /// `auxiliaryWakeIntervalNS` so a burst of proposals cannot flood the
+    /// reasoner beyond the periodic cadence.
+    func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if let last = self.lastAuxiliaryWakeNS, now - last < self.auxiliaryWakeIntervalNS {
+                return
+            }
+            self.lastAuxiliaryWakeNS = now
+            self.deliberateBehavior(at: now, auxiliaryWake: interrupt)
+        }
     }
 
     private func receive(
@@ -2208,6 +2354,9 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             guard case let .success(frame) = result else { return }
             if !request.informationNeeds.isEmpty {
                 onCuriosityNeeds(request.informationNeeds)
+            }
+            if !frame.memoryProposals.isEmpty {
+                onMemoryProposals(frame.memoryProposals, request.socialOpportunity?.entityID)
             }
             if request.visuals.isEmpty, !frame.requestedVisualResourceIDs.isEmpty {
                 let resources = visualResourceResolver(frame.requestedVisualResourceIDs)

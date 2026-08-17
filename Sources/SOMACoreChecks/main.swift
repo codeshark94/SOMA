@@ -1265,11 +1265,11 @@ require(
     "one exploration face frame opened provisional motor authority"
 )
 require(
-    !FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 3, confidence: 0.89),
+    !FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 3, confidence: 0.74),
     "a weak exploration face opened provisional motor authority"
 )
 require(
-    FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 2, confidence: 0.90),
+    FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 2, confidence: 0.75),
     "repeated high-confidence exploration face could not preempt coverage"
 )
 

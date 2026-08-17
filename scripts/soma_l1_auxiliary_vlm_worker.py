@@ -99,13 +99,28 @@ def main() -> int:
                 "attention_hint (person|object|sound_source|explore|none), "
                 "situation (social_bid|object_presentation|scene_transition|ambient|uncertain), "
                 "wake_reason (direct_social_bid|presented_object|unexpected_change|ambiguity|none), "
-                "wake_score (0..1), confidence (0..1). "
+                "wake_score (0..1), confidence (0..1), "
+                "eye_contact (0..1), engagement (0..1), "
+                "body_language (open|closed|turned_away|leaning_in|none), "
+                "gesture (waving|pointing|nodding|none), "
+                "approach (approaching|stationary|leaving|none), "
+                "reaction (engage|orient|observe|none). "
                 "Every textual value, including every enum value, must be enclosed in JSON double quotes. "
                 "Use attention_hint=person whenever any human, face, or body is visible; use object only "
                 "when no human is visible. social_presence is the probability that a human is visible. "
                 "A quiet static background is ambient with wake_reason=none and low wake_score. "
                 "A social bid requires visible evidence that a person is addressing the camera; merely "
-                "being visible is not enough. Do not use markdown. "
+                "being visible is not enough. "
+                "When a human is visible, also judge: eye_contact is the probability the person is looking "
+                "at the camera; engagement is how available/attentive they are (low if busy, on a phone, "
+                "or turned away); body_language describes their posture; gesture is any clear hand/head "
+                "gesture (waving, pointing, nodding) else none; approach is whether they are moving toward "
+                "or away from the camera. reaction is the proportional response SOMA should take: "
+                "engage when a person is socially addressing the camera (waving, approaching, eye contact, "
+                "a social bid); orient when a non-person object or scene change deserves attention; "
+                "observe for a mild ambient change; none for a quiet static scene. "
+                "When no human is visible, set eye_contact=0, engagement=0, body_language=none, "
+                "gesture=none, approach=none. Do not use markdown. "
                 f"Fast sensor context: {context_text}"
             )
             prompt = apply_chat_template(
@@ -148,6 +163,18 @@ def main() -> int:
             wake_reason = str(parsed.get("wake_reason", "none"))
             if wake_reason not in {"direct_social_bid", "presented_object", "unexpected_change", "ambiguity", "none"}:
                 wake_reason = "none"
+            body_language = str(parsed.get("body_language", "none"))
+            if body_language not in {"open", "closed", "turned_away", "leaning_in", "none"}:
+                body_language = "none"
+            gesture = str(parsed.get("gesture", "none"))
+            if gesture not in {"waving", "pointing", "nodding", "none"}:
+                gesture = "none"
+            approach = str(parsed.get("approach", "none"))
+            if approach not in {"approaching", "stationary", "leaving", "none"}:
+                approach = "none"
+            reaction = str(parsed.get("reaction", "none"))
+            if reaction not in {"engage", "orient", "observe", "none"}:
+                reaction = "none"
             emit({
                 "type": "result",
                 "requestID": request_id,
@@ -162,6 +189,12 @@ def main() -> int:
                 "wakeReason": wake_reason,
                 "wakeScore": bounded_probability(parsed.get("wake_score")),
                 "confidence": bounded_probability(parsed.get("confidence")),
+                "eyeContact": bounded_probability(parsed.get("eye_contact")),
+                "engagement": bounded_probability(parsed.get("engagement")),
+                "bodyLanguage": body_language,
+                "gesture": gesture,
+                "approach": approach,
+                "reaction": reaction,
                 "inferenceMS": inference_ms,
                 "promptTokens": getattr(generated, "prompt_tokens", 0),
                 "generationTokens": getattr(generated, "generation_tokens", 0),

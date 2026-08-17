@@ -44,6 +44,12 @@ private struct L1AuxiliaryWorkerEnvelope: Decodable {
     let wakeReason: L1AuxiliaryWakeReason?
     let wakeScore: Double?
     let confidence: Double?
+    let eyeContact: Double?
+    let engagement: Double?
+    let bodyLanguage: L1AuxiliaryBodyLanguage?
+    let gesture: L1AuxiliaryGesture?
+    let approach: L1AuxiliaryApproach?
+    let reaction: L1AuxiliaryReaction?
     let inferenceMS: Double?
 }
 
@@ -66,7 +72,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private let onCue: @Sendable (L1AuxiliarySemanticCue) -> Void
     private let onInterrupt: @Sendable (L1AuxiliarySemanticInterrupt) -> Void
     private var admission = L1AuxiliarySemanticAdmissionGate()
-    private var interruptGate = L1AuxiliarySemanticInterruptGate()
+    private var interruptGate: L1AuxiliarySemanticInterruptGate
     private var pending: Pending?
     private var inFlight = false
     private var ready = false
@@ -81,6 +87,9 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         pythonURL: URL,
         workerURL: URL,
         model: String,
+        wakeMinimumScore: Double = 0.65,
+        wakeMinimumConfidence: Double = 0.55,
+        wakeRepeatIntervalMilliseconds: UInt64 = 5_000,
         onHealth: @escaping @Sendable (String, String) -> Void,
         onCue: @escaping @Sendable (L1AuxiliarySemanticCue) -> Void,
         onInterrupt: @escaping @Sendable (L1AuxiliarySemanticInterrupt) -> Void
@@ -88,6 +97,11 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         self.onHealth = onHealth
         self.onCue = onCue
         self.onInterrupt = onInterrupt
+        interruptGate = L1AuxiliarySemanticInterruptGate(
+            minimumWakeScore: wakeMinimumScore,
+            minimumConfidence: wakeMinimumConfidence,
+            repeatIntervalMilliseconds: wakeRepeatIntervalMilliseconds
+        )
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -266,6 +280,12 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
                 wakeReason: wakeReason,
                 wakeScore: wakeScore,
                 confidence: confidence,
+                eyeContact: envelope.eyeContact ?? 0,
+                engagement: envelope.engagement ?? 0,
+                bodyLanguage: envelope.bodyLanguage ?? .none,
+                gesture: envelope.gesture ?? .none,
+                approach: envelope.approach ?? .none,
+                reaction: envelope.reaction ?? .none,
                 inferenceMS: inferenceMS
             )
             onCue(cue)

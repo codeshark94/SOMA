@@ -27,6 +27,12 @@ func somaEnvDouble(_ key: String, default defaultValue: Double) -> Double {
     return value
 }
 
+func somaEnvString(_ key: String, default defaultValue: String) -> String {
+    guard let raw = ProcessInfo.processInfo.environment[key],
+          !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return defaultValue }
+    return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 /// The base host of the local Ollama server (from `.env` `OLLAMA_HOST`).
 func somaOllamaHost() -> String {
     let raw = ProcessInfo.processInfo.environment["OLLAMA_HOST"] ?? "http://127.0.0.1:11434"
@@ -1173,7 +1179,13 @@ private struct SpeechInteractionTraceEvent: Encodable, Sendable {
 
 private final class ConversationContactRuntime: @unchecked Sendable {
     private let lock = NSLock()
-    private var gate = ConversationContactGate()
+    private var gate: ConversationContactGate
+
+    init(eyeContactFreshnessMilliseconds: UInt64 = 450) {
+        gate = ConversationContactGate(configuration: .init(
+            eyeContactFreshnessMilliseconds: eyeContactFreshnessMilliseconds
+        ))
+    }
 
     func observe(_ candidates: [SceneCandidate], at monotonicNS: UInt64) {
         let hasEyeContact = candidates.contains { candidate in
@@ -1366,12 +1378,14 @@ private struct IdentityPresenceUpdate: Sendable {
 /// display name or a biometric projection.
 private final class IdentityPresenceCoordinator: @unchecked Sendable {
     private let administrator: SOMAAdministratorIdentity?
+    private let openWithUnknownIdentity: Bool
     private let lock = NSLock()
     private var tracker = IdentityPresenceTracker()
     private var latestParticipant: InteractionParticipant?
 
-    init(administrator: SOMAAdministratorIdentity?) {
+    init(administrator: SOMAAdministratorIdentity?, openWithUnknownIdentity: Bool = false) {
         self.administrator = administrator
+        self.openWithUnknownIdentity = openWithUnknownIdentity
     }
 
     func observe(
@@ -1384,7 +1398,18 @@ private final class IdentityPresenceCoordinator: @unchecked Sendable {
             identity = IdentityPresenceIdentity(entityID: entityID, kind: .enrolled)
         case let .anonymous(entityID, _, _, _):
             identity = IdentityPresenceIdentity(entityID: entityID, kind: .pseudonymous)
-        case .unknownCandidate, .knownCandidate:
+        case let .unknownCandidate(handle, _):
+            // When proactive openings with unknown identities are enabled, an
+            // unrecognized face is treated as a pseudonymous participant so L1
+            // may open with it. The entityID is derived from the anonymous
+            // handle, so a later promotion to a registered anonymous identity
+            // keeps the same participant identity.
+            guard openWithUnknownIdentity else { return [] }
+            identity = IdentityPresenceIdentity(
+                entityID: FaceIdentityRuntime.pseudonymousEntityID(for: handle),
+                kind: .pseudonymous
+            )
+        case .knownCandidate:
             return []
         }
         lock.lock()
@@ -1660,6 +1685,48 @@ private func identityPresenceRuntimeEvent(
     }
 }
 
+/// Forwards E2B's proportional reaction from the auxiliary VLM cue path to the
+/// AttentionGimbalBridge, which is created later in setup. The cue closure runs
+/// before the bridge exists, so the sink is attached once the bridge is up.
+private final class L1AuxiliaryReactionRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: (@Sendable (L1AuxiliaryReaction, UInt64) -> Void)?
+
+    func record(_ reaction: L1AuxiliaryReaction, at monotonicNS: UInt64) {
+        lock.lock()
+        let active = sink
+        lock.unlock()
+        active?(reaction, monotonicNS)
+    }
+
+    func attach(_ sink: @escaping @Sendable (L1AuxiliaryReaction, UInt64) -> Void) {
+        lock.lock()
+        self.sink = sink
+        lock.unlock()
+    }
+}
+
+/// Forwards E2B's scalar wake proposal to the primary L1 stream, which is
+/// created later in setup. The interrupt closure runs before the L1 stream
+/// exists, so the proposal is buffered here and forwarded once the stream is up.
+private final class L1AuxiliaryWakeRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: (@Sendable (L1AuxiliarySemanticInterrupt) -> Void)?
+
+    func record(_ interrupt: L1AuxiliarySemanticInterrupt) {
+        lock.lock()
+        let active = sink
+        lock.unlock()
+        active?(interrupt)
+    }
+
+    func attach(_ sink: @escaping @Sendable (L1AuxiliarySemanticInterrupt) -> Void) {
+        lock.lock()
+        self.sink = sink
+        lock.unlock()
+    }
+}
+
 private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
     let event = "l1.auxiliary.semantic"
     let requestID: UInt64
@@ -1674,6 +1741,12 @@ private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
     let wakeReason: L1AuxiliaryWakeReason
     let wakeScore: Double
     let confidence: Double
+    let eyeContact: Double
+    let engagement: Double
+    let bodyLanguage: L1AuxiliaryBodyLanguage
+    let gesture: L1AuxiliaryGesture
+    let approach: L1AuxiliaryApproach
+    let reaction: L1AuxiliaryReaction
     let inferenceMS: Double
     let captureToCueMS: Double
 
@@ -1690,6 +1763,12 @@ private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
         wakeReason = cue.wakeReason
         wakeScore = cue.wakeScore
         confidence = cue.confidence
+        eyeContact = cue.eyeContact
+        engagement = cue.engagement
+        bodyLanguage = cue.bodyLanguage
+        gesture = cue.gesture
+        approach = cue.approach
+        reaction = cue.reaction
         inferenceMS = cue.inferenceMS
         captureToCueMS = milliseconds(from: cue.captureNS, to: cue.completedNS)
     }
@@ -2533,6 +2612,15 @@ private final class GimbalPoseStore: @unchecked Sendable {
         return pose
     }
 
+    /// The most recent pose regardless of age. Used by bounded expressions so a
+    /// stale attitude sample (e.g. during an SDK AI-tracking transaction) does
+    /// not stall a bow/nod that should complete on a fixed timer.
+    func lastKnown() -> GimbalPose? {
+        lock.lock()
+        defer { lock.unlock() }
+        return recent.last
+    }
+
 }
 
 /// Keeps semantic binding off the Vision queue. At most one scene update is
@@ -2715,6 +2803,14 @@ private enum LiveVoicePresentationState: String, Sendable {
     case responding
 }
 
+/// Motor command authority, L0 < L1 < L2. A higher layer may preempt a lower
+/// layer's reflexive face lock or in-flight gesture.
+private enum ScanPriority {
+    case l0
+    case l1
+    case l2
+}
+
 private final class AttentionGimbalBridge: @unchecked Sendable {
     private enum State {
         case running
@@ -2794,6 +2890,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var externalStopGeneration = 0
     private var scanGeneration = 0
     private var scanRunning = false
+    /// Motor authority is L0 < L1 < L2: the higher the layer, the more it may
+    /// preempt the reflexive L0 face lock. A coverage scan records which layer
+    /// started it so a lower layer never tears a higher layer's scan away.
+    private var scanPriority: ScanPriority = .l0
     private var nextScanDirection = 1.0
     private var explorationWaypoint: SpatialCoverageDirection?
     private var explorationWaypointStartedNS: UInt64?
@@ -2857,6 +2957,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// absence that a genuine departure would produce.
     private var nativeTrustContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 5_000)
     private var faceLock = FaceLockLease()
+    /// Consecutive E2B reactions (orient/observe) observed while L0 is face-locked.
+    /// When this reaches the threshold, E2B forcibly releases what it judges to be
+    /// a wrong fixation and resumes scanning.
+    private var consecutiveAuxiliaryReleaseSignal = 0
+    private let auxiliaryOrientReleaseCount = 2
+    private let auxiliaryObserveReleaseCount = 3
     private var activeSpatialFaceReacquisition: (id: String, deadlineNS: UInt64)?
     private var attemptedSpatialFaceReacquisitionIDs: Set<String> = []
     private var confirmedVisualLossNS: UInt64?
@@ -3237,10 +3343,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             let key = perceived.uuidString
             guard self.pendingAcknowledgmentEntityIDs.removeValue(forKey: key) != nil else { return }
             self.deliveredAcknowledgmentEntityIDs.insert(key)
+            // Use the current time for the lease, not the L1 directive's
+            // (possibly stale) timestamp, so the bow has its full window to
+            // complete instead of expiring immediately. The two-waypoint bow
+            // needs ~0.5s of motion, so give it a comfortable 1.5s lease so it
+            // reports cognitive_expression_completed rather than timing out.
+            let now = monotonicNanoseconds()
             self.applyEmbodimentIntent(.express(
-                requestID: "l1-ack-\(monotonicNS)",
+                requestID: "l1-ack-\(now)",
                 expression: .acknowledge,
-                expiresAtNS: monotonicNS + 600_000_000
+                expiresAtNS: now + 1_500_000_000
             ))
         }
     }
@@ -4107,6 +4219,57 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         applySpatialFaceReacquisition(rememberedFace, at: monotonicNS)
     }
 
+    /// Apply E2B's proportional reaction as a simple L0 control signal. Called
+    /// from the auxiliary VLM cue path (not the face pipeline) so E2B can add
+    /// human detection without disturbing face-lock evidence.
+    func applyAuxiliaryReaction(_ reaction: L1AuxiliaryReaction, at monotonicNS: UInt64) {
+        let prior = indicatorInputs.resolvedState
+        indicatorInputs.applyAuxiliaryReaction(reaction)
+        if indicatorInputs.resolvedState != prior {
+            refreshIndicator(at: monotonicNS)
+        }
+        applyAuxiliaryL0Release(reaction, at: monotonicNS)
+    }
+
+    /// Direct L0 un-stick: if L0 is currently face-locked but E2B consistently
+    /// reports a reaction that points attention elsewhere (orient = non-person
+    /// scene change; observe = sustained ambient change), release the lock and
+    /// resume scanning. This lets E2B break a fixation the face detector itself
+    /// will not clear. Requires several consecutive cues so a single transient
+    /// judgment does not tear down a legitimate lock.
+    private func applyAuxiliaryL0Release(_ reaction: L1AuxiliaryReaction, at monotonicNS: UInt64) {
+        guard faceLock.sceneID != nil else {
+            consecutiveAuxiliaryReleaseSignal = 0
+            return
+        }
+        let threshold: Int
+        switch reaction {
+        case .orient: threshold = auxiliaryOrientReleaseCount
+        case .observe: threshold = auxiliaryObserveReleaseCount
+        default:
+            consecutiveAuxiliaryReleaseSignal = 0
+            return
+        }
+        consecutiveAuxiliaryReleaseSignal += 1
+        guard consecutiveAuxiliaryReleaseSignal >= threshold else { return }
+        consecutiveAuxiliaryReleaseSignal = 0
+        releaseWrongFixation(reason: "auxiliary_\(reaction.rawValue)", at: monotonicNS)
+    }
+
+    private func releaseWrongFixation(reason: String, at monotonicNS: UInt64) {
+        faceLock.invalidate()
+        lastMotorTarget = nil
+        sendExternalStop(state: reason, at: monotonicNS)
+        resumeCoverageScan()
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "l0_auxiliary_release",
+            state: reason,
+            message: "E2B released a fixation E2B judged to be wrong; resumed coverage scan"
+        ))
+    }
+
     private func isFaceAcquisitionFramed(_ rect: SOMACore.NormalizedRect) -> Bool {
         // A new lock needs a foveal face measurement. This is deliberately
         // stricter than the ongoing servo envelope: after a real face has
@@ -4520,7 +4683,17 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             scheduleCognitiveMotionTick(generation: generation, afterMilliseconds: 100)
             return
         }
-        guard let pose = poseStore.current(maximumAgeNS: 250_000_000) else {
+        // Bounded expressions (bow/nod/greeting) complete on a fixed timer, so
+        // they may use the last known pose even if the attitude sample is stale
+        // (e.g. during an SDK AI-tracking transaction). Other modes need a fresh
+        // pose to avoid driving on outdated geometry.
+        let pose: GimbalPose?
+        if case .expression = cognitiveMotionMode {
+            pose = poseStore.lastKnown()
+        } else {
+            pose = poseStore.current(maximumAgeNS: 250_000_000)
+        }
+        guard let pose else {
             if !cognitiveMotionHolding {
                 stopCognitiveMotion(state: "cognitive_pose_wait", at: now, retainLease: true)
                 cognitiveMotionLoopRunning = true
@@ -4860,7 +5033,28 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let startedNS = waypointStartedNS ?? monotonicNS
         let minimumWaypointNS: UInt64 = kind == .greeting ? 70_000_000 : 120_000_000
         let arrivalToleranceDegrees = kind == .greeting ? 0.75 : 1.8
-        if distance <= arrivalToleranceDegrees && monotonicNS >= startedNS + minimumWaypointNS {
+        // Advance on arrival OR on a time fallback. Some gimbal SDKs do not
+        // reflect commanded movement in the attitude feedback, so the pose
+        // distance never converges; without this fallback the expression would
+        // hold until the lease expires and never report completion.
+        let waypointTimeoutNS: UInt64 = kind == .greeting ? 250_000_000 : 400_000_000
+        if distance <= arrivalToleranceDegrees {
+            // Waypoint reached. Advance once the minimum dwell time has elapsed;
+            // otherwise hold (keep the loop running) WITHOUT re-driving the
+            // waypoint. Re-driving would hit the "_holding" branch in
+            // driveCognitiveWaypoint, which stops the motion loop and stalls the
+            // expression before it can advance to the next waypoint.
+            let dwellElapsed = monotonicNS >= startedNS + minimumWaypointNS
+            cognitiveMotionMode = .expression(
+                kind: kind,
+                basePose: base,
+                waypointIndex: dwellElapsed ? waypointIndex + 1 : waypointIndex,
+                waypointStartedNS: dwellElapsed ? monotonicNS : startedNS
+            )
+            return
+        }
+        if monotonicNS >= startedNS + waypointTimeoutNS {
+            // Time fallback: advance even if the pose never converged.
             cognitiveMotionMode = .expression(
                 kind: kind,
                 basePose: base,
@@ -4894,9 +5088,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let inward = currentPan > 0 ? -1.0 : 1.0
         switch expression {
         case .acknowledge:
-            return [(pitch: -5, pan: 0), (pitch: 0, pan: 0)]
+            // Positive pitch = down (pitchCommand == error with pitchSign -1 and
+            // pitchImageSign -1). A bow must lower the head, so use +5.
+            return [(pitch: 5, pan: 0), (pitch: 0, pan: 0)]
         case .nod:
-            return [(pitch: -7, pan: 0), (pitch: 3, pan: 0), (pitch: 0, pan: 0)]
+            // Down, up, return.
+            return [(pitch: 7, pan: 0), (pitch: -3, pan: 0), (pitch: 0, pan: 0)]
         case .attentiveReframe:
             return [(pitch: 2, pan: 7 * inward), (pitch: 0, pan: 0)]
         case .thinkingGlance:
@@ -5132,16 +5329,37 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         externalStopGeneration += 1
     }
 
-    private func startSmoothExploration(initialPan: Double) {
+    private func startSmoothExploration(initialPan: Double, priority: ScanPriority = .l0) {
         // A remembered face has its own bounded return path. Starting a
         // coverage trajectory alongside it races two targets through the same
         // command slot and is perceived as looking away from the person.
         let now = monotonicNanoseconds()
         let exclusiveScan = cameraGeometryCalibrationMode || panoramaStripScanMode
-        guard (exclusiveScan || !hasRecentObservedFace(at: now)),
-              (exclusiveScan || activeSpatialFaceReacquisition == nil),
-              !scanRunning,
-              !explorationRecentering else { return }
+        switch priority {
+        case .l0:
+            // Reflexive L0 scan is the lowest authority: it yields to a
+            // recently observed face, an active L0 face lock, and an in-flight
+            // L1 cognitive expression (bow/nod/greeting).
+            guard (exclusiveScan || !hasRecentObservedFace(at: now)),
+                  (exclusiveScan || activeSpatialFaceReacquisition == nil),
+                  (exclusiveScan || !faceLock.permitsMotor(at: now)),
+                  (exclusiveScan || !cognitiveMotionLoopRunning),
+                  !scanRunning,
+                  !explorationRecentering else { return }
+        case .l1:
+            // L1 (conscious stream) outranks L0: it may tear away the reflexive
+            // face lock to scan, but yields to an active L2 scan.
+            guard !(scanRunning && scanPriority == .l2),
+                  !explorationRecentering else { return }
+            faceLock.invalidate()
+        case .l2:
+            // L2 (conversation) is the highest authority: it may tear away the
+            // L0 face lock and preempt an in-flight L1 cognitive expression.
+            guard !explorationRecentering else { return }
+            faceLock.invalidate()
+            stopCognitiveMotion(state: "l2_preempted", at: now, retainLease: false)
+        }
+        scanPriority = priority
         scanRunning = true
         scanGeneration += 1
         explorationWaypoint = nil
@@ -5158,11 +5376,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         scheduleScanControlTick(initialPan: initialPan, generation: scanGeneration)
     }
 
-    /// L1 behavior directive entry point: resume the coverage scan. The guards
-    /// inside `startSmoothExploration` still yield to a recently observed face,
-    /// so this never tears a confirmed face lock away.
-    func resumeCoverageScan() {
-        startSmoothExploration(initialPan: 0)
+    /// L1/L2 behavior directive entry point: resume the coverage scan. The
+    /// `priority` argument encodes the motor authority of the issuing layer
+    /// (L1 conscious stream or L2 conversation), so a higher layer may tear
+    /// away the reflexive L0 face lock.
+    func resumeCoverageScan(priority: ScanPriority = .l0) {
+        startSmoothExploration(initialPan: 0, priority: priority)
     }
 
     private func cancelScan() {
@@ -5199,8 +5418,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private func runScanControlTick(initialPan: Double, generation: Int) {
         guard scanRunning, generation == scanGeneration else { return }
         let now = monotonicNanoseconds()
+        // A reflexive L0 scan yields to a recently observed face, an active L0
+        // face lock, and a spatial reacquisition. A higher-authority L1/L2 scan
+        // keeps scanning: it already tore the face lock away on initiation.
+        let l0Yields = !hasRecentObservedFace(at: now)
+            && activeSpatialFaceReacquisition == nil
+            && !faceLock.permitsMotor(at: now)
         guard cameraGeometryCalibrationMode || panoramaStripScanMode
-            || (!hasRecentObservedFace(at: now) && activeSpatialFaceReacquisition == nil) else {
+            || (scanPriority == .l0 ? l0Yields : true) else {
             cancelScan()
             return
         }
@@ -6572,6 +6797,15 @@ private struct SystemFaceEvidence: Sendable {
 }
 
 private final class SystemFaceVerifier: @unchecked Sendable {
+    /// Scales the pupil-centering thresholds that decide directed eye contact.
+    /// 1.0 = default (0.68 X / 0.82 Y). Lower = stricter (pupil must be more
+    /// centered); higher = more lenient.
+    private let pupilCenteringThreshold: Double
+
+    init(pupilCenteringThreshold: Double = 1.0) {
+        self.pupilCenteringThreshold = min(max(pupilCenteringThreshold, 0.1), 2.0)
+    }
+
     func detect(in pixelBuffer: CVPixelBuffer) -> [SystemFaceEvidence] {
         let faceRequest = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
@@ -6739,7 +6973,8 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         // permissive threshold so a direct stare — and a slightly turned head
         // that is still making eye contact — is accepted; a clear head turn is
         // rejected by the yaw guard in gazeAssessment instead.
-        return normalizedX <= 0.68 && normalizedY <= 0.82
+        return normalizedX <= 0.68 * pupilCenteringThreshold
+            && normalizedY <= 0.82 * pupilCenteringThreshold
     }
 
 }
@@ -6918,7 +7153,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)?
     private let onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)?
     private let systemSaliencyDetector = SystemSaliencyDetector()
-    private let systemFaceVerifier = SystemFaceVerifier()
+    private let systemFaceVerifier: SystemFaceVerifier
     private let stateLock = NSLock()
     private var sceneField = SceneField(requiresFaceActivity: true)
     private var detectorCountdown = 0
@@ -6973,7 +7208,8 @@ private final class VisionWorker: @unchecked Sendable {
         onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64) -> Void)? = nil,
         onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)? = nil,
         onFatalVisionFailure: (() -> Void)? = nil,
-        anonymousReviewProvider: @escaping @Sendable () -> Bool = { true }
+        anonymousReviewProvider: @escaping @Sendable () -> Bool = { true },
+        pupilCenteringThreshold: Double = 1.0
     ) {
         self.worldModel = worldModel
         self.publisher = publisher
@@ -6988,6 +7224,9 @@ private final class VisionWorker: @unchecked Sendable {
         self.onCameraFrame = onCameraFrame
         self.onFatalVisionFailure = onFatalVisionFailure
         self.onIdentityPresenceEvidence = onIdentityPresenceEvidence
+        self.systemFaceVerifier = SystemFaceVerifier(
+            pupilCenteringThreshold: pupilCenteringThreshold
+        )
         do {
             let detector = try ANEObjectDetector()
             neuralObjectDetector = detector
@@ -7381,6 +7620,10 @@ private final class VisionWorker: @unchecked Sendable {
             // gimbal chase a synthetic zig-zag for one physical face.
         }
         candidates = facePersonFusion.fuse(candidates, at: faceVerificationNow)
+        let directedContactFreshnessNS = UInt64(somaEnvDouble(
+            "SOMA_L0_EYE_CONTACT_FRESHNESS_MS",
+            default: 450
+        )) * 1_000_000
         candidates = candidates.map { candidate in
             guard isFaceCandidate(candidate) else { return candidate }
             // FacePersonFusion is the primary motor corroboration boundary.
@@ -7391,7 +7634,7 @@ private final class VisionWorker: @unchecked Sendable {
             let directedEyeContact = independentlyVerified
                 && directedContactEvidence.contains { evidence in
                     faceVerificationNow >= evidence.observedNS
-                        && faceVerificationNow - evidence.observedNS <= 450_000_000
+                        && faceVerificationNow - evidence.observedNS <= directedContactFreshnessNS
                         && Self.faceEvidenceMatches(evidence.rect, candidate.rect)
                 }
             if independentlyVerified {
@@ -7949,7 +8192,8 @@ private func run(_ options: Options) throws {
         ))
     }
     let identityPresence = IdentityPresenceCoordinator(
-        administrator: controlSettings.administrator
+        administrator: controlSettings.administrator,
+        openWithUnknownIdentity: somaEnvBool("SOMA_L1_OPEN_WITH_UNKNOWN", default: false)
     )
     let presentIdentityRoster = PresentIdentityRoster()
     let latestPrimaryIdentity = LatestIdentityBox()
@@ -7984,6 +8228,8 @@ private func run(_ options: Options) throws {
     placeMemoryPersistence?.restore()
     let panoramaStatus = PanoramaMapStatusStore()
     let liveVisualContextRelay = LiveVisualContextRelay()
+    let auxiliaryReactionRelay = L1AuxiliaryReactionRelay()
+    let auxiliaryWakeRelay = L1AuxiliaryWakeRelay()
     let liveCameraFrameRelay = options.l2LiveVoice && controlSettings.realtimeVoiceEnabled
         ? LiveCameraFrameRelay()
         : nil
@@ -8002,6 +8248,9 @@ private func run(_ options: Options) throws {
             pythonURL: pythonURL,
             workerURL: workerURL,
             model: model,
+            wakeMinimumScore: somaEnvDouble("SOMA_L0_E2B_WAKE_SCORE", default: 0.65),
+            wakeMinimumConfidence: somaEnvDouble("SOMA_L0_E2B_WAKE_CONFIDENCE", default: 0.55),
+            wakeRepeatIntervalMilliseconds: UInt64(somaEnvDouble("SOMA_L0_E2B_WAKE_INTERVAL_MS", default: 5_000)),
             onHealth: { state, message in
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -8013,9 +8262,11 @@ private func run(_ options: Options) throws {
             },
             onCue: { cue in
                 liveVisualContextRelay.record(cue)
+                auxiliaryReactionRelay.record(cue.reaction, at: cue.completedNS)
                 writer.write(L1AuxiliarySemanticTraceEvent(cue))
             },
             onInterrupt: { interrupt in
+                auxiliaryWakeRelay.record(interrupt)
                 writer.write(L1AuxiliarySemanticInterruptTraceEvent(interrupt))
             }
         )
@@ -8153,7 +8404,12 @@ private func run(_ options: Options) throws {
         ))
     }
     let complete = DispatchSemaphore(value: 0)
-    let conversationContact = ConversationContactRuntime()
+    let conversationContact = ConversationContactRuntime(
+        eyeContactFreshnessMilliseconds: UInt64(somaEnvDouble(
+            "SOMA_L0_EYE_CONTACT_FRESHNESS_MS",
+            default: 450
+        ))
+    )
     let faceLockDiagnosticRecorder = try options.faceLockDiagnosticDirectoryURL.map {
         try FaceLockDiagnosticRecorder(directoryURL: $0)
     }
@@ -8207,6 +8463,12 @@ private func run(_ options: Options) throws {
         attentionGimbalBridge?.recognizedPersonEntityIDProvider = {
             identityPresence.recognizedPersonEntityID()
         }
+        // The auxiliary VLM cue closure runs before the bridge exists, so E2B's
+        // proportional reaction is buffered in the relay and attached here once
+        // the bridge is up.
+        auxiliaryReactionRelay.attach { [weak attentionGimbalBridge] reaction, monotonicNS in
+            attentionGimbalBridge?.applyAuxiliaryReaction(reaction, at: monotonicNS)
+        }
     } else {
         attentionGimbalBridge = nil
     }
@@ -8246,7 +8508,8 @@ private func run(_ options: Options) throws {
         },
         onSocialContactPersisted: { personEntityID in
             l1ThoughtRelay.invalidateMemoryContext(for: personEntityID)
-        }
+        },
+        transcriptRetentionSeconds: somaEnvDouble("SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS", default: 24) * 60 * 60
     )
     if let administratorID = controlSettings.administrator?.entityID {
         l1MemoryContext.warmContext(for: administratorID)
@@ -8285,6 +8548,11 @@ private func run(_ options: Options) throws {
         dailyWorldMemoryCollector.collectIfNeeded(current: current)
     }
     defer { dailyWorldMemoryCollector.stop() }
+    // Language detected from the participant's most recent speech. L1 and L2
+    // both read this so a person who speaks first in a language is answered in
+    // that same language even without a stored preferred language.
+    let activeLanguage = L1ActiveLanguage()
+    let speechInteractionBox = SpeechInteractionBox()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     let liveVoiceBox = LiveVoiceLauncherBox()
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
@@ -8426,6 +8694,20 @@ private func run(_ options: Options) throws {
                         rawText: text
                     )
                     if role == .user {
+                        // Detect the participant's spoken language from their
+                        // transcript so L1/L2 answer in the same language, and
+                        // switch the on-device recognizer to that locale so
+                        // subsequent turns transcribe more accurately.
+                        if let detected = activeLanguage.detectAndSet(from: text) {
+                            speechInteractionBox.coordinator?.setRecognitionLocale(detected)
+                            writer.write(RuntimeEvent(
+                                event: "source.health",
+                                monotonicNS: monotonicNanoseconds(),
+                                source: "l1_language",
+                                state: "detected",
+                                message: "language=\(detected)"
+                            ))
+                        }
                         Task {
                             await l1MemoryContext.captureUserPreferences(
                                 threadID: threadID,
@@ -8611,7 +8893,7 @@ private func run(_ options: Options) throws {
             let entityID = (args["entity_id"] as? String).flatMap(UUID.init(uuidString:))
             return l1RecallEpisodes(l1MemoryContext, query: query, entityID: entityID)
         case "orient_camera":
-            attentionGimbalBridge?.resumeCoverageScan()
+            attentionGimbalBridge?.resumeCoverageScan(priority: .l2)
             return #"{"ok":true,"orient_requested":true}"#
         case "web_search":
             guard let data = arguments.data(using: .utf8),
@@ -8861,16 +9143,10 @@ private func run(_ options: Options) throws {
             behaviorContextProvider: { [weak attentionGimbalBridge] in
                 attentionGimbalBridge?.makeBehaviorContext(at: monotonicNanoseconds())
             },
-            personPresentProvider: { [weak attentionGimbalBridge] in
-                guard let ctx = attentionGimbalBridge?.makeBehaviorContext(at: monotonicNanoseconds()) else {
-                    return false
-                }
-                return ctx.isFaceTarget || ctx.recognizedIdentity != nil
-            },
             onBehaviorDirective: { [weak attentionGimbalBridge] directive, atNS in
                 switch directive.action {
                 case .resumeScanning, .seekPeople:
-                    attentionGimbalBridge?.resumeCoverageScan()
+                    attentionGimbalBridge?.resumeCoverageScan(priority: .l1)
                 case .acknowledgePerson:
                     attentionGimbalBridge?.acknowledgePersonIfEligible(at: atNS)
                 case .keepObserving, .none:
@@ -8901,9 +9177,23 @@ private func run(_ options: Options) throws {
             toolExecutor: l1ToolExecutor,
             onCuriosityNeeds: { needs in
                 l1CuriosityCollector.registerTopics(from: needs)
+            },
+            onMemoryProposals: { proposals, entityID in
+                Task {
+                    await l1MemoryContext.proposeMemories(proposals, personEntityID: entityID)
+                }
+            },
+            activeLanguageProvider: {
+                activeLanguage.recent()
             }
         )
         l1ThoughtRelay.install(l1ThoughtStream)
+        // E2B's wake proposals are buffered in the relay (the interrupt closure
+        // runs before the L1 stream exists) and forwarded here once the stream is
+        // up, so the primary L1 cycle can accept or revise each proposal.
+        auxiliaryWakeRelay.attach { [weak l1ThoughtStream] interrupt in
+            l1ThoughtStream?.wakeFromAuxiliary(interrupt)
+        }
         l1CuriosityCollector.start()
     } catch {
         writer.write(RuntimeEvent(
@@ -9244,7 +9534,8 @@ private func run(_ options: Options) throws {
         onFatalVisionFailure: {
             complete.signal()
         },
-        anonymousReviewProvider: { anonymousReviewBox.approve() }
+        anonymousReviewProvider: { anonymousReviewBox.approve() },
+        pupilCenteringThreshold: somaEnvDouble("SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD", default: 1.0)
     )
     let eventImportanceModel = EventImportanceModel()
     let speechInteraction: LocalSpeechInteractionCoordinator?
@@ -9283,6 +9574,7 @@ private func run(_ options: Options) throws {
             state: "configured",
             message: "engine=speech_analyzer; locale=\(String(localeIdentifier.prefix(32))); on_device=true; audio_persistence=false; pre_roll_ms=900; l2_handoff=\(options.l2CodexBridgeURL != nil)"
         ))
+        speechInteractionBox.coordinator = speechInteraction
     } else {
         speechInteraction = nil
     }
@@ -9318,7 +9610,7 @@ private func run(_ options: Options) throws {
             let recognizedPersonEntityID = recognizedParticipant?.entityID
             let preferredLanguageTag = recognizedPersonEntityID.flatMap {
                 l1MemoryContext.cachedPreferredLanguage(for: $0)
-            }
+            } ?? activeLanguage.recent()
             let languageStartInstruction = l1LanguageInstructions.directive(for: preferredLanguageTag)
             if let openingAuthorization {
                 let sessionCapability = liveSessionCapabilities.issue(
@@ -9845,6 +10137,10 @@ private func l1ProactiveInteractionContext(
 /// initialized local `let`.
 private final class LiveVoiceLauncherBox: @unchecked Sendable {
     weak var launcher: AppServerLiveVoiceLauncher?
+}
+
+private final class SpeechInteractionBox: @unchecked Sendable {
+    weak var coordinator: LocalSpeechInteractionCoordinator?
 }
 
 private final class AccessResult: @unchecked Sendable {

@@ -173,6 +173,7 @@ final class SOMADiagnosticsModel: ObservableObject {
 /// overlaid, and a live tail of the L1 situation stream below.
 struct SOMADiagnosticsView: View {
     @ObservedObject var model: SOMADiagnosticsModel
+    @State private var didInitialScroll = false
 
     private static let aspect: CGFloat = 16.0 / 9.0
 
@@ -297,11 +298,25 @@ struct SOMADiagnosticsView: View {
                 }
             }
             .background(Color.black.opacity(0.06))
-            .onChange(of: model.thoughts.last?.id) { _ in
+            // Open already at the most recent log instead of the backlog, so
+            // enabling diagnostics does not scroll through old entries. The
+            // first load (backlog) jumps straight to the bottom without
+            // animation; only later live updates animate.
+            .onAppear {
                 if let last = model.thoughts.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                    didInitialScroll = true
+                }
+            }
+            .onChange(of: model.thoughts.last?.id) { _ in
+                guard let last = model.thoughts.last else { return }
+                if didInitialScroll {
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
+                } else {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                    didInitialScroll = true
                 }
             }
         }

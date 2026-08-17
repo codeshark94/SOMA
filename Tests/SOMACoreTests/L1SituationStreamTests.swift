@@ -331,6 +331,52 @@ final class L1SituationStreamTests: XCTestCase {
         XCTAssertThrowsError(try L1SituationResponseDecoder.decode(invented, for: request))
     }
 
+    func testMemoryProposalsAreDecoded() throws {
+        let turnID = UUID()
+        let request = L1SituationRequest(
+            observedAt: Date(timeIntervalSince1970: 1),
+            evidenceIDs: ["scene:1", "turn:1"],
+            beliefSummary: "A familiar person is present.",
+            recentConversation: [
+                L1ConversationContext(
+                    turnRecordID: turnID,
+                    role: .user,
+                    rawText: "Please remember my update preference."
+                )
+            ]
+        )
+        let json = Data("""
+        {
+          "summary": "The person mentioned an update preference.",
+          "uncertainty": 0.2,
+          "evidence_ids": ["scene:1"],
+          "memory_proposals": [
+            {
+              "kind": "person_fact",
+              "summary": "Prefers evening update check-ins.",
+              "confidence": 0.85,
+              "evidence_ids": ["scene:1"],
+              "source_turn_record_ids": ["\(turnID.uuidString)"]
+            },
+            {
+              "kind": "open_question",
+              "summary": "What update cadence does this person prefer?",
+              "confidence": 0.6,
+              "evidence_ids": ["scene:1"]
+            }
+          ]
+        }
+        """.utf8)
+        let frame = try L1SituationResponseDecoder.decode(json, for: request)
+        XCTAssertEqual(frame.memoryProposals.count, 2)
+        XCTAssertEqual(frame.memoryProposals[0].kind, .personFact)
+        XCTAssertEqual(frame.memoryProposals[0].summary, "Prefers evening update check-ins.")
+        XCTAssertEqual(frame.memoryProposals[0].confidence, 0.85)
+        XCTAssertEqual(frame.memoryProposals[0].sourceTurnRecordIDs, [turnID])
+        XCTAssertEqual(frame.memoryProposals[1].kind, .openQuestion)
+        XCTAssertEqual(frame.memoryProposals[1].evidenceIDs, ["scene:1"])
+    }
+
     private func fixtureRequest() -> L1SituationRequest {
         L1SituationRequest(
             observedAt: Date(timeIntervalSince1970: 1),

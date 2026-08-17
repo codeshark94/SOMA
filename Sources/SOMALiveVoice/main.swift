@@ -17,6 +17,9 @@ private struct Command: Decodable {
     let preferredLanguageTag: String?
     let languageStartInstruction: String?
     let proactiveOpeningTrigger: String?
+    let interactionAuthority: String?
+    let codexSandbox: String?
+    let codexAdminOnly: Bool?
     let text: String?
     let role: String?
     let data: String?
@@ -211,6 +214,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var preferredLanguageTag: String?
     private var languageStartInstruction: String?
     private var proactiveOpeningTrigger: String?
+    private var interactionAuthority: String?
+    private var codexSandbox = "danger-full-access"
+    private var codexAdminOnly = false
     private var pendingCommands: [Command] = []
     private var webViewReady = false
     private var stopping = false
@@ -269,6 +275,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             proactiveOpeningTrigger = (command.proactiveOpeningTrigger ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            interactionAuthority = (command.interactionAuthority ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let sandbox = command.codexSandbox,
+               ["read-only", "workspace-write", "danger-full-access"].contains(sandbox) {
+                codexSandbox = sandbox
+            }
+            codexAdminOnly = command.codexAdminOnly ?? false
             startAppServer()
         case .appendText:
             guard let threadID,
@@ -393,6 +406,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func startThread() {
+        // When admin-only is enabled, only the local administrator gets the
+        // configured Codex sandbox; every other participant is restricted to
+        // read-only so a guest cannot create/delete files or touch sensitive
+        // paths through the conversation agent.
+        let isAdministrator = interactionAuthority == "administrator"
+        let effectiveSandbox = (codexAdminOnly && !isAdministrator) ? "read-only" : codexSandbox
         connection.request(
             method: "thread/start",
             params: [
@@ -400,7 +419,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "threadSource": "realtime_voice",
                 "ephemeral": true,
                 "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
+                "sandbox": effectiveSandbox,
             ]
         ) { [weak self] response in
             DispatchQueue.main.async {
@@ -906,6 +925,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     preferredLanguageTag: nil,
                     languageStartInstruction: nil,
                     proactiveOpeningTrigger: nil,
+                    interactionAuthority: nil,
+                    codexSandbox: nil,
+                    codexAdminOnly: nil,
                     text: nil,
                     role: nil,
                     data: nil,

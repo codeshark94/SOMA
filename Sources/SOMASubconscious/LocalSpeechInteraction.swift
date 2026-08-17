@@ -422,7 +422,8 @@ final class LocalSpeechInteractionCoordinator: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private let recognizer: LocalOnDeviceSpeechRecognizer
+    private var recognizer: LocalOnDeviceSpeechRecognizer
+    private var currentLocaleIdentifier: String
     private let codexBridge: CodexVoiceHandoff?
     private let speechOutput: LocalSpeechOutput?
     private let onState: @Sendable (LocalSpeechInteractionState) -> Void
@@ -439,6 +440,7 @@ final class LocalSpeechInteractionCoordinator: @unchecked Sendable {
         onState: @escaping @Sendable (LocalSpeechInteractionState) -> Void
     ) throws {
         recognizer = try LocalOnDeviceSpeechRecognizer(localeIdentifier: localeIdentifier)
+        currentLocaleIdentifier = localeIdentifier
         self.onState = onState
         interactionID = "voice-\(ProcessInfo.processInfo.processIdentifier)-\(DispatchTime.now().uptimeNanoseconds)"
         if let codexBridgeURL {
@@ -456,6 +458,20 @@ final class LocalSpeechInteractionCoordinator: @unchecked Sendable {
             speechOutput = nil
             codexBridge = nil
         }
+    }
+
+    /// Switch the on-device speech recognizer to a new locale (e.g. the language
+    /// detected from the participant's speech). Recreates the recognizer only
+    /// when the locale actually changes, and only between recognition turns.
+    func setRecognitionLocale(_ localeIdentifier: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard localeIdentifier != currentLocaleIdentifier else { return }
+        guard let newRecognizer = try? LocalOnDeviceSpeechRecognizer(localeIdentifier: localeIdentifier) else {
+            return
+        }
+        recognizer = newRecognizer
+        currentLocaleIdentifier = localeIdentifier
     }
 
     func ingestAudio(_ chunk: SpeechAudioChunk) {

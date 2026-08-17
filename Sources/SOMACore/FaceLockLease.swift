@@ -27,14 +27,22 @@ public struct FaceLockLease: Sendable {
 
     /// During an active coverage pulse, camera motion can prevent both the
     /// landmark verifier and world-motion activity test from completing. Two
-    /// consecutive, high-confidence detections of the same SceneField track
-    /// may therefore open only the bounded provisional re-centering path. They
-    /// do not grant persistent/native tracking authority by themselves.
+    /// consecutive detections of the same SceneField track may therefore open
+    /// only the bounded provisional re-centering path. They do not grant
+    /// persistent/native tracking authority by themselves.
+    ///
+    /// The confidence bar is deliberately lower than the verifier's own
+    /// threshold: a real face seen while the gimbal is sweeping is motion
+    /// blurred and off-axis, so its blended track confidence lands well below
+    /// 0.90 even though the raw ANE detector score cleared its 0.75 gate. The
+    /// `observationCount >= 2` requirement plus the bounded provisional lease
+    /// (which still requires independent verification for full motor
+    /// authority) keep a face-shaped texture from becoming a permanent person.
     public static func permitsProvisionalExplorationInterception(
         observationCount: Int,
         confidence: Double
     ) -> Bool {
-        observationCount >= 2 && confidence >= 0.90
+        observationCount >= 2 && confidence >= 0.75
     }
 
     public mutating func record(sceneID: String, at monotonicNS: UInt64) {
