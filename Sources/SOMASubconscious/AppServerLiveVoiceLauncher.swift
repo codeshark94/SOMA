@@ -379,7 +379,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         "role": pendingContext.role,
                     ])
                 }
-                enqueueCurrentCameraImage(force: true)
+                enqueueCurrentCameraImageIfEnabled(force: true)
                 onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
             case "audio_input_progress":
                 guard !inputTransportReported else { continue }
@@ -391,7 +391,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.proactiveOpeningTriggered)
             case "input_speech_started":
                 recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
-                enqueueCurrentCameraImage(force: true)
+                enqueueCurrentCameraImageIfEnabled(force: true)
                 onEvent(.hearingUser)
             case "context_appended":
                 onEvent(.contextAppended)
@@ -525,12 +525,19 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ])
     }
 
+    /// Camera frames are pulled on demand by L2 via the capture_view MCP tool
+    /// by default, so the injected image is never mistaken for the user's turn.
+    /// Set SOMA_L2_AUTO_INJECT_CAMERA=1 to restore per-turn auto-injection.
+    private func enqueueCurrentCameraImageIfEnabled(force: Bool) {
+        guard somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: false) else { return }
+        enqueueCurrentCameraImage(force: force)
+    }
+
     /// A camera frame is transient input for the active turn, never a trace
     /// artifact or person-memory record. The relay already bounds the JPEG
     /// cadence; this guard prevents an audio transport retry from duplicating
     /// the same visual item in one instant.
-    private func enqueueCurrentCameraImage(force: Bool) {
-        guard active,
+    private func enqueueCurrentCameraImage(force: Bool) {        guard active,
               let currentCameraImageDataURI,
               let dataURI = currentCameraImageDataURI(),
               dataURI.utf8.count <= 4 * 1_048_576 else { return }

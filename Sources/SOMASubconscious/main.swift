@@ -10091,6 +10091,7 @@ private func run(_ options: Options) throws {
             let preferredLanguageTag = recognizedPersonEntityID.flatMap {
                 l1MemoryContext.cachedPreferredLanguage(for: $0)
             } ?? activeLanguage.recent()
+                ?? somaEnvString("SOMA_L1_DEFAULT_LANGUAGE", default: "ko")
             let languageStartInstruction = l1LanguageInstructions.directive(for: preferredLanguageTag)
             if let openingAuthorization {
                 let sessionCapability = liveSessionCapabilities.issue(
