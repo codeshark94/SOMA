@@ -713,6 +713,18 @@ private struct SOMASettingsView: View {
                 Toggle("Explore when no verified target is present", isOn: l0ExploreBinding)
                 Divider()
                 HStack {
+                    Text("Release fixation after no response")
+                    Spacer()
+                    Stepper(
+                        model.envSettings.l0FaceFixationReleaseSeconds <= 0
+                            ? "Keep gazing (no time limit)"
+                            : "\(Int(model.envSettings.l0FaceFixationReleaseSeconds)) s",
+                        value: l0FaceFixationReleaseBinding,
+                        in: 0...120,
+                        step: 15
+                    )
+                }
+                HStack {
                     Text("Local vision wake sensitivity")
                     Spacer()
                     Stepper("Score ≥ \(String(format: "%.2f", model.envSettings.l0E2BWakeScore))", value: l0E2BWakeScoreBinding, in: 0.1...0.95, step: 0.05)
@@ -744,7 +756,7 @@ private struct SOMASettingsView: View {
                     .pickerStyle(.menu)
                     .frame(width: 130)
                 }
-                Text("The on-device vision layer (E2B) wakes L1 on events. Lower thresholds wake L1 more eagerly; higher ones make it more selective. Eye-contact sensitivity is how long a fresh gaze stays valid for opening a spoken turn — lower is stricter. The pupil threshold scales how centered the pupil must be for a direct gaze — lower is stricter.")
+                Text("The on-device vision layer (E2B) wakes L1 on events. Lower thresholds wake L1 more eagerly; higher ones make it more selective. Eye-contact sensitivity is how long a fresh gaze stays valid for opening a spoken turn — lower is stricter. The pupil threshold scales how centered the pupil must be for a direct gaze — lower is stricter. 'Release fixation after no response' time-limits a held gaze that never becomes engagement; 'Keep gazing' disables that timer (E2B still releases a wrong fixation it judges to be non-person).")
                     .font(.caption).foregroundStyle(.secondary)
             }
             SettingsCard(title: "L1 — Conscious stream", subtitle: "How often L1 reasons, and whether it collects the topics it is curious about.") {
@@ -1039,6 +1051,12 @@ private struct SOMASettingsView: View {
         Binding(
             get: { model.envSettings.l0E2BWakeScore },
             set: { model.envSettings.l0E2BWakeScore = min(max($0, 0.1), 0.95) }
+        )
+    }
+    private var l0FaceFixationReleaseBinding: Binding<Double> {
+        Binding(
+            get: { model.envSettings.l0FaceFixationReleaseSeconds },
+            set: { model.envSettings.l0FaceFixationReleaseSeconds = max($0, 0) }
         )
     }
 

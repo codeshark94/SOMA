@@ -28,6 +28,11 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     /// Whether the gimbal may autonomously explore when no verified target is
     /// present.
     public var l0ExploreEnabled: Bool
+    /// Whether to time-limit a face fixation that never becomes engagement.
+    /// 0 (default) keeps gazing indefinitely; a positive value tolerates
+    /// non-response for that many seconds before releasing the face lock and
+    /// resuming scanning. The judgment-based E2B release is unaffected.
+    public var l0FaceFixationReleaseSeconds: Double
 
     // MARK: L1 — conscious stream (situation awareness cadence)
     /// How often (seconds) L1 re-runs its situation-awareness pass while a
@@ -90,6 +95,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l1Model: String = "gemma4:31b-cloud",
         l0TrackingEnabled: Bool = true,
         l0ExploreEnabled: Bool = true,
+        l0FaceFixationReleaseSeconds: Double = 0,
         l1ActiveCadenceSeconds: Double = 30,
         l1IdleCadenceSeconds: Double = 150,
         l1CuriosityCollectionEnabled: Bool = true,
@@ -113,6 +119,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         self.l1Model = l1Model
         self.l0TrackingEnabled = l0TrackingEnabled
         self.l0ExploreEnabled = l0ExploreEnabled
+        self.l0FaceFixationReleaseSeconds = max(l0FaceFixationReleaseSeconds, 0)
         self.l1ActiveCadenceSeconds = l1ActiveCadenceSeconds
         self.l1IdleCadenceSeconds = l1IdleCadenceSeconds
         self.l1CuriosityCollectionEnabled = l1CuriosityCollectionEnabled
@@ -144,6 +151,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
             "SOMA_L1_MODEL=\(l1Model)",
             "SOMA_L0_TRACKING_ENABLED=\(l0TrackingEnabled ? "true" : "false")",
             "SOMA_L0_EXPLORE_ENABLED=\(l0ExploreEnabled ? "true" : "false")",
+            "SOMA_L0_FIXATION_RELEASE_SECONDS=\(String(format: "%g", l0FaceFixationReleaseSeconds))",
             "SOMA_L1_ACTIVE_CADENCE_SECONDS=\(String(format: "%g", l1ActiveCadenceSeconds))",
             "SOMA_L1_IDLE_CADENCE_SECONDS=\(String(format: "%g", l1IdleCadenceSeconds))",
             "SOMA_L1_CURIOSITY_ENABLED=\(l1CuriosityCollectionEnabled ? "true" : "false")",
@@ -170,6 +178,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         case l1Model
         case l0TrackingEnabled
         case l0ExploreEnabled
+        case l0FaceFixationReleaseSeconds
         case l1ActiveCadenceSeconds
         case l1IdleCadenceSeconds
         case l1CuriosityCollectionEnabled
@@ -196,6 +205,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l1Model = try values.decodeIfPresent(String.self, forKey: .l1Model) ?? "gemma4:31b-cloud"
         l0TrackingEnabled = try values.decodeIfPresent(Bool.self, forKey: .l0TrackingEnabled) ?? true
         l0ExploreEnabled = try values.decodeIfPresent(Bool.self, forKey: .l0ExploreEnabled) ?? true
+        l0FaceFixationReleaseSeconds = max(try values.decodeIfPresent(Double.self, forKey: .l0FaceFixationReleaseSeconds) ?? 0, 0)
         l1ActiveCadenceSeconds = try values.decodeIfPresent(Double.self, forKey: .l1ActiveCadenceSeconds) ?? 30
         l1IdleCadenceSeconds = try values.decodeIfPresent(Double.self, forKey: .l1IdleCadenceSeconds) ?? 150
         l1CuriosityCollectionEnabled = try values.decodeIfPresent(Bool.self, forKey: .l1CuriosityCollectionEnabled) ?? true
@@ -276,6 +286,7 @@ public struct SOMAEnvStore: Sendable {
             l1Model: values["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud",
             l0TrackingEnabled: boolValue(values["SOMA_L0_TRACKING_ENABLED"], default: true),
             l0ExploreEnabled: boolValue(values["SOMA_L0_EXPLORE_ENABLED"], default: true),
+            l0FaceFixationReleaseSeconds: doubleValue(values["SOMA_L0_FIXATION_RELEASE_SECONDS"], default: 0),
             l1ActiveCadenceSeconds: doubleValue(values["SOMA_L1_ACTIVE_CADENCE_SECONDS"], default: 30),
             l1IdleCadenceSeconds: doubleValue(values["SOMA_L1_IDLE_CADENCE_SECONDS"], default: 150),
             l1CuriosityCollectionEnabled: boolValue(values["SOMA_L1_CURIOSITY_ENABLED"], default: true),
