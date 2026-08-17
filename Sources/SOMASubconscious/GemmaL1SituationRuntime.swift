@@ -958,6 +958,20 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         return activeConversations[threadID]?.personEntityID
     }
 
+    /// Just-in-time episodic recall for an active conversation turn: recalls
+    /// episodes relevant to the user's latest message and returns their
+    /// narratives so the live-voice runtime can append them as context.
+    func recallEpisodesForTurn(
+        threadID: String?,
+        text: String,
+        at date: Date = Date()
+    ) async -> [String] {
+        let normalizedThreadID = threadID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !normalizedThreadID.isEmpty,
+              let personEntityID = activePersonEntityID(forThread: normalizedThreadID) else { return [] }
+        return await recallEpisodes(for: personEntityID, query: text, at: date)
+    }
+
     /// Reads the stored preference directives for a person as one instruction
     /// string (used by the L1 packet and the L2 conversation context).
     func personPreferenceDirectives(for personEntityID: UUID) -> String {

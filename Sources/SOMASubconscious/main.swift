@@ -8239,6 +8239,7 @@ private func run(_ options: Options) throws {
     }
     defer { dailyWorldMemoryCollector.stop() }
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
+    let liveVoiceBox = LiveVoiceLauncherBox()
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(
             voice: controlSettings.realtimeVoice,
@@ -8386,6 +8387,21 @@ private func run(_ options: Options) throws {
                                 at: Date()
                             )
                         }
+                        // Just-in-time episodic recall: surface shared history
+                        // relevant to the user's latest message into the active
+                        // conversation so L2 can reference it mid-conversation.
+                        Task {
+                            let recalled = await l1MemoryContext.recallEpisodesForTurn(
+                                threadID: threadID,
+                                text: text,
+                                at: Date()
+                            )
+                            guard !recalled.isEmpty else { return }
+                            liveVoiceBox.launcher?.appendActiveContext(
+                                "Recalled shared history relevant to the user's last message: "
+                                    + recalled.joined(separator: " | ")
+                            )
+                        }
                     }
                 }
             case .preparingResponse:
@@ -8460,6 +8476,7 @@ private func run(_ options: Options) throws {
         liveVoiceLanguageRelay.attach { directive in
             launcher.appendActiveContext(directive)
         }
+        liveVoiceBox.launcher = launcher
         liveVoiceLauncher = launcher
         writer.write(RuntimeEvent(
             event: "source.health",
@@ -9740,6 +9757,13 @@ private func l1ProactiveInteractionContext(
         memorySummaries: request.memory.map(\.summary) + request.recalledEpisodes,
         embodimentSummary: "L0 is maintaining visual attention while L2 leads the interaction. Do not issue camera-control instructions as part of ordinary conversation."
     )
+}
+
+/// Weak holder for the live-voice launcher so the @Sendable event closure can
+/// append context to the active conversation without capturing the not-yet-
+/// initialized local `let`.
+private final class LiveVoiceLauncherBox: @unchecked Sendable {
+    weak var launcher: AppServerLiveVoiceLauncher?
 }
 
 private final class AccessResult: @unchecked Sendable {
