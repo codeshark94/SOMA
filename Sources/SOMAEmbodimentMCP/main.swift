@@ -126,6 +126,7 @@ private struct PersonContextArguments: Codable {
     let key: String?
     let value: String?
     let confirmedByUser: Bool?
+    let query: String?
 
     func request(for operation: PersonContextIPCOperation) throws -> PersonContextIPCRequest {
         switch operation {
@@ -159,6 +160,10 @@ private struct PersonContextArguments: Codable {
             guard key != nil, confirmedByUser == true else {
                 throw ServerFailure.invalidArguments("remove_person_fact requires key and confirmed_by_user=true")
             }
+        case .recallEpisodes:
+            guard let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ServerFailure.invalidArguments("recall_episodes requires query")
+            }
         }
         return PersonContextIPCRequest(
             operation: operation,
@@ -170,7 +175,8 @@ private struct PersonContextArguments: Codable {
             communicationAlignment: communicationAlignment,
             factKey: key,
             factValue: value,
-            confirmedByUser: confirmedByUser ?? false
+            confirmedByUser: confirmedByUser ?? false,
+            query: query
         )
     }
 }
@@ -478,6 +484,7 @@ private final class EmbodimentMCPServer {
         case "set_person_rapport": .setRapport
         case "set_person_fact": .setFact
         case "remove_person_fact": .removeFact
+        case "recall_episodes": .recallEpisodes
         default: nil
         }
     }
@@ -647,6 +654,10 @@ private final class EmbodimentMCPServer {
                 "key": stringSchema(maxLength: 64),
                 "confirmed_by_user": ["type": "boolean", "const": true],
             ], required: ["person_entity_id", "key", "confirmed_by_user"])),
+            tool("recall_episodes", "Recall past conversation episodes relevant to a query, scoped to the current participant. Use to remember what was discussed with this person before, or to ground a reply in shared history. Returns narrative summaries only, never raw transcripts.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "query": stringSchema(maxLength: 512),
+            ], required: ["person_entity_id", "query"])),
             tool("register_semantic_target", "Register a stable semantic target label or visual query with L0.", objectSchema([
                 "control": controlSchema(),
                 "registration": registrationSchema(),

@@ -22,6 +22,7 @@ public enum PersonContextIPCOperation: String, Codable, Sendable {
     case setRapport = "set_rapport"
     case setFact = "set_fact"
     case removeFact = "remove_fact"
+    case recallEpisodes = "recall_episodes"
 }
 
 public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
@@ -35,6 +36,8 @@ public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
     public let factKey: String?
     public let factValue: String?
     public let confirmedByUser: Bool
+    /// Free-text query for the `recallEpisodes` operation.
+    public let query: String?
 
     public init(
         operation: PersonContextIPCOperation,
@@ -46,7 +49,8 @@ public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
         communicationAlignment: Double? = nil,
         factKey: String? = nil,
         factValue: String? = nil,
-        confirmedByUser: Bool = false
+        confirmedByUser: Bool = false,
+        query: String? = nil
     ) {
         self.operation = operation
         self.personEntityID = personEntityID
@@ -58,6 +62,7 @@ public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
         self.factKey = factKey.map { String($0.prefix(64)) }
         self.factValue = factValue.map { String($0.prefix(1_024)) }
         self.confirmedByUser = confirmedByUser
+        self.query = query.map { String($0.prefix(512)) }
     }
 }
 
@@ -167,6 +172,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
     public let personContext: PersonContextSnapshot?
     public let identityRoster: IdentityRosterSnapshot?
     public let identityEnrollment: IdentityEnrollmentResult?
+    public let recalledEpisodes: [String]?
 
     public init(
         ok: Bool,
@@ -176,7 +182,8 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         viewResource: EmbodimentViewResource? = nil,
         personContext: PersonContextSnapshot? = nil,
         identityRoster: IdentityRosterSnapshot? = nil,
-        identityEnrollment: IdentityEnrollmentResult? = nil
+        identityEnrollment: IdentityEnrollmentResult? = nil,
+        recalledEpisodes: [String]? = nil
     ) {
         self.ok = ok
         self.error = error.map { String($0.prefix(240)) }
@@ -186,6 +193,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         self.personContext = personContext
         self.identityRoster = identityRoster
         self.identityEnrollment = identityEnrollment
+        self.recalledEpisodes = recalledEpisodes.map { Array($0.prefix(8)).map { String($0.prefix(1_200)) } }
     }
 }
 
@@ -226,6 +234,9 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     public typealias PersonContextProvider = @Sendable (
         _ request: PersonContextIPCRequest
     ) -> Result<PersonContextSnapshot, Error>
+    public typealias RecallEpisodesProvider = @Sendable (
+        _ request: PersonContextIPCRequest
+    ) -> Result<[String], Error>
     public typealias IdentityRosterProvider = @Sendable (
         _ query: IdentityRosterQuery
     ) -> Result<IdentityRosterSnapshot, Error>
@@ -246,6 +257,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let onHealth: HealthHandler
     private let captureResultProvider: CaptureResultProvider
     private let personContextProvider: PersonContextProvider
+    private let recallEpisodesProvider: RecallEpisodesProvider
     private let identityRosterProvider: IdentityRosterProvider
     private let identityEnrollmentProvider: IdentityEnrollmentProvider
     private let indicatorCalibrationHandler: IndicatorCalibrationHandler
@@ -265,6 +277,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         onDecision: @escaping DecisionHandler = { _, _ in },
         captureResultProvider: @escaping CaptureResultProvider = { _, _ in nil },
         personContextProvider: @escaping PersonContextProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
+        recallEpisodesProvider: @escaping RecallEpisodesProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         identityRosterProvider: @escaping IdentityRosterProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         identityEnrollmentProvider: @escaping IdentityEnrollmentProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
@@ -276,6 +289,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.onDecision = onDecision
         self.captureResultProvider = captureResultProvider
         self.personContextProvider = personContextProvider
+        self.recallEpisodesProvider = recallEpisodesProvider
         self.identityRosterProvider = identityRosterProvider
         self.identityEnrollmentProvider = identityEnrollmentProvider
         self.indicatorCalibrationHandler = indicatorCalibrationHandler
@@ -435,6 +449,15 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                     throw EmbodimentIPCError.malformedMessage
                 }
                 try authorize(command.sessionAuthorization, scope: .personContext(request.personEntityID))
+                if request.operation == .recallEpisodes {
+                    switch recallEpisodesProvider(request) {
+                    case let .success(episodes):
+                        writeReply(.init(ok: true, recalledEpisodes: episodes), to: clientFD)
+                    case let .failure(error):
+                        writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                    }
+                    break
+                }
                 switch personContextProvider(request) {
                 case let .success(context):
                     writeReply(.init(ok: true, personContext: context), to: clientFD)

@@ -235,6 +235,22 @@ func l1StorePersonFact(_ provider: L1MemoryContextProvider, for entityID: UUID, 
     return #"{"ok":false,"error":"store_unavailable"}"#
 }
 
+func l1RecallEpisodes(_ provider: L1MemoryContextProvider, query: String, entityID: UUID?) -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SynchronousResultBox<String>()
+    Task { [provider] in
+        let recalled = await provider.recallEpisodes(query: query, entityID: entityID)
+        let joined = recalled.joined(separator: " | ").replacingOccurrences(of: "\"", with: "'")
+        box.set(.success(#"{"ok":true,"count":\#(recalled.count),"episodes":"\#(joined)"}"#))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case let .success(summary)? = box.get() {
+        return summary
+    }
+    return #"{"ok":false,"error":"recall_failed"}"#
+}
+
 private struct L1WebSearchResult: Decodable {
     let results: [ResultItem]?
     struct ResultItem: Decodable {
@@ -8517,6 +8533,11 @@ private func run(_ options: Options) throws {
             "fact": .init(type: "string", description: "The observed fact to remember"),
             "reason": .init(type: "string", description: "Why you are recording this fact")
         ], required: ["entity_id", "fact", "reason"]))),
+        .init(function: .init(name: "recall_episodes", description: "Recall past conversation episodes relevant to a query (optionally scoped to one person via entity_id). Use when you need to remember what was discussed with this person before, or to ground an opening in shared history.", parameters: .init(properties: [
+            "query": .init(type: "string", description: "What you want to remember (topic, person, event)"),
+            "entity_id": .init(type: "string", description: "Optional person entity ID to scope the recall"),
+            "reason": .init(type: "string", description: "Why you are recalling past episodes")
+        ], required: ["query", "reason"]))),
         .init(function: .init(name: "orient_camera", description: "Turn the camera to face a direction. Prefer behavior_directive unless you specifically need to look elsewhere now.", parameters: .init(properties: [
             "direction": .init(type: "string", description: "Compass direction or target to face"),
             "reason": .init(type: "string", description: "Why you are reorienting the camera")
@@ -8550,6 +8571,14 @@ private func run(_ options: Options) throws {
                 return #"{"ok":false,"error":"missing entity_id or fact"}"#
             }
             return l1StorePersonFact(l1MemoryContext, for: entityID, fact: fact)
+        case "recall_episodes":
+            guard let data = arguments.data(using: .utf8),
+                  let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let query = args["query"] as? String, !query.isEmpty else {
+                return #"{"ok":false,"error":"missing query"}"#
+            }
+            let entityID = (args["entity_id"] as? String).flatMap(UUID.init(uuidString:))
+            return l1RecallEpisodes(l1MemoryContext, query: query, entityID: entityID)
         case "orient_camera":
             attentionGimbalBridge?.resumeCoverageScan()
             return #"{"ok":true,"orient_requested":true}"#
@@ -8945,6 +8974,21 @@ private func run(_ options: Options) throws {
                     }
                 }
                 return result
+            },
+            recallEpisodesProvider: { request in
+                let semaphore = DispatchSemaphore(value: 0)
+                let resultBox = SynchronousResultBox<[String]>()
+                Task {
+                    let recalled = await l1MemoryContext.recallEpisodes(
+                        query: request.query ?? "",
+                        entityID: request.personEntityID,
+                        at: Date()
+                    )
+                    resultBox.set(.success(recalled))
+                    semaphore.signal()
+                }
+                semaphore.wait()
+                return resultBox.get() ?? .failure(EmbodimentIPCError.timeout)
             },
             identityRosterProvider: { query in
                 let now = monotonicNanoseconds()

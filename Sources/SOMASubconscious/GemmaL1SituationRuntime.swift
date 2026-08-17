@@ -382,7 +382,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             let personContext = try await store.personContext(for: entityID, at: now)
             cachePersonContext(personContext)
             let recalled = await recallEpisodes(
-                for: entityID,
+                entityID: entityID,
                 query: personContext.preferenceDirectives().joined(separator: " "),
                 at: now
             )
@@ -411,29 +411,32 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
-    /// Semantically recalls the most relevant past episodes for a person by
-    /// embedding the query and episode narratives and ranking by cosine
-    /// similarity blended with salience and recency. Falls back to recency-only
-    /// ranking when the embedding model is unavailable.
+    /// Semantically recalls the most relevant past episodes by embedding the
+    /// query and episode narratives and ranking by cosine similarity blended
+    /// with salience and recency. Falls back to recency-only ranking when the
+    /// embedding model is unavailable. `entityID` optionally scopes to one
+    /// person; nil recalls across all episodes.
     private func recallEpisodes(
-        for entityID: UUID,
+        entityID: UUID?,
         query: String,
+        limit: Int = 4,
         at date: Date
     ) async -> [String] {
         guard let store else { return [] }
         do {
             let episodes = try await store.query(
-                .init(kinds: [.episode], relatedTo: [entityID], limit: 200),
+                .init(kinds: [.episode], relatedTo: entityID.map { [$0] } ?? [], limit: 200),
                 at: date
             )
             guard !episodes.isEmpty else { return [] }
+            let scoped = entityID != nil
             let queryText = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "recent meaningful conversation with this person"
-                : "conversation with this person about \(query)"
+                ? (scoped ? "recent meaningful conversation with this person" : "recent meaningful conversation")
+                : (scoped ? "conversation with this person about \(query)" : query)
             guard let queryEmbedding = await embeddingClient.embed(queryText) else {
                 return episodes
                     .sorted { $0.updatedAt > $1.updatedAt }
-                    .prefix(4)
+                    .prefix(limit)
                     .compactMap { episodeNarrative($0) }
             }
             var scored: [(narrative: String, similarity: Float, salience: Double, updatedAt: Date)] = []
@@ -456,10 +459,20 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 let r = Double(rhs.similarity) * 0.6 + rhs.salience * 0.3 + recencyScore(rhs.updatedAt, now: date) * 0.1
                 return l > r
             }
-            return ranked.prefix(4).map(\.narrative)
+            return ranked.prefix(limit).map(\.narrative)
         } catch {
             return []
         }
+    }
+
+    /// Public episodic recall for the L1 `recall_episodes` tool.
+    func recallEpisodes(
+        query: String,
+        entityID: UUID?,
+        limit: Int = 4,
+        at date: Date = Date()
+    ) async -> [String] {
+        await recallEpisodes(entityID: entityID, query: query, limit: limit, at: date)
     }
 
     private func episodeNarrative(_ record: CognitiveMemoryRecord) -> String? {
@@ -969,7 +982,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         let normalizedThreadID = threadID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !normalizedThreadID.isEmpty,
               let personEntityID = activePersonEntityID(forThread: normalizedThreadID) else { return [] }
-        return await recallEpisodes(for: personEntityID, query: text, at: date)
+        return await recallEpisodes(entityID: personEntityID, query: text, at: date)
     }
 
     /// Reads the stored preference directives for a person as one instruction
@@ -1282,6 +1295,10 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 personEntityID: request.personEntityID,
                 key: key
             )
+        case .recallEpisodes:
+            // Handled by the dedicated recallEpisodesProvider; not a person-
+            // context mutation.
+            throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
         }
         cachePersonContext(snapshot)
         return snapshot
