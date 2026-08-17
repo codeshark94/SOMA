@@ -1981,16 +1981,16 @@ private func identityPresenceRuntimeEvent(
 /// before the bridge exists, so the sink is attached once the bridge is up.
 private final class L1AuxiliaryReactionRelay: @unchecked Sendable {
     private let lock = NSLock()
-    private var sink: (@Sendable (L1AuxiliaryReaction, UInt64) -> Void)?
+    private var sink: (@Sendable (L1AuxiliaryReaction, Double, UInt64) -> Void)?
 
-    func record(_ reaction: L1AuxiliaryReaction, at monotonicNS: UInt64) {
+    func record(_ reaction: L1AuxiliaryReaction, socialPresence: Double, at monotonicNS: UInt64) {
         lock.lock()
         let active = sink
         lock.unlock()
-        active?(reaction, monotonicNS)
+        active?(reaction, socialPresence, monotonicNS)
     }
 
-    func attach(_ sink: @escaping @Sendable (L1AuxiliaryReaction, UInt64) -> Void) {
+    func attach(_ sink: @escaping @Sendable (L1AuxiliaryReaction, Double, UInt64) -> Void) {
         lock.lock()
         self.sink = sink
         lock.unlock()
@@ -3254,12 +3254,31 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// the lock is released and L0 resumes scanning.
     private var socialRetentionDeadlineNS: UInt64?
     private let socialRetentionWindowNS: UInt64 = 5_000_000_000
+    /// Auto-release a long social fixation that never turns into engagement.
+    /// If the robot holds the same face lock for `faceFixationReleaseWindowNS`
+    /// with no active conversation, it releases the lock and resumes scanning.
+    /// This prevents a false-positive "face" (e.g. an object bound to a stored
+    /// identity) from pinning the gimbal indefinitely. A cooldown after each
+    /// release keeps the scan running instead of instantly re-latching.
+    private var faceFixationSceneID: String?
+    private var faceFixationStartNS: UInt64?
+    private var faceFixationCooldownUntilNS: UInt64 = 0
+    private let faceFixationReleaseWindowNS: UInt64 = 45_000_000_000
+    private let faceFixationReleaseCooldownNS: UInt64 = 30_000_000_000
     /// Consecutive E2B reactions (orient/observe) observed while L0 is face-locked.
     /// When this reaches the threshold, E2B forcibly releases what it judges to be
     /// a wrong fixation and resumes scanning.
     private var consecutiveAuxiliaryReleaseSignal = 0
     private let auxiliaryOrientReleaseCount = 2
     private let auxiliaryObserveReleaseCount = 3
+    /// E2B's low-social-presence force release. When the robot is face-locked but
+    /// E2B consistently judges there is no real social presence behind the held
+    /// face (a phantom / false-positive face, e.g. an object bound to a stored
+    /// identity), it force-releases and resumes scanning. Threshold mirrors the
+    /// "empty exploration" cutoff used by the object-recognition path.
+    private var consecutiveLowSocialPresenceSignal = 0
+    private let auxiliaryLowSocialPresenceReleaseCount = 3
+    private let auxiliaryLowSocialPresenceThreshold = 0.3
     private var activeSpatialFaceReacquisition: (id: String, deadlineNS: UInt64)?
     private var attemptedSpatialFaceReacquisitionIDs: Set<String> = []
     private var confirmedVisualLossNS: UInt64?
@@ -3842,6 +3861,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         case .socialFixation:
             socialRetentionDeadlineNS = nil
+            applyFaceFixationAutoRelease(target: belief.target, at: now)
             break
         }
         guard let target = belief.target else { return }
@@ -4454,12 +4474,19 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // independent verification, so an edge-clipped real face is not
             // discarded before the verifier can see it. Verification is still
             // required to extend the lease or enable native AI tracking.
-            let accepted = faceLock.observe(
-                sceneID: observedFace.id,
-                rect: observedFace.observation.rect,
-                verified: observedFace.faceVerificationEligible,
-                at: monotonicNS
-            )
+            let accepted: Bool
+            if monotonicNS < faceFixationCooldownUntilNS {
+                // Post-release cooldown: keep scanning instead of instantly
+                // re-latching a face already judged to be a wrong fixation.
+                accepted = false
+            } else {
+                accepted = faceLock.observe(
+                    sceneID: observedFace.id,
+                    rect: observedFace.observation.rect,
+                    verified: observedFace.faceVerificationEligible,
+                    at: monotonicNS
+                )
+            }
             if accepted, faceLock.permitsInitialMotor(at: monotonicNS) {
                 let preemptedExploration = scanRunning || activeSpatialFaceReacquisition != nil
                 lastObservedFaceNS = monotonicNS
@@ -4544,13 +4571,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// Apply E2B's proportional reaction as a simple L0 control signal. Called
     /// from the auxiliary VLM cue path (not the face pipeline) so E2B can add
     /// human detection without disturbing face-lock evidence.
-    func applyAuxiliaryReaction(_ reaction: L1AuxiliaryReaction, at monotonicNS: UInt64) {
+    func applyAuxiliaryReaction(_ reaction: L1AuxiliaryReaction, socialPresence: Double, at monotonicNS: UInt64) {
         let prior = indicatorInputs.resolvedState
         indicatorInputs.applyAuxiliaryReaction(reaction)
         if indicatorInputs.resolvedState != prior {
             refreshIndicator(at: monotonicNS)
         }
-        applyAuxiliaryL0Release(reaction, at: monotonicNS)
+        applyAuxiliaryL0Release(reaction, socialPresence: socialPresence, at: monotonicNS)
     }
 
     /// Direct L0 un-stick: if L0 is currently face-locked but E2B consistently
@@ -4558,11 +4585,23 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// scene change; observe = sustained ambient change), release the lock and
     /// resume scanning. This lets E2B break a fixation the face detector itself
     /// will not clear. Requires several consecutive cues so a single transient
-    /// judgment does not tear down a legitimate lock.
-    private func applyAuxiliaryL0Release(_ reaction: L1AuxiliaryReaction, at monotonicNS: UInt64) {
+    /// judgment does not tear down a legitimate lock. A separate path force-
+    /// releases when E2B consistently judges there is no social presence behind
+    /// the held face at all (phantom / false-positive face).
+    private func applyAuxiliaryL0Release(_ reaction: L1AuxiliaryReaction, socialPresence: Double, at monotonicNS: UInt64) {
         guard faceLock.sceneID != nil else {
             consecutiveAuxiliaryReleaseSignal = 0
+            consecutiveLowSocialPresenceSignal = 0
             return
+        }
+        if socialPresence < auxiliaryLowSocialPresenceThreshold {
+            consecutiveLowSocialPresenceSignal += 1
+            if consecutiveLowSocialPresenceSignal >= auxiliaryLowSocialPresenceReleaseCount {
+                consecutiveLowSocialPresenceSignal = 0
+                releaseWrongFixation(reason: "auxiliary_low_social_presence", at: monotonicNS, priority: .l1)
+            }
+        } else {
+            consecutiveLowSocialPresenceSignal = 0
         }
         let threshold: Int
         switch reaction {
@@ -4578,19 +4617,58 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         releaseWrongFixation(reason: "auxiliary_\(reaction.rawValue)", at: monotonicNS)
     }
 
-    private func releaseWrongFixation(reason: String, at monotonicNS: UInt64) {
+    private func releaseWrongFixation(reason: String, at monotonicNS: UInt64, priority: ScanPriority = .l0) {
         faceLock.invalidate()
         lastMotorTarget = nil
+        // Make the release sticky: block re-acquiring the same (possibly
+        // false-positive) face lock for the cooldown window so the coverage
+        // scan actually runs instead of instantly re-latching.
+        faceFixationCooldownUntilNS = monotonicNS + faceFixationReleaseCooldownNS
         sendExternalStop(state: reason, at: monotonicNS)
-        resumeCoverageScan()
+        resumeCoverageScan(priority: priority)
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNS,
             source: "l0_auxiliary_release",
             state: reason,
-            message: "E2B released a fixation E2B judged to be wrong; resumed coverage scan"
+            message: "Released a fixation judged to be wrong; resumed coverage scan (priority \(priority))"
         ))
     }
+
+    /// Time-bounded auto-release for a social fixation that never becomes
+    /// engagement. A real conversation must never be torn away, so an active
+    /// conversation resets the timer. Otherwise, holding the same face lock
+    /// beyond `faceFixationReleaseWindowNS` releases it and resumes scanning
+    /// with L1 authority, which also tears away the reflexive face lock even
+    /// while the detector keeps reporting the (possibly false-positive) face.
+    private func applyFaceFixationAutoRelease(target: AttentionTarget?, at now: UInt64) {
+        let conversationActive = liveVoicePresentation == .hearingUser
+            || liveVoicePresentation == .responding
+        if conversationActive {
+            faceFixationSceneID = nil
+            faceFixationStartNS = nil
+            return
+        }
+        guard let target,
+              target.isFaceMotorTarget,
+              faceLock.permitsMotor(at: now) else {
+            faceFixationSceneID = nil
+            faceFixationStartNS = nil
+            return
+        }
+        if faceFixationSceneID != target.id {
+            faceFixationSceneID = target.id
+            faceFixationStartNS = now
+        }
+        guard let start = faceFixationStartNS,
+              now >= start + faceFixationReleaseWindowNS,
+              now >= faceFixationCooldownUntilNS else { return }
+        faceFixationSceneID = nil
+        faceFixationStartNS = nil
+        faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
+        releaseWrongFixation(reason: "face_fixation_timeout", at: now, priority: .l1)
+    }
+
 
     private func isFaceAcquisitionFramed(_ rect: SOMACore.NormalizedRect) -> Bool {
         // A new lock needs a foveal face measurement. This is deliberately
@@ -8661,7 +8739,7 @@ private func run(_ options: Options) throws {
             },
             onCue: { cue in
                 liveVisualContextRelay.record(cue)
-                auxiliaryReactionRelay.record(cue.reaction, at: cue.completedNS)
+                auxiliaryReactionRelay.record(cue.reaction, socialPresence: cue.socialPresence, at: cue.completedNS)
                 writer.write(L1AuxiliarySemanticTraceEvent(cue))
                 // Parallel object recognition: when L1's visual helper flags an
                 // object (presented to the robot, or encountered while scanning
@@ -8920,8 +8998,8 @@ private func run(_ options: Options) throws {
         // The auxiliary VLM cue closure runs before the bridge exists, so E2B's
         // proportional reaction is buffered in the relay and attached here once
         // the bridge is up.
-        auxiliaryReactionRelay.attach { [weak attentionGimbalBridge] reaction, monotonicNS in
-            attentionGimbalBridge?.applyAuxiliaryReaction(reaction, at: monotonicNS)
+        auxiliaryReactionRelay.attach { [weak attentionGimbalBridge] reaction, socialPresence, monotonicNS in
+            attentionGimbalBridge?.applyAuxiliaryReaction(reaction, socialPresence: socialPresence, at: monotonicNS)
         }
     } else {
         attentionGimbalBridge = nil
