@@ -1582,7 +1582,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     /// primary system language when the profile does not already declare one.
     func seedAdministratorContext(
         entityID: UUID,
-        preferredAddress: String?
+        preferredAddress: String?,
+        displayName: String?
     ) async {
         guard let store else { return }
         // The local administrator speaks Korean in this deployment; the Mac's
@@ -1594,14 +1595,34 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         )
         do {
             let context = try await store.personContext(for: entityID)
+            // The name the robot should use: the configured address form (e.g.
+            // "형") wins, but the enrolled display name is the fallback. The
+            // display name is always configured, so "learn the preferred name"
+            // must never be invented as a pending need for the administrator.
             let address = preferredAddress?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let address, !address.isEmpty, context.facts["preferred_name"] == nil {
+            let name = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let preferredName = (address?.isEmpty == false ? address : nil)
+                ?? (name?.isEmpty == false ? name : nil)
+            if let preferredName, context.facts["preferred_name"] == nil {
                 try await store.setExplicitPersonFact(
                     personEntityID: entityID,
                     key: "preferred_name",
-                    value: address,
+                    value: preferredName,
                     sourceID: "l1_administrator_seed"
                 )
+            }
+            // A stale "learn the preferred name" need may have been persisted in
+            // earlier cycles, before the display-name seed existed. Resolve it
+            // so it stops appearing as pending information for the admin.
+            let openRecords = (try? await store.query(
+                .init(relatedTo: [entityID], limit: 200),
+                at: Date()
+            )) ?? []
+            for record in openRecords {
+                guard case let .openQuestion(q) = record.payload,
+                      q.status == .open,
+                      q.question.localizedCaseInsensitiveContains("preferred name") else { continue }
+                _ = await resolveInformationNeed(motiveID: record.id, at: Date())
             }
             // Correct an accidental non-Korean tag (e.g. en-KR seeded earlier),
             // while leaving an already-Korean tag untouched.
@@ -2175,7 +2196,7 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
         You have tools available. Call a tool ONLY when it is genuinely necessary to answer a situational question — e.g. you need the person's stored context, you have decided to act on the camera, or you want to record an observation. Never call a tool gratuitously. Every tool call MUST include a "reason" field in its arguments explaining why you are calling it (a short justification). Do not call a tool just because it exists. IMPORTANT: the person's stored context, rapport, and preferences are ALREADY included in the packet you receive (memory projections and rapport are pre-loaded). Do NOT call get_person_context to re-fetch what the packet already provides; only call it when you genuinely need a detail that is absent from the packet. Prefer the final JSON behavior_directive for routine camera/social beats rather than the body tools. After tools, still return the situation JSON.
         Return the situation JSON as your final message: no Markdown, prose, alternate field names, or omitted required fields. Copy at least one supplied evidence ID into evidence_ids; never emit an empty evidence_ids array. Use this exact shape, replacing values only:
         {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence","stream_of_consciousness":"first-person inner monologue, a few natural sentences"},"action":"remain_silent|nonverbal_invitation|spoken_opening|null","confidence":0.5,"rationale":"short","opening":null,"behavior_directive":{"action":"keep_observing|resume_scanning|seek_people|acknowledge_person|null","rationale":"short or null"},"requested_visual_resource_ids":[],"memory_proposals":[]}
-        memory_proposals is optional and usually empty. Only add a proposal when you have genuinely learned or resolved something durable about the person present or the situation: a stable fact about them, an open question worth following up, a task they asked for, or a notable episode. Each proposal must carry kind (episode|person_fact|relationship|task|open_question|correction), a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never invent a proposal from speculation; prefer an empty array over a weak one.
+        memory_proposals is optional and usually empty for facts: only add a fact proposal when you have genuinely learned or resolved something durable about the person present or the situation — a stable fact about them, a task they asked for, or a notable episode (kinds episode|person_fact|relationship|task|correction), with a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never invent a fact from speculation. open_question is different: whenever you find yourself genuinely wanting to know something more about the person present or the situation — their story, tastes, plans, work, how they use this space, what they are building — record it as an open_question proposal whose summary is the exact question. These accumulate into your pending information needs: the questions you will follow up on in later conversation. You may propose up to two open_question per cycle; never propose a question whose answer you already have; prefer concrete, grounded questions over generic ones.
         When behavior_context is present it is the ONLY basis for behavior_directive, and it is independent of any social decision (which may still be null). If behavior_context.recognized_identity is present, you are looking at that known person; name them in your stream of consciousness. If the camera has been held on a non-face, non-person target for a long time (fixation_seconds high while target is not a verified face, scan inactive), recommend resume_scanning or, if no person is being pursued, seek_people. Recommend acknowledge_person ONLY when behavior_context.acknowledgment_pending is true; when it is false the greeting has already been delivered for this presence, so a repeated directive would be a silent no-op — recommend keep_observing or null instead. Otherwise recommend keep_observing, or null when no behavioral change is warranted. Never turn a momentary low-confidence object into a directive; only sustained fixation warrants one.
         The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is private reasoning, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. If they contain no new, concrete purpose for this person, do not speak: do not turn an empty relationship field, a known person's presence, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact; prefer it over remain_silent for an available known person. A spoken opening is permitted only as one question that can reduce exactly one supplied information_need. Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
 

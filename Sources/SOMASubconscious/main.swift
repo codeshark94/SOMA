@@ -9080,7 +9080,8 @@ private func run(_ options: Options) throws {
         Task {
             await l1MemoryContext.seedAdministratorContext(
                 entityID: administratorID,
-                preferredAddress: controlSettings.administrator?.preferredAddress
+                preferredAddress: controlSettings.administrator?.preferredAddress,
+                displayName: controlSettings.administrator?.displayName
             )
         }
     }
