@@ -39,6 +39,29 @@ func somaOllamaHost() -> String {
     return raw.replacingOccurrences(of: "/$", with: "", options: .regularExpression)
 }
 
+/// Issues a lightweight warm-up generate request to the L1 model with a keep-
+/// alive window, so the first real concurrent requests (situation analysis and
+/// the language-directive generation) are not rejected with done_reason == "load"
+/// while the model is still loading.
+func warmUpL1Model() {
+    let model = ProcessInfo.processInfo.environment["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud"
+    guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    let body: [String: Any] = [
+        "model": model,
+        "prompt": "ping",
+        "stream": false,
+        "keep_alive": 600,
+        "options": ["num_predict": 1],
+    ]
+    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    request.timeoutInterval = 15
+    URLSession.shared.dataTask(with: request).resume()
+}
+
+
 /// Runs registered graceful-stop closures when the process receives SIGTERM or
 /// SIGINT (e.g. `launchctl bootout` from the menu bar "Stop SOMA"). Without this
 /// the runtime is killed abruptly and the camera's built-in AI tracking is left
@@ -8922,6 +8945,10 @@ private func run(_ options: Options) throws {
             liveVoiceLanguageRelay.publish(directive)
         }
     )
+    // Pre-warm the L1 model so the first concurrent requests (including the
+    // language-directive generation) are not rejected with done_reason == "load"
+    // while the model is still loading.
+    warmUpL1Model()
     let l1ThoughtRelay = L1ThoughtStreamRelay()
     let l1LiveConversationState = L1LiveConversationStateRelay()
     let l1MemoryContext = L1MemoryContextProvider(

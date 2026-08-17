@@ -46,6 +46,11 @@ struct OllamaGenerateRequest: Encodable {
 
 struct OllamaGenerateResponse: Decodable {
     let response: String?
+    let doneReason: String?
+    enum CodingKeys: String, CodingKey {
+        case response
+        case doneReason = "done_reason"
+    }
 }
 
 /// A tool definition passed to Ollama's /api/chat tool-calling.
