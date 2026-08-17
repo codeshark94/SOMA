@@ -3753,7 +3753,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             state = .stopped
         }
         guard process.isRunning else { return }
-        if exited.wait(timeout: .now() + 3) == .timedOut {
+        // The helper parks the gimbal at center before sleeping on shutdown
+        // (up to ~4s of travel), so allow it to finish instead of killing it
+        // mid-park.
+        if exited.wait(timeout: .now() + 8) == .timedOut {
             process.terminate()
             _ = exited.wait(timeout: .now() + 3)
         }

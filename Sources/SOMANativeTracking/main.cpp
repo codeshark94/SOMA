@@ -1472,6 +1472,27 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                     } else {
                         trace.event("camera.ack", "manual", "manual_active", RM_RET_OK, "bridge_shutdown_manual", command.commandID);
                     }
+                    // Park the gimbal at center before sleeping so the camera
+                    // rests in a neutral pose instead of freezing wherever it
+                    // was last looking. The move is bounded: worst-case travel
+                    // (pan +-120deg at 90deg/s, pitch +-90deg at 60deg/s) is
+                    // ~1.5s, so a 4s deadline is generous.
+                    int centerResult = RM_RET_ERR;
+                    {
+                        std::lock_guard<std::mutex> lock(sdkMutex);
+                        try { centerResult = device->gimbalSetSpeedPositionR(0, 0, 0, 0, 60, 90); } catch (...) {}
+                    }
+                    if (centerResult == RM_RET_OK) {
+                        trace.event("camera.command", "manual", "center_sent", 0, "shutdown_park; pitch_degrees=0; yaw_degrees=0", command.commandID);
+                        const auto centerDeadline = Clock::now() + std::chrono::seconds(4);
+                        while (Clock::now() < centerDeadline && !interrupted) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            const auto attitude = readGimbalAttitude(device);
+                            if (attitude && std::abs(attitude->pitch) <= 1.5 && std::abs(attitude->pan) <= 1.5) break;
+                        }
+                    } else {
+                        trace.event("camera.ack", "fault", "center_rejected", centerResult, "shutdown_park_rejected", command.commandID);
+                    }
                     // Put the camera into sleep mode so it fully powers down its
                     // AI tracking rather than continuing to follow people after
                     // SOMA has been stopped.
