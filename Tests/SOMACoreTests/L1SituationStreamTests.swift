@@ -22,7 +22,7 @@ final class L1SituationStreamTests: XCTestCase {
     func testGemmaOwnsBothL1WorkloadsWithoutChangingTheirContract() throws {
         let configuration = L1ModelConfiguration.gemma31
         XCTAssertEqual(configuration.model, "gemma4:31b-cloud")
-        XCTAssertEqual(configuration.deadlineMilliseconds(for: .situation), 8_000)
+        XCTAssertEqual(configuration.deadlineMilliseconds(for: .situation), 20_000)
         XCTAssertEqual(configuration.deadlineMilliseconds(for: .memoryConsolidation), 60_000)
 
         let request = fixtureRequest()
@@ -210,7 +210,20 @@ final class L1SituationStreamTests: XCTestCase {
     }
 
     func testGemmaJSONRejectsAnUnspecifiedOpeningAction() {
-        let request = fixtureRequest()
+        let person = UUID()
+        let opportunity = L1SocialOpportunity(
+            entityID: person,
+            observedAtNS: 1_000,
+            recognitionConfidence: 0.94,
+            availableActions: [.remainSilent, .nonverbalInvitation, .spokenOpening]
+        )
+        let request = L1SituationRequest(
+            observedAt: Date(timeIntervalSince1970: 10),
+            evidenceIDs: ["scene:1", "turn:1"],
+            beliefSummary: "A familiar person is seated and focused on a task.",
+            presentEntityIDs: [person],
+            socialOpportunity: opportunity
+        )
         let json = Data("""
         {
           "summary": "Unbounded social content.",

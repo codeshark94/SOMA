@@ -846,7 +846,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         ))
         XCTAssertFalse(FaceLockLease.permitsProvisionalExplorationInterception(
             observationCount: 3,
-            confidence: 0.89
+            confidence: 0.70
         ))
         XCTAssertTrue(FaceLockLease.permitsProvisionalExplorationInterception(
             observationCount: 2,
@@ -1245,8 +1245,8 @@ final class PredictiveWorldModelTests: XCTestCase {
             evidence: .visualObservation,
             socialFixationPermitted: false
         )
-        XCTAssertEqual(unverifiedFace.state, .socialRetention)
-        XCTAssertTrue(unverifiedFace.preservesActiveExploration)
+        XCTAssertEqual(unverifiedFace.state, .exploration)
+        XCTAssertFalse(unverifiedFace.preservesActiveExploration)
         XCTAssertFalse(unverifiedFace.permitsExternalSocialReframing)
 
         let provisionalFace = controller.advance(

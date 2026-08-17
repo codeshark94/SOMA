@@ -56,7 +56,17 @@ final class KnownPersonContactTests: XCTestCase {
         XCTAssertTrue(recognized.isRecognized)
 
         let ambiguous = try embedding([0.71, 0.70, 0, 0])
-        XCTAssertEqual(matcher.match(ambiguous, profiles: [a, b], at: 250_000_000), .unknown)
+        // Below the open-set margin so it is never recognized, but still
+        // correlated with a known identity above the correlation floor, so it
+        // is a known candidate rather than falling through to anonymous.
+        let ambiguousDecision = matcher.match(ambiguous, profiles: [a, b], at: 250_000_000)
+        guard case let .candidate(entityID, similarity, margin) = ambiguousDecision else {
+            return XCTFail("expected a known candidate, got \(ambiguousDecision)")
+        }
+        XCTAssertEqual(entityID, personA)
+        XCTAssertLessThan(similarity, matcher.calibration.minimumCosineSimilarity)
+        XCTAssertGreaterThanOrEqual(similarity, matcher.calibration.minimumCorrelationFloor)
+        XCTAssertLessThan(margin, matcher.calibration.minimumBestAlternativeMargin)
     }
 
     func testUnknownFacesUseStablePerInstallOpaqueHandlesAfterConfirmation() async throws {
