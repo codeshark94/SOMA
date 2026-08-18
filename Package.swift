@@ -42,7 +42,7 @@ let package = Package(
             dependencies: ["SOMACore", "SOMAVADModel", "SOMAOpenCV"],
             exclude: ["Info.plist"],
             resources: [
-                .process("Resources/YOLOv3TinyFP16.mlmodel"),
+                .copy("Resources/YOLO11n.mlpackage"),
                 .copy("Resources/BlazeFaceShortRange.mlpackage")
             ],
             linkerSettings: [

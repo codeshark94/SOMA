@@ -7198,39 +7198,82 @@ private final class ANEObjectDetector: @unchecked Sendable {
     let warmupMS: Double
     let confidenceThreshold: Double
     let personConfidenceThreshold: Double
-    private let model: VNCoreMLModel
+    private let model: MLModel
+    private let ciContext = CIContext()
 
     init(confidenceThreshold: Double, personConfidenceThreshold: Double) throws {
         self.confidenceThreshold = confidenceThreshold
         self.personConfidenceThreshold = personConfidenceThreshold
         let modelURL: URL
-        if let compiledURL = Bundle.module.url(forResource: "YOLOv3TinyFP16", withExtension: "mlmodelc") {
+        if let compiledURL = Bundle.module.url(forResource: "YOLO11n", withExtension: "mlpackage") {
             modelURL = compiledURL
-        } else if let sourceURL = Bundle.module.url(forResource: "YOLOv3TinyFP16", withExtension: "mlmodel") {
-            modelURL = try MLModel.compileModel(at: sourceURL)
         } else {
             throw RuntimeError.configuration("Bundled Core ML object detector is missing")
         }
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .cpuAndNeuralEngine
         computeUnits = "cpu_and_neural_engine"
-        let loadedModel = try MLModel(contentsOf: modelURL, configuration: configuration)
-        model = try VNCoreMLModel(for: loadedModel)
+        let compiledURL = try MLModel.compileModel(at: modelURL)
+        let loadedModel = try MLModel(contentsOf: compiledURL, configuration: configuration)
+        model = loadedModel
         let startedNS = monotonicNanoseconds()
         try Self.warmUp(model)
         warmupMS = milliseconds(from: startedNS, to: monotonicNanoseconds())
     }
 
     func detect(in pixelBuffer: CVPixelBuffer) throws -> [VisualObservation] {
-        try Self.detect(
-            in: pixelBuffer,
-            model: model,
-            confidenceThreshold: confidenceThreshold,
-            personConfidenceThreshold: personConfidenceThreshold
+        // YOLO11n (COCO, NMS built in): 640x640 input, outputs
+        // coordinates [N,4] xywh (top-left origin, normalized) and
+        // confidence [N,80] per class. Only the person class (index 0)
+        // is used: the old YOLOv3Tiny produced a flood of spurious
+        // object labels (chair/phone/mouse/banana) that destabilized
+        // the belief target.
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return [] }
+        let scale = 640.0 / Double(max(width, height))
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cg = ciContext.createCGImage(scaled, from: scaled.extent) else { return [] }
+        guard let constraint = model.modelDescription.inputDescriptionsByName["image"]?.imageConstraint else {
+            return []
+        }
+        let input = try MLFeatureValue(
+            cgImage: cg,
+            constraint: constraint,
+            options: [.cropAndScale: VNImageCropAndScaleOption.scaleFill.rawValue]
         )
+        let prediction = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["image": input]))
+        guard let coords = prediction.featureValue(for: "coordinates")?.multiArrayValue,
+              let confidences = prediction.featureValue(for: "confidence")?.multiArrayValue else {
+            return []
+        }
+        let count = coords.shape[0].intValue
+        guard count > 0, coords.shape.count >= 2, coords.shape[1].intValue >= 4,
+              confidences.shape.count >= 2, confidences.shape[1].intValue >= 1 else {
+            return []
+        }
+        var observations: [VisualObservation] = []
+        observations.reserveCapacity(count)
+        for index in 0..<count {
+            let personConfidence = confidences[index * confidences.shape[1].intValue].doubleValue
+            guard personConfidence >= personConfidenceThreshold else { continue }
+            let x = coords[index * 4].doubleValue
+            let y = coords[index * 4 + 1].doubleValue
+            let w = coords[index * 4 + 2].doubleValue
+            let h = coords[index * 4 + 3].doubleValue
+            observations.append(VisualObservation(
+                rect: SOMACore.NormalizedRect(x: x, y: y, width: w, height: h),
+                confidence: personConfidence,
+                source: .neuralDetector,
+                kind: .human,
+                label: "person"
+            ))
+        }
+        return observations
     }
 
-    private static func warmUp(_ model: VNCoreMLModel) throws {
+    private static func warmUp(_ model: MLModel) throws {
         var pixelBuffer: CVPixelBuffer?
         let attributes = [
             kCVPixelBufferCGImageCompatibilityKey: true,
@@ -7238,8 +7281,8 @@ private final class ANEObjectDetector: @unchecked Sendable {
         ] as CFDictionary
         guard CVPixelBufferCreate(
             kCFAllocatorDefault,
-            416,
-            416,
+            640,
+            640,
             kCVPixelFormatType_32BGRA,
             attributes,
             &pixelBuffer
@@ -7247,42 +7290,18 @@ private final class ANEObjectDetector: @unchecked Sendable {
               let pixelBuffer else {
             throw RuntimeError.configuration("Cannot allocate Core ML warmup frame")
         }
-        _ = try detect(in: pixelBuffer, model: model, confidenceThreshold: 0.5, personConfidenceThreshold: 0.35)
-    }
-
-    private static func detect(
-        in pixelBuffer: CVPixelBuffer,
-        model: VNCoreMLModel,
-        confidenceThreshold: Double,
-        personConfidenceThreshold: Double
-    ) throws -> [VisualObservation] {
-        let request = VNCoreMLRequest(model: model)
-        request.imageCropAndScaleOption = .scaleFill
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        try handler.perform([request])
-        let results = request.results as? [VNRecognizedObjectObservation] ?? []
-        return results.compactMap { observation in
-            guard let label = observation.labels.max(by: { $0.confidence < $1.confidence }) else {
-                return nil
-            }
-            // The person class is kept on its own (lower) threshold: YOLOv3Tiny
-            // person confidence dips frame-to-frame (0.4-0.9 on the same
-            // person), and gating the person on the object threshold makes the
-            // human observation strobe on and off, which flashes the LED and
-            // destabilizes tracking. Objects (toothbrush etc.) keep the
-            // configured threshold, which is what the Control Center dials.
-            let minimum = label.identifier == "person" ? personConfidenceThreshold : confidenceThreshold
-            guard Double(label.confidence) >= minimum else {
-                return nil
-            }
-            return VisualObservation(
-                rect: SOMACore.NormalizedRect(observation.boundingBox),
-                confidence: Double(label.confidence),
-                source: .neuralDetector,
-                kind: label.identifier == "person" ? .human : .object,
-                label: label.identifier
-            )
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        let context = CIContext()
+        guard let cg = context.createCGImage(ci, from: ci.extent),
+              let constraint = model.modelDescription.inputDescriptionsByName["image"]?.imageConstraint else {
+            throw RuntimeError.configuration("Cannot prepare Core ML warmup frame")
         }
+        let input = try MLFeatureValue(
+            cgImage: cg,
+            constraint: constraint,
+            options: [.cropAndScale: VNImageCropAndScaleOption.scaleFill.rawValue]
+        )
+        _ = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["image": input]))
     }
 }
 
@@ -8015,7 +8034,7 @@ private final class VisionWorker: @unchecked Sendable {
                 monotonicNS: monotonicNanoseconds(),
                 source: "object_neural_engine",
                 state: "configured",
-                message: "model=YOLOv3TinyFP16; compute_units=\(detector.computeUnits); labels=person_and_objects; object_confidence_threshold=\(yoloConfidence); person_confidence_threshold=\(yoloPersonConfidence); prewarm_ms=\(detector.warmupMS)"
+                message: "model=YOLO11n; compute_units=\(detector.computeUnits); labels=person_only; person_confidence_threshold=\(yoloPersonConfidence); prewarm_ms=\(detector.warmupMS)"
             ))
         } catch {
             neuralObjectDetector = nil
