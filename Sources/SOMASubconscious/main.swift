@@ -7221,17 +7221,31 @@ private final class ANEObjectDetector: @unchecked Sendable {
         warmupMS = milliseconds(from: startedNS, to: monotonicNanoseconds())
     }
 
+    /// COCO 80 class names in YOLO index order (class 0 = person).
+    private static let cocoClassNames: [String] = [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+        "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+        "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+        "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+        "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+        "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+        "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+    ]
+
     func detect(in pixelBuffer: CVPixelBuffer) throws -> [VisualObservation] {
         // YOLO11n (COCO, NMS built in): 640x640 input, outputs
-        // coordinates [N,4] xywh (top-left origin, normalized) and
-        // confidence [N,80] per class. Only the person class (index 0)
-        // is used: the old YOLOv3Tiny produced a flood of spurious
-        // object labels (chair/phone/mouse/banana) that destabilized
-        // the belief target.
+        // coordinates [N,4] xywh (normalized) and confidence [N,80].
+        // The CIImage->CGImage path flips Y (CI is bottom-left, CGImage
+        // top-left) and scaleFill stretches the shorter axis to 640, so
+        // the raw Y must be un-flipped and un-stretched back to the
+        // source frame's top-left coordinate system.
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         guard width > 0, height > 0 else { return [] }
         let scale = 640.0 / Double(max(width, height))
+        let scaledHeight = Double(height) * scale
+        let yStretch = scaledHeight / 640.0
         let ci = CIImage(cvPixelBuffer: pixelBuffer)
         let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         guard let cg = ciContext.createCGImage(scaled, from: scaled.extent) else { return [] }
@@ -7243,31 +7257,59 @@ private final class ANEObjectDetector: @unchecked Sendable {
             constraint: constraint,
             options: [.cropAndScale: VNImageCropAndScaleOption.scaleFill.rawValue]
         )
-        let prediction = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["image": input]))
+        // Pass the configured thresholds into the model's built-in NMS:
+        // without them the model runs at its default 0.25 and emits
+        // spurious low-confidence boxes (phantom persons).
+        let prediction = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "image": input,
+            "confidenceThreshold": MLFeatureValue(double: personConfidenceThreshold),
+            "iouThreshold": MLFeatureValue(double: 0.7),
+        ]))
         guard let coords = prediction.featureValue(for: "coordinates")?.multiArrayValue,
               let confidences = prediction.featureValue(for: "confidence")?.multiArrayValue else {
             return []
         }
         let count = coords.shape[0].intValue
+        let classCount = confidences.shape[1].intValue
         guard count > 0, coords.shape.count >= 2, coords.shape[1].intValue >= 4,
-              confidences.shape.count >= 2, confidences.shape[1].intValue >= 1 else {
+              classCount >= 1 else {
             return []
         }
         var observations: [VisualObservation] = []
         observations.reserveCapacity(count)
         for index in 0..<count {
-            let personConfidence = confidences[index * confidences.shape[1].intValue].doubleValue
-            guard personConfidence >= personConfidenceThreshold else { continue }
+            var bestClass = 0
+            var bestConfidence = 0.0
+            for classIndex in 0..<classCount {
+                let value = confidences[index * classCount + classIndex].doubleValue
+                if value > bestConfidence {
+                    bestConfidence = value
+                    bestClass = classIndex
+                }
+            }
+            let minimum = bestClass == 0 ? personConfidenceThreshold : confidenceThreshold
+            guard bestConfidence >= minimum else { continue }
             let x = coords[index * 4].doubleValue
             let y = coords[index * 4 + 1].doubleValue
             let w = coords[index * 4 + 2].doubleValue
             let h = coords[index * 4 + 3].doubleValue
+            // Reject degenerate boxes: the NMS head occasionally emits
+            // zero-size or out-of-range coordinates that would otherwise
+            // become phantom observations.
+            guard x >= 0, y >= 0, w > 0.02, h > 0.02,
+                  x + w <= 1.05, y + h <= 1.05 else { continue }
+            let yUnstretched = (y + h) * yStretch
             observations.append(VisualObservation(
-                rect: SOMACore.NormalizedRect(x: x, y: y, width: w, height: h),
-                confidence: personConfidence,
+                rect: SOMACore.NormalizedRect(
+                    x: x,
+                    y: 1 - yUnstretched,
+                    width: w,
+                    height: h * yStretch
+                ),
+                confidence: bestConfidence,
                 source: .neuralDetector,
-                kind: .human,
-                label: "person"
+                kind: bestClass == 0 ? .human : .object,
+                label: bestClass < Self.cocoClassNames.count ? Self.cocoClassNames[bestClass] : "class\(bestClass)"
             ))
         }
         return observations
@@ -8023,7 +8065,7 @@ private final class VisionWorker: @unchecked Sendable {
         )
         do {
             let yoloConfidence = somaEnvDouble("SOMA_YOLO_CONFIDENCE_THRESHOLD", default: 0.5)
-            let yoloPersonConfidence = somaEnvDouble("SOMA_YOLO_PERSON_THRESHOLD", default: 0.35)
+            let yoloPersonConfidence = somaEnvDouble("SOMA_YOLO_PERSON_THRESHOLD", default: 0.5)
             let detector = try ANEObjectDetector(
                 confidenceThreshold: yoloConfidence,
                 personConfidenceThreshold: yoloPersonConfidence
