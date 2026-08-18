@@ -3254,14 +3254,20 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// more while the gimbal moves. This longer window trusts device-confirmed
     /// native tracking across those dropouts, releasing only after a sustained
     /// absence that a genuine departure would produce.
-    private var nativeTrustContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 5_000)
+    private var nativeTrustContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 15_000)
     private var faceLock = FaceLockLease()
     /// Bounded recovery window for a verified face lock that has lost its face.
     /// The lock may hold through a short detector gap, but it must not pin the
     /// gimbal indefinitely when the person has actually left. After this window
     /// the lock is released and L0 resumes scanning.
     private var socialRetentionDeadlineNS: UInt64?
-    private let socialRetentionWindowNS: UInt64 = 5_000_000_000
+    /// How long a face lock holds through continuous detector misses before
+    /// the release path resumes scanning. The face detector delivers in bursts
+    /// (several frames, then gaps of 1-18s under ANE contention), so a short
+    /// window turns a normal inter-burst gap into a lock release. 15s covers
+    /// the observed gap distribution; a continuous 15s absence is a physical
+    /// departure, not a dropped frame.
+    private let socialRetentionWindowNS: UInt64 = 15_000_000_000
     /// Auto-release a long social fixation that never turns into engagement.
     /// If the robot holds the same face lock for `faceFixationReleaseWindowNS`
     /// with no active conversation, it releases the lock and resumes scanning.
@@ -3845,16 +3851,24 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 // Bounded recovery: a verified face lock may hold through a
                 // short detector gap, but must not pin the gimbal indefinitely
                 // when the person has actually left. After the window, release
-                // the lock and resume scanning. The release is sticky: without
-                // the post-release cooldown a phantom face (verified identity
-                // bound to a static object) re-latches within a second and the
-                // robot oscillates fixation/retention forever.
+                // the lock and resume scanning. The release is sticky for
+                // unverified locks: without the post-release cooldown a
+                // phantom face re-latches within a second and the robot
+                // oscillates fixation/retention forever. A verified lock is a
+                // real person by construction (the landmark verifier rules out
+                // static face-shaped distractors), so its release — a long
+                // detector gap, not a wrong fixation — must not trigger the
+                // ignore-cooldown: the person re-entering the view is latched
+                // immediately.
                 if socialRetentionDeadlineNS == nil {
                     socialRetentionDeadlineNS = now + socialRetentionWindowNS
                 } else if now >= socialRetentionDeadlineNS! {
                     socialRetentionDeadlineNS = nil
+                    let wasVerified = faceLock.permitsMotor(at: now)
                     faceLock.invalidate()
-                    faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
+                    if !wasVerified {
+                        faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
+                    }
                     lastMotorTarget = nil
                     applyVisualLoss(belief, at: now)
                 }
@@ -3906,14 +3920,19 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // must not pin the gimbal indefinitely when the person has actually
             // left. After a bounded recovery window, release the lock and
             // resume scanning so the robot does not sit still forever. The
-            // release sets the post-release cooldown so a phantom face cannot
-            // instantly re-latch and restart the oscillation.
+            // release sets the post-release cooldown for unverified locks so a
+            // phantom face cannot instantly re-latch and restart the
+            // oscillation; a verified lock's release is a long detector gap and
+            // re-latches immediately when the person re-enters the view.
             if socialRetentionDeadlineNS == nil {
                 socialRetentionDeadlineNS = now + socialRetentionWindowNS
             } else if now >= socialRetentionDeadlineNS! {
                 socialRetentionDeadlineNS = nil
+                let wasVerified = faceLock.permitsMotor(at: now)
                 faceLock.invalidate()
-                faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
+                if !wasVerified {
+                    faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
+                }
                 lastMotorTarget = nil
                 applyVisualLoss(belief, at: now)
             }
@@ -3930,6 +3949,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // spherical explorer without waiting for it to vanish from pixels.
             let explorationAfterObservationDwell = decision.sceneID != nil
             guard explorationAfterObservationDwell || actionableVisualContinuity.confirmsLoss(at: now) else { return }
+            // A device-confirmed native lock is its own live visual loop: the
+            // OBSBOT tracks the person independently of this app's detectors.
+            // An app-side object/body dwell ending is not evidence that the
+            // tracked person left, and resuming the coverage scan would send
+            // external velocity that yields the device's AI lock away. Retain
+            // the lease through the competing candidate (same rule as
+            // scene_observation and social_reframing); only a sustained
+            // absence confirmed by the native-trust window may tear it down.
+            if retainNativeLeaseThroughCompetingAttention(at: now) {
+                cancelScan()
+                return
+            }
             applyVisualLoss(belief, at: now)
             return
         case .socialFixation:
@@ -4123,12 +4154,36 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         scanScheduledForEvidenceGeneration = nil
     }
 
+    /// The device-confirmed native lease (or a pending handoff) owns the
+    /// gimbal. Competing L0 attention — a body candidate of the tracked
+    /// person, a scene/object candidate, or a detector-ID transition — is
+    /// perception-only while the native-trust continuity is fresh: it must
+    /// not tear the lease down (gate.invalidate sends a manual_stop, which
+    /// kills the device's AI lock) nor steer the gimbal (an external motion
+    /// would yield the device's tracking away). Only a sustained absence
+    /// confirmed by the 15 s native-trust window, an explicit release, or a
+    /// higher-authority motor claim may end the lease.
+    /// Returns true when the lease was retained this frame.
+    @discardableResult
+    private func retainNativeLeaseThroughCompetingAttention(at now: UInt64) -> Bool {
+        guard nativeTrackingActive || nativeTrackingStartPending else { return false }
+        guard !nativeTrustContinuity.confirmsLoss(at: now) else { return false }
+        let action = gate.heartbeatIfActive(at: now)
+        if action != .none {
+            apply(action, at: now, target: nil, reason: "native_lease_retained")
+        }
+        return true
+    }
+
     private func quiesceForNonMotorAttention(
         at monotonicNS: UInt64,
         target: AttentionTarget?,
         reason: String
     ) {
         cancelScan()
+        if retainNativeLeaseThroughCompetingAttention(at: monotonicNS) {
+            return
+        }
         let nativeAction = gate.invalidate()
         apply(nativeAction, at: monotonicNS, target: target, reason: reason)
         guard externalCommandID != nil else { return }
@@ -4144,6 +4199,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     ) {
         guard target.kind == .human, target.label != "face" else {
             quiesceForNonMotorAttention(at: monotonicNS, target: target, reason: reason)
+            return
+        }
+        // A body candidate of the tracked person (or a false-positive
+        // person box) must not tear down a confirmed native lease or drag
+        // the gimbal away from the device's AI lock.
+        if retainNativeLeaseThroughCompetingAttention(at: monotonicNS) {
             return
         }
         cancelScan()
@@ -4316,6 +4377,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             let commandID = nextCommandID(prefix: "native-human")
             nativeTrackingStartPending = true
             nativeStartDeadlineNS = now + nativeStartConfirmationWindowNS
+            // The native lease makes the device the sole motor owner. The
+            // coverage scan must not keep emitting external velocity during
+            // the handoff: the helper yields native tracking to any external
+            // velocity command, so a leftover scan pulse would kill the very
+            // lock this start is establishing.
+            cancelScan()
             send("native_start \(commandID)")
             nativeCommandID = commandID
             writer.write(CameraIntentEvent(
@@ -4744,6 +4811,19 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// the held face at all (phantom / false-positive face).
     private func applyAuxiliaryL0Release(_ reaction: L1AuxiliaryReaction, socialPresence: Double, at monotonicNS: UInt64) {
         guard faceLock.sceneID != nil else {
+            consecutiveAuxiliaryReleaseSignal = 0
+            consecutiveLowSocialPresenceSignal = 0
+            return
+        }
+        // A verified face lock is a real person by construction: the landmark
+        // verifier rules out static face-shaped distractors (photos, textures),
+        // and verification requires a live, pupil-centered face. E2B's
+        // low-social-presence judgment is a coarse VLM reading of a single
+        // downscaled frame and can be blind (close-ups, motion blur, stale
+        // queue) — it must never tear down a verified lock of the actual user.
+        // Provisional/unverified locks (the phantom-face case) keep the full
+        // E2B release protection.
+        if faceLock.permitsMotor(at: monotonicNS) {
             consecutiveAuxiliaryReleaseSignal = 0
             consecutiveLowSocialPresenceSignal = 0
             return
