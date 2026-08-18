@@ -3172,6 +3172,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var nativeCommandID: String?
     private var nativeTrackingActive = false
     private var nativeTrackingStartPending = false
+    /// Deadline for a pending native start. The device handoff (external
+    /// yield + AI-mode switch) takes ~1-4s; if the helper never confirms
+    /// within this window the pending start is cancelled so a stuck device
+    /// cannot block future start attempts forever.
+    private var nativeStartDeadlineNS: UInt64?
+    private let nativeStartConfirmationWindowNS: UInt64 = 8_000_000_000
     private var nativeHeartbeatGeneration = 0
     private var externalGate: ExternalGimbalAttentionGate?
     private var idleExplorationGate: IdleExplorationGate?
@@ -3513,6 +3519,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             if state == "active" {
                 nativeTrackingActive = true
                 nativeTrackingStartPending = false
+                nativeStartDeadlineNS = nil
                 startNativeHeartbeatLoop()
                 // Native human tracking can replace the visible hardware
                 // indication while it activates. Reassert the selected SOMA
@@ -3525,6 +3532,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 stopNativeHeartbeatLoop()
                 nativeTrackingActive = false
                 nativeTrackingStartPending = false
+                nativeStartDeadlineNS = nil
                 nativeCommandID = nil
                 _ = gate.stop()
             }
@@ -3796,6 +3804,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         }
         let now = belief.monotonicNS
+        cancelStaleNativeStartIfNeeded(at: now)
         if reason == "vision_miss" {
             // A completed detector miss can race another detector's fresh
             // face result. The worker already applies this continuity rule,
@@ -4283,9 +4292,30 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         case .start:
             guard let target else { return }
-            guard !nativeTrackingStartPending, !nativeTrackingActive else { return }
+            guard !nativeTrackingActive else { return }
+            if nativeTrackingStartPending {
+                // A pending start whose confirmation window has passed is
+                // stale: clear it (and the helper's half-finished handoff)
+                // before starting fresh.
+                guard now >= (nativeStartDeadlineNS ?? .max) else { return }
+                nativeStartDeadlineNS = nil
+                nativeTrackingStartPending = false
+                let cleanupID = nextCommandID(prefix: "manual-stop")
+                send("manual_stop \(cleanupID)")
+                writer.write(CameraIntentEvent(
+                    monotonicNS: now,
+                    owner: .nativeAI,
+                    state: "native_tracking_timeout",
+                    route: .none,
+                    commandID: cleanupID,
+                    targetKind: nil,
+                    targetLabel: nil,
+                    targetProbability: 0
+                ))
+            }
             let commandID = nextCommandID(prefix: "native-human")
             nativeTrackingStartPending = true
+            nativeStartDeadlineNS = now + nativeStartConfirmationWindowNS
             send("native_start \(commandID)")
             nativeCommandID = commandID
             writer.write(CameraIntentEvent(
@@ -4302,6 +4332,19 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             guard nativeTrackingActive, let commandID = nativeCommandID else { return }
             send("heartbeat \(commandID)")
         case .stop:
+            // A pending start is an ordered barrier: the helper is switching
+            // the device into AI tracking (external yield + mode switch takes
+            // ~1-4s), and an app-side detector gap during that window is not
+            // permission to cancel the handoff. Tearing the start down on a
+            // gap makes it cancel itself before the device confirms, then the
+            // helper still holds the half-finished tracking, so the next start
+            // bounces off with owner_busy and native tracking never engages.
+            // Only the bounded confirmation window (device never confirmed)
+            // cancels a pending start.
+            if nativeTrackingStartPending {
+                guard now >= (nativeStartDeadlineNS ?? .max) else { return }
+                nativeStartDeadlineNS = nil
+            }
             stopNativeHeartbeatLoop()
             let commandID = nextCommandID(prefix: "manual-stop")
             send("manual_stop \(commandID)")
@@ -4319,6 +4362,30 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 targetProbability: 0
             ))
         }
+    }
+
+    /// A native start the device never confirmed within its window is stale:
+    /// cancel it so a later start attempt is not blocked forever. Runs on the
+    /// belief frame path, so a stuck pending start is cleaned up within one
+    /// frame of the deadline even when no vision loss ever arrives.
+    private func cancelStaleNativeStartIfNeeded(at now: UInt64) {
+        guard nativeTrackingStartPending,
+              let deadline = nativeStartDeadlineNS,
+              now >= deadline else { return }
+        nativeStartDeadlineNS = nil
+        nativeTrackingStartPending = false
+        let commandID = nextCommandID(prefix: "manual-stop")
+        send("manual_stop \(commandID)")
+        writer.write(CameraIntentEvent(
+            monotonicNS: now,
+            owner: .nativeAI,
+            state: "native_tracking_timeout",
+            route: .none,
+            commandID: commandID,
+            targetKind: nil,
+            targetLabel: nil,
+            targetProbability: 0
+        ))
     }
 
     /// The helper's 750 ms ownership watchdog protects against a dead bridge,
