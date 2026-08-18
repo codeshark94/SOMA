@@ -3310,6 +3310,17 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var cognitiveExplorationWaypointStartedNS: UInt64?
     private var socialPulseIssuedForRequestID: String?
     private var indicatorInputs = SubconsciousIndicatorInputs()
+    /// Monotonic time of the most recent frame with a fresh human observation.
+    /// The indicator's visual state must not drop on a single miss frame:
+    /// detector confidence dips frame-to-frame, and a strobe on every dip
+    /// flashes the LED and reads as lost tracking.
+    private var lastFreshHumanObservationNS: UInt64?
+    /// How long a fresh human observation keeps the indicator lit through
+    /// subsequent miss frames (hysteresis window). Face detections arrive in
+    /// bursts (several frames, then a 1-4s gap), so the window must cover the
+    /// typical inter-burst gap (p90 ~3.7s) or the LED still strobes between
+    /// bursts.
+    private let indicatorVisualGraceNS: UInt64 = 4_000_000_000
     private var localSpeechListening = false
     private var localSpeechWorking = false
     private var localSpeechSpeaking = false
@@ -4148,10 +4159,22 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         // selector publishes its matching belief. A miss in that interval is
         // not permission to restart exploration and look away from the face.
         guard !hasRecentObservedFace(at: now) else { return }
+        // Hysteresis for the LED only: a fresh human observation within the
+        // grace window keeps the indicator lit through brief detector misses,
+        // so a per-frame confidence dip cannot strobe the LED. The attention
+        // loss bookkeeping below (confirmedVisualLossNS, scan scheduling) must
+        // ALWAYS run — a lit indicator (e.g. a low-confidence person or a
+        // static false positive) must never freeze exploration, or the scan
+        // never starts and the gimbal sits still forever.
         if indicatorInputs.visualState != .none {
-            indicatorInputs.visualState = .none
-            eyeContactIndicatorLease.clear()
-            refreshIndicator(at: now)
+            if let lastHit = lastFreshHumanObservationNS,
+               now - lastHit < indicatorVisualGraceNS {
+                // Keep the LED lit through the detector gap.
+            } else {
+                indicatorInputs.visualState = .none
+                eyeContactIndicatorLease.clear()
+                refreshIndicator(at: now)
+            }
         }
         // Keep the first confirmed-loss time. Replacing it on every empty
         // detector frame makes every recovery grace period recede forever.
@@ -4438,6 +4461,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         if candidates.contains(where: {
             $0.observedThisFrame && $0.observation.kind == .human
         }) {
+            lastFreshHumanObservationNS = monotonicNS
             let priorVisualState = indicatorInputs.visualState
             indicatorInputs.observeHumanVisualPresence()
             // A person is in view but the ready-to-speak blink must still
@@ -6948,10 +6972,12 @@ private final class ANEObjectDetector: @unchecked Sendable {
     let computeUnits: String
     let warmupMS: Double
     let confidenceThreshold: Double
+    let personConfidenceThreshold: Double
     private let model: VNCoreMLModel
 
-    init(confidenceThreshold: Double) throws {
+    init(confidenceThreshold: Double, personConfidenceThreshold: Double) throws {
         self.confidenceThreshold = confidenceThreshold
+        self.personConfidenceThreshold = personConfidenceThreshold
         let modelURL: URL
         if let compiledURL = Bundle.module.url(forResource: "YOLOv3TinyFP16", withExtension: "mlmodelc") {
             modelURL = compiledURL
@@ -6971,7 +6997,12 @@ private final class ANEObjectDetector: @unchecked Sendable {
     }
 
     func detect(in pixelBuffer: CVPixelBuffer) throws -> [VisualObservation] {
-        try Self.detect(in: pixelBuffer, model: model, confidenceThreshold: confidenceThreshold)
+        try Self.detect(
+            in: pixelBuffer,
+            model: model,
+            confidenceThreshold: confidenceThreshold,
+            personConfidenceThreshold: personConfidenceThreshold
+        )
     }
 
     private static func warmUp(_ model: VNCoreMLModel) throws {
@@ -6991,13 +7022,14 @@ private final class ANEObjectDetector: @unchecked Sendable {
               let pixelBuffer else {
             throw RuntimeError.configuration("Cannot allocate Core ML warmup frame")
         }
-        _ = try detect(in: pixelBuffer, model: model, confidenceThreshold: 0.5)
+        _ = try detect(in: pixelBuffer, model: model, confidenceThreshold: 0.5, personConfidenceThreshold: 0.35)
     }
 
     private static func detect(
         in pixelBuffer: CVPixelBuffer,
         model: VNCoreMLModel,
-        confidenceThreshold: Double
+        confidenceThreshold: Double,
+        personConfidenceThreshold: Double
     ) throws -> [VisualObservation] {
         let request = VNCoreMLRequest(model: model)
         request.imageCropAndScaleOption = .scaleFill
@@ -7005,8 +7037,17 @@ private final class ANEObjectDetector: @unchecked Sendable {
         try handler.perform([request])
         let results = request.results as? [VNRecognizedObjectObservation] ?? []
         return results.compactMap { observation in
-            guard let label = observation.labels.max(by: { $0.confidence < $1.confidence }),
-                  Double(label.confidence) >= confidenceThreshold else {
+            guard let label = observation.labels.max(by: { $0.confidence < $1.confidence }) else {
+                return nil
+            }
+            // The person class is kept on its own (lower) threshold: YOLOv3Tiny
+            // person confidence dips frame-to-frame (0.4-0.9 on the same
+            // person), and gating the person on the object threshold makes the
+            // human observation strobe on and off, which flashes the LED and
+            // destabilizes tracking. Objects (toothbrush etc.) keep the
+            // configured threshold, which is what the Control Center dials.
+            let minimum = label.identifier == "person" ? personConfidenceThreshold : confidenceThreshold
+            guard Double(label.confidence) >= minimum else {
                 return nil
             }
             return VisualObservation(
@@ -7716,14 +7757,18 @@ private final class VisionWorker: @unchecked Sendable {
         )
         do {
             let yoloConfidence = somaEnvDouble("SOMA_YOLO_CONFIDENCE_THRESHOLD", default: 0.5)
-            let detector = try ANEObjectDetector(confidenceThreshold: yoloConfidence)
+            let yoloPersonConfidence = somaEnvDouble("SOMA_YOLO_PERSON_THRESHOLD", default: 0.35)
+            let detector = try ANEObjectDetector(
+                confidenceThreshold: yoloConfidence,
+                personConfidenceThreshold: yoloPersonConfidence
+            )
             neuralObjectDetector = detector
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
                 source: "object_neural_engine",
                 state: "configured",
-                message: "model=YOLOv3TinyFP16; compute_units=\(detector.computeUnits); labels=person_and_objects; confidence_threshold=\(yoloConfidence); prewarm_ms=\(detector.warmupMS)"
+                message: "model=YOLOv3TinyFP16; compute_units=\(detector.computeUnits); labels=person_and_objects; object_confidence_threshold=\(yoloConfidence); person_confidence_threshold=\(yoloPersonConfidence); prewarm_ms=\(detector.warmupMS)"
             ))
         } catch {
             neuralObjectDetector = nil
