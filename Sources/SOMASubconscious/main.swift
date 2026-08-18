@@ -3553,6 +3553,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 // the next native start indefinitely. Only a native session we
                 // actually own (active or pending) is a real failure signal.
                 guard nativeTrackingActive || nativeTrackingStartPending else { return }
+                // A PENDING start is mid-handoff: the helper's own reinit
+                // (requestManualStop before switching the device into AI mode)
+                // emits this inactive ack as part of the handshake. Treating
+                // it as a failure clears nativeCommandID, so the heartbeats
+                // after the device confirms carry no command and the helper's
+                // 750 ms watchdog kills the fresh native lock ~1 s after every
+                // successful start. Real start failures are caught by the 8 s
+                // confirmation deadline, not this ack.
+                guard !nativeTrackingStartPending else { return }
                 stopNativeHeartbeatLoop()
                 nativeTrackingActive = false
                 nativeTrackingStartPending = false
@@ -4087,9 +4096,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     + " trustLoss=\(nativeTrustContinuity.confirmsLoss(at: now))"
                     + " enabled=\(nativeHumanTrackingEnabled)"
                     + " nativeActive=\(nativeTrackingActive)"
-                    + " cooldownUntil=\(nativeRetryCooldownUntilNS.map { String(format: "%.0f", Double($0 - now) / 1e9) } ?? "-")s"
+                    + " cooldownUntil=\(nativeRetryCooldownUntilNS.map { $0 >= now ? String(format: "%.0f", Double($0 - now) / 1e9) : "0" } ?? "-")s"
                     + " pending=\(nativeTrackingStartPending)"
-                    + " deadlineIn=\(nativeStartDeadlineNS.map { String(format: "%.0f", Double($0 - now) / 1e9) } ?? "-")s"
+                    + " deadlineIn=\(nativeStartDeadlineNS.map { $0 >= now ? String(format: "%.0f", Double($0 - now) / 1e9) : "0" } ?? "-")s"
             ))
         }
         let externalAction: ExternalGimbalAttentionAction
@@ -4303,7 +4312,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             confirmedVisualLossNS = now
         }
         let nativeAction = nativeHumanTrackingEnabled
-            ? gate.update(belief, hasVisualEvidence: false)
+            ? (gate.isActive
+                && !nativeTrustContinuity.confirmsLoss(at: now)
+                ? gate.heartbeatIfActive(at: now)
+                : gate.update(belief, hasVisualEvidence: false))
             : gate.invalidate()
         let externalAction: ExternalGimbalAttentionAction
         if var externalGate {
@@ -4771,7 +4783,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             if accepted, faceLock.permitsInitialMotor(at: monotonicNS) {
                 let preemptedExploration = scanRunning || activeSpatialFaceReacquisition != nil
                 lastObservedFaceNS = monotonicNS
-                if faceLock.permitsMotor(at: monotonicNS) {
+                if faceLock.isActive(at: monotonicNS) {
                     // The ready-to-speak invitation must be earned by the
                     // camera actually following the person (device-confirmed
                     // native tracking). A locked face with eye contact but no
@@ -7542,14 +7554,35 @@ private final class SystemFaceVerifier: @unchecked Sendable {
     /// 1.0 = default (0.68 X / 0.82 Y). Lower = stricter (pupil must be more
     /// centered); higher = more lenient.
     private let pupilCenteringThreshold: Double
+    private let ciContext = CIContext()
 
     init(pupilCenteringThreshold: Double = 1.0) {
         self.pupilCenteringThreshold = min(max(pupilCenteringThreshold, 0.1), 2.0)
     }
 
+    /// VNDetectFaceLandmarksRequest fails on this camera's full-resolution
+    /// frames (0 detections at 1920x1080/1280x720, works at <=800px wide).
+    /// Downscale before detection; boundingBox/landmarks are normalized so
+    /// results remain valid at any scale.
+    func scaledCGImage(from pixelBuffer: CVPixelBuffer, maxWidth: Int = 640) -> CGImage? {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return nil }
+        guard width > maxWidth else { return nil }
+        let scale = Double(maxWidth) / Double(width)
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return ciContext.createCGImage(scaled, from: scaled.extent)
+    }
+
     func detect(in pixelBuffer: CVPixelBuffer) -> [SystemFaceEvidence] {
         let faceRequest = VNDetectFaceLandmarksRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        let handler: VNImageRequestHandler
+        if let scaled = scaledCGImage(from: pixelBuffer) {
+            handler = VNImageRequestHandler(cgImage: scaled, options: [:])
+        } else {
+            handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        }
         guard (try? handler.perform([faceRequest])) != nil else { return [] }
         return (faceRequest.results ?? []).compactMap { observation in
             guard let landmarks = observation.landmarks,
@@ -8182,9 +8215,16 @@ private final class VisionWorker: @unchecked Sendable {
             }
             let attentionCandidates = (hasVerifiedFace
                 ? observedCandidates.filter {
+                    // A verified face is the strongest L0 motor evidence and
+                    // must be the sole human attention input this frame. The
+                    // YOLO person box around the same face (and any raw
+                    // unverified face hypothesis) must not compete with it:
+                    // when the probabilistic selector alternates between the
+                    // face and the enclosing person box, the native gate sees
+                    // a non-face target mid-lock, returns .stop and the
+                    // device-native tracking lease is torn down.
                     $0.observation.kind != .human
-                        || $0.observation.label != "face"
-                        || $0.faceVerificationEligible
+                        || ($0.observation.label == "face" && $0.faceVerificationEligible)
                 }
                 : observedCandidates
             ).map { $0.attentionObservation() }
@@ -8359,12 +8399,80 @@ private final class VisionWorker: @unchecked Sendable {
             faceConfirmationLease.record(systemFaces.map(\.rect), at: faceVerificationNow)
             if faceVerificationNow >= nextFaceVerifierDiagnosticNS {
                 nextFaceVerifierDiagnosticNS = faceVerificationNow + 2_000_000_000
+                var rawFaces = 0
+                var landmarkComplete = 0
+                var alignmentOK = 0
+                var rawUp = 0
+                var rawRight = 0
+                var rawDown = 0
+                var rawLeft = 0
+                let width = CVPixelBufferGetWidth(pixelBuffer)
+                let height = CVPixelBufferGetHeight(pixelBuffer)
+                let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+                let orientations: [CGImagePropertyOrientation] = [.up, .right, .down, .left]
+                var orientationCounts = [Int](repeating: 0, count: 4)
+                let probeImage = systemFaceVerifier.scaledCGImage(from: pixelBuffer)
+                for (index, orientation) in orientations.enumerated() {
+                    let rawRequest = VNDetectFaceLandmarksRequest()
+                    let rawHandler: VNImageRequestHandler
+                    if let probeImage {
+                        rawHandler = VNImageRequestHandler(cgImage: probeImage, orientation: orientation, options: [:])
+                    } else {
+                        rawHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
+                    }
+                    if (try? rawHandler.perform([rawRequest])) != nil {
+                        orientationCounts[index] = rawRequest.results?.count ?? 0
+                    }
+                }
+                rawUp = orientationCounts[0]
+                rawRight = orientationCounts[1]
+                rawDown = orientationCounts[2]
+                rawLeft = orientationCounts[3]
+                rawFaces = rawUp
+                let rawRequest = VNDetectFaceLandmarksRequest()
+                let rawHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+                if (try? rawHandler.perform([rawRequest])) != nil {
+                    for obs in rawRequest.results ?? [] {
+                        guard let lms = obs.landmarks else { continue }
+                        let eyes = (lms.leftEye?.pointCount ?? 0) >= 2 && (lms.rightEye?.pointCount ?? 0) >= 2
+                        let nose = (lms.nose?.pointCount ?? 0) >= 2
+                        let mouth = (lms.outerLips?.pointCount ?? 0) >= 3
+                        if eyes && nose && mouth { landmarkComplete += 1 }
+                        let r = SOMACore.NormalizedRect(obs.boundingBox)
+                        if let le = lms.leftEye, let re = lms.rightEye, let nz = lms.nose,
+                           le.pointCount > 0, re.pointCount > 0, nz.pointCount > 0 {
+                            let lec = le.normalizedPoints.map { $0.x }.reduce(0, +) / Double(le.pointCount)
+                            let rec = re.normalizedPoints.map { $0.x }.reduce(0, +) / Double(re.pointCount)
+                            let eyeX = abs(lec - rec) * r.width
+                            if eyeX >= r.width * 0.12 { alignmentOK += 1 }
+                        }
+                    }
+                }
+                let blazeFacesCount = candidates.filter { isFaceCandidate($0) }.count
+                if rawUp == 0, blazeFacesCount > 0 {
+                    let dumpURL = URL(fileURLWithPath: "/tmp/soma-verify-frame.jpg")
+                    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+                    let context = CIContext()
+                    if let cgImage = context.createCGImage(ciImage, from: ciImage.extent),
+                       let destination = CGImageDestinationCreateWithURL(dumpURL as CFURL, "public.jpeg" as CFString, 1, nil) {
+                        CGImageDestinationAddImage(destination, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
+                        if CGImageDestinationFinalize(destination) {
+                            writer.write(RuntimeEvent(
+                                event: "source.health",
+                                monotonicNS: faceVerificationNow,
+                                source: "system_face_verifier",
+                                state: "verification_dump",
+                                message: dumpURL.lastPathComponent
+                            ))
+                        }
+                    }
+                }
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: faceVerificationNow,
                     source: "system_face_verifier",
                     state: "verification_probe",
-                    message: "system_faces=\(systemFaces.count); blaze_faces=\(candidates.filter { isFaceCandidate($0) }.count)"
+                    message: "system_faces=\(systemFaces.count); blaze_faces=\(candidates.filter { isFaceCandidate($0) }.count); raw_up=\(rawUp); raw_right=\(rawRight); raw_down=\(rawDown); raw_left=\(rawLeft); landmarks=\(landmarkComplete); alignment=\(alignmentOK); frame=\(width)x\(height); fmt=0x\(String(format: "%08X", format))"
                 ))
             }
             directedContactEvidence = systemFaces
