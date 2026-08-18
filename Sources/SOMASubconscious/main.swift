@@ -3177,6 +3177,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// within this window the pending start is cancelled so a stuck device
     /// cannot block future start attempts forever.
     private var nativeStartDeadlineNS: UInt64?
+    private var lastNativeGateDiagnosticNS: UInt64 = 0
     /// The device can refuse to re-enter its AI tracking mode after a stop
     /// (firmware wedge). Spamming native_start every frame keeps it wedged
     /// and floods the helper with futile mode switches. After an unconfirmed
@@ -3544,6 +3545,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     forceHardwareReassertion: true
                 )
             } else if state == "inactive" {
+                // The helper's requestManualStop emits an inactive native
+                // tracking ack for ANY manual transition, including the
+                // external servo's own release/stop cycles while no native
+                // session exists. Treating those as native failures would
+                // re-arm the retry cooldown on every servo release and starve
+                // the next native start indefinitely. Only a native session we
+                // actually own (active or pending) is a real failure signal.
+                guard nativeTrackingActive || nativeTrackingStartPending else { return }
                 stopNativeHeartbeatLoop()
                 nativeTrackingActive = false
                 nativeTrackingStartPending = false
@@ -4057,11 +4066,37 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         } else {
             nativeAction = gate.invalidate()
         }
+        if now - lastNativeGateDiagnosticNS >= 500_000_000 {
+            lastNativeGateDiagnosticNS = now
+            let diagTarget = belief.target
+            writer.write(RuntimeEvent(
+                event: "native.gate",
+                monotonicNS: now,
+                source: "native_gate",
+                state: String(describing: nativeAction),
+                message: "target=\(diagTarget?.label ?? "nil")/\(diagTarget?.id ?? "-")"
+                    + " conf=\(String(format: "%.2f", diagTarget?.confidence ?? 0))"
+                    + " post=\(String(format: "%.2f", diagTarget?.posteriorProbability ?? 0))"
+                    + " eligible=\(diagTarget?.isActionEligible ?? false)"
+                    + " lockScene=\(faceLock.sceneID ?? "-")"
+                    + " lockActive=\(faceLock.isActive(at: now))"
+                    + " lockPermits=\(faceLock.permitsMotor(at: now))"
+                    + " lockProvisional=\(faceLock.isProvisional(at: now))"
+                    + " gateActive=\(gate.isActive)"
+                    + " verifiedLock=\(verifiedCurrentFaceLock)"
+                    + " trustLoss=\(nativeTrustContinuity.confirmsLoss(at: now))"
+                    + " enabled=\(nativeHumanTrackingEnabled)"
+                    + " nativeActive=\(nativeTrackingActive)"
+                    + " cooldownUntil=\(nativeRetryCooldownUntilNS.map { String(format: "%.0f", Double($0 - now) / 1e9) } ?? "-")s"
+                    + " pending=\(nativeTrackingStartPending)"
+                    + " deadlineIn=\(nativeStartDeadlineNS.map { String(format: "%.0f", Double($0 - now) / 1e9) } ?? "-")s"
+            ))
+        }
         let externalAction: ExternalGimbalAttentionAction
         if var externalGate {
             // Keep the visual servo alive while a fresh face earns the native
             // lease. Once the device confirms native tracking, it becomes the
-            // sole motor owner; a face must never create a 160 ms dead zone.
+            // sole motor owner; a face must never create a 500 ms dead zone.
             let nativeHandoffPending = nativeHumanTrackingEnabled
                 && (nativeTrackingStartPending || nativeAction == .start)
             let nativeOwnsHuman = nativeTrackingActive || nativeHandoffPending
@@ -4069,7 +4104,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             if let target = belief.target,
                let stored = freshFaceBearings[target.id],
                now >= stored.monotonicNS,
-               now - stored.monotonicNS <= 160_000_000 {
+               now - stored.monotonicNS <= 500_000_000 {
                 faceBearing = stored.bearing
             } else {
                 faceBearing = nil
@@ -4846,9 +4881,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         // low-social-presence judgment is a coarse VLM reading of a single
         // downscaled frame and can be blind (close-ups, motion blur, stale
         // queue) — it must never tear down a verified lock of the actual user.
-        // Provisional/unverified locks (the phantom-face case) keep the full
-        // E2B release protection.
-        if faceLock.permitsMotor(at: monotonicNS) {
+        // Provisional/unverified locks keep the full E2B release protection,
+        // but an *active* provisional lock still represents a face currently
+        // in view that the static-rejection machinery has not dismissed. A
+        // p=0 reading while the camera is actually tracking a live face must
+        // not throw the robot back into the coverage scan (which blurs the
+        // face, churns the tracks, and starves the verifier). Only a lock
+        // that has gone fully inactive — or was never accepted — is eligible
+        // for the E2B release.
+        if faceLock.isActive(at: monotonicNS) {
             consecutiveAuxiliaryReleaseSignal = 0
             consecutiveLowSocialPresenceSignal = 0
             return
@@ -6354,8 +6395,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         .init(azimuthDegrees: -110, elevationDegrees: 24),
     ]
 
-    private static let maximumExplorationPanDegreesPerSecond = 30.0
-    private static let maximumExplorationPitchDegreesPerSecond = 18.0
+    private static let maximumExplorationPanDegreesPerSecond = 12.0
+    private static let maximumExplorationPitchDegreesPerSecond = 10.0
     private static let maximumPanoramaStripPanDegreesPerSecond = 12.0
     private static let maximumPanoramaStripPitchDegreesPerSecond = 8.0
 
@@ -7860,6 +7901,7 @@ private final class VisionWorker: @unchecked Sendable {
     private var nextObjectNS: UInt64 = 0
     private var nextFaceNS: UInt64 = 0
     private var nextFaceVerificationNS: UInt64 = 0
+    private var nextFaceVerifierDiagnosticNS: UInt64 = 0
     private var directedContactEvidence: [(rect: SOMACore.NormalizedRect, observedNS: UInt64)] = []
     private var identityAlignmentEvidence: [(evidence: SystemFaceEvidence, observedNS: UInt64)] = []
     private var nextSaliencyNS: UInt64 = 0
@@ -8315,6 +8357,16 @@ private final class VisionWorker: @unchecked Sendable {
             nextFaceVerificationNS = faceVerificationNow + 50_000_000
             let systemFaces = systemFaceVerifier.detect(in: pixelBuffer)
             faceConfirmationLease.record(systemFaces.map(\.rect), at: faceVerificationNow)
+            if faceVerificationNow >= nextFaceVerifierDiagnosticNS {
+                nextFaceVerifierDiagnosticNS = faceVerificationNow + 2_000_000_000
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: faceVerificationNow,
+                    source: "system_face_verifier",
+                    state: "verification_probe",
+                    message: "system_faces=\(systemFaces.count); blaze_faces=\(candidates.filter { isFaceCandidate($0) }.count)"
+                ))
+            }
             directedContactEvidence = systemFaces
                 .filter(\.directedEyeContact)
                 .map { ($0.rect, faceVerificationNow) }
