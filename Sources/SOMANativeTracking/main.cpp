@@ -1336,6 +1336,22 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                     // direct speed command has physically settled. Starting AI
                     // immediately after that ACK often remains in mode 0.
                     std::this_thread::sleep_for(std::chrono::milliseconds(350));
+                } else if (!nativeTracking) {
+                    // A retry after a failed/stopped handoff must re-establish
+                    // the manual (AiWorkModeNone) state first. The device's AI
+                    // state machine can wedge after a stop-while-tracking: a
+                    // direct AiWorkModeHuman request is acknowledged (RM_RET_OK)
+                    // but the camera stays in mode 0 forever. Cycling through
+                    // None with a confirmed manual status resets it.
+                    const bool manual = requestManualStop(
+                        device,
+                        trace,
+                        "reinit_for_native",
+                        "reinit-" + command.commandID,
+                        "external"
+                    );
+                    if (!manual) return 4;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(350));
                 }
                 if (!nativeTracking) {
                     nativeTracking = requestNativeHumanTracking(

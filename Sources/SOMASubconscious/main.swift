@@ -3177,6 +3177,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// within this window the pending start is cancelled so a stuck device
     /// cannot block future start attempts forever.
     private var nativeStartDeadlineNS: UInt64?
+    /// The device can refuse to re-enter its AI tracking mode after a stop
+    /// (firmware wedge). Spamming native_start every frame keeps it wedged
+    /// and floods the helper with futile mode switches. After an unconfirmed
+    /// start, back off with an exponential cooldown so the device gets time
+    /// to recover; the app's face servo holds the person meanwhile.
+    private var nativeRetryCooldownUntilNS: UInt64?
+    private var nativeConsecutiveFailures = 0
     private let nativeStartConfirmationWindowNS: UInt64 = 8_000_000_000
     private var nativeHeartbeatGeneration = 0
     private var externalGate: ExternalGimbalAttentionGate?
@@ -3526,6 +3533,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 nativeTrackingActive = true
                 nativeTrackingStartPending = false
                 nativeStartDeadlineNS = nil
+                nativeConsecutiveFailures = 0
+                nativeRetryCooldownUntilNS = nil
                 startNativeHeartbeatLoop()
                 // Native human tracking can replace the visible hardware
                 // indication while it activates. Reassert the selected SOMA
@@ -3541,6 +3550,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 nativeStartDeadlineNS = nil
                 nativeCommandID = nil
                 _ = gate.stop()
+                nativeConsecutiveFailures += 1
+                let cooldownMilliseconds = min(
+                    10_000 * (1 << min(nativeConsecutiveFailures - 1, 3)),
+                    60_000
+                )
+                nativeRetryCooldownUntilNS = monotonicNanoseconds()
+                    + UInt64(cooldownMilliseconds) * 1_000_000
             }
             return
         }
@@ -4354,6 +4370,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         case .start:
             guard let target else { return }
             guard !nativeTrackingActive else { return }
+            guard now >= (nativeRetryCooldownUntilNS ?? 0) else { return }
             if nativeTrackingStartPending {
                 // A pending start whose confirmation window has passed is
                 // stale: clear it (and the helper's half-finished handoff)
@@ -4441,6 +4458,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               now >= deadline else { return }
         nativeStartDeadlineNS = nil
         nativeTrackingStartPending = false
+        // A start the device never confirmed within the window is a failure
+        // too: back off so a wedged device is not hammered on every frame.
+        nativeConsecutiveFailures += 1
+        let cooldownMilliseconds = min(
+            10_000 * (1 << min(nativeConsecutiveFailures - 1, 3)),
+            60_000
+        )
+        nativeRetryCooldownUntilNS = now + UInt64(cooldownMilliseconds) * 1_000_000
         let commandID = nextCommandID(prefix: "manual-stop")
         send("manual_stop \(commandID)")
         writer.write(CameraIntentEvent(
