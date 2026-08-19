@@ -67,7 +67,7 @@ fi
 
 exec "$soma_binary" \
   --duration 0 \
-  --video-id 0x31000003564fef9 \
+  --video-id 0x21000003564fef9 \
   --audio-id 'AppleUSBAudioEngine:Remo Tech Co., Ltd.:OBSBOT Tiny 2 Lite:3100000:3' \
   --output "$soma_runtime_root/detail/subconscious.jsonl" \
   --trace-max-megabytes 128 \

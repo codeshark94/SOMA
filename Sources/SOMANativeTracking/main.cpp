@@ -680,7 +680,7 @@ bool requestNativeHumanTracking(
         "native_ai",
         "human_normal_sent",
         0,
-        "Tiny 2 Lite; vertical_tracking_mode=motion",
+        "Tiny 2 Lite; vertical_tracking_mode=standard",
         commandID
     );
     int startResult = RM_RET_ERR;
@@ -697,7 +697,7 @@ bool requestNativeHumanTracking(
     int trackingModeResult = RM_RET_ERR;
     {
         std::lock_guard<std::mutex> lock(sdkMutex);
-        try { trackingModeResult = device->aiSetTrackingModeR(Device::AiVTrackMotion); } catch (...) {}
+        try { trackingModeResult = device->aiSetTrackingModeR(Device::AiVTrackStandard); } catch (...) {}
     }
     bool activated = false;
     try { activated = waitForMode(device, Device::AiWorkModeHuman, 2'000); } catch (...) {}

@@ -11090,24 +11090,34 @@ private func requestLowLatencyFormat(on device: AVCaptureDevice) throws -> Video
 }
 
 private func obsbotDevice(for mediaType: AVMediaType, uniqueID: String) -> AVCaptureDevice? {
-    let matches: (AVCaptureDevice) -> Bool = {
-        $0.uniqueID == uniqueID && $0.localizedName.range(of: "obsbot", options: .caseInsensitive) != nil
+    // The OBSBOT is matched by name first, then by requested unique ID. The
+    // unique ID prefix (bus/port portion) can change across reboots or USB
+    // replugs while the product suffix stays stable, so the ID is a preference,
+    // not a hard requirement: prefer the exact ID, fall back to any OBSBOT.
+    let isObsbot: (AVCaptureDevice) -> Bool = {
+        $0.localizedName.range(of: "obsbot", options: .caseInsensitive) != nil
     }
+    let devices: [AVCaptureDevice]
     if mediaType == .video {
-        return AVCaptureDevice.DiscoverySession(
+        devices = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.externalUnknown],
             mediaType: mediaType,
             position: .unspecified
-        ).devices.first(where: matches)
-    }
-    if #available(macOS 14.0, *) {
-        return AVCaptureDevice.DiscoverySession(
+        ).devices
+    } else if #available(macOS 14.0, *) {
+        devices = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.microphone],
             mediaType: mediaType,
             position: .unspecified
-        ).devices.first(where: matches)
+        ).devices
+    } else {
+        devices = AVCaptureDevice.devices(for: mediaType)
     }
-    return AVCaptureDevice.devices(for: mediaType).first(where: matches)
+    let obsbots = devices.filter(isObsbot)
+    if !uniqueID.isEmpty, let exact = obsbots.first(where: { $0.uniqueID == uniqueID }) {
+        return exact
+    }
+    return obsbots.first
 }
 
 private func requestAccess(for mediaType: AVMediaType, label: String) throws {
