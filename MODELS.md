@@ -27,10 +27,10 @@ no camera pixels or scene entities are included.
   [Ultralytics](https://docs.ultralytics.com/license/). An Enterprise license
   is the alternative offered by Ultralytics for use outside the AGPL route.
 
-The package is a bundled third-party model asset, not a claim that SOMA's own
-source has been relicensed. Anyone redistributing or deploying the bundled
-YOLO11n package must determine and satisfy the applicable Ultralytics terms;
-see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The package is a bundled third-party model asset. SOMA's source is also
+distributed under AGPL-3.0; anyone redistributing or deploying the bundled
+YOLO11n package must determine and satisfy the applicable Ultralytics terms.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 SOMA requires macOS 13 or later and loads this model with
 `MLModelConfiguration.computeUnits = .cpuAndNeuralEngine`. This excludes GPU

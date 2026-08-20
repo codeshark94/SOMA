@@ -297,12 +297,10 @@ Detailed implementation status and open acceptance work live in
 
 - SOMA is an independent research project and is not affiliated with OBSBOT.
 - OBSBOT and Tiny 2 Lite are trademarks of their respective owners.
+- SOMA source code is licensed under [AGPL-3.0](LICENSE).
 - Third-party model terms are documented in [MODELS.md](MODELS.md) and
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The bundled YOLO11n package
   is AGPL-3.0; its terms apply to that asset.
-- SOMA's own source does not currently include a project license. Do not assume
-  reuse, redistribution, or contribution terms for it until a license is
-  selected.
 
 ## Artwork
 
