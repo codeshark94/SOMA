@@ -6,8 +6,15 @@
     <string>com.soma.menu-bar</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/seungyeop/Library/Application Support/SOMA/Applications/SOMA Subconscious.app/Contents/MacOS/soma-menu-bar</string>
+        <string>@SOMA_APP_ROOT@/Contents/MacOS/soma-menu-bar</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SOMA_ROOT</key>
+        <string>@SOMA_ROOT@</string>
+        <key>SOMA_RUNTIME_ROOT</key>
+        <string>@SOMA_ROOT@/artifacts/subconscious/runtime</string>
+    </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>RunAtLoad</key>

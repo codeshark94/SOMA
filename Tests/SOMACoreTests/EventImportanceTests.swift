@@ -332,43 +332,77 @@ final class EventImportanceTests: XCTestCase {
         )
     }
 
-    func testFirstConversationRequiresEyeContactOrBotSocialPulse() {
+    func testDirectContactStartsConversationAndSocialPulseDoesNotRequireIt() {
         let start: UInt64 = 1_000_000_000
         var gate = ConversationContactGate(configuration: .init(
-            eyeContactFreshnessMilliseconds: 450,
             socialPulseResponseMilliseconds: 8_000,
             conversationInactivityMilliseconds: 60_000
         ))
-        XCTAssertNil(gate.authorizeSpeechOnset(at: start))
-
-        gate.observeEyeContact(at: start)
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 450_000_000),
-            .eyeContact
+            gate.authorizeSpeechOnset(at: start, directContact: false),
+            nil
         )
-        XCTAssertNil(gate.authorizeSpeechOnset(at: start + 451_000_000))
+        XCTAssertEqual(
+            gate.authorizeSpeechOnset(at: start, directContact: true),
+            .voiceActivity
+        )
 
         gate.issueSocialPulse(at: start + 1_000_000_000)
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 1_100_000_000),
+            gate.authorizeSpeechOnset(at: start + 1_100_000_000, directContact: false),
             .botInitiatedPulseResponse
         )
-        XCTAssertNil(gate.authorizeSpeechOnset(at: start + 1_200_000_000))
+        XCTAssertEqual(
+            gate.authorizeSpeechOnset(at: start + 1_200_000_000, directContact: true),
+            .voiceActivity
+        )
+    }
+
+    func testNewLiveConversationRequiresCurrentVerifiedHumanTarget() {
+        let anchoredModel = PredictiveWorldModel()
+        let anchored = anchoredModel.ingestVisual(
+            VisualObservation(
+                rect: NormalizedRect(x: 0.40, y: 0.25, width: 0.20, height: 0.30),
+                confidence: 0.90,
+                source: .neuralFaceDetector,
+                kind: .human,
+                label: "face",
+                isActionEligible: true
+            ),
+            at: 1_000_000_000
+        )
+        XCTAssertTrue(LiveConversationVisualAdmission.permitsNewSession(for: anchored))
+
+        let unanchoredModel = PredictiveWorldModel()
+        let unanchored = unanchoredModel.ingestVisual(
+            VisualObservation(
+                rect: NormalizedRect(x: 0.40, y: 0.25, width: 0.20, height: 0.30),
+                confidence: 0.90,
+                source: .neuralDetector,
+                kind: .object,
+                label: "bicycle",
+                isActionEligible: false
+            ),
+            at: 1_000_000_000
+        )
+        XCTAssertFalse(LiveConversationVisualAdmission.permitsNewSession(for: unanchored))
     }
 
     func testOpenedConversationAllowsFollowUpsUntilInactivityExpiry() {
         let start: UInt64 = 2_000_000_000
         var gate = ConversationContactGate(configuration: .init(
-            eyeContactFreshnessMilliseconds: 450,
             socialPulseResponseMilliseconds: 8_000,
             conversationInactivityMilliseconds: 60_000
         ))
         gate.markConversationOpened(at: start)
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 59_999_000_000),
+            gate.authorizeSpeechOnset(at: start + 59_999_000_000, directContact: false),
             .activeConversation
         )
-        XCTAssertNil(gate.authorizeSpeechOnset(at: start + 60_000_000_000))
+        XCTAssertEqual(
+            gate.authorizeSpeechOnset(at: start + 60_000_000_000, directContact: true),
+            .voiceActivity
+        )
     }
 
     func testLiveVoiceSessionClosesAfterOneMinuteWithoutUserActivity() {
@@ -418,13 +452,10 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(SubconsciousIndicatorState.contactReady.humanMeaning, "ready_speak_now")
         XCTAssertEqual(SubconsciousIndicatorState.conversation.humanMeaning, "conversation_active")
         XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "please_wait_preparing_reply")
-        let blueSteady = SOMALEDDeviceRendering(stateID: 57, specialPatternEnabled: false)
-        let blueBlink = SOMALEDDeviceRendering(stateID: 57, specialPatternEnabled: true)
-        let yellowSteady = SOMALEDDeviceRendering(stateID: 16, specialPatternEnabled: false)
-        XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, blueSteady.stateID)
-        XCTAssertEqual(SOMALEDColor.yellow.firmwareStateID, yellowSteady.stateID)
-        XCTAssertTrue(blueBlink.specialPatternEnabled)
-        XCTAssertFalse(blueSteady.specialPatternEnabled)
+        let blue = SOMALEDDeviceRendering(stateID: 57)
+        let yellow = SOMALEDDeviceRendering(stateID: 16)
+        XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, blue.stateID)
+        XCTAssertEqual(SOMALEDColor.yellow.firmwareStateID, yellow.stateID)
     }
 
     func testEyeContactIndicatorLeaseBridgesBriefGazeDropoutsOnly() {

@@ -59,7 +59,7 @@ public enum SOMALEDResponseMode: String, CaseIterable, Codable, Sendable {
 }
 
 /// A user-facing colour available from the Tiny 2 Lite indicator. There is no
-/// public RGB API, so these map to the physically verified device palette.
+/// public RGB API, so these map to the installed device-palette state IDs.
 public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
     case yellow
     case blue
@@ -67,7 +67,7 @@ public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
 
     public var displayName: String { rawValue.capitalized }
 
-    /// State 57 is the physically verified steady-blue device state.
+    /// State 57 is the Tiny firmware's tracking palette entry.
     public var firmwareStateID: Int {
         switch self {
         case .yellow: 16
@@ -77,16 +77,13 @@ public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
     }
 }
 
-/// The Tiny 2 Lite renders the same indicator ID differently when its
-/// special-pattern gate is open. Treat both values as one hardware state so
-/// callers cannot accidentally select a colour without its rendering mode.
+/// A Tiny 2 Lite status-indicator state is an opaque firmware palette entry.
+/// The host only uses the documented palette state API for social signalling.
 public struct SOMALEDDeviceRendering: Equatable, Sendable {
     public let stateID: Int
-    public let specialPatternEnabled: Bool
 
-    public init(stateID: Int, specialPatternEnabled: Bool) {
+    public init(stateID: Int) {
         self.stateID = stateID
-        self.specialPatternEnabled = specialPatternEnabled
     }
 }
 
@@ -107,13 +104,6 @@ public enum SOMALEDFirmwarePreset: String, CaseIterable, Codable, Sendable {
         case .targetLock, .gesture: "Green"
         case .normalWork: "Green"
         case .tracking: "Blue"
-        }
-    }
-
-    public var hasFirmwareBlink: Bool {
-        switch self {
-        case .targetLock, .gesture: true
-        case .targetLost, .normalWork, .tracking: false
         }
     }
 
@@ -149,12 +139,10 @@ public enum SOMALEDPattern: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    /// The Tiny 2 Lite exposes only a steady indicator plus one physically
-    /// verified continuous blue blink through the special-pattern gate. Its state-clear API accepts
-    /// commands but does not produce a reliable visible off phase, so host
-    /// cadence names are retained only to migrate old settings safely.
+    /// The exposed status palette supports steady states. UVC special effects
+    /// are camera-control functions, not a reliable status-light cadence.
     public func isPhysicallySupported(for color: SOMALEDColor) -> Bool {
-        self == .steady || (self == .blink && color == .blue)
+        self == .steady
     }
 
     public var indicatorPattern: SubconsciousIndicatorPattern {
@@ -203,15 +191,8 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
         self.pattern = pattern
     }
 
-    public var usesFirmwareBlink: Bool {
-        color == .blue && pattern == .blink
-    }
-
     public var deviceRendering: SOMALEDDeviceRendering {
-        .init(
-            stateID: color.firmwareStateID,
-            specialPatternEnabled: usesFirmwareBlink
-        )
+        .init(stateID: color.firmwareStateID)
     }
 
     public var firmwareStateID: Int {
@@ -288,7 +269,17 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         _ signals: [SubconsciousIndicatorState: SOMALEDSignalSettings]
     ) -> [SubconsciousIndicatorState: SOMALEDSignalSettings] {
         Dictionary(uniqueKeysWithValues: SubconsciousIndicatorState.configurationStates.map { state in
-            (state, signal(for: state, from: signals).normalizedForDevice())
+            let selected = signal(for: state, from: signals)
+            // A prior runtime treated the UVC camera special effect as a blue
+            // status blink. On this firmware it extinguishes the indicator.
+            // Preserve contact-ready's semantic distinction with a visible
+            // palette colour instead of replaying that unsafe configuration.
+            let normalized = state == .contactReady
+                && selected.color == .blue
+                && selected.pattern == .blink
+                ? SOMALEDSignalSettings(color: .green, pattern: .steady)
+                : selected.normalizedForDevice()
+            return (state, normalized)
         })
     }
 
@@ -309,8 +300,7 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         switch state {
         case .exploring: .init(color: .yellow, pattern: .steady)
         case .humanDetected: .init(color: .blue, pattern: .steady)
-        // Blue blink uses the steady-blue state with the special-pattern gate.
-        case .contactReady: .init(color: .blue, pattern: .blink)
+        case .contactReady: .init(color: .green, pattern: .steady)
         case .conversation, .listening, .speaking: .init(color: .blue, pattern: .steady)
         case .working: .init(color: .green, pattern: .steady)
         }
@@ -408,12 +398,9 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoiceEnabled = try values.decodeIfPresent(Bool.self, forKey: .realtimeVoiceEnabled) ?? true
         realtimeVoice = try values.decodeIfPresent(SOMARealtimeVoice.self, forKey: .realtimeVoice) ?? .maple
         var decodedLED = try values.decodeIfPresent(SOMALEDSettings.self, forKey: .led) ?? .init()
-        // Schema 2 used a host-generated double pulse for Ready to talk. The
-        // connected device accepts those phase commands without visibly
-        // blinking, so migrate the shipped default to its native blue blink.
         if sourceVersion < 3,
            decodedLED.signal(for: .contactReady).color == .blue {
-            decodedLED.signals[.contactReady] = .init(color: .blue, pattern: .blink)
+            decodedLED.signals[.contactReady] = .init(color: .green, pattern: .steady)
         }
         led = decodedLED
         nativeHumanTrackingEnabled = try values.decodeIfPresent(Bool.self, forKey: .nativeHumanTrackingEnabled) ?? true

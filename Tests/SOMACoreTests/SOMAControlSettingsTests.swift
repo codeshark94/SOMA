@@ -62,10 +62,20 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertEqual(SOMALEDColor.yellow.displayName, "Yellow")
         XCTAssertEqual(SOMALEDColor.green.displayName, "Green")
         XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, 57)
-        XCTAssertEqual(decoded.led.signal(for: .contactReady).firmwareStateID, 57)
+        XCTAssertEqual(decoded.led.signal(for: .contactReady).firmwareStateID, 54)
         XCTAssertEqual(
             decoded.led.signal(for: .contactReady).deviceRendering,
-            .init(stateID: 57, specialPatternEnabled: true)
+            .init(stateID: 54)
+        )
+    }
+
+    func testLegacyContactBlinkBecomesAVisiblePaletteState() {
+        let legacy = SOMALEDSettings(
+            signals: [.contactReady: .init(color: .blue, pattern: .blink)]
+        )
+        XCTAssertEqual(
+            legacy.signal(for: .contactReady),
+            .init(color: .green, pattern: .steady)
         )
     }
 
@@ -92,7 +102,7 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertEqual(migrated.led.signal(for: .conversation).pattern, .steady)
     }
 
-    func testVersionTwoPresetSettingsMigrateToVisibleColorAndReadyBlink() throws {
+    func testVersionTwoPresetSettingsMigrateToVisibleSteadyPaletteState() throws {
         let legacy = """
         {
           "schemaVersion": 2,
@@ -113,8 +123,8 @@ final class SOMAControlSettingsTests: XCTestCase {
         )
 
         XCTAssertEqual(migrated.schemaVersion, 5)
-        XCTAssertEqual(migrated.led.signal(for: .contactReady).color, .blue)
-        XCTAssertEqual(migrated.led.signal(for: .contactReady).pattern, .blink)
+        XCTAssertEqual(migrated.led.signal(for: .contactReady).color, .green)
+        XCTAssertEqual(migrated.led.signal(for: .contactReady).pattern, .steady)
     }
 
     func testUnsupportedHostCadenceMigratesToVerifiedSteadyDeviceState() throws {

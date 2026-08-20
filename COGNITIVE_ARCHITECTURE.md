@@ -42,7 +42,7 @@ flowchart LR
     Sensors["Camera and microphone"] --> L0["L0 perception and motor control"]
     L0 --> Router["Event-importance router"]
     Router --> L1["L1 31B conscious stream"]
-    Router -->|"eye contact plus speech onset"| Speech["Codex app-server GPT-Live WebRTC"]
+    Router -->|"authorized direct contact"| Speech["Codex app-server GPT-Live WebRTC"]
     L1 --> Helper["Local E2B visual helper"]
     Helper --> L1
     Memory["Short, medium, and long-term memory"] <--> L1
@@ -88,15 +88,14 @@ Human presence and a recognized identity raise the allowed L1 sampling cadence
 because social context changes quickly. They create a social-deliberation
 opportunity, not a speech trigger. Every such L1 cycle may conclude
 `remain_silent`, `nonverbal_invitation`, or `spoken_opening`; only an explicit,
-grounded L1 decision can take the latter two paths. A human's first spoken
-turn requires fresh directed eye contact plus voice. The only exception is one
-response inside the bounded invitation window after SOMA initiates a greeting
-pulse. Once an L2 handoff opens a conversation, follow-up turns use the active
-conversation lease instead of repeatedly demanding gaze. An L2 interaction
-therefore needs one of two causes:
+grounded L1 decision can take the latter two paths. A locally validated social
+admission can open a voice conversation; the bounded response window after
+SOMA initiates a greeting pulse remains available. Once an L2 handoff opens a
+conversation, follow-up turns use the active conversation lease. An L2
+interaction therefore needs one of two causes:
 
-1. an explicit human contact signal satisfying that first-turn rule, or SOMA's
-   own still-active greeting invitation; or
+1. an authorized local social admission, or SOMA's own still-active greeting
+   invitation; or
 2. a grounded L1 social decision that passes relevance, confidence, temporal
    contact-history, interruption-cost, and social-appropriateness policy. A useful open question
    may supply its content, but curiosity is not mandatory: L1 may conclude that
@@ -316,9 +315,9 @@ Important features are:
 - urgency and local safety state; and
 - recent wake frequency, interruption cost, and temporal contact context.
 
-Explicit directed human contact opens L2 immediately while also creating an L1
-context packet in parallel. It does not wait for L1 admission or a 31B response.
-Non-human novelty normally wakes L1, not L2 interaction. Immediate
+An authorized high-salience contact can open L2 immediately while also creating
+an L1 context packet in parallel. It does not wait for L1 admission or a 31B
+response. Non-human novelty normally wakes L1, not L2 interaction. Immediate
 physical protection remains an L0 responsibility and cannot wait for either
 model. All transitions record the route distribution, evidence IDs, and the
 policy reason so false wakes and missed wakes can be labelled later.
@@ -343,8 +342,9 @@ gate because its latency and calibration are not part of L0.
 `SOMACore/EventImportance.swift` implements a model-independent event vector,
 a versioned bootstrap parameter set, numerically stable softmax distribution,
 and a separate transition policy. The policy keeps immediate physical
-protection in L0, masks human interaction unless directed contact or an accepted memory
-curiosity is present with a human, and does not let optional-wake rate control
+protection in L0, masks human interaction unless an authorized social admission
+or an accepted memory curiosity is present with a human, and does not let
+optional-wake rate control
 suppress strong explicit contact. The result records the model version, all
 three route probabilities, bounded evidence IDs, the recommended route, and the
 policy reason. Its dispatch contract independently states whether to open L2 interaction,
@@ -528,16 +528,19 @@ The supplied and installed `libdev` evidence exposes:
 - `sysMgSetIndicatorStateR(uint8_t state_id)`;
 - `sysMgClearIndicatorStateR(uint8_t state_id)`;
 - `sysMgSetLedBrightnessR(uint8_t)` and `sysMgGetLedBrightnessR(uint8_t&)`;
-- `sysMgSetLedEnabledR(bool)` and `sysMgGetLedEnabledR(bool&)`; and
-- `cameraSetLedCtrlU(bool)`, a separate Tiny 2-series special pattern used while
-  configuring zone or hand tracking.
+- `sysMgSetLedEnabledR(bool)` and `sysMgGetLedEnabledR(bool&)`.
+
+`cameraSetLedCtrlU(bool)` is a separate Tiny 2-series UVC camera-control
+function. It is not used by the status renderer: on the connected firmware it
+does not provide a stable visible status-light cadence.
 
 On the connected Tiny 2 Lite with firmware `6.2.8.1`, read-only calls returned
 success for LED enabled state and brightness, with brightness level `3`.
 The Tally Light API returned unsupported and is not the RGB status indicator.
 The resulting capability contract is `rgb_palette=true`,
-`arbitrary_rgb=false`, four brightness levels, firmware patterns enabled, and
-Tally unavailable.
+`arbitrary_rgb=false`, four brightness levels, firmware-defined state patterns,
+and Tally unavailable. An SDK acknowledgement confirms a requested palette
+state only; physical colour/pattern verification remains a camera-side check.
 
 The MCP contract uses human-facing interaction meanings rather than assuming
 colours or exposing raw implementation status:
@@ -556,12 +559,13 @@ The native boundary now exposes `setIndicatorState(state_id)`,
 the allowlisted non-error firmware IDs `16` target-lost, `17` target-lock,
 `18` gesture-recognizing, `54` normal-work, and `57` tracking-work. The L0
 priority is `speaking > working > listening > contact_ready > human_detected > exploring`.
-Firmware colour and SOMA cadence jointly encode what a nearby person can do:
-the exploration beacon means SOMA is not engaged, steady presence means it has
-noticed someone, the double invitation means "make eye contact and speak", calm
-long-on listening means "keep speaking", the slow work heartbeat means "please
-wait", and steady speaking means "listen to the response". The cadence
-scheduler is generation-bound, so a stale timer cannot revive a previous state.
+Firmware palette state communicates the current interaction state to a nearby
+person: ordinary human presence is the blue steady tracking state (`57`), while
+the green target-ready palette state (`54`) signals that SOMA is ready for an
+interaction. The other semantic states use their corresponding steady firmware
+palette entries; SOMA does not synthesize unsupported host-timed cadences. State
+replacement is generation-bound, so a stale request cannot revive a previous
+state.
 On every transition the bridge sets the new state and clears the previous
 SOMA-owned state. Its native session remembers the prior enabled/brightness
 values, clears all SOMA-owned IDs, and restores any changed global setting on
@@ -650,11 +654,11 @@ frame.
 
 ## L2 voice and Codex account integration
 
-Human interaction is an L2 capability, not a separate cognitive layer. The
-first explicit-contact event requires directed eye contact and voice, except for
-the bounded response to a greeting pulse initiated by SOMA. An authorized event
-opens an L2 turn directly from L0 and never
-waits for the 31B L1 stream. L1 prepares richer situation and memory context in
+Human interaction is an L2 capability, not a separate cognitive layer. A
+locally validated social admission opens an L2 turn directly from L0, while an
+L1-approved proactive opening needs a concrete purpose. The bounded response to
+a greeting pulse initiated by SOMA remains an exception. Neither route waits
+for the 31B L1 stream. L1 prepares richer situation and memory context in
 parallel. An accepted L1 social decision may also open a turn; recognized
 identity alone never does. L1 receives a recognized participant only at a
 local presence arrival or confirmed replacement, never from repeated frame
@@ -675,9 +679,8 @@ ContextPacket
 ```
 
 The primary route is `--l2-live-voice`, using the installed app-server's
-`maple` voice. L0 authorizes an opening only when a
-Core ML voice onset coincides with fresh directed eye contact, or when a human
-answers one recent SOMA social pulse. A dedicated helper starts the installed
+`maple` voice. L0 evaluates local social evidence, and a human may
+also answer one recent SOMA social pulse. A dedicated helper starts the installed
 Codex app-server with `realtime_conversation`, creates an ephemeral
 `realtime_voice` thread that is not materialized in the Codex desktop task
 list, and negotiates V3 WebRTC under the existing ChatGPT account. L0 batches its
@@ -700,14 +703,14 @@ account smoke and 1.73-second local synthesis smoke do not measure GPT-Live and
 are not conversational-latency acceptance evidence.
 
 Text and image context use distinct contracts. V3 `initialItems` injects the
-opening role-bearing text context. Changed, ephemeral E2B camera summaries are
-forwarded through `thread/realtime/appendText`, so the conversation receives
-current visual meaning without retaining or transmitting raw camera frames.
-The realtime append API does not accept images. `capture_view`
-therefore returns its bounded settled JPEG as an MCP image block and 60-second
-resource link to a Codex tool turn; the grounded result can be appended back to
-Live as text. Direct image injection into the realtime session remains
-unclaimed.
+opening role-bearing text context, including the private conversational purpose
+when L1 initiated the exchange. L2 answers the participant's actual speech; it
+does not receive a running stream of E2B descriptions or camera frames that
+could turn into unsolicited scene narration. When visual evidence is necessary,
+L2 decides to call `capture_view`; that MCP tool returns a bounded settled JPEG
+as an image block and 60-second resource link to a Codex tool turn. The grounded
+result can be appended back to Live as text. Direct realtime image injection
+remains unclaimed.
 Closing an interaction releases embodiment leases, persists its observed social
 outcome, and finalizes the interaction state. Its raw local turns are ready for
 the same `gemma4:31b-cloud` consolidation stream when that pass is enabled.
@@ -736,8 +739,8 @@ Official implementation references:
 | C5 Local embodiment MCP | Shadow transport implemented and deployed | MCP lifecycle plus thirteen schema-described tools; stdio to owner-only Unix socket; live L0 scene/atlas/state reply and scalar audit trace; no actuator writes |
 | C6 Leased embodiment actions | Implemented and physically validated | Target ownership, registration-before-tracking, priority preemption, independently scheduled expiry, owner release, explicit-scene permanence, probabilistic descriptor ambiguity, orient/grounded-track/policy-explore/active-view/social-expression execution, transient image return, labelled target reacquisition, and native stop/watchdog pass |
 | C7 Panoramic spatial memory | Learned fixed-base place memory and active mapping implemented; robustness evaluation pending | Capture-aligned spherical projection, bounded image registration, best-observation pixels, versioned Feature Print revisits, bounded cross-session persistence, information-gain reachable view planning, MCP map projection, static/dynamic separation and familiar-space evaluation |
-| C8 L0-to-L2 interaction bridge | Account-authenticated app-server GPT-Live WebRTC handshake implemented; physical conversation validation pending | Directed eye-contact plus VAD opening, bot-pulse exception, V3 WebRTC session, one-second PCM pre-roll, text context injection, duplicate-launch suppression, scalar audit, and an explicit local CLI/ASR/TTS fallback |
-| C9 LED signalling | Firmware ABI, native L0 state wiring, and semantic cadence engine implemented; MCP tool and visual hue characterization pending | `rgb_palette=true`, `arbitrary_rgb=false`, allowlisted state set/clear, six distinct steady/blink signatures, brightness/enabled access, shutdown restore, semantic priority trace, and physical SDK acknowledgements |
+| C8 L0-to-L2 interaction bridge | Account-authenticated app-server GPT-Live WebRTC handshake implemented; physical conversation validation pending | Locally validated direct-contact opening, bot-pulse exception, V3 WebRTC session, one-second PCM pre-roll, purpose/context injection, duplicate-launch suppression, scalar audit, and an explicit local CLI/ASR/TTS fallback |
+| C9 LED signalling | Firmware ABI and native L0 state wiring implemented; MCP tool and visual hue characterization pending | `rgb_palette=true`, `arbitrary_rgb=false`, allowlisted state set/clear, green contact-ready and blue human-presence palette states, brightness/enabled access, shutdown restore, semantic priority trace, and physical SDK acknowledgements |
 | C10 End-to-end social evaluation | Planned | Labelled explicit-contact, curiosity, dialogue, task, opt-out, memory-correction, and embodiment scenarios |
 
 The physical intent adapter and its end-to-end target/view gates are complete.

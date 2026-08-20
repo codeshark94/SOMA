@@ -43,6 +43,16 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         let observedNS: UInt64
     }
 
+    /// A panel box is a present-tense display object, not a SceneField track.
+    /// Multiple detector hypotheses may describe one physical subject in the
+    /// same frame; this carries the resolved display semantics until one
+    /// representative box is selected.
+    private struct DisplayCandidate: Sendable {
+        let candidate: SceneCandidate
+        let label: String
+        let identity: String?
+    }
+
     struct Thought: Encodable, Sendable {
         let monotonicNS: UInt64
         let state: String
@@ -109,34 +119,46 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
 
     func recordSceneCandidates(_ candidates: [SceneCandidate], at captureNS: UInt64) {
         guard isActive else { return }
-        // Show objects that are currently present. The scene field retains
-        // persistent tracks, so "observed this frame" is far too strict (it is
-        // true only on detector frames and leaves the overlay empty). Keep
-        // anything seen within the last 1.5s and de-overlap stacked boxes.
-        let current = candidates
-            .filter { $0.lastSeenMilliseconds <= 1_500 }
-            .sorted { $0.observation.confidence > $1.observation.confidence }
-            .reduce(into: [SceneCandidate]()) { accepted, candidate in
-                guard !accepted.contains(where: {
-                    Self.iou($0.observation.rect, candidate.observation.rect) > 0.3
-                }) else { return }
-                accepted.append(candidate)
+        // SceneField intentionally retains old tracks for spatial memory and
+        // re-acquisition. The panel is a view of this camera frame, so drawing
+        // retained tracks here made a box lag behind the image after a turn.
+        // Only a current observation may produce a panel box.
+        let present = candidates
+            .filter {
+                $0.observedThisFrame
+                    && ($0.observation.kind != .unknown || $0.observation.label != nil)
             }
         lock.lock()
         let identity = latestIdentity
-        latestCandidates = current.map { candidate in
+        let display = present.map { candidate -> DisplayCandidate in
             let rect = candidate.observation.rect
-            let identityLabel = matchedIdentityLabel(for: rect, identity: identity)
+            let identityLabel = matchedIdentityLabel(
+                for: rect,
+                identity: identity,
+                at: captureNS
+            )
             let baseLabel = candidate.observation.label ?? candidate.observation.kind.rawValue
-            // A box that carries a recognized identity is a person's body; YOLO
-            // may still label it "unknown", which mislabels an identified human.
+            // A body box enclosing an identified face is still the same human.
             let label = (identityLabel != nil && baseLabel != "face") ? "person" : baseLabel
+            return DisplayCandidate(candidate: candidate, label: label, identity: identityLabel)
+        }
+        let current = display
+            .sorted(by: Self.preferredDisplayOrder)
+            .reduce(into: [DisplayCandidate]()) { accepted, candidate in
+                guard !accepted.contains(where: { Self.representsSameEntity($0, candidate) }) else {
+                    return
+                }
+                accepted.append(candidate)
+            }
+        latestCandidates = current.map { display in
+            let candidate = display.candidate
+            let rect = candidate.observation.rect
             return Candidate(
-                label: label,
+                label: display.label,
                 confidence: candidate.observation.confidence,
                 rect: Rect(x: rect.x, y: rect.y, width: rect.width, height: rect.height),
                 faceVerified: candidate.faceVerificationEligible,
-                identity: identityLabel
+                identity: display.identity
             )
         }
         latestCaptureNS = captureNS
@@ -168,9 +190,16 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
 
     private func matchedIdentityLabel(
         for rect: SOMACore.NormalizedRect,
-        identity: IdentityInfo?
+        identity: IdentityInfo?,
+        at captureNS: UInt64
     ) -> String? {
         guard let identity else { return nil }
+        // Identity inference is asynchronous. Its label may decorate a newer
+        // current box, but an old result must not survive a camera turn.
+        guard captureNS >= identity.observedNS,
+              captureNS - identity.observedNS <= 1_500_000_000 else {
+            return nil
+        }
         // "unknown" is the not-yet-recognized sentinel, not a real identity.
         // It must never be propagated as a person's identity.
         guard identity.label != "unknown" else { return nil }
@@ -191,6 +220,48 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
             && idCenterY <= rect.y + rect.height
         guard containsFaceCenter || Self.iou(rect, idRect) > 0.3 else { return nil }
         return identity.label
+    }
+
+    private static func preferredDisplayOrder(_ lhs: DisplayCandidate, _ rhs: DisplayCandidate) -> Bool {
+        let lhsRank = displayRank(lhs)
+        let rhsRank = displayRank(rhs)
+        if lhsRank != rhsRank { return lhsRank > rhsRank }
+        return lhs.candidate.observation.confidence > rhs.candidate.observation.confidence
+    }
+
+    private static func displayRank(_ candidate: DisplayCandidate) -> Int {
+        if candidate.candidate.faceVerificationEligible { return 4 }
+        if candidate.label == "face" { return 3 }
+        if candidate.candidate.observation.kind == .human { return 2 }
+        return 1
+    }
+
+    private static func representsSameEntity(_ lhs: DisplayCandidate, _ rhs: DisplayCandidate) -> Bool {
+        if let lhsIdentity = lhs.identity,
+           let rhsIdentity = rhs.identity,
+           lhsIdentity == rhsIdentity {
+            return true
+        }
+        let lhsObservation = lhs.candidate.observation
+        let rhsObservation = rhs.candidate.observation
+        let bothHuman = lhsObservation.kind == .human && rhsObservation.kind == .human
+        if bothHuman,
+           (lhs.label == "face" || rhs.label == "face"),
+           (contains(lhsObservation.rect, centerOf: rhsObservation.rect)
+                || contains(rhsObservation.rect, centerOf: lhsObservation.rect)) {
+            return true
+        }
+        // Detections from two models for the same labelled object are nearly
+        // coincident. A stricter overlap than track association preserves two
+        // genuinely adjacent instances of the same class.
+        return lhs.label == rhs.label && iou(lhsObservation.rect, rhsObservation.rect) >= 0.55
+    }
+
+    private static func contains(_ outer: NormalizedRect, centerOf inner: NormalizedRect) -> Bool {
+        let x = inner.x + inner.width / 2
+        let y = inner.y + inner.height / 2
+        return x >= outer.x && x <= outer.x + outer.width
+            && y >= outer.y && y <= outer.y + outer.height
     }
 
     private static func iou(_ lhs: NormalizedRect, _ rhs: NormalizedRect) -> Double {

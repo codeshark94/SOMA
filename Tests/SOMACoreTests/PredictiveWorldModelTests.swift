@@ -1245,9 +1245,18 @@ final class PredictiveWorldModelTests: XCTestCase {
             evidence: .visualObservation,
             socialFixationPermitted: false
         )
-        XCTAssertEqual(unverifiedFace.state, .exploration)
-        XCTAssertFalse(unverifiedFace.preservesActiveExploration)
+        XCTAssertEqual(unverifiedFace.state, .socialRetention)
+        XCTAssertTrue(unverifiedFace.preservesActiveExploration)
         XCTAssertFalse(unverifiedFace.permitsExternalSocialReframing)
+
+        var rawFaceController = SubconsciousAttentionController()
+        let initialRawFace = rawFaceController.advance(
+            belief: faceBelief,
+            evidence: .visualObservation,
+            socialFixationPermitted: false
+        )
+        XCTAssertEqual(initialRawFace.state, .exploration)
+        XCTAssertFalse(initialRawFace.suppressesExploration)
 
         let provisionalFace = controller.advance(
             belief: faceBelief,

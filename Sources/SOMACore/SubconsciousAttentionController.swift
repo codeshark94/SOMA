@@ -154,8 +154,24 @@ public struct SubconsciousAttentionController: Sendable {
 
             if target.kind == .human {
                 clearSceneObservation()
+                // A face-shaped candidate without the independent landmark
+                // lease is meaningful social evidence, but it is not motor
+                // evidence. Preserve an *established* social context across
+                // a short verifier dropout, but do not let a first raw face
+                // candidate stop autonomous coverage. Either way it cannot
+                // become an external body reframe.
+                if target.label == "face" {
+                    let retainsEstablishedSocialContext = state == .socialFixation || state == .socialRetention
+                    state = retainsEstablishedSocialContext ? .socialRetention : .exploration
+                    return decision(
+                        state: state,
+                        target: target,
+                        permitsNativeSocialTracking: false,
+                        permitsExternalSocialReframing: false,
+                        suppressesExploration: retainsEstablishedSocialContext
+                    )
+                }
                 let canReframe = target.isActionEligible
-                    && target.label != "face"
                     && target.confidence >= 0.60
                     && target.posteriorProbability >= 0.18
                 state = canReframe ? .socialReframing : .exploration

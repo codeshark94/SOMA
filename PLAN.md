@@ -454,34 +454,30 @@ the installed helper accepted OBSBOT-format PCM, produced an input transcript,
 created a response turn, and played a detected remote audio track. The deployed
 default is the app-server's `maple` voice. Physical field validation with a
 human still has to measure microphone, echo, and barge-in behaviour. Build C4
-without coupling its latency to this route. L0 now permits the first spoken turn
-only when fresh directed
-eye-contact evidence and voice coincide, except for one response after a
-SOMA-initiated greeting pulse. A successful L2 handoff opens a bounded follow-up
-conversation lease. The authorized C3 wake becomes a bounded
-utterance and consumes one second of memory-only PCM pre-roll. The primary path
-starts an account-authenticated Codex app-server V3 WebRTC session, supplies the
-opening context through `initialItems`, verifies the local embodiment MCP at
-session start, batches PCM into a continuous Web Audio worklet, and injects a
-camera JPEG no older than two seconds with each user speech onset through
-`thread/injectItems`. That JPEG is never persisted. L2 first uses the injected
-current view; `capture_view` remains the separate bounded motor request for an
-intentional reframe or target-specific view. Changed ephemeral E2B camera
-summaries remain available through
-`appendText`.
-The local CLI/Apple-ASR/AVSpeechSynthesizer bridge remains a
-diagnostic fallback only. A labelled directed/non-directed speech set must
-still measure false wakes, missed wakes, speech-start-to-transcript latency,
-multilingual accuracy, account-to-audio latency, echo, and barge-in without
-weakening the eye-contact opening gate or immediate L0 acknowledgement.
+without coupling its latency to this route. L0 validates a new direct-contact
+turn locally, while an L1-approved proactive opening has its own bounded social
+path. One response after a SOMA-initiated greeting pulse remains an exception.
+A successful L2 handoff opens a bounded follow-up conversation lease.
+The authorized C3 wake becomes a bounded utterance and consumes one second of
+memory-only PCM pre-roll. The primary path starts an account-authenticated Codex
+app-server V3 WebRTC session, supplies opening purpose and scoped context through
+`initialItems`, verifies the local embodiment MCP at session start, and batches
+PCM into a continuous Web Audio worklet. L2 receives no running camera-image or
+E2B-description feed; it uses `capture_view` when its own reasoning determines
+that an intentional reframe or target-specific view is necessary.
+The local CLI/Apple-ASR/AVSpeechSynthesizer bridge remains a diagnostic fallback
+only. A labelled interaction-evidence set must still measure false wakes,
+missed wakes, speech-start-to-transcript latency, multilingual accuracy,
+account-to-audio latency, echo, and barge-in without weakening immediate L0
+acknowledgement.
 Meanwhile the primary 31B situational stream consumes a bounded
 `SituationFrame`, C2 memory projection, and C6 embodiment MCP and prepares the
 richer interaction context in parallel. It requests transient views only for
 visual disambiguation, proposes rather than directly commits memory, and uses a
 leased embodiment action rather than SDK access. Extend the labelled L0 corpus
-with directed and non-directed speech, gaze/contact bids, people, ordinary
-objects, empty wall, reflections, and occlusion so false interaction wakes and
-missed contacts remain measurable.
+with interaction-relevant audio/visual cues, people, ordinary objects, empty
+wall, reflections, and occlusion so false interaction wakes and missed contacts
+remain measurable.
 
 An unrecognized speaker receives a short-lived interaction capability for the
 same leased embodiment tools as a recognized participant, without a

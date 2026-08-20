@@ -1,184 +1,311 @@
 <p align="center">
-  <img src="assets/branding/soma-mark.png" width="248" alt="SOMA character mark">
+  <img src="assets/branding/soma-mark.png" width="236" alt="SOMA mark">
 </p>
 
 <h1 align="center">SOMA</h1>
 
-<p align="center"><strong>An embodied local intelligence with a non-negotiable physical boundary.</strong></p>
-
 <p align="center">
-  <img alt="macOS 13 or later" src="https://img.shields.io/badge/platform-macOS%2013%2B-111827?style=flat-square&amp;logo=apple&amp;logoColor=white">
-  <img alt="Local-first" src="https://img.shields.io/badge/runtime-local--first-0f766e?style=flat-square">
-  <img alt="Safety-gated" src="https://img.shields.io/badge/actuation-safety--gated-7c2d12?style=flat-square">
+  <strong>An embodied-AI research interface for attention, memory, and human-like interaction.</strong>
 </p>
 
 <p align="center">
-  <a href="COGNITIVE_ARCHITECTURE.md">Architecture</a> ·
-  <a href="TECHNICAL_REFERENCE.md">Technical reference</a> ·
-  <a href="PLAN.md">Roadmap</a> ·
-  <a href="MODELS.md">Models</a>
+  <a href="https://www.obsbot.com/obsbot-tiny-2-lite-4k-webcam">OBSBOT Tiny 2 Lite</a> ·
+  macOS 13+ · Swift · Core ML · Model Context Protocol · Codex Live Voice
 </p>
 
-SOMA is a macOS system for an OBSBOT Tiny 2 Lite that combines local
-perception, bounded live conversation, and deliberate physical presence. It
-can notice, understand, and respond—but a language model never acquires a
-direct path to camera control.
+<p align="center">
+  <img alt="Platform macOS 13+" src="https://img.shields.io/badge/platform-macOS%2013%2B-111827?style=flat-square&amp;logo=apple&amp;logoColor=white">
+  <img alt="Runtime local first" src="https://img.shields.io/badge/runtime-local--first-0f766e?style=flat-square">
+  <img alt="Embodiment semantic leases" src="https://img.shields.io/badge/embodiment-semantic--leases-7c2d12?style=flat-square">
+</p>
 
-## Presence, without surrendering control
+<p align="center">
+  <a href="#why-soma">Why SOMA</a> ·
+  <a href="#the-cognitive-architecture">Architecture</a> ·
+  <a href="#the-embodiment-interface">Embodiment MCP</a> ·
+  <a href="#run-a-safe-probe-first">Getting started</a> ·
+  <a href="COGNITIVE_ARCHITECTURE.md">Technical architecture</a>
+</p>
 
-> [!IMPORTANT]
-> **L0 observes and moves. L1 interprets. L2 converses.** Every physical action
-> still passes back through L0’s local safety, stabilization, watchdog, and
-> joint-limit checks.
+> [!NOTE]
+> SOMA is not a “camera assistant” and not an autonomous task agent. It is a
+> research system for building an interface through which artificial
+> intelligence can perceive, attend to, remember, and interact with people in
+> a way that feels situated rather than merely reactive.
 
-**L0 · Subconscious** keeps the camera, microphone, VAD, target continuity,
-spatial coverage, and final motor veto close to the device.
+## Why SOMA
 
-**L1 · Situation stream** turns bounded evidence and permitted memory into
-context, curiosity, and goal-level attention—never SDK velocity.
+Most assistants begin after a user has typed or spoken a command. Human
+interaction begins much earlier: someone enters a room, glances over, pauses,
+speaks, changes posture, or returns after an earlier conversation. Those events
+occur on different time scales and they call for different kinds of cognition.
 
-L1 is time-aware: a public-world brief may be collected through an ephemeral
-Codex App Server session **once per local calendar day**, then kept as encrypted
-daily memory. It never receives person identity, camera media, or conversation
-content during that collection; relevance to a person is judged locally from
-their permitted memory and interests.
+SOMA investigates how to connect them without pretending that a single model
+should do everything:
 
-**L2 · Interaction** owns account-backed live conversation and user-requested
-work, while using the same leased embodiment boundary as L1.
+- **Perception must react in milliseconds.** A moving face, an interrupted
+  voice, or a lost target cannot wait for a long reasoning cycle.
+- **Interpretation needs continuity.** A familiar person, a room, a prior
+  conversation, and an unfinished question only make sense across time.
+- **Interaction needs embodiment.** Where the camera looks, how it pauses, a
+  small acknowledgement motion, and an indicator light are part of the social
+  signal—not decorative output.
+- **Deliberation must remain accountable.** Higher-level models may decide what
+  deserves attention, but a local physical boundary still owns the final motor
+  command, joint envelope, watchdog, and stale-evidence veto.
 
-While Live Voice is active, L0 keeps only one recent downscaled camera JPEG in
-memory. A frame no older than two seconds is injected into the L2 turn when the
-person begins speaking, so a request to look at the current view has fresh
-sensor evidence rather than a textual scene guess. The frame is never written
-to a trace, report, person memory, or disk. `capture_view` remains the separate
-MCP path for a deliberate reframe or target-specific view.
+The resulting system is an **embodied interaction interface**: a platform for
+studying how an AI can share attention with a person, develop contextual memory,
+and choose when to speak, stay quiet, look again, or express readiness.
 
-Read the complete authority model in
-[COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md).
+## The body: OBSBOT Tiny 2 Lite
 
-## The control surface
+SOMA is developed around the [OBSBOT Tiny 2 Lite](https://www.obsbot.com/obsbot-tiny-2-lite-4k-webcam),
+a 2-axis PTZ webcam with an integrated camera, microphone, and vendor tracking
+capabilities. SOMA uses it as a sensorimotor body rather than treating it as a
+passive webcam:
 
-Launch the native status-menu application during development:
+| Hardware affordance | Role in SOMA |
+| --- | --- |
+| UVC video | Low-latency visual evidence, face/person/object observations, scene change, and spherical mapping |
+| USB audio | On-device voice-activity evidence and live conversation audio |
+| 2-axis gimbal | Fixation, re-acquisition, active exploration, and compact nonverbal expressions |
+| Firmware LED palette | A nearby person can see whether SOMA has noticed them, is ready to listen, is thinking, or is in conversation |
 
-```sh
-swift run soma-menu-bar
+The camera's vendor SDK is used only by a separately enabled local bridge. It
+does not become a direct model tool or a free-form velocity interface.
+
+## The cognitive architecture
+
+SOMA organizes cognition by **latency, context horizon, and authority**. The
+layers are connected, but they are not interchangeable.
+
+| Layer | Time scale | What it does | What it may control |
+| --- | --- | --- | --- |
+| **L0 · subconscious** | Video/audio cadence | Captures sensor evidence, follows a verified face, keeps target continuity, estimates voice activity, maintains spatial coverage, and executes the final motor policy | The only path to SDK motion, stabilization, limits, watchdogs, and immediate stops |
+| **L0.5 · local semantic helper** | Sparse asynchronous inference | Supplies optional low-latency semantic cues to L1 without blocking L0 | No independent motor, speech, identity, or memory authority |
+| **L1 · situation stream** | Event-driven, broad context | Interprets a situation using memory, rapport, spatial context, unresolved questions, and permitted world context; forms curiosity and social hypotheses | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through leased MCP goals |
+| **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and user-requested work | The same semantic embodiment interface as L1; never raw SDK velocity |
+
+L0.5 is intentionally a supporting process inside the L1 path, not a fourth
+mind. Its job is to make slow contextual reasoning more perceptive without
+weakening the real-time loop.
+
+```mermaid
+flowchart LR
+    Body["OBSBOT Tiny 2 Lite\nvideo · audio · gimbal · LED"] --> L0["L0 subconscious\nreal-time perception and motor safety"]
+    L0 --> Router["event importance\nand current state"]
+    Router -->|"situational evidence"| L1["L1 situation stream\nmemory · curiosity · context"]
+    Router -->|"authorized direct contact"| L2["L2 Live Voice\nconversation and reasoning"]
+    L1 <--> Memory["local memory\nshort · medium · long"]
+    L1 <--> Atlas["spherical place memory\nand scene field"]
+    L1 --> MCP["SOMA embodiment MCP\nsemantic leased goals"]
+    L2 --> MCP
+    MCP --> L0
+    L0 --> Body
 ```
 
-The menu bar is the local interface between a person and the running device.
+This loop lets a high-level model influence *why* SOMA looks somewhere, which
+object matters, how long attention should persist, or whether a gesture would
+be appropriate—while L0 remains responsible for *how* the hardware gets there
+safely and continuously.
 
-**Voice** — enable account-backed realtime conversation and select a voice,
-including `Maple`.
+## From sensing to social interaction
 
-**Indicator** — choose an Expressive, Contextual, Quiet, or Off response;
-adjust brightness from 0–3; then assign a verified colour and supported
-behaviour to each meaningful interaction state. The Tiny 2 Lite exposes yellow,
-blue, and green. Continuous blinking is a verified blue firmware capability,
-not a simulated RGB effect.
+### 1. Notice
 
-**Attention** — restrict verified-human tracking or no-target exploration that
-the active service has already been authorized to perform. These controls never
-create a new physical permission.
+L0 treats visual and auditory evidence as separate but converging signals.
+Core ML face/person/object observations, landmark confirmation, target
+continuity, on-device VAD, and gimbal pose are combined into a current belief
+about what is present and what deserves immediate attention.
 
-**Administrator identity** — explicitly enroll the face currently in view, set
-a display name or preferred address, inspect local verification, or delete the
-enrollment. Facial templates remain encrypted on this Mac and never enter the
-activity trace or L2 context. An administrator L2 session can compare the
-current non-biometric presence roster with registered identities and update
-their explicit language, rapport, and factual context. An unregistered speaker
-can still use interaction-scoped embodiment tools, but cannot create a
-persistent person record until explicit enrollment.
+### 2. Maintain shared attention
 
-**Runtime** — see the current Vision, Voice, Identity, Embodiment, and
-indicator state without exposing raw camera or microphone media.
+The gimbal is not only a tracker. It can hold a face, recover a briefly lost
+person, inspect uncertain space, and explore unobserved but reachable regions.
+A spherical scene field and rolling panoramic map allow past observations to
+remain spatially meaningful as the camera moves.
 
-## Start safely
+### 3. Interpret the situation
 
-Build and run the test suite:
+L1 receives bounded, policy-filtered context rather than a permanent raw video
+stream. It can combine a current scene, a person's relationship history,
+explicit preferences, open information needs, place memory, and previous
+thought state. It may decide to remain silent, make a nonverbal invitation, or
+open a conversation with a concrete purpose.
+
+### 4. Converse without losing the body
+
+An authorized direct human contact can open an L2 Live Voice session, while L1
+can also initiate a conversation when it has a concrete purpose. L2 receives
+the private conversational objective and relevant memory context, then responds
+to the person's actual words.
+
+Camera imagery is not streamed into conversation as a running caption feed.
+When visual evidence is genuinely useful, L2 can decide to call
+`capture_view` through MCP and inspect that bounded, current resource itself.
+This keeps a conversation from turning into unsolicited image description.
+
+## Memory as continuity, not a transcript dump
+
+SOMA keeps several different forms of memory because an interaction has more
+than one useful duration:
+
+| Horizon | Examples | Role |
+| --- | --- | --- |
+| **Short-term** | Active tracks, current conversation turns, transient hypotheses | Supports the present interaction and bounded recovery |
+| **Medium-term** | Recent episodes, open questions, current tasks, daily public-world brief | Gives L1 an evolving situation rather than a fresh start every cycle |
+| **Long-term** | Explicitly confirmed preferences, rapport, familiar-place references, consolidated facts | Supports continuity across encounters without treating every observation as permanent truth |
+
+Raw conversation turns remain in the encrypted local short-term journal before
+L1 consolidates an allowed, typed memory. Identity and person-context changes
+require explicit confirmation. A model may propose a memory update; it does
+not get to invent one from tone or camera appearance.
+
+## The embodiment interface
+
+L1 and L2 use one local [Model Context Protocol](https://modelcontextprotocol.io/)
+surface, `soma-embodiment`. The interface lets cognition customize nearly the
+whole attention policy while keeping the physical executor local.
+
+| Read and understand | Guide embodied behavior |
+| --- | --- |
+| Current attention and uncertainty | Register or revise a semantic target label |
+| Stable scene entities, bearings, freshness, and action eligibility | Set probabilistic attention priors and tracking commitment |
+| Spherical map, coverage, place familiarity, and available bearings | Track a grounded target or orient to a bearing |
+| A fresh `capture_view` image or selected panorama data | Shape exploration regions, direction distributions, dwell, and tempo |
+| Hardware capability report | Request a small social expression or semantic LED state |
+
+Every mutating request includes an owner, evidence references, a priority, and
+a bounded lease. L0 rejects stale or ambiguous targets, expires finished goals,
+and resolves competing requests before anything reaches the vendor SDK.
+
+## Presence is a communication channel
+
+SOMA treats motion and light as part of interaction design:
+
+- **Fixation** says “I am attending here.”
+- **A short acknowledgement or thinking glance** can communicate intent without
+  taking over a conversation.
+- **Exploration** is driven by coverage, novelty, place uncertainty, and
+  remembered bearings—not a fixed left-right sweep.
+- **LED state** is semantic: it can make human presence, interaction readiness,
+  active conversation, and cognitive work legible from across the room.
+
+The Tiny 2 Lite exposes a firmware-defined RGB palette and pattern states—not
+arbitrary 24-bit color. SOMA requests semantic states and restores its own LED
+state on shutdown without overriding unrelated camera firmware states.
+
+## Privacy and physical boundaries
+
+SOMA is designed around the fact that a socially responsive camera is sensitive
+by default.
+
+- Scalar runtime traces do not contain raw camera frames, PCM, biometric
+  templates, or direct SDK payloads.
+- Face templates and raw conversation turns are encrypted local records; they
+  are not placed in L1 prompts or normal diagnostic traces.
+- Visual capture for a reasoning turn is bounded and short-lived rather than a
+  rolling remote camera feed.
+- Identity enrollment, persistent personal facts, and preference changes are
+  explicit actions with confirmation.
+- L1 and L2 can express high-level embodied intent, but only L0 owns final
+  motion safety and the physical stop path.
+
+See [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) for the detailed
+authority, memory, and privacy contracts.
+
+## Run a safe probe first
+
+SOMA is a research prototype with real hardware. Start with a non-actuating
+probe before enabling any camera motion.
 
 ```sh
 swift build
 swift test
-```
 
-Inspect connected capture devices without moving the camera:
-
-```sh
+# Inspect connected capture devices and formats; this does not move the camera.
 swift run soma-probe --list-formats
-```
 
-Then run a bounded, read-only health probe with the reported IDs:
-
-```sh
+# Replace these values with the OBSBOT IDs reported above.
 swift run soma-probe --duration 60 \
   --video-id '<OBSBOT video unique ID>' \
   --audio-id '<OBSBOT microphone unique ID>'
 ```
 
-The probe writes scalar JSONL health telemetry only. It neither records media
-nor moves the camera.
+The probe writes health-only scalar JSONL. It does not record media or issue a
+gimbal command.
+
+For the native macOS control surface:
+
+```sh
+swift run soma-menu-bar
+```
+
+The menu bar application is where a local operator configures voice, indicator
+semantics, attention policy, and explicit identity enrollment. Review the
+scripts and hardware flags before enabling physical camera control.
 
 <details>
 <summary><strong>Local companion installation</strong></summary>
 
 <br>
 
-The launcher packages configured helpers, code-signs the app, and registers the
-current user’s menu-bar LaunchAgent:
-
 ```sh
 swift build --build-path .build/soma-live
+mkdir -p "$HOME/Library/Application Support/SOMA"
+cp config/soma.env.example "$HOME/Library/Application Support/SOMA/.env"
+# Edit .env with the OBSBOT IDs from the safe probe above.
 scripts/install-soma-subconscious-app.zsh
+scripts/soma.zsh start
 ```
 
-Review the script and explicit motion flags before enabling a camera-control
-path.
+The installed runtime is intended for a local macOS user with the connected
+camera, configured permissions, and—when Live Voice is enabled—a signed-in
+Codex installation. Motion stays disabled until the local configuration
+explicitly enables it with a calibration for the connected device.
 </details>
 
-<details>
-<summary><strong>Requirements</strong></summary>
+## Repository map
 
-<br>
+| Path | Responsibility |
+| --- | --- |
+| [`Sources/SOMACore`](Sources/SOMACore) | Cognition contracts, memory, identity, semantic embodiment leases, attention, and spatial models |
+| [`Sources/SOMASubconscious`](Sources/SOMASubconscious) | L0 capture/perception runtime, panorama worker, L1 situation stream, and local safety integration |
+| [`Sources/SOMANativeTracking`](Sources/SOMANativeTracking) | Explicitly gated OBSBOT SDK bridge |
+| [`Sources/SOMAEmbodimentMCP`](Sources/SOMAEmbodimentMCP) | MCP server for embodiment and person-context operations |
+| [`Sources/SOMALiveVoice`](Sources/SOMALiveVoice) | Account-backed Codex app-server Live Voice helper |
+| [`Sources/SOMAMenuBar`](Sources/SOMAMenuBar) | Native local settings, status, and diagnostics interface |
+| [`Tests/SOMACoreTests`](Tests/SOMACoreTests) | Contract and regression tests for cognition, memory, embodiment, and spatial behavior |
 
-- macOS 13 or later and a Swift 6 toolchain
-- OBSBOT Tiny 2 Lite for camera and indicator features
-- The vendor SDK only for explicitly enabled native camera control
-- A signed-in local Codex installation only for account-backed live voice
-</details>
+## Research status
 
-## Inside the project
+SOMA is actively developed hardware-facing research software, not a finished
+consumer assistant. The project already contains the real-time L0 loop,
+semantic embodiment contracts, identity and memory infrastructure, rolling
+spatial mapping, LED presence semantics, and an account-backed Live Voice
+route. The important remaining work is empirical: evaluate perception and
+interaction in real rooms, measure long-horizon memory quality, characterize
+physical LED behavior, and test whether the resulting behavior is actually
+experienced as attentive and appropriate by people.
 
-**Core contracts**
-[`Sources/SOMACore`](Sources/SOMACore) holds cognition, memory, identity,
-settings, and embodiment leases.
+Detailed implementation status and open acceptance work live in
+[PLAN.md](PLAN.md), [MODELS.md](MODELS.md), and
+[COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md).
 
-**Device runtime**
-[`Sources/SOMASubconscious`](Sources/SOMASubconscious) hosts L0 perception and
-the local safety boundary; [`Sources/SOMANativeTracking`](Sources/SOMANativeTracking)
-is the explicitly gated OBSBOT SDK bridge.
+## Project notes
 
-**Human-facing applications**
-[`Sources/SOMAMenuBar`](Sources/SOMAMenuBar) provides the native control
-surface, and [`Sources/SOMALiveVoice`](Sources/SOMALiveVoice) provides the
-account-backed live-voice helper.
+- SOMA is an independent research project and is not affiliated with OBSBOT.
+- OBSBOT and Tiny 2 Lite are trademarks of their respective owners.
+- Third-party model terms are documented in [MODELS.md](MODELS.md) and
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The bundled YOLO11n package
+  is AGPL-3.0; its terms apply to that asset.
+- SOMA's own source does not currently include a project license. Do not assume
+  reuse, redistribution, or contribution terms for it until a license is
+  selected.
 
-**Verification**
-[`Tests/SOMACoreTests`](Tests/SOMACoreTests) contains core contract and
-regression coverage.
+## Artwork
 
-## The technical record
-
-- [Technical reference](TECHNICAL_REFERENCE.md) — runtime behaviour, command
-  boundaries, hardware observations, traces, and calibration evidence.
-- [Cognitive architecture](COGNITIVE_ARCHITECTURE.md) — layer contracts,
-  authority boundaries, and privacy model.
-- [Roadmap](PLAN.md) — execution sequence and open work.
-- [Model registry](MODELS.md) — model roles and deployment boundaries.
-- [VAD evaluation](docs/VAD_EVALUATION.md) — evaluation protocol and corpus
-  constraints.
-
-## Source artwork
-
-[`assets/branding/soma-original.png`](assets/branding/soma-original.png) is the
-unaltered source illustration. The compact
-[`soma-mark.png`](assets/branding/soma-mark.png) is a display-only crop for the
-README and application derivatives.
+[`assets/branding/soma-original.png`](assets/branding/soma-original.png) is
+the canonical source illustration. [`soma-mark.png`](assets/branding/soma-mark.png)
+is the compact display crop used here.

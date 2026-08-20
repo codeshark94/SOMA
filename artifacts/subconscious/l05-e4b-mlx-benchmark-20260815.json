@@ -10,7 +10,7 @@
   },
   "model": {
     "repository": "mlx-community/gemma-4-e4b-it-nvfp4",
-    "local_path": "/Users/seungyeop/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4",
+    "local_path": "$HOME/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4",
     "model_safetensors_bytes": 5146755012,
     "model_safetensors_sha256": "42361d0a7d1af5c9cf6f42c2a46be0f39fa4e060cedf0dfc43b0b4d97e413c9e",
     "revision": "769ca8889f89f8ec8c1ca59bf427332895eb1cb2"

@@ -16,14 +16,21 @@ claiming ANE execution. Optional cross-session storage contains only bounded
 embeddings and scalar spherical-cell statistics in an owner-only local file;
 no camera pixels or scene entities are included.
 
-## YOLOv3TinyFP16
+## Ultralytics YOLO11n
 
-- File: `Sources/SOMASubconscious/Resources/YOLOv3TinyFP16.mlmodel`
-- SHA-256: `73406178d0f5793d0d5d1e38274acd146a744c2245c9b63a11998a5015925dda`
-- Source: [Apple Core ML model gallery](https://developer.apple.com/machine-learning/models/)
-- Model: YOLOv3 Tiny, FP16, COCO object detection; SOMA accepts only the
-  `person` label as attention evidence.
-- License: MIT, as stated on the [Apple model card](https://huggingface.co/apple/coreml-YOLOv3).
+- Package: `Sources/SOMASubconscious/Resources/YOLO11n.mlpackage`
+- Core ML model SHA-256: `4922e5fd9c9511e8e042fb93435d250665a2b837f36cf7847594f3dfaa527843`
+- Weight SHA-256: `d291ffef8e23d2d944ef6c17470d83b157f5d3300fad742a1a27af1bad7adc4f`
+- Model: Ultralytics YOLO11n, COCO object detection with built-in NMS; SOMA
+  accepts only the `person` label as L0 attention evidence.
+- License: AGPL-3.0, as embedded in the package metadata and documented by
+  [Ultralytics](https://docs.ultralytics.com/license/). An Enterprise license
+  is the alternative offered by Ultralytics for use outside the AGPL route.
+
+The package is a bundled third-party model asset, not a claim that SOMA's own
+source has been relicensed. Anyone redistributing or deploying the bundled
+YOLO11n package must determine and satisfy the applicable Ultralytics terms;
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 SOMA requires macOS 13 or later and loads this model with
 `MLModelConfiguration.computeUnits = .cpuAndNeuralEngine`. This excludes GPU

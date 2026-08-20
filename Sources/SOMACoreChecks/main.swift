@@ -14,37 +14,64 @@ private func rect(_ x: Double) -> NormalizedRect {
 
 let model = PredictiveWorldModel()
 let start: UInt64 = 1_000_000_000
+let conversationAnchorModel = PredictiveWorldModel()
+let conversationAnchor = conversationAnchorModel.ingestVisual(
+    VisualObservation(
+        rect: rect(0.4),
+        confidence: 0.90,
+        source: .neuralFaceDetector,
+        kind: .human,
+        label: "face",
+        isActionEligible: true
+    ),
+    at: start
+)
+require(
+    LiveConversationVisualAdmission.permitsNewSession(for: conversationAnchor),
+    "verified human fixation did not admit a new live conversation"
+)
+let ambientObjectModel = PredictiveWorldModel()
+let ambientObject = ambientObjectModel.ingestVisual(
+    VisualObservation(
+        rect: rect(0.4),
+        confidence: 0.90,
+        source: .neuralDetector,
+        kind: .object,
+        label: "object",
+        isActionEligible: false
+    ),
+    at: start
+)
+require(
+    !LiveConversationVisualAdmission.permitsNewSession(for: ambientObject),
+    "ambient object admitted a new live conversation"
+)
 var contactGate = ConversationContactGate()
 require(
-    contactGate.authorizeSpeechOnset(at: start) == nil,
-    "ambient speech opened a first conversation without eye contact"
-)
-contactGate.observeEyeContact(at: start)
-require(
-    contactGate.authorizeSpeechOnset(at: start + 450_000_000) == .eyeContact,
-    "fresh eye contact did not authorize the first spoken turn"
+    contactGate.authorizeSpeechOnset(at: start, directContact: false) == nil,
+    "ambient speech authorized a new spoken turn"
 )
 require(
-    contactGate.authorizeSpeechOnset(at: start + 451_000_000) == nil,
-    "stale eye contact authorized a first spoken turn"
+    contactGate.authorizeSpeechOnset(at: start, directContact: true) == .voiceActivity,
+    "direct contact did not authorize the first spoken turn"
 )
 contactGate.issueSocialPulse(at: start + 1_000_000_000)
 require(
-    contactGate.authorizeSpeechOnset(at: start + 1_100_000_000) == .botInitiatedPulseResponse,
+    contactGate.authorizeSpeechOnset(at: start + 1_100_000_000, directContact: false) == .botInitiatedPulseResponse,
     "bot-initiated social pulse did not authorize its response"
 )
 require(
-    contactGate.authorizeSpeechOnset(at: start + 1_200_000_000) == nil,
-    "one social pulse authorized more than one first-turn attempt"
+    contactGate.authorizeSpeechOnset(at: start + 1_200_000_000, directContact: true) == .voiceActivity,
+    "direct contact did not remain admissible after a social pulse"
 )
 contactGate.markConversationOpened(at: start + 2_000_000_000)
 require(
-    contactGate.authorizeSpeechOnset(at: start + 61_999_000_000) == .activeConversation,
-    "opened conversation required repeated eye contact"
+    contactGate.authorizeSpeechOnset(at: start + 61_999_000_000, directContact: false) == .activeConversation,
+    "opened conversation did not retain its active lease"
 )
 require(
-    contactGate.authorizeSpeechOnset(at: start + 62_000_000_000) == nil,
-    "inactive conversation lease did not close"
+    contactGate.authorizeSpeechOnset(at: start + 62_000_000_000, directContact: true) == .voiceActivity,
+    "direct contact did not remain admissible after the conversation lease closed"
 )
 var liveSessionInactivity = LiveVoiceSessionInactivityGate()
 let firstLiveDeadline = liveSessionInactivity.activate(at: start)
@@ -73,9 +100,9 @@ require(indicatorInputs.resolvedState == .working, "working LED priority is wron
 let contactReadyRendering = SOMALEDSettings().signal(for: .contactReady).deviceRendering
 let humanDetectedRendering = SOMALEDSettings().signal(for: .humanDetected).deviceRendering
 require(
-    contactReadyRendering == .init(stateID: 57, specialPatternEnabled: true)
-        && humanDetectedRendering == .init(stateID: 57, specialPatternEnabled: false),
-    "LED state does not resolve to the verified physical rendering"
+    contactReadyRendering == .init(stateID: 54)
+        && humanDetectedRendering == .init(stateID: 57),
+    "LED state does not resolve contact-ready and human presence independently"
 )
 require(
     SubconsciousIndicatorState.contactReady.humanMeaning == "ready_speak_now"

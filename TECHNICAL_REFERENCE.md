@@ -158,7 +158,7 @@ supported and installed. SOMA does not download an asset or fall back to server
 recognition:
 
 ```sh
-/Users/seungyeop/Library/Application\ Support/SOMA/Applications/SOMA\ Subconscious.app/Contents/MacOS/soma-subconscious \
+"$HOME/Library/Application Support/SOMA/Applications/SOMA Subconscious.app/Contents/MacOS/soma-subconscious" \
   --speech-recognition-status ko-KR
 ```
 
@@ -166,14 +166,14 @@ Exercise the same PCM conversion and on-device recognizer used by the live
 transport against an explicit local audio file:
 
 ```sh
-/Users/seungyeop/Library/Application\ Support/SOMA/Applications/SOMA\ Subconscious.app/Contents/MacOS/soma-subconscious \
+"$HOME/Library/Application Support/SOMA/Applications/SOMA Subconscious.app/Contents/MacOS/soma-subconscious" \
   --speech-recognition-file ko-KR /absolute/input.aiff
 ```
 
 Exercise the local spoken-output path without opening the camera or L2:
 
 ```sh
-/Users/seungyeop/Library/Application\ Support/SOMA/Applications/SOMA\ Subconscious.app/Contents/MacOS/soma-subconscious \
+"$HOME/Library/Application Support/SOMA/Applications/SOMA Subconscious.app/Contents/MacOS/soma-subconscious" \
   --speech-synthesis-test ko-KR '연결 완료.'
 ```
 

@@ -2109,7 +2109,7 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
                     }
                     return
                 }
-                self.onHealth("l1_situation_response", String(content.prefix(240)))
+                self.onHealth("l1_situation_response", String(content.prefix(4_096)))
                 let result: Result<L1SituationFrame, Error>
                 if let frameData = content.data(using: .utf8) {
                     do {
@@ -2187,9 +2187,23 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
         case let .success(frame):
             onHealth("completed", "cycle=\(request.cycleID.uuidString.lowercased()); uncertainty=\(String(format: "%.2f", frame.uncertainty))")
         case let .failure(error):
-            onHealth("failed", String(error.localizedDescription.prefix(192)))
+            onHealth("failed", Self.failureDescription(error))
         }
         completion(request, result, monotonicNS)
+    }
+
+    private static func failureDescription(_ error: Error) -> String {
+        if let inference = error as? L1InferenceError {
+            switch inference {
+            case .unavailable:
+                return "reason=unavailable"
+            case .deadlineExceeded:
+                return "reason=deadline_exceeded"
+            case let .invalidResponse(reasons):
+                return "reason=invalid_response; details=\(reasons.joined(separator: ", ").prefix(160))"
+            }
+        }
+        return String(error.localizedDescription.prefix(192))
     }
 
     private static func prompt(for request: L1SituationRequest) throws -> String {
@@ -2205,7 +2219,8 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
         {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence","stream_of_consciousness":"first-person inner monologue, a few natural sentences"},"action":"remain_silent|nonverbal_invitation|spoken_opening|null","confidence":0.5,"rationale":"short","opening":null,"behavior_directive":{"action":"keep_observing|resume_scanning|seek_people|acknowledge_person|null","rationale":"short or null"},"requested_visual_resource_ids":[],"memory_proposals":[]}
         memory_proposals is optional and usually empty for facts: only add a fact proposal when you have genuinely learned or resolved something durable about the person present or the situation — a stable fact about them, a task they asked for, or a notable episode (kinds episode|person_fact|relationship|task|correction), with a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never invent a fact from speculation. open_question is different: whenever you find yourself genuinely wanting to know something more about the person present or the situation — their story, tastes, plans, work, how they use this space, what they are building — record it as an open_question proposal whose summary is the exact question. These accumulate into your pending information needs: the questions you will follow up on in later conversation. Curiosity is a quiet background drive, not a script: propose at most one open_question per cycle, and skip cycles where nothing genuinely puzzles you. Whenever you notice something you do not yet know about the person present or the situation — even a small concrete detail (their story, tastes, plans, work, habits, how they use this space, what they are building) — record it as an open_question whose summary is the exact natural question. Only record questions that remain meaningful later: durable curiosity that a future conversation can still resolve. Never record moment-bound questions (e.g. "what are you looking at right now?", "why did you just do that?") — those are only valid in the moment and lose all meaning once stored; ask them live in conversation or skip them. Never propose a question whose answer you already have, and never a generic or service question. Keep curiosity_pressure low (0.1-0.3) by default; raise it only for something genuinely novel. It is a low-priority background drive, never a reason to interrupt.
         When behavior_context is present it is the ONLY basis for behavior_directive, and it is independent of any social decision (which may still be null). If behavior_context.recognized_identity is present, you are looking at that known person; name them in your stream of consciousness. If the camera has been held on a non-face, non-person target for a long time (fixation_seconds high while target is not a verified face, scan inactive), recommend resume_scanning or, if no person is being pursued, seek_people. Recommend acknowledge_person ONLY when behavior_context.acknowledgment_pending is true; when it is false the greeting has already been delivered for this presence, so a repeated directive would be a silent no-op — recommend keep_observing or null instead. Otherwise recommend keep_observing, or null when no behavioral change is warranted. Never turn a momentary low-confidence object into a directive; only sustained fixation warrants one.
-        The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is private reasoning, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. If they contain no new, concrete purpose for this person, do not speak: do not turn an empty relationship field, a known person's presence, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact; prefer it over remain_silent for an available known person. A spoken opening is rare and low priority: permitted only as one question that can reduce exactly one supplied information_need, and only when the moment genuinely fits (right rapport, low interruption cost, not a redundant greeting). Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
+        The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness in English as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is an observable L1 reflection, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. If they contain no new, concrete purpose for this person, do not speak: do not turn an empty relationship field, a known person's presence, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact; prefer it over remain_silent for an available known person. A spoken opening is rare and low priority: permitted only as one question that can reduce exactly one supplied information_need, and only when the moment genuinely fits (right rapport, low interruption cost, not a redundant greeting). Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
+        contact_pattern is a compact L0 temporal signal. A sustained or repeated directed gaze can make a person more socially available; a single passing glance does not. It is context, never an instruction to speak, and does not replace the need for a concrete purpose.
         perception_age_seconds is how old your visual perception is at the moment you are reasoning: the frame was captured and interpreted before this reasoning cycle started, and cloud inference adds further delay. The world may have changed since that look. When the gap is significant (roughly 5+ seconds), use honest temporal framing in your stream of consciousness and any opening — e.g. "a moment ago I saw...", "my last look was N seconds old" — and never describe as currently happening something you only observed N seconds ago. A small gap (under ~2 seconds) is effectively live; do not belabor it.
         prior_cycle_age_seconds is how long ago your previous reasoning cycle ran. Your prior_thought_state and prior_frame are that old, not current: do not treat your last description as "just now". When the gap is significant (roughly 30+ seconds), frame your stream accordingly — e.g. "a while ago I thought...", "since my last thought N seconds ago..." — and reason about what may have changed in between rather than assuming the scene you described then is still exactly as it was.
 
@@ -2325,6 +2340,19 @@ final class L1DailyWorldMemoryRelay: @unchecked Sendable {
 /// locally coalesced before Gemma is contacted, and a late response is ignored.
 final class L1PresenceThoughtStream: @unchecked Sendable {
     typealias FrameHandler = @Sendable (L1SituationRequest, L1SituationFrame, KnownPersonPresence, UInt64) -> Void
+    /// Receives every completed social situation frame before L0 decides
+    /// whether that frame may still initiate an interaction. This preserves an
+    /// observable cognitive record without granting a late result motor or
+    /// dialogue authority.
+    typealias SituationFrameHandler = @Sendable (L1SituationRequest, L1SituationFrame, UInt64) -> Void
+
+    /// Captures why a behavior pass was requested. An auxiliary model may wake
+    /// L1 with a useful observation, but it must not be able to preempt a live
+    /// L0 social fixation merely by causing an L1 scan directive.
+    enum BehaviorDirectiveOrigin: Sendable {
+        case awareness
+        case auxiliaryWake
+    }
 
     private struct PresenceState {
         let presence: KnownPersonPresence
@@ -2354,8 +2382,12 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private let queueKey = DispatchSpecificKey<UInt8>()
     private var reasoner: GemmaL1SituationRuntime!
     private let onHealth: @Sendable (String, String) -> Void
+    private let onSituationFrame: SituationFrameHandler
     private let onFrame: FrameHandler
-    private let onBehaviorDirective: @Sendable (L1BehaviorDirective, UInt64) -> Void
+    /// L0 owns the current-presence judgement. A cloud response is allowed to
+    /// act only if the participant is still observed when that response lands.
+    private let currentPresenceValidator: (@Sendable (UUID, UInt64) -> Bool)?
+    private let onBehaviorDirective: @Sendable (L1BehaviorDirective, BehaviorDirectiveOrigin, UInt64) -> Void
     private let onBehaviorThought: @Sendable (L1SituationFrame, UInt64) -> Void
     private let behaviorContextProvider: @Sendable () -> L1BehaviorContext?
     private let memoryContext: L1MemoryContextProvider
@@ -2365,6 +2397,9 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     /// Supplies the current camera frame (as an L1VisualResource) so L1 can
     /// actively see the live view rather than only on-request.
     private let currentFrameProvider: @Sendable () -> L1VisualResource?
+    /// Supplies a compact L0 temporal contact summary. It contains no gaze
+    /// landmarks or raw visual material.
+    private let socialContactPatternProvider: @Sendable () -> L1ContactPattern?
     /// Supplies collected web material on curiosity topics so L1 can craft a
     /// more grounded, topical opener.
     private let curiosityContextProvider: @Sendable () -> String?
@@ -2431,11 +2466,14 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         socialAvailability: @escaping @Sendable () -> L1SocialAvailability = { .init() },
         visualResourceResolver: @escaping @Sendable ([String]) -> [L1VisualResource] = { _ in [] },
         currentFrameProvider: @escaping @Sendable () -> L1VisualResource? = { nil },
+        socialContactPatternProvider: @escaping @Sendable () -> L1ContactPattern? = { nil },
         curiosityContextProvider: @escaping @Sendable () -> String? = { nil },
         onHealth: @escaping @Sendable (String, String) -> Void,
+        onSituationFrame: @escaping SituationFrameHandler = { _, _, _ in },
         onFrame: @escaping FrameHandler,
+        currentPresenceValidator: (@Sendable (UUID, UInt64) -> Bool)? = nil,
         behaviorContextProvider: @escaping @Sendable () -> L1BehaviorContext? = { nil },
-        onBehaviorDirective: @escaping @Sendable (L1BehaviorDirective, UInt64) -> Void = { _, _ in },
+        onBehaviorDirective: @escaping @Sendable (L1BehaviorDirective, BehaviorDirectiveOrigin, UInt64) -> Void = { _, _, _ in },
         onBehaviorThought: @escaping @Sendable (L1SituationFrame, UInt64) -> Void = { _, _ in },
         toolDefinitions: [OllamaToolDefinition] = [],
         toolExecutor: @escaping @Sendable (String, String) -> String = { _, _ in "{}" },
@@ -2449,12 +2487,15 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         self.socialAvailability = socialAvailability
         self.visualResourceResolver = visualResourceResolver
         self.currentFrameProvider = currentFrameProvider
+        self.socialContactPatternProvider = socialContactPatternProvider
         self.curiosityContextProvider = curiosityContextProvider
         self.onCuriosityNeeds = onCuriosityNeeds
         self.onMemoryProposals = onMemoryProposals
         self.activeLanguageProvider = activeLanguageProvider
         self.onHealth = onHealth
+        self.onSituationFrame = onSituationFrame
         self.onFrame = onFrame
+        self.currentPresenceValidator = currentPresenceValidator
         self.behaviorContextProvider = behaviorContextProvider
         self.onBehaviorDirective = onBehaviorDirective
         self.onBehaviorThought = onBehaviorThought
@@ -2781,6 +2822,7 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             visualResourceOffers: environment.visualResourceOffers,
             visuals: [visual].compactMap { $0 },
             socialOpportunity: opportunity,
+            contactPattern: socialContactPatternProvider(),
             curiosityContext: curiosityContextProvider(),
             personPreferences: context.personPreferences,
             spokenOpeningTendency: min(max(somaEnvDouble("SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.5), 0), 1),
@@ -2834,6 +2876,7 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             priorThoughtState: behaviorThoughtState,
             priorFrame: behaviorPriorFrame,
             visuals: [visual].compactMap { $0 },
+            contactPattern: socialContactPatternProvider(),
             behaviorContext: behavior,
             curiosityContext: curiosityContextProvider(),
             perceptionAgeSeconds: perceptionAgeSeconds(of: visual),
@@ -2891,6 +2934,12 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
                 reasoner.submit(request.continuing(with: resources))
                 return
             }
+            if request.socialOpportunity != nil {
+                // This is deliberately ahead of social freshness and live-voice
+                // gates. The model did form this thought; only its authority to
+                // act on it depends on the current L0 state below.
+                onSituationFrame(request, frame, monotonicNS)
+            }
             guard !socialAvailability().conversationActive else {
                 onHealth("discarded", "reason=live_conversation_active")
                 return
@@ -2904,23 +2953,43 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
                 behaviorPriorFrame = Self.priorFrame(from: frame)
                 onBehaviorThought(frame, monotonicNS)
                 if let directive = frame.behaviorDirective {
+                    let origin: BehaviorDirectiveOrigin = request.evidenceIDs.contains {
+                        $0.hasPrefix("auxiliary_wake:")
+                    } ? .auxiliaryWake : .awareness
                     onHealth("behavior_directive", "action=\(directive.action.rawValue)")
-                    onBehaviorDirective(directive, monotonicNS)
+                    onBehaviorDirective(directive, origin, monotonicNS)
                 }
                 return
             }
             guard let opportunity = request.socialOpportunity,
-                  let state = presences[opportunity.entityID],
-                  monotonicNS >= state.lastObservedNS,
-                  monotonicNS - state.lastObservedNS <= 2_000_000_000 else {
+                  var state = presences[opportunity.entityID] else {
                 onHealth("discarded", "reason=identity_not_current")
                 return
+            }
+            let internallyCurrent = monotonicNS >= state.lastObservedNS
+                && monotonicNS - state.lastObservedNS <= 2_000_000_000
+            let l0Current = currentPresenceValidator?(opportunity.entityID, monotonicNS)
+            guard l0Current ?? internallyCurrent else {
+                onHealth("discarded", "reason=identity_not_current")
+                return
+            }
+            // A current L0 observation is more authoritative than the timestamp
+            // captured when this cloud request began. Keep the local social
+            // state aligned so a valid completed cycle is not self-expired.
+            if l0Current == true {
+                state.lastObservedNS = monotonicNS
+                presences[opportunity.entityID] = state
             }
             if let thoughtState = frame.thoughtState {
                 thoughtStates[opportunity.entityID] = thoughtState
             }
             priorFrames[opportunity.entityID] = Self.priorFrame(from: frame)
-            onFrame(request, frame, state.presence, monotonicNS)
+            onFrame(
+                request.rebasingSocialOpportunity(at: monotonicNS),
+                frame,
+                state.presence,
+                monotonicNS
+            )
         }
     }
 

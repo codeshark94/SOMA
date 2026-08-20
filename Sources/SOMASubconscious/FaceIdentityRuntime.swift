@@ -105,8 +105,10 @@ private final class ArcFaceR50Embedder: @unchecked Sendable {
         let aligned = try Self.makePixelBuffer()
         let width = Double(CVPixelBufferGetWidth(pixelBuffer))
         let height = Double(CVPixelBufferGetHeight(pixelBuffer))
+        // Eye/nose landmarks are top-left normalized (the pipeline convention);
+        // Core Image renders bottom-left, so flip Y before scaling.
         let source = [alignment.leftEye, alignment.rightEye, alignment.nose].map {
-            CGPoint(x: Double($0.x) * width, y: Double($0.y) * height)
+            CGPoint(x: Double($0.x) * width, y: (1 - Double($0.y)) * height)
         }
         // ArcFace's canonical template uses top-left image coordinates;
         // Core Image uses bottom-left coordinates.
@@ -548,12 +550,45 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     /// identity worker. A successful recognition can improve later viewpoint
     /// coverage but must not hold up this frame's recognition decision.
     private func retainKnownView(entityID: UUID, embedding: LocalFaceEmbedding) {
+        queue.async { [weak self] in
+            let entityPrefix = entityID.uuidString.prefix(8)
+            let qualityText = String(format: "%.3f", embedding.quality)
+            self?.onHealth("profile_view_probe", "entity=\(entityPrefix); quality=\(qualityText)")
+        }
         Task { [weak self, profileStore] in
             do {
+                let allProfiles = await profileStore.profiles()
+                if let existing = allProfiles.first(where: { $0.entityID == entityID }) {
+                    let refs = existing.references
+                    let compatible = refs.filter {
+                        $0.modelID == embedding.modelID && $0.modelRevision == embedding.modelRevision && $0.values.count == embedding.values.count
+                    }
+                    let modelSet = Set(refs.map { "\($0.modelID)#\($0.modelRevision)" }).sorted().joined(separator: ",")
+                    self?.queue.async { [weak self] in
+                        self?.onHealth("profile_view_detail", "entity=\(entityID.uuidString.prefix(8)); refs=\(refs.count); compatible=\(compatible.count); models=\(modelSet)")
+                    }
+                }
+                let existing = allProfiles.first { $0.entityID == entityID }
+                if existing == nil {
+                    self?.queue.async { [weak self] in
+                        self?.onHealth("profile_view_skipped", "entity=\(entityID.uuidString.prefix(8)); reason=no_profile")
+                    }
+                    return
+                }
+                guard existing?.consentScope == .persistent else {
+                    let scopeName = existing?.consentScope.rawValue ?? "nil"
+                    self?.queue.async { [weak self] in
+                        self?.onHealth("profile_view_skipped", "entity=\(entityID.uuidString.prefix(8)); reason=consent=\(scopeName)")
+                    }
+                    return
+                }
                 guard let referenceCount = try await profileStore.retainPersistentObservation(
                     entityID: entityID,
                     embedding: embedding
                 ) else {
+                    self?.queue.async { [weak self] in
+                        self?.onHealth("profile_view_skipped", "entity=\(entityID.uuidString.prefix(8)); reason=store_rejected")
+                    }
                     return
                 }
                 let profiles = await profileStore.profiles()

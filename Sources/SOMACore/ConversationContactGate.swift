@@ -1,46 +1,36 @@
 import Foundation
 
 public enum ConversationOpeningAuthorization: String, Equatable, Sendable {
-    case eyeContact = "eye_contact"
+    case voiceActivity = "voice_activity"
     case botInitiatedPulseResponse = "bot_initiated_pulse_response"
     case activeConversation = "active_conversation"
 }
 
 public struct ConversationContactConfiguration: Equatable, Sendable {
-    public let eyeContactFreshnessMilliseconds: UInt64
     public let socialPulseResponseMilliseconds: UInt64
     public let conversationInactivityMilliseconds: UInt64
 
     public init(
-        eyeContactFreshnessMilliseconds: UInt64 = 450,
         socialPulseResponseMilliseconds: UInt64 = 8_000,
         conversationInactivityMilliseconds: UInt64 = 60_000
     ) {
-        precondition(eyeContactFreshnessMilliseconds > 0)
         precondition(socialPulseResponseMilliseconds > 0)
         precondition(conversationInactivityMilliseconds > 0)
-        self.eyeContactFreshnessMilliseconds = eyeContactFreshnessMilliseconds
         self.socialPulseResponseMilliseconds = socialPulseResponseMilliseconds
         self.conversationInactivityMilliseconds = conversationInactivityMilliseconds
     }
 }
 
-/// Owns the boundary between ambient speech and an interaction addressed to
-/// SOMA. The first human turn needs fresh directed eye-contact evidence unless
-/// SOMA has just emitted an explicit social invitation. Follow-up turns use a
-/// bounded conversation lease and therefore do not repeatedly demand gaze.
+/// Owns the temporal boundary between a validated direct-contact event and an
+/// interaction. It keeps the one-turn social-pulse exception and the active
+/// conversation lease independent from a new direct contact.
 public struct ConversationContactGate: Sendable {
     public let configuration: ConversationContactConfiguration
-    private var lastEyeContactNS: UInt64?
     private var socialPulseExpiresAtNS: UInt64?
     private var conversationExpiresAtNS: UInt64?
 
     public init(configuration: ConversationContactConfiguration = .init()) {
         self.configuration = configuration
-    }
-
-    public mutating func observeEyeContact(at monotonicNS: UInt64) {
-        lastEyeContactNS = monotonicNS
     }
 
     public mutating func issueSocialPulse(at monotonicNS: UInt64) {
@@ -51,18 +41,12 @@ public struct ConversationContactGate: Sendable {
     }
 
     public mutating func authorizeSpeechOnset(
-        at monotonicNS: UInt64
+        at monotonicNS: UInt64,
+        directContact: Bool
     ) -> ConversationOpeningAuthorization? {
         expire(at: monotonicNS)
         if let conversationExpiresAtNS, monotonicNS < conversationExpiresAtNS {
             return .activeConversation
-        }
-        if isFresh(
-            lastEyeContactNS,
-            at: monotonicNS,
-            maximumAgeMilliseconds: configuration.eyeContactFreshnessMilliseconds
-        ) {
-            return .eyeContact
         }
         if let socialPulseExpiresAtNS, monotonicNS < socialPulseExpiresAtNS {
             // One invitation authorizes one opening attempt. A persistent
@@ -70,7 +54,8 @@ public struct ConversationContactGate: Sendable {
             self.socialPulseExpiresAtNS = nil
             return .botInitiatedPulseResponse
         }
-        return nil
+        guard directContact else { return nil }
+        return .voiceActivity
     }
 
     public mutating func markConversationOpened(at monotonicNS: UInt64) {
@@ -103,20 +88,25 @@ public struct ConversationContactGate: Sendable {
         }
     }
 
-    private func isFresh(
-        _ observedNS: UInt64?,
-        at monotonicNS: UInt64,
-        maximumAgeMilliseconds: UInt64
-    ) -> Bool {
-        guard let observedNS, monotonicNS >= observedNS else { return false }
-        return monotonicNS - observedNS <= maximumAgeMilliseconds * 1_000_000
-    }
-
     private func addingMilliseconds(_ milliseconds: UInt64, to monotonicNS: UInt64) -> UInt64 {
         let nanoseconds = milliseconds.multipliedReportingOverflow(by: 1_000_000)
         guard !nanoseconds.overflow else { return UInt64.max }
         let result = monotonicNS.addingReportingOverflow(nanoseconds.partialValue)
         return result.overflow ? UInt64.max : result.partialValue
+    }
+}
+
+/// Defines when a detected voice can be attributed to the person SOMA is
+/// currently addressing. Speech alone is sufficient to request a response,
+/// but a new live conversation must be visually anchored to the current
+/// verified human fixation rather than an arbitrary sound in the room.
+public enum LiveConversationVisualAdmission {
+    public static func permitsNewSession(for belief: BeliefSnapshot) -> Bool {
+        guard belief.targetStatus == .tracked,
+              let target = belief.target else {
+            return false
+        }
+        return target.isFaceMotorTarget
     }
 }
 
@@ -252,11 +242,6 @@ public enum SubconsciousIndicatorInteractionState: String, Equatable, Sendable {
 public struct SubconsciousIndicatorInputs: Equatable, Sendable {
     public var visualState: SubconsciousIndicatorVisualState
     public var interactionState: SubconsciousIndicatorInteractionState
-    /// E2B's simple "person present" control signal. It is OR'd with the
-    /// face-detection visualState so E2B can add human detection (e.g. a person
-    /// turned away that the face detector misses) without ever clearing a real
-    /// face observation. E2B sets it on every cue: engage -> true, else false.
-    public var auxiliaryHumanDetected: Bool
 
     public init(
         humanDetected: Bool = false,
@@ -270,7 +255,6 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
         interactionState = working
             ? .preparingReply
             : (conversation ? .conversation : .idle)
-        auxiliaryHumanDetected = false
     }
 
     public init(
@@ -279,17 +263,6 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
     ) {
         self.visualState = visualState
         self.interactionState = interactionState
-        auxiliaryHumanDetected = false
-    }
-
-    /// Apply E2B's proportional reaction as a simple L0 control signal.
-    public mutating func applyAuxiliaryReaction(_ reaction: L1AuxiliaryReaction) {
-        switch reaction {
-        case .engage:
-            auxiliaryHumanDetected = true
-        case .orient, .observe, .none:
-            auxiliaryHumanDetected = false
-        }
     }
 
     /// A fresh human observation is sufficient to communicate that SOMA has
@@ -355,7 +328,7 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
             switch visualState {
             case .eyeContact: return .contactReady
             case .humanDetected: return .humanDetected
-            case .none: return auxiliaryHumanDetected ? .humanDetected : .exploring
+            case .none: return .exploring
             }
         }
     }

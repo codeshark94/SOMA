@@ -46,10 +46,10 @@ public enum L1AuxiliaryApproach: String, Codable, CaseIterable, Sendable {
     case none
 }
 
-/// The proportional response SOMA should take to the current scene. This is the
-/// simple control signal E2B hands to L0: engage for a person socially addressing
-/// the camera, orient for a non-person object/scene change, observe for a mild
-/// ambient change, none for a quiet static scene.
+/// An advisory interpretation of the current scene. It is context for L1,
+/// never a command to L0: engage for a person socially addressing the camera,
+/// orient for a non-person object/scene change, observe for a mild ambient
+/// change, none for a quiet static scene.
 public enum L1AuxiliaryReaction: String, Codable, CaseIterable, Sendable {
     case engage
     case orient

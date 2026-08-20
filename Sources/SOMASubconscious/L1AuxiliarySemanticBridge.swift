@@ -57,7 +57,7 @@ private struct L1AuxiliaryWorkerEnvelope: Decodable {
 
 /// Local visual helper owned by L1. Frames are JPEG-encoded on a utility queue,
 /// sent to one persistent MLX worker, and never written to disk. It can propose
-/// L1 context updates but is not a separate cognitive or motor authority.
+/// L1 context updates and wake proposals but has no L0 display or motor path.
 final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private struct Pending: Sendable {
         let pixelBuffer: L1AuxiliaryPixelBuffer

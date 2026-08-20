@@ -6,7 +6,7 @@ soma_root=${soma_script_dir:h}
 soma_label=com.soma.reactive-l0
 soma_domain="gui/$(id -u)"
 soma_target="$soma_domain/$soma_label"
-soma_plist="$soma_root/LaunchAgents/$soma_label.plist"
+soma_plist="$HOME/Library/LaunchAgents/$soma_label.plist"
 
 function soma_loaded() {
   local soma_status
@@ -20,7 +20,7 @@ function soma_start() {
     return
   fi
   if [[ ! -f "$soma_plist" ]]; then
-    print -u2 -r -- "SOMA service definition is unavailable: $soma_plist"
+    print -u2 -r -- "SOMA is not installed. Run $soma_root/scripts/install-soma-subconscious-app.zsh first."
     return 2
   fi
   /bin/launchctl bootstrap "$soma_domain" "$soma_plist"

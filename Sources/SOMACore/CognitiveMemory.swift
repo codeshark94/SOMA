@@ -1145,6 +1145,13 @@ private extension JSONDecoder {
 public actor CognitiveMemoryStore {
     public static let journalFilename = "cognitive-memory.encjsonl"
     public static let lockFilename = "cognitive-memory.lock"
+    /// Encrypted journal grows past this size before append() triggers an
+    /// expired-record purge and a compacted rewrite. Bounds disk growth
+    /// without imposing a write on every upsert.
+    public static let journalCompactionLimitBytes = 4_000_000
+    /// Rewrites keep only the newest revisions per record; the full revision
+    /// chain is what makes an uncompacted journal grow without bound.
+    public static let maximumHistoryPerRecord = 12
 
     private let directoryURL: URL
     private let journalURL: URL
@@ -1627,6 +1634,22 @@ public actor CognitiveMemoryStore {
         try journalHandle.write(contentsOf: data)
         try journalHandle.synchronize()
         sequence = entry.sequence
+        if try journalExceedsCompactionLimit() {
+            // The journal is append-only on the hot path; without a bound it
+            // grows without limit. On crossing the threshold, purge expired
+            // records first (their delete entries are folded away by the
+            // rewrite), then rewrite the journal as a compacted snapshot with
+            // per-record history trimmed.
+            if try purgeExpired(at: Date()).isEmpty {
+                try rewriteJournal()
+            }
+        }
+    }
+
+    private func journalExceedsCompactionLimit() throws -> Bool {
+        let attributes = try FileManager.default.attributesOfItem(atPath: journalURL.path)
+        let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        return size > Self.journalCompactionLimitBytes
     }
 
     private func rewriteJournal() throws {
@@ -1635,6 +1658,10 @@ public actor CognitiveMemoryStore {
         let tempHandle = try FileHandle(forWritingTo: tempURL)
         var nextSequence: UInt64 = 0
         do {
+            for id in historyByID.keys {
+                guard let chain = historyByID[id], chain.count > Self.maximumHistoryPerRecord else { continue }
+                historyByID[id] = Array(chain.suffix(Self.maximumHistoryPerRecord))
+            }
             let records = historyByID.values.flatMap { $0 }.sorted {
                 if $0.id != $1.id { return $0.id.uuidString < $1.id.uuidString }
                 return $0.revision < $1.revision

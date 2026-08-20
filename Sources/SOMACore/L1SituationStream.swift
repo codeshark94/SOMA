@@ -390,6 +390,29 @@ public struct L1BehaviorDirective: Codable, Equatable, Sendable {
     }
 }
 
+/// A bounded L0 summary of directed visual contact. It describes temporal
+/// interaction evidence rather than a single frame, so L1 can distinguish a
+/// passing glance from sustained or repeated attention without receiving gaze
+/// landmarks or video data.
+public struct L1ContactPattern: Codable, Equatable, Sendable {
+    public let eyeContactActive: Bool
+    public let recentEpisodeCount: Int
+    public let latestEpisodeAgeSeconds: Double?
+    public let activeDurationSeconds: Double
+
+    public init(
+        eyeContactActive: Bool,
+        recentEpisodeCount: Int,
+        latestEpisodeAgeSeconds: Double?,
+        activeDurationSeconds: Double
+    ) {
+        self.eyeContactActive = eyeContactActive
+        self.recentEpisodeCount = min(max(recentEpisodeCount, 0), 32)
+        self.latestEpisodeAgeSeconds = latestEpisodeAgeSeconds.map { max($0, 0) }
+        self.activeDurationSeconds = max(activeDurationSeconds, 0)
+    }
+}
+
 public struct L1SituationRequest: Codable, Equatable, Sendable {
     public let cycleID: UUID
     public let observedAt: Date
@@ -409,6 +432,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
     public let visualResourceOffers: [L1VisualResourceOffer]
     public let visuals: [L1VisualResource]
     public let socialOpportunity: L1SocialOpportunity?
+    public let contactPattern: L1ContactPattern?
     public let behaviorContext: L1BehaviorContext?
     /// Collected web material on curiosity topics, surfaced so L1 can craft a
     /// more grounded, topical conversation opener.
@@ -452,6 +476,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         visualResourceOffers: [L1VisualResourceOffer] = [],
         visuals: [L1VisualResource] = [],
         socialOpportunity: L1SocialOpportunity? = nil,
+        contactPattern: L1ContactPattern? = nil,
         behaviorContext: L1BehaviorContext? = nil,
         curiosityContext: String? = nil,
         personPreferences: String? = nil,
@@ -478,6 +503,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         self.visualResourceOffers = Array(visualResourceOffers.prefix(8))
         self.visuals = Array(visuals.prefix(8))
         self.socialOpportunity = socialOpportunity
+        self.contactPattern = contactPattern
         self.behaviorContext = behaviorContext
         self.curiosityContext = curiosityContext.map { String($0.prefix(2_000)) }
         self.personPreferences = personPreferences.map { String($0.prefix(1_500)) }
@@ -499,6 +525,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
             rapport: rapport,
             preferredLanguageTag: preferredLanguageTag,
             priorThoughtState: priorThoughtState,
+            priorFrame: priorFrame,
             recentConversation: recentConversation,
             contactHistory: contactHistory,
             spatialContext: spatialContext,
@@ -506,6 +533,8 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
             visualResourceOffers: visualResourceOffers,
             visuals: visuals,
             socialOpportunity: socialOpportunity,
+            contactPattern: contactPattern,
+            behaviorContext: behaviorContext,
             curiosityContext: curiosityContext,
             personPreferences: personPreferences,
             spokenOpeningTendency: spokenOpeningTendency,
@@ -514,6 +543,51 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
             priorCycleAgeSeconds: priorCycleAgeSeconds
         )
     }
+
+    /// Keeps the model's original evidence intact while rebasing the one field
+    /// that represents L0's present-tense authority. A slow L1 result may be
+    /// acted on only after the perception layer confirms that the same person
+    /// is still present at completion time.
+    public func rebasingSocialOpportunity(at monotonicNS: UInt64) -> Self {
+        guard let socialOpportunity else { return self }
+        let currentOpportunity = L1SocialOpportunity(
+            id: socialOpportunity.id,
+            presenceID: socialOpportunity.presenceID,
+            entityID: socialOpportunity.entityID,
+            observedAtNS: monotonicNS,
+            recognitionConfidence: socialOpportunity.recognitionConfidence,
+            availableActions: socialOpportunity.availableActions
+        )
+        return Self(
+            cycleID: cycleID,
+            observedAt: observedAt,
+            evidenceIDs: evidenceIDs,
+            beliefSummary: beliefSummary,
+            presentEntityIDs: presentEntityIDs,
+            memory: memory,
+            informationNeeds: informationNeeds,
+            rapport: rapport,
+            preferredLanguageTag: preferredLanguageTag,
+            priorThoughtState: priorThoughtState,
+            priorFrame: priorFrame,
+            recentConversation: recentConversation,
+            contactHistory: contactHistory,
+            spatialContext: spatialContext,
+            dailyWorldMemory: dailyWorldMemory,
+            visualResourceOffers: visualResourceOffers,
+            visuals: visuals,
+            socialOpportunity: currentOpportunity,
+            contactPattern: contactPattern,
+            behaviorContext: behaviorContext,
+            curiosityContext: curiosityContext,
+            personPreferences: personPreferences,
+            spokenOpeningTendency: spokenOpeningTendency,
+            recalledEpisodes: recalledEpisodes,
+            perceptionAgeSeconds: perceptionAgeSeconds,
+            priorCycleAgeSeconds: priorCycleAgeSeconds
+        )
+    }
+
 }
 
 public enum L1MemoryProposalKind: String, Codable, CaseIterable, Hashable, Sendable {
@@ -630,7 +704,12 @@ public struct L1SituationFrameValidator: Sendable {
         if !frame.uncertainty.isFinite || !(0 ... 1).contains(frame.uncertainty) {
             failures.append("uncertainty must be in 0...1")
         }
+        // An image already attached to the current request is first-class
+        // evidence.  Models naturally cite its resource ID (for example
+        // "current_frame") rather than inventing a scalar sensor ID, so
+        // validate it alongside the packet evidence IDs.
         let requestEvidence = Set(request.evidenceIDs)
+            .union(request.visuals.map(\.resourceID))
         if frame.evidenceIDs.isEmpty || !Set(frame.evidenceIDs).isSubset(of: requestEvidence) {
             failures.append("frame evidence must reference request evidence")
         }

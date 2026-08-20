@@ -54,6 +54,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let voice: SOMARealtimeVoice
     private let currentCameraImageDataURI: (@Sendable () -> String?)?
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
+    var onInject: (@Sendable (String, String, String) -> Void)?
     private var gate = LiveVoiceLaunchGate()
     private var inactivityGate = LiveVoiceSessionInactivityGate()
     private var inactivityTimer: DispatchWorkItem?
@@ -74,12 +75,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var lastVisualContextNS: UInt64 = 0
 
     init(
-        projectDirectory: String = "/Users/seungyeop/workspace/Research/SOMA",
+        projectDirectory: String? = nil,
         voice: SOMARealtimeVoice = .maple,
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         onEvent: @escaping @Sendable (AppServerLiveVoiceEvent) -> Void
     ) {
         self.projectDirectory = projectDirectory
+            ?? ProcessInfo.processInfo.environment["SOMA_ROOT"]
+            ?? FileManager.default.currentDirectoryPath
         self.voice = voice
         self.currentCameraImageDataURI = currentCameraImageDataURI
         self.onEvent = onEvent
@@ -115,24 +118,21 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     /// opening. The directive is short-lived session context, not a stored
     /// transcript or a substitute for the normal conversation gate.
     func startProactiveOpening(
-        text: String,
         context: CodexInteractionContext?,
         personEntityID: UUID,
         at monotonicNS: UInt64
     ) {
-        let normalized = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(512))
-        guard !normalized.isEmpty else { return }
         queue.async { [weak self] in
             guard let self, !stopped else { return }
             guard gate.beginLaunch(at: monotonicNS) else { return }
             let base = context.map(Self.contextText) ?? ""
-            let directive = "This is a closed-purpose L1-initiated interaction. Treat the supplied objective and completion condition as private conversational orientation, never as text to recite or a checklist to expose. Start with exactly one brief question that serves that objective, then listen. After each reply, lead only one natural conversational step at a time: follow up when it genuinely clarifies the same purpose, shift into ordinary reciprocal conversation when the person reciprocates, and stop pursuing the purpose after it is answered or declined. Do not dump multiple questions, narrate your plan, replace the opening with a generic greeting or offer of help, or invent another motive. If the purpose cannot be preserved, remain silent. Suggested first question: \(normalized)"
+            let directive = "This is a closed-purpose L1-initiated interaction. The supplied objective and completion condition are private conversational orientation, never text to recite or a checklist to expose. Form your own one brief, natural opening only if it serves that objective, then listen. After each reply, respond to what the participant actually said; let their answer determine the next conversational step. Surface a relevant information need only when it naturally fits the evolving conversation, and stop pursuing the objective once it is answered or declined. Do not dump multiple questions, narrate a plan, replace the opening with a generic greeting or offer of help, or invent another motive. If the purpose cannot be preserved, remain silent."
             launch(
                 authorization: "l1_social_opening",
                 initialContext: String([base, directive].filter { !$0.isEmpty }.joined(separator: "\n\n").prefix(24_000)),
                 preferredLanguageTag: context?.preferredLanguageTag,
                 languageStartInstruction: context?.languageStartInstruction,
-                proactiveOpeningTrigger: "Controller event, not user speech: L1 has authorized the proactive opening described in the developer context. Speak exactly one brief opening question now, then listen.",
+                proactiveOpeningTrigger: "Controller event, not user speech: L1 has authorized a private conversation objective in the developer context. If that objective supports a natural opening now, speak exactly one brief opening question, then listen.",
                 personEntityID: personEntityID,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
@@ -155,6 +155,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 "text": bounded,
                 "role": role,
             ])
+            self.onInject?("relay", role, bounded)
         }
     }
 
@@ -165,11 +166,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         guard !normalized.isEmpty else { return }
         queue.async { [weak self] in
             guard let self, self.active else { return }
+            let bounded = String(normalized.prefix(8_192))
             send([
                 "type": "append_text",
-                "text": String(normalized.prefix(8_192)),
+                "text": bounded,
                 "role": role,
             ])
+            self.onInject?("active", role, bounded)
         }
     }
 
@@ -552,6 +555,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 
     @discardableResult
     private func send(_ object: [String: Any], reportFailure: Bool = true) -> Bool {
+        if let type = object["type"] as? String, type == "append_text" {
+            let text = (object["text"] as? String) ?? ""
+            let role = (object["role"] as? String) ?? "developer"
+            onInject?("send:\(role)", role, text)
+        }
         guard let input,
               JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object) else { return false }
@@ -633,66 +641,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
         }
         return data
-    }
-}
-
-/// Bridges the latest ephemeral L1 visual interpretation into an active Live
-/// conversation without persisting or forwarding camera pixels. Repeated
-/// identical scene descriptions are suppressed so a static room does not
-/// consume conversation context every refresh cycle.
-final class LiveVisualContextRelay: @unchecked Sendable {
-    private let lock = NSLock()
-    private var latest: String?
-    private var latestRecordedNS: UInt64 = 0
-    private var lastForwarded: String?
-    private var sink: (@Sendable (String) -> Void)?
-
-    /// Formats the scene body with an honest age prefix. Perception (frame
-    /// capture + on-device interpretation) happens before the cloud reasoning
-    /// that consumes this context, so the age must be stated rather than
-    /// implying the scene is live.
-    private static func framed(_ body: String, ageSeconds: Double) -> String {
-        String(
-            String(
-                "Camera context from \(String(format: "%.0f", ageSeconds))s ago (L1 visual interpretation, not user speech): \(body)"
-            ).prefix(512)
-        )
-    }
-
-    func record(_ cue: L1AuxiliarySemanticCue) {
-        let socialPresence = String(format: "%.2f", cue.socialPresence)
-        let confidence = String(format: "%.2f", cue.confidence)
-        let body = String(
-            "\(cue.summary) Situation=\(cue.situation.rawValue); "
-                + "social_presence=\(socialPresence); confidence=\(confidence)."
-        ).prefix(512)
-        let bounded = String(body)
-        let nowNS = DispatchTime.now().uptimeNanoseconds
-        lock.lock()
-        latest = bounded
-        latestRecordedNS = nowNS
-        let shouldForward = bounded != lastForwarded
-        if shouldForward { lastForwarded = bounded }
-        let activeSink = sink
-        lock.unlock()
-        if shouldForward {
-            let ageSeconds = max(0, Double(nowNS - cue.completedNS)) / 1_000_000_000
-            activeSink?(Self.framed(bounded, ageSeconds: ageSeconds))
-        }
-    }
-
-    func attach(to launcher: AppServerLiveVoiceLauncher) {
-        lock.lock()
-        sink = { [weak launcher] text in launcher?.appendContext(text) }
-        lock.unlock()
-    }
-
-    var latestSummary: String? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let latest else { return nil }
-        let ageSeconds = max(0, Double(DispatchTime.now().uptimeNanoseconds - latestRecordedNS)) / 1_000_000_000
-        return Self.framed(latest, ageSeconds: ageSeconds)
     }
 }
 

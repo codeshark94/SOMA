@@ -1471,13 +1471,63 @@ private struct SpeechInteractionTraceEvent: Encodable, Sendable {
 }
 
 private final class ConversationContactRuntime: @unchecked Sendable {
+    private struct DirectedContactHistory {
+        private let continuityNS: UInt64 = 500_000_000
+        private let windowNS: UInt64 = 45_000_000_000
+        private var episodeStartsNS: [UInt64] = []
+        private var activeSinceNS: UInt64?
+        private var lastObservedNS: UInt64?
+
+        mutating func observe(_ present: Bool, at monotonicNS: UInt64) {
+            prune(at: monotonicNS)
+            guard present else { return }
+            let continues = lastObservedNS.map {
+                monotonicNS >= $0 && monotonicNS - $0 <= continuityNS
+            } ?? false
+            if !continues {
+                activeSinceNS = monotonicNS
+                episodeStartsNS.append(monotonicNS)
+            }
+            lastObservedNS = monotonicNS
+        }
+
+        mutating func snapshot(at monotonicNS: UInt64) -> L1ContactPattern {
+            prune(at: monotonicNS)
+            let active = lastObservedNS.map {
+                monotonicNS >= $0 && monotonicNS - $0 <= continuityNS
+            } ?? false
+            let latestAge = lastObservedNS.map {
+                monotonicNS >= $0 ? Double(monotonicNS - $0) / 1_000_000_000 : 0
+            }
+            let activeDuration = active && activeSinceNS != nil
+                ? Double(monotonicNS - activeSinceNS!) / 1_000_000_000
+                : 0
+            return L1ContactPattern(
+                eyeContactActive: active,
+                recentEpisodeCount: episodeStartsNS.count,
+                latestEpisodeAgeSeconds: latestAge,
+                activeDurationSeconds: activeDuration
+            )
+        }
+
+        private mutating func prune(at monotonicNS: UInt64) {
+            episodeStartsNS.removeAll { start in
+                monotonicNS >= start && monotonicNS - start > windowNS
+            }
+            if let lastObservedNS,
+               monotonicNS >= lastObservedNS,
+               monotonicNS - lastObservedNS > continuityNS {
+                activeSinceNS = nil
+            }
+        }
+    }
+
     private let lock = NSLock()
     private var gate: ConversationContactGate
+    private var directedContactHistory = DirectedContactHistory()
 
-    init(eyeContactFreshnessMilliseconds: UInt64 = 450) {
-        gate = ConversationContactGate(configuration: .init(
-            eyeContactFreshnessMilliseconds: eyeContactFreshnessMilliseconds
-        ))
+    init() {
+        gate = ConversationContactGate()
     }
 
     func observe(_ candidates: [SceneCandidate], at monotonicNS: UInt64) {
@@ -1489,10 +1539,15 @@ private final class ConversationContactRuntime: @unchecked Sendable {
                 && candidate.faceVerificationEligible
                 && candidate.eyeContactEligible
         }
-        guard hasEyeContact else { return }
         lock.lock()
-        gate.observeEyeContact(at: monotonicNS)
+        directedContactHistory.observe(hasEyeContact, at: monotonicNS)
         lock.unlock()
+    }
+
+    func contactPattern(at monotonicNS: UInt64) -> L1ContactPattern {
+        lock.lock()
+        defer { lock.unlock() }
+        return directedContactHistory.snapshot(at: monotonicNS)
     }
 
     func issueSocialPulse(at monotonicNS: UInt64) {
@@ -1504,7 +1559,8 @@ private final class ConversationContactRuntime: @unchecked Sendable {
     func authorizeSpeechOnset(at monotonicNS: UInt64) -> ConversationOpeningAuthorization? {
         lock.lock()
         defer { lock.unlock() }
-        return gate.authorizeSpeechOnset(at: monotonicNS)
+        let directContact = directedContactHistory.snapshot(at: monotonicNS).eyeContactActive
+        return gate.authorizeSpeechOnset(at: monotonicNS, directContact: directContact)
     }
 
     func markConversationOpened(at monotonicNS: UInt64) {
@@ -1879,32 +1935,96 @@ private final class PresentIdentityRoster: @unchecked Sendable {
     }
 }
 
-/// Composes the natural-language L1 thought for the diagnostic thought log:
-/// the situation summary, the social-decision rationale, the working
-/// hypothesis, and any spoken-opening text the model chose.
-private func l1ThoughtStreamMessage(
+/// Produces a small, stable operational summary for the live panel. The full
+/// model frame remains in the runtime trace; the panel carries only the
+/// decision variables needed to understand the current cognitive state.
+private func l1DiagnosticMessage(
     for frame: L1SituationFrame,
-    action: String
+    action: String? = nil,
+    mode: String
 ) -> String {
-    var parts: [String] = ["action=\(action)"]
-    if !frame.summary.isEmpty {
-        parts.append(frame.summary)
+    var parts: [String] = ["mode=\(mode)"]
+    if let action {
+        parts.append("action=\(action)")
     }
-    if let hypothesis = frame.thoughtState?.workingHypothesis, !hypothesis.isEmpty {
-        parts.append("hypothesis: \(hypothesis)")
+    parts.append("uncertainty=\(String(format: "%.2f", frame.uncertainty))")
+    if let thought = frame.thoughtState {
+        parts.append("social_availability=\(String(format: "%.2f", thought.socialAvailability))")
+        parts.append("curiosity_pressure=\(String(format: "%.2f", thought.curiosityPressure))")
+        parts.append("interruption_cost=\(String(format: "%.2f", thought.interruptionCost))")
+        parts.append("relationship_uncertainty=\(String(format: "%.2f", thought.relationshipUncertainty))")
     }
-    if let rationale = frame.socialDecision?.rationale, !rationale.isEmpty {
-        parts.append("rationale: \(rationale)")
-    }
-    switch frame.socialDecision?.openingContent {
-    case .greeting:
-        parts.append("opening: greeting")
-    case let .question(_, text):
-        parts.append("opening: \(text)")
-    case nil:
-        break
+    if let directive = frame.behaviorDirective {
+        parts.append("directive=\(directive.action.rawValue)")
     }
     return parts.joined(separator: " · ")
+}
+
+/// Publishes the model-authored, continuing L1 reflection separately from the
+/// compact control variables. This is an observable self-report, not an
+/// actuator instruction: L0 still receives only the validated decision and
+/// directive fields from the same frame.
+private func l1ReflectionMessage(for frame: L1SituationFrame) -> String? {
+    guard let thought = frame.thoughtState else { return nil }
+    let reflection = thought.streamOfConsciousness
+    guard !reflection.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    return reflection
+}
+
+/// Projects L1 runtime health into the deliberately small vocabulary used by
+/// the live diagnostics panel. Runtime traces retain the original event for
+/// audit; the panel must never become a second renderer for model prose.
+private func l1PanelHealthEvent(state: String, message: String) -> (state: String, message: String)? {
+    func value(_ key: String) -> String? {
+        message
+            .split(whereSeparator: { $0 == ";" || $0 == "·" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { $0.hasPrefix("\(key)=") }
+            .map { String($0.dropFirst(key.count + 1)) }
+    }
+
+    switch state {
+    case "configured":
+        return ("configured", "status=ready")
+    case "wake":
+        let allowedCauses: Set<String> = ["recognized_person", "behavior_awareness", "auxiliary_wake"]
+        let cause = value("cause").flatMap { allowedCauses.contains($0) ? $0 : nil } ?? "situational_change"
+        return ("wake", "cause=\(cause)")
+    case "deliberating":
+        return ("deliberating", "status=context_and_memory")
+    case "l1_situation_response":
+        return ("model_response_received", "status=validation")
+    case "tool_call":
+        return ("tool_call", "status=authorization_review")
+    case "tool_round":
+        return ("tool_round", "status=tool_result_review")
+    case "completed":
+        guard let uncertainty = value("uncertainty"), Double(uncertainty) != nil else {
+            return ("completed", "status=applied")
+        }
+        return ("completed", "uncertainty=\(uncertainty)")
+    case "failed":
+        return ("failed", "reason=runtime_or_validation_failure")
+    case "l1_memory_proposals":
+        let count = value("count").flatMap(Int.init) ?? 0
+        return ("l1_memory_proposals", "count=\(max(0, count))")
+    case "visual_followup":
+        return ("visual_followup", "status=requested_context")
+    case "visual_request_unavailable":
+        return ("visual_request_unavailable", "status=context_unavailable")
+    case "behavior_directive":
+        let allowedActions: Set<String> = ["keep_observing", "resume_scanning", "seek_people", "acknowledge_person"]
+        let action = value("action").flatMap { allowedActions.contains($0) ? $0 : nil } ?? "none"
+        return ("behavior_directive", "action=\(action)")
+    case "discarded", "decision_rejected", "opening_suppressed":
+        return (state, "reason=policy_or_context_guard")
+    case "memory_ready", "memory_consolidated", "memory_proposal_stored", "daily_world_memory_stored", "person_fact_stored", "person_preference_captured":
+        return ("memory_updated", "status=stored")
+    case "memory_unavailable", "memory_consolidation_failed", "memory_proposal_store_failed", "daily_world_memory_store_failed", "person_fact_store_failed", "person_preference_capture_failed":
+        return ("memory_deferred", "status=storage_unavailable")
+    default:
+        return nil
+    }
 }
 
 private func identityDiagnosticLabel(
@@ -1975,27 +2095,6 @@ private func identityPresenceRuntimeEvent(
             confirmations: nil,
             reason: "verified_face_absent"
         )
-    }
-}
-
-/// Forwards E2B's proportional reaction from the auxiliary VLM cue path to the
-/// AttentionGimbalBridge, which is created later in setup. The cue closure runs
-/// before the bridge exists, so the sink is attached once the bridge is up.
-private final class L1AuxiliaryReactionRelay: @unchecked Sendable {
-    private let lock = NSLock()
-    private var sink: (@Sendable (L1AuxiliaryReaction, Double, UInt64) -> Void)?
-
-    func record(_ reaction: L1AuxiliaryReaction, socialPresence: Double, at monotonicNS: UInt64) {
-        lock.lock()
-        let active = sink
-        lock.unlock()
-        active?(reaction, socialPresence, monotonicNS)
-    }
-
-    func attach(_ sink: @escaping @Sendable (L1AuxiliaryReaction, Double, UInt64) -> Void) {
-        lock.lock()
-        self.sink = sink
-        lock.unlock()
     }
 }
 
@@ -3294,20 +3393,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         UInt64(somaEnvDouble("SOMA_L0_FIXATION_RELEASE_SECONDS", default: 0) * 1_000_000_000)
     }
     private let faceFixationReleaseCooldownNS: UInt64 = 30_000_000_000
-    /// Consecutive E2B reactions (orient/observe) observed while L0 is face-locked.
-    /// When this reaches the threshold, E2B forcibly releases what it judges to be
-    /// a wrong fixation and resumes scanning.
-    private var consecutiveAuxiliaryReleaseSignal = 0
-    private let auxiliaryOrientReleaseCount = 2
-    private let auxiliaryObserveReleaseCount = 3
-    /// E2B's low-social-presence force release. When the robot is face-locked but
-    /// E2B consistently judges there is no real social presence behind the held
-    /// face (a phantom / false-positive face, e.g. an object bound to a stored
-    /// identity), it force-releases and resumes scanning. Threshold mirrors the
-    /// "empty exploration" cutoff used by the object-recognition path.
-    private var consecutiveLowSocialPresenceSignal = 0
-    private let auxiliaryLowSocialPresenceReleaseCount = 3
-    private let auxiliaryLowSocialPresenceThreshold = 0.3
     private var activeSpatialFaceReacquisition: (id: String, deadlineNS: UInt64)?
     private var attemptedSpatialFaceReacquisitionIDs: Set<String> = []
     private var confirmedVisualLossNS: UInt64?
@@ -3354,9 +3439,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var indicatorCalibrationStateID: Int?
     private var indicatorReassertionGeneration = 0
     /// The visual invitation stays legible through brief gaze-estimator
-    /// dropouts. Voice admission deliberately remains governed by its own,
-    /// shorter fresh-eye-contact window.
-    private var eyeContactIndicatorLease = EyeContactIndicatorLease(holdMilliseconds: 2_000)
+    /// dropouts. Voice activity is admitted independently of gaze.
+    private var eyeContactIndicatorLease = EyeContactIndicatorLease(holdMilliseconds: 750)
     private let indicatorReassertionIntervalMilliseconds = 1_000
 
     init(
@@ -4207,6 +4291,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         )
     }
 
+    /// The L0 face lock is the current real-time social commitment. L1 may
+    /// deliberately supersede it, but an auxiliary model's wake-up cannot turn
+    /// its own advisory cue into an indirect motor preemption.
+    func hasVerifiedFaceLock(at monotonicNS: UInt64) -> Bool {
+        faceLock.permitsMotor(at: monotonicNS)
+    }
+
     private func recordCurrentVisualAttention(at monotonicNS: UInt64) {
         actionableVisualContinuity.recordObservation(at: monotonicNS)
         confirmedVisualLossNS = nil
@@ -4861,74 +4952,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         applySpatialFaceReacquisition(rememberedFace, at: monotonicNS)
     }
 
-    /// Apply E2B's proportional reaction as a simple L0 control signal. Called
-    /// from the auxiliary VLM cue path (not the face pipeline) so E2B can add
-    /// human detection without disturbing face-lock evidence.
-    func applyAuxiliaryReaction(_ reaction: L1AuxiliaryReaction, socialPresence: Double, at monotonicNS: UInt64) {
-        let prior = indicatorInputs.resolvedState
-        indicatorInputs.applyAuxiliaryReaction(reaction)
-        if indicatorInputs.resolvedState != prior {
-            refreshIndicator(at: monotonicNS)
-        }
-        applyAuxiliaryL0Release(reaction, socialPresence: socialPresence, at: monotonicNS)
-    }
-
-    /// Direct L0 un-stick: if L0 is currently face-locked but E2B consistently
-    /// reports a reaction that points attention elsewhere (orient = non-person
-    /// scene change; observe = sustained ambient change), release the lock and
-    /// resume scanning. This lets E2B break a fixation the face detector itself
-    /// will not clear. Requires several consecutive cues so a single transient
-    /// judgment does not tear down a legitimate lock. A separate path force-
-    /// releases when E2B consistently judges there is no social presence behind
-    /// the held face at all (phantom / false-positive face).
-    private func applyAuxiliaryL0Release(_ reaction: L1AuxiliaryReaction, socialPresence: Double, at monotonicNS: UInt64) {
-        guard faceLock.sceneID != nil else {
-            consecutiveAuxiliaryReleaseSignal = 0
-            consecutiveLowSocialPresenceSignal = 0
-            return
-        }
-        // A verified face lock is a real person by construction: the landmark
-        // verifier rules out static face-shaped distractors (photos, textures),
-        // and verification requires a live, pupil-centered face. E2B's
-        // low-social-presence judgment is a coarse VLM reading of a single
-        // downscaled frame and can be blind (close-ups, motion blur, stale
-        // queue) — it must never tear down a verified lock of the actual user.
-        // Provisional/unverified locks keep the full E2B release protection,
-        // but an *active* provisional lock still represents a face currently
-        // in view that the static-rejection machinery has not dismissed. A
-        // p=0 reading while the camera is actually tracking a live face must
-        // not throw the robot back into the coverage scan (which blurs the
-        // face, churns the tracks, and starves the verifier). Only a lock
-        // that has gone fully inactive — or was never accepted — is eligible
-        // for the E2B release.
-        if faceLock.isActive(at: monotonicNS) {
-            consecutiveAuxiliaryReleaseSignal = 0
-            consecutiveLowSocialPresenceSignal = 0
-            return
-        }
-        if socialPresence < auxiliaryLowSocialPresenceThreshold {
-            consecutiveLowSocialPresenceSignal += 1
-            if consecutiveLowSocialPresenceSignal >= auxiliaryLowSocialPresenceReleaseCount {
-                consecutiveLowSocialPresenceSignal = 0
-                releaseWrongFixation(reason: "auxiliary_low_social_presence", at: monotonicNS, priority: .l1)
-            }
-        } else {
-            consecutiveLowSocialPresenceSignal = 0
-        }
-        let threshold: Int
-        switch reaction {
-        case .orient: threshold = auxiliaryOrientReleaseCount
-        case .observe: threshold = auxiliaryObserveReleaseCount
-        default:
-            consecutiveAuxiliaryReleaseSignal = 0
-            return
-        }
-        consecutiveAuxiliaryReleaseSignal += 1
-        guard consecutiveAuxiliaryReleaseSignal >= threshold else { return }
-        consecutiveAuxiliaryReleaseSignal = 0
-        releaseWrongFixation(reason: "auxiliary_\(reaction.rawValue)", at: monotonicNS)
-    }
-
     private func releaseWrongFixation(reason: String, at monotonicNS: UInt64, priority: ScanPriority = .l0) {
         faceLock.invalidate()
         lastMotorTarget = nil
@@ -4951,12 +4974,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// engagement. A real conversation must never be torn away, so an active
     /// conversation resets the timer. Otherwise, holding the same face lock
     /// beyond `faceFixationReleaseWindowNS` releases it and resumes scanning
-    /// with L1 authority, which also tears away the reflexive face lock even
-    /// while the detector keeps reporting the (possibly false-positive) face.
+    /// while the detector keeps reporting the same false-positive face.
     private func applyFaceFixationAutoRelease(target: AttentionTarget?, at now: UInt64) {
         // Time-based release is opt-in via SOMA_L0_FIXATION_RELEASE_SECONDS.
-        // When disabled (0) the robot keeps gazing; only the judgment-based E2B
-        // release (applyAuxiliaryL0Release) may then tear away a wrong lock.
+        // When disabled (0) the robot keeps gazing until L0 observes departure.
         guard faceFixationReleaseWindowNS > 0 else {
             faceFixationSceneID = nil
             faceFixationStartNS = nil
@@ -6774,10 +6795,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let next = indicatorInputs.resolvedState
         guard ledSettings.responseMode.permits(next) else {
             guard helperReady, process.isRunning, next != activeIndicatorState || indicatorIlluminated else { return }
-            if activeIndicatorRendering?.specialPatternEnabled == true {
-                let commandID = nextCommandID(prefix: "indicator-special")
-                send("indicator_special_pattern \(commandID) 0")
-            }
             if indicatorIlluminated, let previous = activeIndicatorState {
                 let commandID = nextCommandID(prefix: "indicator-policy-clear")
                 send("indicator_clear \(commandID) \(indicatorFirmwareStateID(previous))")
@@ -6802,7 +6819,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let nextRendering = nextSignal.deviceRendering
         let commandID = nextCommandID(prefix: "indicator-enforce")
         send(
-            "indicator_enforce \(commandID) \(nextRendering.stateID) \(nextRendering.specialPatternEnabled ? 1 : 0)"
+            "indicator_enforce \(commandID) \(nextRendering.stateID)"
         )
         activeIndicatorRendering = nextRendering
         indicatorIlluminated = true
@@ -6811,7 +6828,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNS,
             source: "social_indicator",
             state: next.rawValue,
-            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); special_pattern=\(nextRendering.specialPatternEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); enforced=true; rgb_palette=true; arbitrary_rgb=false"
+            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); command_submitted=true; physical_visibility=unverified; rgb_palette=true; arbitrary_rgb=false"
         ))
     }
 
@@ -6824,20 +6841,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               indicatorIlluminated,
               next == activeIndicatorState,
               let activeIndicatorRendering,
-              activeIndicatorRendering == indicatorRendering(next),
-              // Do not run the blind periodic re-assertion while the LED is in
-              // a firmware blink (special pattern): re-setting the state id /
-              // clearing the palette every second resets the blink phase and
-              // produces "one blink, long off-gap" instead of continuous
-              // blinking. During a blink the rendering is left undisturbed and
-              // colour recovery happens on the next state transition (enforce).
-              activeIndicatorRendering.specialPatternEnabled == false else {
+              activeIndicatorRendering == indicatorRendering(next) else {
             refreshIndicator(at: monotonicNS)
             return
         }
         let commandID = nextCommandID(prefix: "indicator-reconcile")
         send(
-            "indicator_reconcile \(commandID) \(activeIndicatorRendering.stateID) \(activeIndicatorRendering.specialPatternEnabled ? 1 : 0)"
+            "indicator_reconcile \(commandID) \(activeIndicatorRendering.stateID)"
         )
     }
 
@@ -6859,7 +6869,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             let commandID = nextCommandID(prefix: "indicator-calibration")
             let nextStateID = preset?.firmwareStateID
 
-            send("indicator_special_pattern \(commandID)-special 0")
             if indicatorIlluminated,
                let activeIndicatorState,
                indicatorFirmwareStateID(activeIndicatorState) != nextStateID {
@@ -7199,7 +7208,7 @@ private final class ANEObjectDetector: @unchecked Sendable {
     let confidenceThreshold: Double
     let personConfidenceThreshold: Double
     private let model: MLModel
-    private let ciContext = CIContext()
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     init(confidenceThreshold: Double, personConfidenceThreshold: Double) throws {
         self.confidenceThreshold = confidenceThreshold
@@ -7236,16 +7245,15 @@ private final class ANEObjectDetector: @unchecked Sendable {
     func detect(in pixelBuffer: CVPixelBuffer) throws -> [VisualObservation] {
         // YOLO11n (COCO, NMS built in): 640x640 input, outputs
         // coordinates [N,4] xywh (normalized) and confidence [N,80].
-        // The CIImage->CGImage path flips Y (CI is bottom-left, CGImage
-        // top-left) and scaleFill stretches the shorter axis to 640, so
-        // the raw Y must be un-flipped and un-stretched back to the
-        // source frame's top-left coordinate system.
+        // MLFeatureValue .scaleFill preserves normalized coordinates 1:1
+        // (the whole frame maps to 0...1 on both axes), so the raw xywh
+        // is already top-left in the source frame. Store it as-is; any
+        // extra flip/un-stretch produced a bottom-left box that moved
+        // opposite to the tracked person.
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         guard width > 0, height > 0 else { return [] }
         let scale = 640.0 / Double(max(width, height))
-        let scaledHeight = Double(height) * scale
-        let yStretch = scaledHeight / 640.0
         let ci = CIImage(cvPixelBuffer: pixelBuffer)
         let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         guard let cg = ciContext.createCGImage(scaled, from: scaled.extent) else { return [] }
@@ -7298,13 +7306,12 @@ private final class ANEObjectDetector: @unchecked Sendable {
             // become phantom observations.
             guard x >= 0, y >= 0, w > 0.02, h > 0.02,
                   x + w <= 1.05, y + h <= 1.05 else { continue }
-            let yUnstretched = (y + h) * yStretch
             observations.append(VisualObservation(
                 rect: SOMACore.NormalizedRect(
                     x: x,
-                    y: 1 - yUnstretched,
+                    y: y,
                     width: w,
-                    height: h * yStretch
+                    height: h
                 ),
                 confidence: bestConfidence,
                 source: .neuralDetector,
@@ -7333,7 +7340,7 @@ private final class ANEObjectDetector: @unchecked Sendable {
             throw RuntimeError.configuration("Cannot allocate Core ML warmup frame")
         }
         let ci = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
+        let context = CIContext(options: [.cacheIntermediates: false])
         guard let cg = context.createCGImage(ci, from: ci.extent),
               let constraint = model.modelDescription.inputDescriptionsByName["image"]?.imageConstraint else {
             throw RuntimeError.configuration("Cannot prepare Core ML warmup frame")
@@ -7357,6 +7364,12 @@ private final class ANEFaceDetector: @unchecked Sendable {
     let warmupMS: Double
     private let model: VNCoreMLModel
     private let anchors: [Anchor]
+    /// Post-softmax face confidence bar. The bundled short-range model was
+    /// tuned at 0.75, but appearance changes (new haircut, glasses, mask)
+    /// routinely push a real face below it while System Vision landmarks
+    /// still verify the same rect. The verifier is the motor gate, so this
+    /// bar only needs to admit candidates worth verifying, not reject noise.
+    private let confidenceThreshold: Double
 
     init() throws {
         guard let modelURL = Bundle.module.url(forResource: "BlazeFaceShortRange", withExtension: "mlpackage") else {
@@ -7369,13 +7382,14 @@ private final class ANEFaceDetector: @unchecked Sendable {
         let loadedModel = try MLModel(contentsOf: compiledURL, configuration: configuration)
         model = try VNCoreMLModel(for: loadedModel)
         anchors = Self.makeAnchors()
+        confidenceThreshold = somaEnvDouble("SOMA_BLAZE_FACE_THRESHOLD", default: 0.5)
         let startedNS = monotonicNanoseconds()
         try Self.warmUp(model: model, anchors: anchors)
         warmupMS = milliseconds(from: startedNS, to: monotonicNanoseconds())
     }
 
     func detect(in pixelBuffer: CVPixelBuffer) throws -> [VisualObservation] {
-        try Self.detect(in: pixelBuffer, model: model, anchors: anchors)
+        try Self.detect(in: pixelBuffer, model: model, anchors: anchors, confidenceThreshold: confidenceThreshold)
     }
 
     private static func warmUp(model: VNCoreMLModel, anchors: [Anchor]) throws {
@@ -7391,10 +7405,10 @@ private final class ANEFaceDetector: @unchecked Sendable {
               let pixelBuffer else {
             throw RuntimeError.configuration("Cannot allocate Core ML face warmup frame")
         }
-        _ = try detect(in: pixelBuffer, model: model, anchors: anchors)
+        _ = try detect(in: pixelBuffer, model: model, anchors: anchors, confidenceThreshold: 0.5)
     }
 
-    private static func detect(in pixelBuffer: CVPixelBuffer, model: VNCoreMLModel, anchors: [Anchor]) throws -> [VisualObservation] {
+    private static func detect(in pixelBuffer: CVPixelBuffer, model: VNCoreMLModel, anchors: [Anchor], confidenceThreshold: Double) throws -> [VisualObservation] {
         let request = VNCoreMLRequest(model: model)
         request.imageCropAndScaleOption = .centerCrop
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
@@ -7420,7 +7434,7 @@ private final class ANEFaceDetector: @unchecked Sendable {
         for index in anchors.indices {
             let scoreOffset = index * scoreStrides[1]
             let score = sigmoid(Double(value(in: rawScores, at: scoreOffset)))
-            guard score >= 0.75 else { continue }
+            guard score >= confidenceThreshold else { continue }
             let boxOffset = index * boxStrides[1]
             let xCenter = Double(value(in: rawBoxes, at: boxOffset)) / 128 + anchors[index].x
             let yCenter = Double(value(in: rawBoxes, at: boxOffset + boxStrides[2])) / 128 + anchors[index].y
@@ -7436,9 +7450,9 @@ private final class ANEFaceDetector: @unchecked Sendable {
             let mappedHeight = height * crop.scaleY
             let rect = SOMACore.NormalizedRect(
                 x: max(0, mappedLeft),
-                y: max(0, 1 - mappedTop - mappedHeight),
+                y: max(0, mappedTop),
                 width: min(mappedWidth, 1 - max(0, mappedLeft)),
-                height: min(mappedHeight, 1 - max(0, 1 - mappedTop - mappedHeight))
+                height: min(mappedHeight, 1 - max(0, mappedTop))
             )
             guard rect.width > 0.02, rect.height > 0.02 else { continue }
             // BlazeFace predicts right eye, left eye, nose, mouth, and ear
@@ -7580,7 +7594,13 @@ private final class SystemSaliencyDetector: @unchecked Sendable {
         try handler.perform([request])
         guard let result = request.results?.first as? VNSaliencyImageObservation else { return [] }
         return (result.salientObjects ?? []).compactMap { region in
-            let rect = SOMACore.NormalizedRect(region.boundingBox)
+            let box = region.boundingBox
+            let rect = SOMACore.NormalizedRect(
+                x: box.origin.x,
+                y: 1 - box.origin.y - box.size.height,
+                width: box.size.width,
+                height: box.size.height
+            )
             guard rect.width * rect.height >= 0.01 else { return nil }
             return VisualObservation(
                 rect: rect,
@@ -7615,8 +7635,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
     /// 1.0 = default (0.68 X / 0.82 Y). Lower = stricter (pupil must be more
     /// centered); higher = more lenient.
     private let pupilCenteringThreshold: Double
-    private let ciContext = CIContext()
-
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
     init(pupilCenteringThreshold: Double = 1.0) {
         self.pupilCenteringThreshold = min(max(pupilCenteringThreshold, 0.1), 2.0)
     }
@@ -7650,7 +7669,17 @@ private final class SystemFaceVerifier: @unchecked Sendable {
                   hasFacialFeatureSet(landmarks) else {
                 return nil
             }
-            let rect = SOMACore.NormalizedRect(observation.boundingBox)
+            // Vision's boundingBox uses a bottom-left origin; the rest of the
+            // pipeline (BlazeFace, YOLO, SceneField, FaceConfirmationLease)
+            // uses top-left. Flip Y here or verification never matches the
+            // ANE face candidate whenever the face leaves the vertical center.
+            let visionBox = observation.boundingBox
+            let rect = SOMACore.NormalizedRect(
+                x: visionBox.origin.x,
+                y: 1 - visionBox.origin.y - visionBox.size.height,
+                width: visionBox.size.width,
+                height: visionBox.size.height
+            )
             guard let alignment = alignmentEvidence(landmarks: landmarks, rect: rect) else {
                 return nil
             }
@@ -7689,7 +7718,8 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         let imageLeftEye = firstEye.x <= secondEye.x ? firstEye : secondEye
         let imageRightEye = firstEye.x <= secondEye.x ? secondEye : firstEye
         guard imageRightEye.x - imageLeftEye.x >= rect.width * 0.12,
-              noseCenter.y < max(imageLeftEye.y, imageRightEye.y) else {
+              // Top-left origin: the nose sits below the eyes (larger y).
+              noseCenter.y > max(imageLeftEye.y, imageRightEye.y) else {
             return nil
         }
         return FaceAlignmentEvidence(
@@ -7714,7 +7744,8 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         let divisor = Double(region.pointCount)
         return CGPoint(
             x: rect.x + (x / divisor) * rect.width,
-            y: rect.y + (y / divisor) * rect.height
+            // Vision landmarks are bottom-left normalized; rect is top-left.
+            y: rect.y + (1 - (y / divisor)) * rect.height
         )
     }
 
@@ -7812,6 +7843,232 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             && normalizedY <= 0.82 * pupilCenteringThreshold
     }
 
+}
+
+/// Runs landmark verification outside the L0 perception queue. The worker has
+/// one pending slot: it may skip stale frames, but L0 never waits behind a
+/// Core Image conversion or a synchronous Vision request to receive its
+/// latest corroborating result.
+private final class SystemFaceVerificationWorker: @unchecked Sendable {
+    struct Result: Sendable {
+        let captureNS: UInt64
+        let completedNS: UInt64
+        let faces: [SystemFaceEvidence]
+    }
+
+    private final class Frame: @unchecked Sendable {
+        let pixelBuffer: CVPixelBuffer
+        let captureNS: UInt64
+
+        init(pixelBuffer: CVPixelBuffer, captureNS: UInt64) {
+            self.pixelBuffer = pixelBuffer
+            self.captureNS = captureNS
+        }
+    }
+
+    private let verifier: SystemFaceVerifier
+    private let queue = DispatchQueue(label: "soma.subconscious.system-face-verifier", qos: .userInitiated)
+    private let lock = NSLock()
+    private let intervalNS: UInt64
+    private var nextSubmissionNS: UInt64 = 0
+    private var pending: Frame?
+    private var latest: Result?
+    private var processing = false
+    private var stopped = false
+
+    init(pupilCenteringThreshold: Double, maximumRateHz: Double = 5) {
+        verifier = SystemFaceVerifier(pupilCenteringThreshold: pupilCenteringThreshold)
+        intervalNS = UInt64(1_000_000_000 / max(maximumRateHz, 1))
+    }
+
+    func submit(pixelBuffer: CVPixelBuffer, captureNS: UInt64) {
+        lock.lock()
+        guard !stopped, captureNS >= nextSubmissionNS else {
+            lock.unlock()
+            return
+        }
+        nextSubmissionNS = captureNS + intervalNS
+        pending = Frame(pixelBuffer: pixelBuffer, captureNS: captureNS)
+        let startWorker = !processing
+        if startWorker { processing = true }
+        lock.unlock()
+        if startWorker {
+            queue.async { [weak self] in self?.drain() }
+        }
+    }
+
+    func latestResult() -> Result? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latest
+    }
+
+    func stop() {
+        lock.lock()
+        stopped = true
+        pending = nil
+        lock.unlock()
+        queue.sync {}
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard !stopped, let frame = pending else {
+                processing = false
+                lock.unlock()
+                return
+            }
+            pending = nil
+            lock.unlock()
+
+            let result: Result = autoreleasepool {
+                let faces = verifier.detect(in: frame.pixelBuffer)
+                return Result(
+                    captureNS: frame.captureNS,
+                    completedNS: monotonicNanoseconds(),
+                    faces: faces
+                )
+            }
+
+            lock.lock()
+            if !stopped, latest?.captureNS ?? 0 <= result.captureNS {
+                latest = result
+            }
+            lock.unlock()
+        }
+    }
+}
+
+/// Low-rate scene understanding is deliberately isolated from the face servo.
+/// Object detection, saliency and their pixel conversions are useful for the
+/// spatial field, but none is allowed to delay the next L0 face frame.
+private final class SceneEnrichmentWorker: @unchecked Sendable {
+    struct Result: Sendable {
+        let captureNS: UInt64
+        let completedNS: UInt64
+        let candidates: [VisualObservation]
+        let objectInferenceMS: Double?
+    }
+
+    private final class Frame: @unchecked Sendable {
+        let pixelBuffer: CVPixelBuffer
+        let captureNS: UInt64
+
+        init(pixelBuffer: CVPixelBuffer, captureNS: UInt64) {
+            self.pixelBuffer = pixelBuffer
+            self.captureNS = captureNS
+        }
+    }
+
+    private let objectDetector: ANEObjectDetector?
+    private let saliencyDetector = SystemSaliencyDetector()
+    private let onHealth: @Sendable (String, String) -> Void
+    private let queue = DispatchQueue(label: "soma.subconscious.scene-enrichment", qos: .utility)
+    private let lock = NSLock()
+    private var pending: Frame?
+    private var latest: Result?
+    private var processing = false
+    private var stopped = false
+    private var nextObjectNS: UInt64 = 0
+    private var nextSaliencyNS: UInt64 = 0
+    private var nextObjectErrorReportNS: UInt64 = 0
+
+    init(
+        objectDetector: ANEObjectDetector?,
+        onHealth: @escaping @Sendable (String, String) -> Void
+    ) {
+        self.objectDetector = objectDetector
+        self.onHealth = onHealth
+    }
+
+    func submit(pixelBuffer: CVPixelBuffer, captureNS: UInt64) {
+        lock.lock()
+        guard !stopped else {
+            lock.unlock()
+            return
+        }
+        pending = Frame(pixelBuffer: pixelBuffer, captureNS: captureNS)
+        let startWorker = !processing
+        if startWorker { processing = true }
+        lock.unlock()
+        if startWorker {
+            queue.async { [weak self] in self?.drain() }
+        }
+    }
+
+    func latestResult() -> Result? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latest
+    }
+
+    func stop() {
+        lock.lock()
+        stopped = true
+        pending = nil
+        lock.unlock()
+        queue.sync {}
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard !stopped, let frame = pending else {
+                processing = false
+                lock.unlock()
+                return
+            }
+            pending = nil
+            lock.unlock()
+
+            let result = autoreleasepool { enrich(frame) }
+            guard let result else { continue }
+
+            lock.lock()
+            if !stopped, latest?.captureNS ?? 0 <= result.captureNS {
+                latest = result
+            }
+            lock.unlock()
+        }
+    }
+
+    private func enrich(_ frame: Frame) -> Result? {
+        let now = monotonicNanoseconds()
+        var candidates: [VisualObservation] = []
+        var objectInferenceMS: Double?
+        var didRun = false
+
+        if let objectDetector, now >= nextObjectNS {
+            nextObjectNS = now + 125_000_000
+            didRun = true
+            let startedNS = monotonicNanoseconds()
+            do {
+                candidates += try objectDetector.detect(in: frame.pixelBuffer)
+                objectInferenceMS = milliseconds(from: startedNS, to: monotonicNanoseconds())
+            } catch {
+                let failedNS = monotonicNanoseconds()
+                if failedNS >= nextObjectErrorReportNS {
+                    nextObjectErrorReportNS = failedNS + 1_000_000_000
+                    onHealth("object_neural_engine", "runtime_error; \(error.localizedDescription)")
+                }
+            }
+        }
+
+        if now >= nextSaliencyNS {
+            nextSaliencyNS = now + 250_000_000
+            didRun = true
+            candidates += (try? saliencyDetector.detect(in: frame.pixelBuffer)) ?? []
+        }
+
+        guard didRun else { return nil }
+        return Result(
+            captureNS: frame.captureNS,
+            completedNS: monotonicNanoseconds(),
+            candidates: candidates,
+            objectInferenceMS: objectInferenceMS
+        )
+    }
 }
 
 private final class DiagnosticPixelBuffer: @unchecked Sendable {
@@ -7982,33 +8239,29 @@ private final class VisionWorker: @unchecked Sendable {
     private let onFatalVisionFailure: (() -> Void)?
     private let poseStore: GimbalPoseStore
     private let externalGimbalCalibration: ExternalGimbalCalibration?
-    private let neuralObjectDetector: ANEObjectDetector?
+    private let sceneEnrichmentWorker: SceneEnrichmentWorker
     private let neuralFaceDetector: ANEFaceDetector?
     private let faceIdentityRuntime: FaceIdentityRuntime?
     private let onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)?
     private let onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)?
-    private let systemSaliencyDetector = SystemSaliencyDetector()
-    private let systemFaceVerifier: SystemFaceVerifier
+    private let systemFaceVerificationWorker: SystemFaceVerificationWorker
     private let stateLock = NSLock()
     private var sceneField = SceneField(requiresFaceActivity: true)
-    private var detectorCountdown = 0
-    private var nextObjectNS: UInt64 = 0
     private var nextFaceNS: UInt64 = 0
-    private var nextFaceVerificationNS: UInt64 = 0
-    private var nextFaceVerifierDiagnosticNS: UInt64 = 0
+    private var lastAppliedFaceVerificationCaptureNS: UInt64 = 0
+    private var lastAppliedSceneEnrichmentCaptureNS: UInt64 = 0
     private var directedContactEvidence: [(rect: SOMACore.NormalizedRect, observedNS: UInt64)] = []
     private var identityAlignmentEvidence: [(evidence: SystemFaceEvidence, observedNS: UInt64)] = []
-    private var nextSaliencyNS: UInt64 = 0
     private var nextSceneSnapshotNS: UInt64 = 0
-    private var nextObjectErrorReportNS: UInt64 = 0
     private var visualEvidenceContinuity = VisualEvidenceContinuity()
     private var socialAttentionLease = SocialAttentionLease()
     private var facePersonFusion = FacePersonFusion()
-    private var faceConfirmationLease = FaceConfirmationLease()
+    // Landmark verification is slower than ANE face detection. It corroborates
+    // the high-rate motor path rather than serializing every control update.
+    private var faceConfirmationLease = FaceConfirmationLease(maximumAgeMilliseconds: 750)
     private var faceMotorContinuityLease = FaceMotorContinuityLease()
     private var unverifiedFaceRejection = UnverifiedFaceRejectionGate()
     private var panoramaBackgroundAdmission = PanoramaBackgroundAdmission()
-    private var trackerRect: CGRect?
     private var lastAttentionEntropy = 0.0
     private var lastFaceInferenceSuccessNS: UInt64 = 0
     private var faceInferenceFailureReported = false
@@ -8060,9 +8313,13 @@ private final class VisionWorker: @unchecked Sendable {
         self.onCameraFrame = onCameraFrame
         self.onFatalVisionFailure = onFatalVisionFailure
         self.onIdentityPresenceEvidence = onIdentityPresenceEvidence
-        self.systemFaceVerifier = SystemFaceVerifier(
-            pupilCenteringThreshold: pupilCenteringThreshold
+        self.systemFaceVerificationWorker = SystemFaceVerificationWorker(
+            pupilCenteringThreshold: pupilCenteringThreshold,
+            maximumRateHz: 5
         )
+        let objectDetector: ANEObjectDetector?
+        let objectDetectorState: String
+        let objectDetectorMessage: String
         do {
             let yoloConfidence = somaEnvDouble("SOMA_YOLO_CONFIDENCE_THRESHOLD", default: 0.5)
             let yoloPersonConfidence = somaEnvDouble("SOMA_YOLO_PERSON_THRESHOLD", default: 0.5)
@@ -8070,24 +8327,34 @@ private final class VisionWorker: @unchecked Sendable {
                 confidenceThreshold: yoloConfidence,
                 personConfidenceThreshold: yoloPersonConfidence
             )
-            neuralObjectDetector = detector
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "object_neural_engine",
-                state: "configured",
-                message: "model=YOLO11n; compute_units=\(detector.computeUnits); labels=person_only; person_confidence_threshold=\(yoloPersonConfidence); prewarm_ms=\(detector.warmupMS)"
-            ))
+            objectDetector = detector
+            objectDetectorState = "configured"
+            objectDetectorMessage = "model=YOLO11n; compute_units=\(detector.computeUnits); labels=person_only; person_confidence_threshold=\(yoloPersonConfidence); prewarm_ms=\(detector.warmupMS); worker=scene_enrichment"
         } catch {
-            neuralObjectDetector = nil
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "object_neural_engine",
-                state: "unavailable",
-                message: error.localizedDescription
-            ))
+            objectDetector = nil
+            objectDetectorState = "unavailable"
+            objectDetectorMessage = error.localizedDescription
         }
+        self.sceneEnrichmentWorker = SceneEnrichmentWorker(
+            objectDetector: objectDetector,
+            onHealth: { source, detail in
+                let split = detail.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: source,
+                    state: split.first.map(String.init) ?? "runtime_error",
+                    message: split.dropFirst().first.map(String.init) ?? detail
+                ))
+            }
+        )
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "object_neural_engine",
+            state: objectDetectorState,
+            message: objectDetectorMessage
+        ))
         do {
             let detector = try ANEFaceDetector()
             neuralFaceDetector = detector
@@ -8147,7 +8414,7 @@ private final class VisionWorker: @unchecked Sendable {
             monotonicNS: monotonicNanoseconds(),
             source: "system_face_verifier",
             state: "configured",
-            message: "source=VNDetectFaceLandmarksRequest; max_hz=20; auxiliary_only"
+            message: "source=VNDetectFaceLandmarksRequest; max_hz=5; latest_result_mailbox=on; corroborates_high_rate_ane_face"
         ))
         writer.write(RuntimeEvent(
             event: "source.health",
@@ -8180,6 +8447,8 @@ private final class VisionWorker: @unchecked Sendable {
         stateLock.unlock()
         wake.signal()
         queue.sync {}
+        systemFaceVerificationWorker.stop()
+        sceneEnrichmentWorker.stop()
         faceIdentityRuntime?.stop()
     }
 
@@ -8207,25 +8476,9 @@ private final class VisionWorker: @unchecked Sendable {
 
     private func process(_ frame: VideoFrame) {
         let startedNS = monotonicNanoseconds()
-        detectorCountdown -= 1
         let outcome: DetectionOutcome
         do {
-            if neuralObjectDetector != nil {
-                outcome = try detect(in: frame.pixelBuffer)
-            } else if let trackerRect, detectorCountdown > 0,
-               let tracked = try track(trackerRect, in: frame.pixelBuffer) {
-                self.trackerRect = tracked.rect.cgRect
-                outcome = .candidates([tracked])
-            } else if detectorCountdown <= 0 {
-                detectorCountdown = 4
-                outcome = try detect(in: frame.pixelBuffer)
-                if case let .candidates(candidates) = outcome, let observation = candidates.first {
-                    trackerRect = observation.rect.cgRect
-                }
-            } else {
-                counters.visionFrameSkipped()
-                return
-            }
+            outcome = try detect(in: frame.pixelBuffer, captureNS: frame.captureNS)
         } catch {
             outcome = .miss
         }
@@ -8254,6 +8507,15 @@ private final class VisionWorker: @unchecked Sendable {
                 poseProjection: externalGimbalCalibration == nil ? .identity : .obsbotTiny2Lite,
                 cameraProjectionModel: projection.cameraProjectionModel
             )
+            let sceneFaceCount = sceneCandidates.filter { $0.observation.label == "face" && $0.observedThisFrame }.count
+            let sceneObservedCount = sceneCandidates.filter { $0.observedThisFrame }.count
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: completedNS,
+                source: "face_pipeline",
+                state: "scene",
+                message: "scene_face=\(sceneFaceCount); scene_total=\(sceneObservedCount)"
+            ))
             writeSceneCandidates(sceneCandidates, at: completedNS)
             onSceneCandidates?(sceneCandidates, completedNS)
             submitPanorama(
@@ -8399,20 +8661,12 @@ private final class VisionWorker: @unchecked Sendable {
         )
     }
 
-    private func track(_ rect: CGRect, in pixelBuffer: CVPixelBuffer) throws -> VisualObservation? {
-        let request = VNTrackObjectRequest(detectedObjectObservation: VNDetectedObjectObservation(boundingBox: rect))
-        request.trackingLevel = .fast
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        try handler.perform([request])
-        guard let result = request.results?.first as? VNDetectedObjectObservation,
-              result.confidence >= 0.35 else {
-            trackerRect = nil
-            return nil
-        }
-        return VisualObservation(rect: SOMACore.NormalizedRect(result.boundingBox), confidence: Double(result.confidence), source: .tracker)
-    }
-
-    private func detect(in pixelBuffer: CVPixelBuffer) throws -> DetectionOutcome {
+    private func detect(in pixelBuffer: CVPixelBuffer, captureNS: UInt64) throws -> DetectionOutcome {
+        // The landmark worker owns its own latest-frame mailbox. Submitting is
+        // nonblocking, so L0 face inference is never serialized behind
+        // Core Image conversion or a synchronous System Vision request.
+        systemFaceVerificationWorker.submit(pixelBuffer: pixelBuffer, captureNS: captureNS)
+        sceneEnrichmentWorker.submit(pixelBuffer: pixelBuffer, captureNS: captureNS)
         var candidates: [VisualObservation] = []
         if let neuralFaceDetector {
             let now = monotonicNanoseconds()
@@ -8428,122 +8682,53 @@ private final class VisionWorker: @unchecked Sendable {
                 }
             }
         }
-        // The face is the only L0 motor target. Running the heavier scene
-        // detector first serializes it behind an unrelated object inference
-        // and adds a visible control delay. Keep scene awareness at 12 Hz,
-        // but reserve every available frame for the face path.
-        let now = monotonicNanoseconds()
-        if let neuralObjectDetector, now >= nextObjectNS {
-            nextObjectNS = now + 125_000_000
-            let startedNS = monotonicNanoseconds()
-            do {
-                candidates += try neuralObjectDetector.detect(in: pixelBuffer)
-                counters.neuralEngineInference(inferenceMS: milliseconds(from: startedNS, to: monotonicNanoseconds()))
-            } catch {
-                let failedNS = monotonicNanoseconds()
-                if failedNS >= nextObjectErrorReportNS {
-                    nextObjectErrorReportNS = failedNS + 1_000_000_000
-                    writer.write(RuntimeEvent(
-                        event: "source.health",
-                        monotonicNS: failedNS,
-                        source: "object_neural_engine",
-                        state: "runtime_error",
-                        message: error.localizedDescription
-                    ))
+        let faceVerificationNow = monotonicNanoseconds()
+        if let enrichment = sceneEnrichmentWorker.latestResult(),
+           enrichment.captureNS > lastAppliedSceneEnrichmentCaptureNS {
+            // Scene results enrich the spatial field, but do not become stale
+            // L0 evidence after the camera has moved on.
+            lastAppliedSceneEnrichmentCaptureNS = enrichment.captureNS
+            if faceVerificationNow >= enrichment.captureNS,
+               faceVerificationNow - enrichment.captureNS <= 750_000_000 {
+                candidates += enrichment.candidates
+                if let objectInferenceMS = enrichment.objectInferenceMS {
+                    counters.neuralEngineInference(inferenceMS: objectInferenceMS)
                 }
             }
         }
-        let faceVerificationNow = monotonicNanoseconds()
-        if faceVerificationNow >= nextFaceVerificationNS {
-            nextFaceVerificationNS = faceVerificationNow + 50_000_000
-            let systemFaces = systemFaceVerifier.detect(in: pixelBuffer)
-            faceConfirmationLease.record(systemFaces.map(\.rect), at: faceVerificationNow)
-            if faceVerificationNow >= nextFaceVerifierDiagnosticNS {
-                nextFaceVerifierDiagnosticNS = faceVerificationNow + 2_000_000_000
-                var rawFaces = 0
-                var landmarkComplete = 0
-                var alignmentOK = 0
-                var rawUp = 0
-                var rawRight = 0
-                var rawDown = 0
-                var rawLeft = 0
-                let width = CVPixelBufferGetWidth(pixelBuffer)
-                let height = CVPixelBufferGetHeight(pixelBuffer)
-                let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
-                let orientations: [CGImagePropertyOrientation] = [.up, .right, .down, .left]
-                var orientationCounts = [Int](repeating: 0, count: 4)
-                let probeImage = systemFaceVerifier.scaledCGImage(from: pixelBuffer)
-                for (index, orientation) in orientations.enumerated() {
-                    let rawRequest = VNDetectFaceLandmarksRequest()
-                    let rawHandler: VNImageRequestHandler
-                    if let probeImage {
-                        rawHandler = VNImageRequestHandler(cgImage: probeImage, orientation: orientation, options: [:])
-                    } else {
-                        rawHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
-                    }
-                    if (try? rawHandler.perform([rawRequest])) != nil {
-                        orientationCounts[index] = rawRequest.results?.count ?? 0
-                    }
-                }
-                rawUp = orientationCounts[0]
-                rawRight = orientationCounts[1]
-                rawDown = orientationCounts[2]
-                rawLeft = orientationCounts[3]
-                rawFaces = rawUp
-                let rawRequest = VNDetectFaceLandmarksRequest()
-                let rawHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-                if (try? rawHandler.perform([rawRequest])) != nil {
-                    for obs in rawRequest.results ?? [] {
-                        guard let lms = obs.landmarks else { continue }
-                        let eyes = (lms.leftEye?.pointCount ?? 0) >= 2 && (lms.rightEye?.pointCount ?? 0) >= 2
-                        let nose = (lms.nose?.pointCount ?? 0) >= 2
-                        let mouth = (lms.outerLips?.pointCount ?? 0) >= 3
-                        if eyes && nose && mouth { landmarkComplete += 1 }
-                        let r = SOMACore.NormalizedRect(obs.boundingBox)
-                        if let le = lms.leftEye, let re = lms.rightEye, let nz = lms.nose,
-                           le.pointCount > 0, re.pointCount > 0, nz.pointCount > 0 {
-                            let lec = le.normalizedPoints.map { $0.x }.reduce(0, +) / Double(le.pointCount)
-                            let rec = re.normalizedPoints.map { $0.x }.reduce(0, +) / Double(re.pointCount)
-                            let eyeX = abs(lec - rec) * r.width
-                            if eyeX >= r.width * 0.12 { alignmentOK += 1 }
-                        }
-                    }
-                }
-                let blazeFacesCount = candidates.filter { isFaceCandidate($0) }.count
-                if rawUp == 0, blazeFacesCount > 0 {
-                    let dumpURL = URL(fileURLWithPath: "/tmp/soma-verify-frame.jpg")
-                    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-                    let context = CIContext()
-                    if let cgImage = context.createCGImage(ciImage, from: ciImage.extent),
-                       let destination = CGImageDestinationCreateWithURL(dumpURL as CFURL, "public.jpeg" as CFString, 1, nil) {
-                        CGImageDestinationAddImage(destination, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
-                        if CGImageDestinationFinalize(destination) {
-                            writer.write(RuntimeEvent(
-                                event: "source.health",
-                                monotonicNS: faceVerificationNow,
-                                source: "system_face_verifier",
-                                state: "verification_dump",
-                                message: dumpURL.lastPathComponent
-                            ))
-                        }
-                    }
-                }
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: faceVerificationNow,
-                    source: "system_face_verifier",
-                    state: "verification_probe",
-                    message: "system_faces=\(systemFaces.count); blaze_faces=\(candidates.filter { isFaceCandidate($0) }.count); raw_up=\(rawUp); raw_right=\(rawRight); raw_down=\(rawDown); raw_left=\(rawLeft); landmarks=\(landmarkComplete); alignment=\(alignmentOK); frame=\(width)x\(height); fmt=0x\(String(format: "%08X", format))"
-                ))
+        var newlyVerifiedFaces: [SystemFaceEvidence] = []
+        if let verification = systemFaceVerificationWorker.latestResult(),
+           verification.captureNS > lastAppliedFaceVerificationCaptureNS {
+            // Consume each mailbox result exactly once. A result that reached
+            // us too late is diagnostic evidence, not a motor measurement.
+            lastAppliedFaceVerificationCaptureNS = verification.captureNS
+            if faceVerificationNow >= verification.captureNS,
+               faceVerificationNow - verification.captureNS <= 750_000_000 {
+                newlyVerifiedFaces = verification.faces
+                faceConfirmationLease.record(verification.faces.map(\.rect), at: verification.captureNS)
+                directedContactEvidence = verification.faces
+                    .filter(\.directedEyeContact)
+                    .map { ($0.rect, verification.captureNS) }
+                identityAlignmentEvidence = verification.faces.map { ($0, verification.captureNS) }
             }
-            directedContactEvidence = systemFaces
-                .filter(\.directedEyeContact)
-                .map { ($0.rect, faceVerificationNow) }
-            identityAlignmentEvidence = systemFaces.map { ($0, faceVerificationNow) }
-            // System Vision is an independent confirmation signal, never a
-            // steering measurement. Its face box has a different crop and
-            // cadence from BlazeFace; alternating the two boxes made the
-            // gimbal chase a synthetic zig-zag for one physical face.
+        }
+        // A newly completed landmark result may rescue an ANE miss, but stale
+        // System Vision geometry never becomes a steering measurement.
+        let aneFaceRects = candidates.filter { isFaceCandidate($0) }.map(\.rect)
+        candidates += newlyVerifiedFaces.compactMap { evidence in
+            guard !aneFaceRects.contains(where: { Self.faceEvidenceMatches(evidence.rect, $0) }) else {
+                return nil
+            }
+            return VisualObservation(
+                rect: evidence.rect,
+                confidence: 1.0,
+                source: .systemFaceDetector,
+                kind: .human,
+                label: "face",
+                isActionEligible: true,
+                isFaceVerified: true,
+                isEyeContactEligible: evidence.directedEyeContact
+            )
         }
         candidates = facePersonFusion.fuse(candidates, at: faceVerificationNow)
         let directedContactFreshnessNS = UInt64(somaEnvDouble(
@@ -8668,6 +8853,13 @@ private final class VisionWorker: @unchecked Sendable {
                         .evidence.alignment
                 }
         }
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: faceVerificationNow,
+            source: "face_identity",
+            state: "alignments",
+            message: "count=\(identityAlignments.count); verified_neural=\(verifiedNeuralFaces.count); evidence=\(identityAlignmentEvidence.count)"
+        ))
         if !identityAlignments.isEmpty {
             faceIdentityRuntime?.submit(
                 pixelBuffer: pixelBuffer,
@@ -8675,6 +8867,13 @@ private final class VisionWorker: @unchecked Sendable {
                 at: faceVerificationNow
             )
         }
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: faceVerificationNow,
+            source: "face_pipeline",
+            state: "detect",
+            message: "candidates_face=\(candidates.filter { self.isFaceCandidate($0) }.count); candidates_total=\(candidates.count); verified=\(verifiedFaceCount)"
+        ))
         let faceLockDiagnosticState: String
         if verifiedFaceCount > 0 {
             faceLockDiagnosticState = "face_verified"
@@ -8691,11 +8890,6 @@ private final class VisionWorker: @unchecked Sendable {
             state: faceLockDiagnosticState,
             force: rawFaceCount > 0
         )
-        let saliencyNow = monotonicNanoseconds()
-        if saliencyNow >= nextSaliencyNS {
-            nextSaliencyNS = saliencyNow + 250_000_000
-            candidates += (try? systemSaliencyDetector.detect(in: pixelBuffer)) ?? []
-        }
         guard !candidates.isEmpty else {
             return .miss
         }
@@ -8865,6 +9059,10 @@ private final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBuf
             writeDiagnosticSnapshot(from: pixelBuffer)
             let belief = worldModel.snapshot(at: now)
             publisher.publish(belief, reason: "fast_prediction")
+            // L0 receives the live sample first. The semantic helper gets the
+            // same retained buffer on a utility queue and has no motor or LED
+            // authority, so semantic work cannot enter the reflex path.
+            visionWorker.submit(pixelBuffer: pixelBuffer, captureNS: now, exposureNS: exposureNS)
             l1AuxiliarySemanticBridge?.submit(
                 pixelBuffer: pixelBuffer,
                 context: L1AuxiliaryFrameContext(captureNS: now, trigger: "visual_sample", belief: belief)
@@ -8873,7 +9071,6 @@ private final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBuf
                 pixelBuffer: pixelBuffer,
                 captureNS: exposureNS
             )
-            visionWorker.submit(pixelBuffer: pixelBuffer, captureNS: now, exposureNS: exposureNS)
             counters.videoCallback(
                 at: now,
                 processingMS: milliseconds(from: now, to: monotonicNanoseconds())
@@ -9075,6 +9272,20 @@ private final class PanoramaPlaceMemoryPersistence: @unchecked Sendable {
     }
 }
 
+/// Actual physical memory impact (resident + compressed + swapped) of this
+/// process, as reported by the kernel. RSS alone hides compressed pages, which
+/// is exactly how the IOSurface leak looked "small" while the machine was
+/// thrashing.
+private func currentPhysicalFootprintBytes() -> UInt64 {
+    var info = task_vm_info()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info>.size / MemoryLayout<natural_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+    }
+    guard result == KERN_SUCCESS else { return 0 }
+    return UInt64(info.phys_footprint)
+}
+
 private func run(_ options: Options) throws {
     let termination = GracefulShutdown(signals: [SIGTERM, SIGINT])
     try requestAccess(for: .video, label: "camera")
@@ -9094,6 +9305,27 @@ private func run(_ options: Options) throws {
         importantRotationPolicy: options.importantRotationPolicy
     )
     defer { writer.close() }
+    // Memory watchdog: a detector/context leak once ballooned phys_footprint
+    // to ~57 GB (IOSurface growth). RSS-based checks would have missed it, so
+    // watch the kernel footprint and exit for launchd to restart us long
+    // before the system starts swapping. 12 GB is ~2x the steady-state
+    // footprint (models + buffers) and far below the leak trajectory.
+    let footprintLimitBytes: UInt64 = 12 * 1_000_000_000
+    Task {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            let footprint = currentPhysicalFootprintBytes()
+            guard footprint > footprintLimitBytes else { continue }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "memory_watchdog",
+                state: "critical",
+                message: "phys_footprint=\(footprint / 1_000_000)MB > limit=\(footprintLimitBytes / 1_000_000)MB; exiting for launchd restart"
+            ))
+            exit(0)
+        }
+    }
     let liveDiagnostics = LiveDiagnosticsWriter(
         rootURL: options.outputURL.deletingLastPathComponent().deletingLastPathComponent()
     )
@@ -9153,8 +9385,6 @@ private func run(_ options: Options) throws {
     }
     placeMemoryPersistence?.restore()
     let panoramaStatus = PanoramaMapStatusStore()
-    let liveVisualContextRelay = LiveVisualContextRelay()
-    let auxiliaryReactionRelay = L1AuxiliaryReactionRelay()
     let auxiliaryWakeRelay = L1AuxiliaryWakeRelay()
     let l1AuxiliaryBridgeBox = L1AuxiliaryBridgeBox()
     let poseStoreBox = PoseStoreBox()
@@ -9264,8 +9494,6 @@ private func run(_ options: Options) throws {
                 ))
             },
             onCue: { cue in
-                liveVisualContextRelay.record(cue)
-                auxiliaryReactionRelay.record(cue.reaction, socialPresence: cue.socialPresence, at: cue.completedNS)
                 writer.write(L1AuxiliarySemanticTraceEvent(cue))
                 // Parallel object recognition: when L1's visual helper flags an
                 // object (presented to the robot, or encountered while scanning
@@ -9462,12 +9690,7 @@ private func run(_ options: Options) throws {
         ))
     }
     let complete = DispatchSemaphore(value: 0)
-    let conversationContact = ConversationContactRuntime(
-        eyeContactFreshnessMilliseconds: UInt64(somaEnvDouble(
-            "SOMA_L0_EYE_CONTACT_FRESHNESS_MS",
-            default: 450
-        ))
-    )
+    let conversationContact = ConversationContactRuntime()
     let faceLockDiagnosticRecorder = try options.faceLockDiagnosticDirectoryURL.map {
         try FaceLockDiagnosticRecorder(directoryURL: $0)
     }
@@ -9520,12 +9743,6 @@ private func run(_ options: Options) throws {
         }
         attentionGimbalBridge?.recognizedPersonEntityIDProvider = {
             identityPresence.recognizedPersonEntityID()
-        }
-        // The auxiliary VLM cue closure runs before the bridge exists, so E2B's
-        // proportional reaction is buffered in the relay and attached here once
-        // the bridge is up.
-        auxiliaryReactionRelay.attach { [weak attentionGimbalBridge] reaction, socialPresence, monotonicNS in
-            attentionGimbalBridge?.applyAuxiliaryReaction(reaction, socialPresence: socialPresence, at: monotonicNS)
         }
     } else {
         attentionGimbalBridge = nil
@@ -9751,6 +9968,13 @@ private func run(_ options: Options) throws {
                     message: "characters=\(min(characters, 65_535)); transcript_trace=false; local_archive=on_final"
                 ))
             case let .transcriptFinalized(threadID, role, text):
+                writer.write(RuntimeEvent(
+                    event: "l2.transcript",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: role == .user ? "user" : "assistant",
+                    message: String(text.prefix(300))
+                ))
                 if let threadID {
                     l1MemoryContext.archiveConversationTurn(
                         threadID: threadID,
@@ -9865,9 +10089,17 @@ private func run(_ options: Options) throws {
                 ))
             }
         }
-        liveVisualContextRelay.attach(to: launcher)
         liveVoiceLanguageRelay.attach { directive in
             launcher.appendActiveContext(directive)
+        }
+        launcher.onInject = { source, role, text in
+            writer.write(RuntimeEvent(
+                event: "l2.context.injection",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l2_live_voice",
+                state: source,
+                message: "role=\(role); chars=\(text.count); prefix=\(String(text.prefix(96)))"
+            ))
         }
         liveVoiceBox.launcher = launcher
         liveVoiceLauncher = launcher
@@ -9876,7 +10108,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=eye_contact_plus_voice_or_social_pulse; user_silence_timeout_seconds=60; visual_context=l1_summary_plus_current_camera_jpeg_per_live_turn; mcp_status_checked=on_session_start; text_context=initial_items_plus_append_text"
+            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=mcp_capture_view_on_demand; mcp_status_checked=on_session_start; text_context=startup_context_plus_explicit_updates"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -10102,6 +10334,9 @@ private func run(_ options: Options) throws {
                     expiresAt: Date().addingTimeInterval(5)
                 )
             },
+            socialContactPatternProvider: {
+                conversationContact.contactPattern(at: monotonicNanoseconds())
+            },
             curiosityContextProvider: {
                 let summary = l1CuriosityCollector.contextSummary(limit: 4)
                 return summary.isEmpty ? nil : summary
@@ -10114,26 +10349,38 @@ private func run(_ options: Options) throws {
                     state: state,
                     message: message
                 ))
-                liveDiagnostics.recordL1Event(
-                    state: state,
-                    message: message,
-                    at: monotonicNanoseconds()
-                )
+                if let panelEvent = l1PanelHealthEvent(state: state, message: message) {
+                    liveDiagnostics.recordL1Event(
+                        state: panelEvent.state,
+                        message: panelEvent.message,
+                        at: monotonicNanoseconds()
+                    )
+                }
             },
-            onFrame: { request, frame, presence, completedNS in
+            onSituationFrame: { request, frame, completedNS in
                 let action = frame.socialDecision?.action.rawValue ?? "no_social_action"
+                let recordedNS = monotonicNanoseconds()
                 writer.write(RuntimeEvent(
                     event: "l1.situation",
-                    monotonicNS: completedNS,
+                    monotonicNS: recordedNS,
                     source: "gemma4_31b_cloud",
                     state: "frame",
                     message: "cycle=\(request.cycleID.uuidString.lowercased()); action=\(action); uncertainty=\(String(format: "%.2f", frame.uncertainty))"
                 ))
                 liveDiagnostics.recordL1Event(
                     state: "frame",
-                    message: l1ThoughtStreamMessage(for: frame, action: action),
-                    at: completedNS
+                    message: l1DiagnosticMessage(for: frame, action: action, mode: "social"),
+                    at: recordedNS
                 )
+                if let reflection = l1ReflectionMessage(for: frame) {
+                    liveDiagnostics.recordL1Event(
+                        state: "reflection",
+                        message: reflection,
+                        at: recordedNS
+                    )
+                }
+            },
+            onFrame: { request, frame, presence, completedNS in
                 guard let opportunity = request.socialOpportunity,
                       let decision = frame.socialDecision else { return }
                 guard !l1LiveConversationState.snapshot().conversationActive else {
@@ -10197,7 +10444,6 @@ private func run(_ options: Options) throws {
                     )
                     let context = l1ProactiveInteractionContext(
                         request: request,
-                        frame: frame,
                         decision: decision,
                         purpose: opening,
                         languageStartInstruction: l1LanguageInstructions.directive(
@@ -10207,14 +10453,12 @@ private func run(_ options: Options) throws {
                         interactionAuthority: interactionAuthority,
                         personMemoryMission: l1MemoryContext.cachedPersonMemoryMission(
                             for: decision.entityID
-                        ),
-                        objectKnowledge: objectKnowledgeStore.recentSummaries()
+                        )
                     )
                     // L1 owns social initiation and transfers directly to the
                     // conversation runtime. L0 may mirror the outcome through
                     // embodiment, but cannot become a serial gate for speech.
                     liveVoiceLauncher?.startProactiveOpening(
-                        text: opening.question,
                         context: context,
                         personEntityID: decision.entityID,
                         at: completedNS
@@ -10248,12 +10492,26 @@ private func run(_ options: Options) throws {
                     )
                 }
             },
+            currentPresenceValidator: { entityID, completedNS in
+                identityPresence.hasCurrentParticipant(entityID)
+            },
             behaviorContextProvider: { [weak attentionGimbalBridge] in
                 attentionGimbalBridge?.makeBehaviorContext(at: monotonicNanoseconds())
             },
-            onBehaviorDirective: { [weak attentionGimbalBridge] directive, atNS in
+            onBehaviorDirective: { [weak attentionGimbalBridge] directive, origin, atNS in
                 switch directive.action {
                 case .resumeScanning, .seekPeople:
+                    if origin == .auxiliaryWake,
+                       attentionGimbalBridge?.hasVerifiedFaceLock(at: atNS) == true {
+                        writer.write(RuntimeEvent(
+                            event: "source.health",
+                            monotonicNS: atNS,
+                            source: "l1_situation",
+                            state: "behavior_directive_deferred",
+                            message: "origin=auxiliary_wake; reason=verified_face_lock"
+                        ))
+                        return
+                    }
                     attentionGimbalBridge?.resumeCoverageScan(priority: .l1)
                 case .acknowledgePerson:
                     attentionGimbalBridge?.acknowledgePersonIfEligible(at: atNS)
@@ -10262,24 +10520,18 @@ private func run(_ options: Options) throws {
                 }
             },
             onBehaviorThought: { frame, atNS in
-                var parts: [String] = ["mode=behavior_awareness"]
-                if !frame.summary.isEmpty {
-                    parts.append(frame.summary)
-                }
-                if let stream = frame.thoughtState?.streamOfConsciousness, !stream.isEmpty {
-                    parts.append("stream: \(stream)")
-                }
-                if let hypothesis = frame.thoughtState?.workingHypothesis, !hypothesis.isEmpty {
-                    parts.append("hypothesis: \(hypothesis)")
-                }
-                if let directive = frame.behaviorDirective {
-                    parts.append("directive: \(directive.action.rawValue)")
-                }
                 liveDiagnostics.recordL1Event(
                     state: "thought",
-                    message: parts.joined(separator: " · "),
+                    message: l1DiagnosticMessage(for: frame, mode: "behavior_awareness"),
                     at: atNS
                 )
+                if let reflection = l1ReflectionMessage(for: frame) {
+                    liveDiagnostics.recordL1Event(
+                        state: "reflection",
+                        message: reflection,
+                        at: atNS
+                    )
+                }
             },
             toolDefinitions: l1ToolDefinitions,
             toolExecutor: l1ToolExecutor,
@@ -10707,13 +10959,16 @@ private func run(_ options: Options) throws {
             if evidence.active, evidence.changed {
                 conversationContact.recordConversationActivity(at: completedNS)
             }
-            let openingAuthorization = evidence.active && evidence.changed
+            let visualAdmission = LiveConversationVisualAdmission.permitsNewSession(for: belief)
+            let openingAuthorization = evidence.active && evidence.changed && visualAdmission
                 ? conversationContact.authorizeSpeechOnset(at: completedNS)
                 : nil
             if evidence.changed, options.l2LiveVoice {
                 attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
             }
-            let recognizedParticipant = identityPresence.currentParticipant()
+            let recognizedParticipant = visualAdmission
+                ? identityPresence.currentParticipant()
+                : nil
             let interactionParticipant = recognizedParticipant ?? InteractionParticipant(
                 entityID: UUID(),
                 authority: .participant
@@ -10725,6 +10980,15 @@ private func run(_ options: Options) throws {
             } ?? activeLanguage.recent()
                 ?? somaEnvString("SOMA_L1_DEFAULT_LANGUAGE", default: "ko")
             let languageStartInstruction = l1LanguageInstructions.directive(for: preferredLanguageTag)
+            if evidence.active, evidence.changed, openingAuthorization == nil {
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: completedNS,
+                    source: "l2_live_voice",
+                    state: "opening_suppressed",
+                    message: "direct_contact_not_current"
+                ))
+            }
             if let openingAuthorization {
                 let sessionCapability = liveSessionCapabilities.issue(
                     personEntityID: interactionParticipant.entityID,
@@ -10733,7 +10997,6 @@ private func run(_ options: Options) throws {
                 )
                 let context = speechInteractionContext(
                     from: belief,
-                    visualSummary: liveVisualContextRelay.latestSummary,
                     identityReference: personContextAvailable ? identityPresence.interactionReference() : nil,
                     participant: interactionParticipant,
                     personContextAvailable: personContextAvailable,
@@ -10743,7 +11006,6 @@ private func run(_ options: Options) throws {
                     },
                     preferredLanguageTag: preferredLanguageTag,
                     languageStartInstruction: languageStartInstruction,
-                    objectKnowledge: objectKnowledgeStore.recentSummaries(),
                     memorySummaries: recognizedPersonEntityID.map {
                         l1MemoryContext.cachedPersonMemorySummaries(for: $0)
                     } ?? [],
@@ -10766,7 +11028,6 @@ private func run(_ options: Options) throws {
                 )
                 guard let context = speechInteractionContext(
                     from: belief,
-                    visualSummary: liveVisualContextRelay.latestSummary,
                     identityReference: personContextAvailable ? identityPresence.interactionReference() : nil,
                     participant: interactionParticipant,
                     personContextAvailable: personContextAvailable,
@@ -10776,7 +11037,6 @@ private func run(_ options: Options) throws {
                     },
                     preferredLanguageTag: preferredLanguageTag,
                     languageStartInstruction: languageStartInstruction,
-                    objectKnowledge: objectKnowledgeStore.recentSummaries(),
                     memorySummaries: recognizedPersonEntityID.map {
                         l1MemoryContext.cachedPersonMemorySummaries(for: $0)
                     } ?? [],
@@ -11148,9 +11408,6 @@ private func speechInteractionWake(
     at monotonicNS: UInt64
 ) -> HumanInteractionWakeRequest? {
     let target = belief.targetStatus == .tracked ? belief.target : nil
-    if authorization == .eyeContact {
-        guard let target, target.isFaceMotorTarget else { return nil }
-    }
     let eventID = "voice-contact-\(monotonicNS)"
     let visualConfidence = target?.confidence ?? belief.presenceProbability
     let decision = model.evaluate(EventImportanceInput(
@@ -11177,7 +11434,6 @@ private func speechInteractionWake(
 
 private func speechInteractionContext(
     from belief: BeliefSnapshot,
-    visualSummary: String? = nil,
     identityReference: String? = nil,
     participant: InteractionParticipant? = nil,
     personContextAvailable: Bool? = nil,
@@ -11185,7 +11441,6 @@ private func speechInteractionContext(
     personMemoryMission: PersonContextMission? = nil,
     preferredLanguageTag: String? = nil,
     languageStartInstruction: String? = nil,
-    objectKnowledge: [String] = [],
     memorySummaries: [String] = [],
     pendingInformationNeeds: [String] = []
 ) -> CodexInteractionContext? {
@@ -11195,9 +11450,7 @@ private func speechInteractionContext(
     } else {
         targetSummary = "L0 has no current visual target."
     }
-    let situationSummary = [targetSummary, visualSummary, objectKnowledge.isEmpty ? nil : "Objects the robot has identified recently: \(objectKnowledge.joined(separator: " | "))"]
-        .compactMap { $0 }
-        .joined(separator: " ")
+    let situationSummary = targetSummary
     let missionSummaries = pendingInformationNeeds.isEmpty ? nil :
         "Acquisition mission — gently try to learn in conversation: \(pendingInformationNeeds.joined(separator: " | "))"
     return try? CodexInteractionContext(
@@ -11218,28 +11471,16 @@ private func speechInteractionContext(
 
 private func l1ProactiveInteractionContext(
     request: L1SituationRequest,
-    frame: L1SituationFrame,
     decision: L1SocialDecision,
     purpose: L1PurposefulOpening,
     languageStartInstruction: String?,
     sessionCapability: String?,
     interactionAuthority: SOMAInteractionAuthority,
-    personMemoryMission: PersonContextMission?,
-    objectKnowledge: [String] = []
+    personMemoryMission: PersonContextMission?
 ) -> CodexInteractionContext? {
     let objective = "Conversation objective: \(purpose.objective)"
     let completion = "Conversation completion condition: \(purpose.completionCondition)"
-    let thought = frame.thoughtState ?? request.priorThoughtState
-    let hypothesis = thought.map { state in
-        "L1 working hypothesis: \(state.workingHypothesis)"
-    }
-    let rationale = String(decision.rationale.prefix(512))
-    let situation = [
-        "L1 situation: \(frame.summary)",
-        hypothesis,
-        "Why L1 opened now: \(rationale)",
-        objectKnowledge.isEmpty ? nil : "Objects the robot has identified recently: \(objectKnowledge.joined(separator: " | "))",
-    ].compactMap { $0 }.joined(separator: " ")
+    let situation = "L1 has opened a brief conversation. The private objective and completion condition are the only proactive reason."
     let identityScope = request.beliefSummary.localizedCaseInsensitiveContains("pseudonymous")
         ? "locally pseudonymous recurring person; no name or biometric material is available"
         : "locally recognized person; do not infer an identity beyond supplied context"

@@ -11,9 +11,15 @@ enum SOMAAccent {
 }
 
 private enum SOMAPaths {
-    static let runtimeRoot = URL(fileURLWithPath: "/Users/seungyeop/workspace/Research/SOMA/artifacts/subconscious/runtime", isDirectory: true)
+    static let runtimeRoot = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SOMA_RUNTIME_ROOT"]
+        ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent("artifacts/subconscious/runtime", isDirectory: true).path,
+        isDirectory: true)
     static let serviceLabel = "com.soma.reactive-l0"
-    static let servicePlist = URL(fileURLWithPath: "/Users/seungyeop/workspace/Research/SOMA/LaunchAgents/com.soma.reactive-l0.plist")
+    static let servicePlist = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents/com.soma.reactive-l0.plist")
+    static let menuBarPlist = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents/com.soma.menu-bar.plist")
 
     static var serviceTarget: String {
         "gui/\(getuid())/\(serviceLabel)"
@@ -366,7 +372,7 @@ private final class SOMAControlModel: ObservableObject {
         _ = runLaunchctl([
             "bootout",
             "gui/\(getuid())",
-            "/Users/seungyeop/Library/LaunchAgents/com.soma.menu-bar.plist",
+            SOMAPaths.menuBarPlist.path,
         ])
     }
 
@@ -668,7 +674,7 @@ private struct SOMASettingsView: View {
                 }
                 .disabled(model.settings.led.responseMode == .off)
             }
-            SettingsCard(title: "LED signals", subtitle: "Choose a verified color and behavior. Continuous blinking is available in blue.") {
+            SettingsCard(title: "LED signals", subtitle: "Choose a supported firmware palette color. Status signals use steady palette states.") {
                 LazyVStack(spacing: 8) {
                     ForEach(SubconsciousIndicatorState.configurationStates, id: \.self) { state in
                         LEDSignalRow(state: state, signal: ledSignalBinding(for: state))
@@ -1166,11 +1172,11 @@ private enum SOMADefaultLanguage: String, CaseIterable {
 
     var label: String {
         switch self {
-        case .korean: "한국어 (Korean)"
+        case .korean: "Korean"
         case .english: "English"
-        case .japanese: "日本語 (Japanese)"
-        case .chinese: "中文 (Chinese)"
-        case .spanish: "Español (Spanish)"
+        case .japanese: "Japanese"
+        case .chinese: "Chinese"
+        case .spanish: "Spanish"
         }
     }
 }
@@ -1256,32 +1262,21 @@ private struct LEDSignalRow: View {
                 .shadow(color: accent.opacity(0.45), radius: 3)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.subheadline.weight(.medium))
-                CadencePreview(pattern: signal.pattern, color: accent)
+                Text("Steady firmware palette")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 16)
-            VStack(alignment: .trailing, spacing: 6) {
-                HStack(spacing: 8) {
-                    Text("Color").foregroundStyle(.secondary)
-                    Picker("Color", selection: colorBinding) {
-                        ForEach(SOMALEDColor.allCases, id: \.self) { color in
-                            Text(color.displayName).tag(color)
-                        }
+            HStack(spacing: 8) {
+                Text("Color").foregroundStyle(.secondary)
+                Picker("Color", selection: colorBinding) {
+                    ForEach(SOMALEDColor.allCases, id: \.self) { color in
+                        Text(color.displayName).tag(color)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 94)
                 }
-                HStack(spacing: 8) {
-                    Text("Behavior").foregroundStyle(.secondary)
-                    Picker("Behavior", selection: $signal.pattern) {
-                        ForEach(availablePatterns, id: \.self) { pattern in
-                            Text(pattern.displayName).tag(pattern)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 110)
-                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 94)
             }
         }
         .padding(.horizontal, 12)
@@ -1314,35 +1309,9 @@ private struct LEDSignalRow: View {
             get: { signal.color },
             set: { color in
                 signal.color = color
-                if !signal.pattern.isPhysicallySupported(for: color) {
-                    signal.pattern = .steady
-                }
+                signal.pattern = .steady
             }
         )
-    }
-
-    private var availablePatterns: [SOMALEDPattern] {
-        signal.color == .blue ? [.steady, .blink] : [.steady]
-    }
-}
-
-private struct CadencePreview: View {
-    let pattern: SOMALEDPattern
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 3) {
-            ForEach(Array(pattern.indicatorPattern.phases.enumerated()), id: \.offset) { _, phase in
-                Capsule(style: .continuous)
-                    .fill(phase.illuminated ? color : Color.secondary.opacity(0.25))
-                    .frame(width: phase.durationMilliseconds == nil ? 42 : cadenceWidth(phase.durationMilliseconds!), height: 4)
-            }
-        }
-        .accessibilityLabel("\(pattern.displayName) cadence")
-    }
-
-    private func cadenceWidth(_ milliseconds: UInt64) -> CGFloat {
-        max(8, min(36, CGFloat(milliseconds) / 32))
     }
 }
 

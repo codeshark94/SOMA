@@ -29,10 +29,173 @@ final class SOMADiagnosticsModel: ObservableObject {
     }
 
     struct Thought: Decodable, Identifiable, Sendable {
+        struct Presentation: Sendable {
+            let category: String
+            let title: String
+            let detail: String
+        }
+
         let monotonicNS: UInt64
         let state: String
         let message: String
-        var id: UInt64 { monotonicNS }
+        // One L1 completion emits both a compact decision and its reflection
+        // at the same monotonic instant.  The time alone therefore is not a
+        // valid SwiftUI list identity: duplicate IDs make LazyVStack reuse the
+        // wrong card and can leave an apparent blank gap before the following
+        // behavior proposal.
+        var id: String { "\(monotonicNS):\(state):\(message)" }
+
+        var presentation: Presentation {
+            switch state {
+            case "configured":
+                return .init(category: "L1 STATUS", title: "Situation model ready", detail: "Memory and visual context are available.")
+            case "wake":
+                let cause = value(for: "cause")
+                let title: String
+                switch cause {
+                case "recognized_person": title = "Recognized person triggered deliberation"
+                case "behavior_awareness": title = "Reviewing current attention state"
+                case "auxiliary_wake": title = "Reconsidering a visual event"
+                default: title = "Reviewing a new situation"
+                }
+                return .init(category: "L1 WAKE", title: title, detail: "Comparing relationship memory with the current scene.")
+            case "deliberating":
+                return .init(category: "L1 PROCESSING", title: "Interpreting situation and memory", detail: "Comparing current evidence with accumulated context.")
+            case "model_response_received":
+                return .init(category: "L1 RESPONSE", title: "Model judgment received", detail: "Checking evidence, schema, and authority.")
+            case "tool_call":
+                return .init(category: "L1 TOOL", title: "Reviewing a context request", detail: "Checking request scope and authority.")
+            case "tool_round":
+                return .init(category: "L1 TOOL", title: "Interpreting tool results", detail: "Folding new context into the next judgment.")
+            case "completed":
+                let uncertainty = value(for: "uncertainty").flatMap(Double.init)
+                let detail = uncertainty.map { "Situation uncertainty: \(Int(($0 * 100).rounded()))%" } ?? "Applied the current situation judgment."
+                return .init(category: "L1 COMPLETE", title: "Situation judgment applied", detail: detail)
+            case "failed":
+                return .init(category: "L1 FAILED", title: "Current judgment not applied", detail: "The next cycle will retry after a model or validation failure.")
+            case "frame":
+                return .init(category: "SOCIAL DECISION", title: socialDecisionTitle, detail: humanizedThought(message))
+            case "thought":
+                return .init(category: "BEHAVIOR DECISION", title: "Current attention and next action", detail: humanizedThought(message))
+            case "reflection":
+                return .init(category: "L1 REFLECTION", title: "Continuous situational thought", detail: message)
+            case "behavior_directive":
+                return .init(category: "BEHAVIOR PROPOSAL", title: humanizedDirective(value(for: "action") ?? "none"), detail: "L0 may execute only within current perception and safety conditions.")
+            case "l1_memory_proposals":
+                let count = value(for: "count").flatMap(Int.init) ?? 0
+                return .init(category: "MEMORY", title: "Reviewing memory candidates", detail: "Memory candidates to review: \(max(0, count))")
+            case "memory_updated":
+                return .init(category: "MEMORY", title: "Memory updated", detail: "Preserved information meaningful to the current situation.")
+            case "memory_deferred":
+                return .init(category: "MEMORY", title: "Memory update deferred", detail: "Will retry when persistent storage is available.")
+            case "visual_followup":
+                return .init(category: "VISUAL CONTEXT", title: "Requested additional visual context", detail: "Checking scene detail needed for the current judgment.")
+            case "visual_request_unavailable":
+                return .init(category: "VISUAL CONTEXT", title: "Additional visual context unavailable", detail: "Continuing with currently observed evidence.")
+            case "discarded", "decision_rejected", "opening_suppressed":
+                return .init(category: "HELD", title: "Social action not taken", detail: "The current relationship context or policy does not support it.")
+            default:
+                return .init(category: "L1", title: "Unclassified internal transition", detail: "Only structured cognitive state is shown here.")
+            }
+        }
+
+        private var socialDecisionTitle: String {
+            switch value(for: "action") {
+            case "spoken_opening": return "Considering a purposeful conversation opening"
+            case "nonverbal_invitation": return "Considering a nonverbal invitation"
+            case "remain_silent": return "Remaining quietly observant"
+            default: return "Updating social judgment"
+            }
+        }
+
+        private func value(for key: String) -> String? {
+            message
+                .split(whereSeparator: { $0 == ";" || $0 == "·" })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { $0.hasPrefix("\(key)=") }
+                .map { String($0.dropFirst(key.count + 1)) }
+        }
+
+        private func readableMetadata(excluding keys: Set<String> = []) -> String {
+            let items = message
+                .split(whereSeparator: { $0 == ";" || $0 == "·" })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { item in
+                    guard let key = item.split(separator: "=", maxSplits: 1).first else { return true }
+                    return !keys.contains(String(key))
+                }
+            return items.isEmpty ? "No additional detail" : String(items.joined(separator: " · ").prefix(600))
+        }
+
+        private func humanizedThought(_ text: String) -> String {
+            let parts = text
+                .split(separator: "·", omittingEmptySubsequences: true)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .compactMap(humanizedThoughtField)
+            return parts.isEmpty ? "No decision variables" : parts.joined(separator: " · ")
+        }
+
+        private func humanizedThoughtField(_ field: String) -> String? {
+            let pair = field.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2 else { return field }
+            let key = String(pair[0])
+            let value = String(pair[1])
+            switch key {
+            case "mode":
+                return nil
+            case "action":
+                return "Decision: \(humanizedAction(value))"
+            case "directive":
+                return "Action: \(humanizedDirective(value))"
+            case "uncertainty":
+                return percentage(value, label: "Situation uncertainty")
+            case "social_availability":
+                return percentage(value, label: "Social availability")
+            case "curiosity_pressure":
+                return percentage(value, label: "Curiosity pressure")
+            case "interruption_cost":
+                return percentage(value, label: "Interruption cost")
+            case "relationship_uncertainty":
+                return percentage(value, label: "Relationship uncertainty")
+            default:
+                return field
+            }
+        }
+
+        private func percentage(_ value: String, label: String) -> String {
+            guard let scalar = Double(value) else { return "\(label): \(value)" }
+            return "\(label): \(Int((scalar * 100).rounded()))%"
+        }
+
+        private func humanizedAction(_ action: String) -> String {
+            switch action {
+            case "remain_silent": return "Remain quietly observant"
+            case "nonverbal_invitation": return "Nonverbal invitation"
+            case "spoken_opening": return "Open conversation"
+            default: return action.replacingOccurrences(of: "_", with: " ")
+            }
+        }
+
+        private func humanizedDirective(_ action: String) -> String {
+            switch action {
+            case "keep_observing": "Keep observing"
+            case "resume_scanning": "Resume scanning"
+            case "seek_people": "Seek people"
+            case "acknowledge_person": "Briefly acknowledge person"
+            default: "No new action"
+            }
+        }
+
+        private func humanizedFailure(_ text: String) -> String {
+            text
+                .replacingOccurrences(of: "reason=", with: "Reason: ")
+                .replacingOccurrences(of: "details=", with: "Details: ")
+                .replacingOccurrences(of: "invalid_response", with: "Model response schema mismatch")
+                .replacingOccurrences(of: "deadline_exceeded", with: "Response deadline exceeded")
+                .replacingOccurrences(of: "unavailable", with: "Model connection unavailable")
+                .prefix(800)
+                .description
+        }
     }
 
     private struct FileStamp: Equatable {
@@ -182,7 +345,7 @@ struct SOMADiagnosticsView: View {
             Text("SOMA Diagnostic")
                 .font(.headline)
                 .padding([.top, .horizontal])
-            Text("Camera + detection boxes (green = verified face) · live L1 situation stream")
+            Text("Current camera and detection boxes · green marks an independently verified face · below is the L1 cognitive stream")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
@@ -192,11 +355,11 @@ struct SOMADiagnosticsView: View {
                 .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.gray.opacity(0.4)))
 
             HStack {
-                Text("Thought stream · \(model.thoughts.count) events")
+                Text("Cognitive stream · latest \(model.thoughts.count) events")
                     .font(.subheadline)
                 Spacer()
                 if model.isLive && model.captureLagSeconds > 0 {
-                    Text(String(format: "frame lag %.1fs", model.captureLagSeconds))
+                    Text(String(format: "Frame lag %.1fs", model.captureLagSeconds))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -230,11 +393,12 @@ struct SOMADiagnosticsView: View {
                         ForEach(model.candidates) { candidate in
                             let color: Color = candidate.faceVerified ? .green : .yellow
                             let x = drawRect.minX + CGFloat(candidate.rect.x) * drawRect.width
-                            // Vision/CoreML boxes are bottom-origin (y=0 at the
-                            // image bottom), while SwiftUI places y=0 at the top.
-                            // Flip the axis so a box tracks the actual object
-                            // instead of its vertical mirror image.
-                            let y = drawRect.maxY - (candidate.rect.y + candidate.rect.height) * drawRect.height
+                            // Scene rects are normalized top-left (y=0 at the
+                            // image top), matching SwiftUI's own origin. No
+                            // vertical flip: flipping would draw the box at the
+                            // mirror position and it would move opposite to the
+                            // tracked object.
+                            let y = drawRect.minY + candidate.rect.y * drawRect.height
                             let w = max(2, CGFloat(candidate.rect.width) * drawRect.width)
                             let h = max(2, CGFloat(candidate.rect.height) * drawRect.height)
                             Rectangle()
@@ -287,12 +451,27 @@ struct SOMADiagnosticsView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(model.thoughts.enumerated()), id: \.element.id) { _, thought in
-                        Text(thought.message)
-                            .font(.system(size: 11, design: .monospaced))
-                            .textSelection(.enabled)
-                            .foregroundStyle(color(for: thought.state))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 4)
+                        let presentation = thought.presentation
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 7) {
+                                Text(presentation.category)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(color(for: thought.state))
+                                Text(presentation.title)
+                                    .font(.system(size: 12, weight: .medium))
+                                Spacer(minLength: 0)
+                            }
+                            Text(presentation.detail)
+                                .font(.system(size: 11))
+                                .textSelection(.enabled)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(color(for: thought.state).opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                        .padding(.horizontal, 4)
                             .id(thought.id)
                     }
                 }

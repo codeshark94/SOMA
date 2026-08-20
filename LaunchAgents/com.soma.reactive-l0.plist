@@ -6,8 +6,17 @@
   <string>com.soma.reactive-l0</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/seungyeop/workspace/Research/SOMA/scripts/soma-reactive-live.zsh</string>
+    <string>@SOMA_ROOT@/scripts/soma-reactive-live.zsh</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SOMA_ROOT</key>
+    <string>@SOMA_ROOT@</string>
+    <key>SOMA_APP_ROOT</key>
+    <string>@SOMA_APP_ROOT@</string>
+    <key>SOMA_RUNTIME_ROOT</key>
+    <string>@SOMA_ROOT@/artifacts/subconscious/runtime</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

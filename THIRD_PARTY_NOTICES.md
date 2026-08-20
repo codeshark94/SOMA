@@ -1,5 +1,13 @@
 # Third-party notices
 
+## Ultralytics YOLO11n
+
+`Sources/SOMASubconscious/Resources/YOLO11n.mlpackage` is an exported
+Ultralytics YOLO11n COCO object-detection model. Its embedded Core ML metadata
+identifies Ultralytics and the AGPL-3.0 license. Ultralytics documents YOLO11
+under AGPL-3.0 or a separate Enterprise license. The bundled package remains
+subject to those terms; see the [Ultralytics license page](https://docs.ultralytics.com/license/).
+
 ## Silero VAD
 
 `Sources/SOMAVADModel/Resources/SileroVAD256ms.mlmodelc` is a Core ML

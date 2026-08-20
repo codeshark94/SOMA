@@ -83,6 +83,36 @@ final class L1SituationStreamTests: XCTestCase {
         XCTAssertEqual(request.contactHistory.first?.purpose, "A Live voice conversation became active.")
     }
 
+    func testRebasedSocialOpportunityPreservesModelEvidenceButRefreshesL0Authority() {
+        let person = UUID()
+        let opportunity = L1SocialOpportunity(
+            entityID: person,
+            observedAtNS: 1_000,
+            recognitionConfidence: 0.92,
+            availableActions: [.remainSilent, .nonverbalInvitation]
+        )
+        let request = L1SituationRequest(
+            observedAt: Date(timeIntervalSince1970: 10),
+            evidenceIDs: ["identity:1"],
+            beliefSummary: "A recognized person is present.",
+            socialOpportunity: opportunity,
+            contactPattern: .init(
+                eyeContactActive: true,
+                recentEpisodeCount: 3,
+                latestEpisodeAgeSeconds: 0,
+                activeDurationSeconds: 1.2
+            )
+        )
+
+        let rebased = request.rebasingSocialOpportunity(at: 9_000_000_000)
+
+        XCTAssertEqual(rebased.cycleID, request.cycleID)
+        XCTAssertEqual(rebased.evidenceIDs, request.evidenceIDs)
+        XCTAssertEqual(rebased.contactPattern, request.contactPattern)
+        XCTAssertEqual(rebased.socialOpportunity?.id, opportunity.id)
+        XCTAssertEqual(rebased.socialOpportunity?.observedAtNS, 9_000_000_000)
+    }
+
     func testVisualFollowupMayOnlyRequestAnOfferedResourceOnce() throws {
         let request = L1SituationRequest(
             observedAt: Date(timeIntervalSince1970: 10),
@@ -124,6 +154,29 @@ final class L1SituationStreamTests: XCTestCase {
             ),
         ])
         XCTAssertThrowsError(try L1SituationFrameValidator().validate(requestVisual, for: continued))
+    }
+
+    func testAttachedCurrentVisualResourceIsValidSituationEvidence() throws {
+        let request = L1SituationRequest(
+            observedAt: Date(timeIntervalSince1970: 10),
+            evidenceIDs: ["behavior:1"],
+            beliefSummary: "The current behavior requires review.",
+            visuals: [
+                L1VisualResource(
+                    resourceID: "current_frame",
+                    projection: .currentView,
+                    localPath: "/private/tmp/current-frame.jpg",
+                    expiresAt: Date(timeIntervalSince1970: 60)
+                ),
+            ]
+        )
+        let frame = L1SituationFrame(
+            cycleID: request.cycleID,
+            summary: "The attached view grounds the current assessment.",
+            uncertainty: 0.2,
+            evidenceIDs: ["current_frame"]
+        )
+        XCTAssertNoThrow(try L1SituationFrameValidator().validate(frame, for: request))
     }
 
     func testModelOutputCannotInventMemoryEvidenceOrConversationTurns() {

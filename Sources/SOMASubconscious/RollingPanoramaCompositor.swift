@@ -506,15 +506,33 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
                 incomingQualities[destinationPixel] = incomingQuality
             }
         }
+        // Guard the C++ entry: an undersized buffer or nil base address made
+        // cv::cvtColor read past the allocation and segfault the process
+        // (EXC_BAD_ACCESS at 0x10 in soma_photometric_feather_rgba). The
+        // compositor runs on a background queue, so the crash took the whole
+        // robot down instead of failing one blend.
+        let requiredPixels = width * height * 4
+        let requiredQualities = width * height
         let blendResult = pixels.withUnsafeMutableBufferPointer { panoramaPixels in
             qualities.withUnsafeMutableBufferPointer { panoramaQualities in
                 incomingPixels.withUnsafeBufferPointer { observationPixels in
                     incomingQualities.withUnsafeBufferPointer { observationQualities in
-                        soma_photometric_feather_rgba(
-                            panoramaPixels.baseAddress,
-                            panoramaQualities.baseAddress,
-                            observationPixels.baseAddress,
-                            observationQualities.baseAddress,
+                        guard panoramaPixels.count >= requiredPixels,
+                              panoramaQualities.count >= requiredQualities,
+                              observationPixels.count >= requiredPixels,
+                              observationQualities.count >= requiredQualities,
+                              let panoramaBase = panoramaPixels.baseAddress,
+                              let qualityBase = panoramaQualities.baseAddress,
+                              let observationBase = observationPixels.baseAddress,
+                              let observationQualityBase = observationQualities.baseAddress
+                        else {
+                            return SOMAPhotometricBlendResult(success: 0, exposure_compensated: 0, overlap_pixels: 0, red_gain: 1, green_gain: 1, blue_gain: 1, elapsed_milliseconds: 0)
+                        }
+                        return soma_photometric_feather_rgba(
+                            panoramaBase,
+                            qualityBase,
+                            observationBase,
+                            observationQualityBase,
                             Int32(width),
                             Int32(height)
                         )

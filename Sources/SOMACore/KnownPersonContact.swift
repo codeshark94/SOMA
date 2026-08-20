@@ -91,6 +91,14 @@ public enum LocalFaceReferenceSet {
     public static let nearDuplicateSimilarity = 0.995
     public static let materialDiversityImprovement = 0.008
     public static let qualityReplacementMargin = 0.08
+    /// Below this similarity to every stored reference, a view is treated as a
+    /// material appearance change and refreshes its nearest slot directly.
+    public static let appearanceChangeSimilarity = 0.95
+    /// Quality slack for the appearance-change replacement: the new view may
+    /// be up to this much lower quality than the stored reference and still
+    /// replace it (a small or distant face can still be the person's current
+    /// look after a haircut).
+    public static let appearanceChangeQualityTolerance = 0.05
 
     /// Inserts an observation when it expands the retained embedding-space
     /// coverage, or replaces a near-duplicate with a materially clearer view.
@@ -101,59 +109,67 @@ public enum LocalFaceReferenceSet {
         in references: inout [LocalFaceEmbedding],
         maximumCount: Int
     ) -> Bool {
-        guard (1 ... 24).contains(maximumCount),
-              references.count <= maximumCount,
-              references.allSatisfy({ isCompatible(observation, $0) }) else {
-            return false
-        }
-        guard !references.isEmpty else {
-            references.append(observation)
-            return true
-        }
-
-        let similarities = references.enumerated().compactMap { index, reference -> (Int, Double)? in
-            guard let similarity = try? observation.cosineSimilarity(to: reference) else { return nil }
-            return (index, similarity)
-        }
-        guard let nearest = similarities.max(by: { $0.1 < $1.1 }) else { return false }
-
-        if nearest.1 >= nearDuplicateSimilarity {
-            guard observation.quality >= references[nearest.0].quality + qualityReplacementMargin else {
-                return false
+        guard (1 ... 24).contains(maximumCount) else { return false }
+        // Only embeddings from the same encoder are comparable. A stale
+        // reference from an older model revision must not block enrichment:
+        // keep it untouched and run the set logic on the compatible subset.
+        let incompatible = references.filter { !isCompatible(observation, $0) }
+        var compatible = references.filter { isCompatible(observation, $0) }
+        guard compatible.count <= maximumCount else { return false }
+        let previous = compatible
+        if compatible.isEmpty {
+            compatible.append(observation)
+        } else {
+            let similarities = compatible.enumerated().compactMap { index, reference -> (Int, Double)? in
+                guard let similarity = try? observation.cosineSimilarity(to: reference) else { return nil }
+                return (index, similarity)
             }
-            references[nearest.0] = observation
-            return true
-        }
+            guard let nearest = similarities.max(by: { $0.1 < $1.1 }) else { return false }
 
-        if references.count < maximumCount {
-            references.append(observation)
-            return true
-        }
-
-        let currentDiversity = minimumPairwiseDiversity(references)
-        var replacement: (index: Int, diversity: Double)?
-        for index in references.indices {
-            var candidate = references
-            candidate[index] = observation
-            let diversity = minimumPairwiseDiversity(candidate)
-            guard let current = replacement else {
-                replacement = (index, diversity)
-                continue
+            if nearest.1 >= nearDuplicateSimilarity {
+                guard observation.quality >= compatible[nearest.0].quality + qualityReplacementMargin else {
+                    return false
+                }
+                compatible[nearest.0] = observation
+            } else if compatible.count < maximumCount {
+                compatible.append(observation)
+            } else if nearest.1 < appearanceChangeSimilarity,
+                      observation.quality >= compatible[nearest.0].quality - appearanceChangeQualityTolerance {
+                // Material appearance change (new haircut, glasses, weight):
+                // the newest view differs from every stored reference, so the
+                // nearest slot is refreshed even when it does not add set
+                // diversity. The person's current face is the truth; diversity
+                // bookkeeping must not freeze recognition at an old look.
+                compatible[nearest.0] = observation
+            } else {
+                let currentDiversity = minimumPairwiseDiversity(compatible)
+                var replacement: (index: Int, diversity: Double)?
+                for index in compatible.indices {
+                    var candidate = compatible
+                    candidate[index] = observation
+                    let diversity = minimumPairwiseDiversity(candidate)
+                    guard let current = replacement else {
+                        replacement = (index, diversity)
+                        continue
+                    }
+                    if diversity > current.diversity + 1e-12 ||
+                        (abs(diversity - current.diversity) <= 1e-12 &&
+                            compatible[index].quality < compatible[current.index].quality) {
+                        replacement = (index, diversity)
+                    }
+                }
+                guard let replacement else { return false }
+                let replacedQuality = compatible[replacement.index].quality
+                guard replacement.diversity >= currentDiversity + materialDiversityImprovement ||
+                      (replacement.diversity >= currentDiversity - materialDiversityImprovement &&
+                          observation.quality >= replacedQuality + qualityReplacementMargin) else {
+                    return false
+                }
+                compatible[replacement.index] = observation
             }
-            if diversity > current.diversity + 1e-12 ||
-                (abs(diversity - current.diversity) <= 1e-12 &&
-                    references[index].quality < references[current.index].quality) {
-                replacement = (index, diversity)
-            }
         }
-        guard let replacement else { return false }
-        let replacedQuality = references[replacement.index].quality
-        guard replacement.diversity >= currentDiversity + materialDiversityImprovement ||
-              (replacement.diversity >= currentDiversity - materialDiversityImprovement &&
-                  observation.quality >= replacedQuality + qualityReplacementMargin) else {
-            return false
-        }
-        references[replacement.index] = observation
+        guard compatible != previous else { return false }
+        references = incompatible + compatible
         return true
     }
 
