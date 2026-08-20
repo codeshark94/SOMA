@@ -140,6 +140,43 @@ public struct CameraProjectionModel: Codable, Equatable, Sendable {
         let radial = 1 + (radialK1 ?? 0) * radius2 + (radialK2 ?? 0) * radius2 * radius2
         return (x * radial * undistorted.2, y * radial * undistorted.2, undistorted.2)
     }
+
+    /// Returns the camera attitude that places a world-fixed target at the
+    /// requested Vision-normalized composition point. The target and result
+    /// remain in the gimbal's reported coordinate system; the image-axis
+    /// convention is applied exactly once through `poseProjection`.
+    public func cameraBearing(
+        placing target: GimbalRelativeBearing,
+        at framing: NormalizedRect,
+        poseProjection: GimbalPoseProjection
+    ) -> GimbalRelativeBearing? {
+        guard isValid,
+              framing.x.isFinite, framing.y.isFinite,
+              framing.width.isFinite, framing.height.isFinite,
+              framing.x >= 0, framing.y >= 0,
+              framing.width > 0, framing.height > 0,
+              framing.x + framing.width <= 1,
+              framing.y + framing.height <= 1 else {
+            return nil
+        }
+        let actualRay = (
+            (framing.centerX - principalXNormalized) / focalXNormalized,
+            ((1 - framing.centerY) - principalYNormalized) / focalYNormalized,
+            1.0
+        )
+        let idealRay = actualToIdeal(actualRay)
+        guard idealRay.2.isFinite, idealRay.2 > 0 else { return nil }
+        let panOffset = atan2(idealRay.0, idealRay.2) * 180 / .pi
+        // Image y is top-down after Vision-to-camera conversion. Positive
+        // ideal y is therefore a downward visual ray and lowers elevation.
+        let elevationOffset = -atan2(idealRay.1, hypot(idealRay.0, idealRay.2)) * 180 / .pi
+        let panSign = poseProjection.panImageSign >= 0 ? 1.0 : -1.0
+        let pitchSign = poseProjection.pitchImageSign >= 0 ? 1.0 : -1.0
+        return GimbalRelativeBearing(
+            azimuthDegrees: target.azimuthDegrees - panSign * panOffset,
+            elevationDegrees: target.elevationDegrees - pitchSign * elevationOffset
+        )
+    }
 }
 
 public struct CameraGeometryCalibration: Codable, Equatable, Sendable {

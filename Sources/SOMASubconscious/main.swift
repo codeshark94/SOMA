@@ -1719,7 +1719,6 @@ private func JSONString(_ s: String) -> String {
 private struct IdentityPresenceUpdate: Sendable {
     let transition: IdentityPresenceTransition
     let participant: InteractionParticipant?
-    let l1Decision: FaceIdentityRuntimeDecision?
 }
 
 /// Converts face-recognition samples into one socially meaningful presence
@@ -1762,10 +1761,7 @@ private final class IdentityPresenceCoordinator: @unchecked Sendable {
             return []
         }
         lock.lock()
-        let updates = materialize(
-            tracker.observe(identity, at: monotonicNS),
-            decision: decision
-        )
+        let updates = materialize(tracker.observe(identity, at: monotonicNS))
         lock.unlock()
         return updates
     }
@@ -1776,7 +1772,7 @@ private final class IdentityPresenceCoordinator: @unchecked Sendable {
         if present {
             tracker.recordVerifiedFace(at: monotonicNS)
         }
-        return materialize(tracker.advance(at: monotonicNS), decision: nil)
+        return materialize(tracker.advance(at: monotonicNS))
     }
 
     func interactionReference() -> String? {
@@ -1809,10 +1805,7 @@ private final class IdentityPresenceCoordinator: @unchecked Sendable {
         return latestParticipant
     }
 
-    private func materialize(
-        _ transitions: [IdentityPresenceTransition],
-        decision: FaceIdentityRuntimeDecision?
-    ) -> [IdentityPresenceUpdate] {
+    private func materialize(_ transitions: [IdentityPresenceTransition]) -> [IdentityPresenceUpdate] {
         transitions.map { transition in
             switch transition {
             case let .arrived(identity):
@@ -1820,16 +1813,14 @@ private final class IdentityPresenceCoordinator: @unchecked Sendable {
                 latestParticipant = participant
                 return IdentityPresenceUpdate(
                     transition: transition,
-                    participant: participant,
-                    l1Decision: decision
+                    participant: participant
                 )
             case let .replaced(_, current):
                 let participant = participant(for: current)
                 latestParticipant = participant
                 return IdentityPresenceUpdate(
                     transition: transition,
-                    participant: participant,
-                    l1Decision: decision
+                    participant: participant
                 )
             case let .departed(identity):
                 if latestParticipant?.entityID == identity.entityID {
@@ -1837,14 +1828,12 @@ private final class IdentityPresenceCoordinator: @unchecked Sendable {
                 }
                 return IdentityPresenceUpdate(
                     transition: transition,
-                    participant: nil,
-                    l1Decision: nil
+                    participant: nil
                 )
             case .replacementCandidate:
                 return IdentityPresenceUpdate(
                     transition: transition,
-                    participant: nil,
-                    l1Decision: nil
+                    participant: nil
                 )
             }
         }
@@ -2236,6 +2225,10 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
     let targetElevationDegrees: Double?
     let fieldOfViewDegrees: Double?
     let observedThisFrame: Bool?
+    let framingCenterX: Double?
+    let framingCenterY: Double?
+    let framingWidth: Double?
+    let framingHeight: Double?
     let expiresAtNS: UInt64?
 
     init(_ intent: EmbodimentMotorIntent, monotonicNS: UInt64) {
@@ -2251,8 +2244,12 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             targetElevationDegrees = bearing.elevationDegrees
             fieldOfViewDegrees = nil
             observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
             self.expiresAtNS = expiresAtNS
-        case let .track(requestID, targetReference, sceneID, bearing, observed, _, expiresAtNS):
+        case let .track(requestID, targetReference, sceneID, bearing, observed, framing, _, expiresAtNS):
             self.requestID = requestID
             action = "track"
             reason = nil
@@ -2262,6 +2259,10 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             targetElevationDegrees = bearing.elevationDegrees
             fieldOfViewDegrees = nil
             observedThisFrame = observed
+            framingCenterX = framing?.centerX
+            framingCenterY = framing?.centerY
+            framingWidth = framing?.width
+            framingHeight = framing?.height
             self.expiresAtNS = expiresAtNS
         case let .capture(requestID, targetReference, sceneID, bearing, fieldOfView, expiresAtNS):
             self.requestID = requestID
@@ -2273,6 +2274,10 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             targetElevationDegrees = bearing.elevationDegrees
             fieldOfViewDegrees = fieldOfView
             observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
             self.expiresAtNS = expiresAtNS
         case let .explore(requestID, policy, expiresAtNS):
             self.requestID = requestID
@@ -2284,6 +2289,10 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             targetElevationDegrees = nil
             fieldOfViewDegrees = nil
             observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
             self.expiresAtNS = expiresAtNS
         case let .express(requestID, expression, expiresAtNS):
             self.requestID = requestID
@@ -2295,6 +2304,10 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             targetElevationDegrees = nil
             fieldOfViewDegrees = nil
             observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
             self.expiresAtNS = expiresAtNS
         case let .suspend(requestID, reason, expiresAtNS):
             self.requestID = requestID
@@ -2306,6 +2319,10 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             targetElevationDegrees = nil
             fieldOfViewDegrees = nil
             observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
             self.expiresAtNS = expiresAtNS
         case let .release(requestID, reason):
             self.requestID = requestID
@@ -2317,6 +2334,10 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             targetElevationDegrees = nil
             fieldOfViewDegrees = nil
             observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
             expiresAtNS = nil
         }
     }
@@ -3300,11 +3321,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// preempt the reflexive L0 face lock. A coverage scan records which layer
     /// started it so a lower layer never tears a higher layer's scan away.
     private var scanPriority: ScanPriority = .l0
-    private var nextScanDirection = 1.0
     private var explorationWaypoint: SpatialCoverageDirection?
     private var explorationWaypointStartedNS: UInt64?
     private var explorationWaypointDeadlineNS: UInt64?
     private var explorationWaypointStartingPose: GimbalPose?
+    /// The atlas cell selected by the posterior. `explorationWaypoint` can be
+    /// an inset motor guide, so only this source cell is valid evidence for a
+    /// completed unproductive look.
+    private var explorationWaypointSource: SpatialCoverageDirection?
     private var explorationWaypointIndex = 0
     private let cameraGeometryCalibrationMode: Bool
     private let panoramaStripScanMode: Bool
@@ -3328,7 +3352,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var panStallRecovery = PanStallRecovery()
     private var explorationRecentering = false
     private var explorationFailureCount = 0
-    private var explorationRandomState: UInt64 = 0x9E37_79B9_7F4A_7C15
+    // The exploration posterior is intentionally stochastic. A process-local
+    // entropy seed avoids replaying the same otherwise-valid route after every
+    // service restart; coverage evidence still shapes every subsequent draw.
+    private var explorationRandomState: UInt64 = 0
     private var attentionController = SubconsciousAttentionController()
     private var lastAttentionDecisionSignature: String?
     /// Snapshot of the current L0 attention state for the periodic L1
@@ -3475,6 +3502,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         self.embodimentViewCaptureStore = embodimentViewCaptureStore
         self.onOutgoingSocialPulse = onOutgoingSocialPulse
         self.externalCalibration = externalCalibration
+        var entropy = SystemRandomNumberGenerator()
+        explorationRandomState = UInt64.random(in: UInt64.min...UInt64.max, using: &entropy)
         calibrationMode = calibrationOutputURL != nil
         externalGate = externalCalibration.map {
             ExternalGimbalAttentionGate(calibration: $0, autonomousScanEnabled: autonomousScanEnabled)
@@ -3528,7 +3557,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNanoseconds(),
             source: "attention_gimbal_bridge",
             state: "started",
-            message: "local_scalar_pipe_only"
+            message: "local_scalar_pipe_only; exploration_posterior=entropy_seeded"
         ))
     }
 
@@ -3598,7 +3627,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 message: "native_endpoint_discovered"
             ))
             if cameraGeometryCalibrationMode || panoramaStripScanMode {
-                startSmoothExploration(initialPan: 0)
+                startSmoothExploration()
             }
             refreshIndicator(
                 at: monotonicNanoseconds(),
@@ -4663,7 +4692,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         case let .velocity(pitch, pan):
             if target == nil {
-                startSmoothExploration(initialPan: pan)
+                startSmoothExploration()
             } else {
                 guard let target else { return }
                 cancelScan()
@@ -5288,10 +5317,17 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             )
             cognitiveMotionHolding = false
             startCognitiveMotionLoop()
-        case let .track(requestID, reference, sceneID, bearing, observed, style, expiresAtNS):
+        case let .track(requestID, reference, sceneID, bearing, observed, framing, style, expiresAtNS):
             claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
+            let targetBearing = framing.flatMap {
+                poseStore.projection(at: now).cameraProjectionModel.cameraBearing(
+                    placing: bearing,
+                    at: $0,
+                    poseProjection: externalCalibration == nil ? .identity : .obsbotTiny2Lite
+                )
+            } ?? bearing
             cognitiveMotionMode = .waypoint(
-                bearing: bearing,
+                bearing: targetBearing,
                 toleranceDegrees: observed ? 2.0 : 4.0,
                 motionStyle: style,
                 state: "cognitive_track_\(String(reference.prefix(32)))_\(String(sceneID.prefix(32)))"
@@ -6074,11 +6110,21 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         externalStopGeneration += 1
     }
 
-    private func startSmoothExploration(initialPan: Double, priority: ScanPriority = .l0) {
+    private func startSmoothExploration(priority: ScanPriority = .l0) {
         // A remembered face has its own bounded return path. Starting a
         // coverage trajectory alongside it races two targets through the same
         // command slot and is perceived as looking away from the person.
         let now = monotonicNanoseconds()
+        guard externalCalibration != nil else {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "attention_gimbal_bridge",
+                state: "coverage_requires_calibrated_pose",
+                message: "autonomous_scan_not_started"
+            ))
+            return
+        }
         let exclusiveScan = cameraGeometryCalibrationMode || panoramaStripScanMode
         switch priority {
         case .l0:
@@ -6111,6 +6157,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         explorationWaypointStartedNS = nil
         explorationWaypointDeadlineNS = nil
         explorationWaypointStartingPose = nil
+        explorationWaypointSource = nil
         explorationWaypointIndex = 0
         cameraGeometryCommandedRouteIndex = nil
         cameraGeometryWaypointStableSinceNS = nil
@@ -6118,7 +6165,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         cameraGeometryNextPositionCommandNS = 0
         explorationBoundaryTurning = false
         smoothExploration.reset()
-        scheduleScanControlTick(initialPan: initialPan, generation: scanGeneration)
+        scheduleScanControlTick(generation: scanGeneration)
     }
 
     /// L1/L2 behavior directive entry point: resume the coverage scan. The
@@ -6126,7 +6173,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// (L1 conscious stream or L2 conversation), so a higher layer may tear
     /// away the reflexive L0 face lock.
     func resumeCoverageScan(priority: ScanPriority = .l0) {
-        startSmoothExploration(initialPan: 0, priority: priority)
+        startSmoothExploration(priority: priority)
     }
 
     private func cancelScan() {
@@ -6136,6 +6183,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         explorationWaypointStartedNS = nil
         explorationWaypointDeadlineNS = nil
         explorationWaypointStartingPose = nil
+        explorationWaypointSource = nil
         cameraGeometryCommandedRouteIndex = nil
         cameraGeometryWaypointStableSinceNS = nil
         panoramaWaypointStableSinceNS = nil
@@ -6150,17 +6198,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         return monotonicNS - lastObservedFaceNS <= 600_000_000
     }
 
-    private func scheduleScanControlTick(
-        initialPan: Double,
-        generation: Int,
-        afterMilliseconds: Int = 0
-    ) {
+    private func scheduleScanControlTick(generation: Int, afterMilliseconds: Int = 0) {
         queue.asyncAfter(deadline: .now() + .milliseconds(afterMilliseconds)) { [weak self] in
-            self?.runScanControlTick(initialPan: initialPan, generation: generation)
+            self?.runScanControlTick(generation: generation)
         }
     }
 
-    private func runScanControlTick(initialPan: Double, generation: Int) {
+    private func runScanControlTick(generation: Int) {
         guard scanRunning, generation == scanGeneration else { return }
         let now = monotonicNanoseconds()
         // A reflexive L0 scan yields to a recently observed face, an active L0
@@ -6174,8 +6218,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             cancelScan()
             return
         }
+        guard let calibration = externalCalibration else {
+            cancelScan()
+            return
+        }
         let desired: (pitch: Double, pan: Double, state: String)
-        if let calibration = externalCalibration {
             // The native helper reports attitude on a dedicated thread at a
             // ~70-90ms cadence (synchronous SDK round-trip), with occasional
             // multi-hundred-ms gaps while the bridge loop is inside a mode
@@ -6197,11 +6244,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     state: "coverage_pose_wait_curve",
                     at: now
                 )
-                scheduleScanControlTick(
-                    initialPan: initialPan,
-                    generation: generation,
-                    afterMilliseconds: 50
-                )
+                scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
                 return
             }
             if cameraGeometryCalibrationMode {
@@ -6253,7 +6296,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                             plannedDirection = (sampledDirection, motionGuide, coverageUniform)
                             break
                         }
-                        spatialAtlas.recordUnproductiveVisit(to: sampledDirection, at: now)
                         writer.write(RuntimeEvent(
                             event: "source.health",
                             monotonicNS: now,
@@ -6282,7 +6324,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                         state: "coverage_exploration_decelerating",
                         at: now
                     )
-                    scheduleScanControlTick(initialPan: initialPan, generation: generation, afterMilliseconds: 150)
+                    scheduleScanControlTick(generation: generation, afterMilliseconds: 150)
                     return
                 }
                 explorationWaypoint = SpatialCoverageDirection(
@@ -6293,6 +6335,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     expectedInformationGain: plannedDirection.cell.expectedInformationGain
                 )
                 explorationWaypointStartedNS = now
+                explorationWaypointSource = plannedDirection.cell
                 explorationWaypointDeadlineNS = now + UInt64(
                     SmoothExplorationDynamics.waypointTimeoutSeconds(
                         panErrorDegrees: plannedDirection.guide.azimuthDegrees - pose.panDegrees,
@@ -6315,7 +6358,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     source: "attention_gimbal_bridge",
                     state: "coverage_direction_sampled",
                     message: String(
-                        format: "temperature=%.2f; uniform=%.6f; probability=%.3f; panorama_quality=%.3f; place_familiarity=%.3f; expected_information_gain=%.3f; cell_azimuth_degrees=%.2f; cell_elevation_degrees=%.2f; guide_azimuth_degrees=%.2f; guide_elevation_degrees=%.2f",
+                        format: "selection=tempered_posterior; temperature=%.2f; uniform=%.6f; probability=%.3f; panorama_quality=%.3f; place_familiarity=%.3f; expected_information_gain=%.3f; cell_azimuth_degrees=%.2f; cell_elevation_degrees=%.2f; guide_azimuth_degrees=%.2f; guide_elevation_degrees=%.2f",
                         explorationTemperature,
                         plannedDirection.uniform,
                         plannedDirection.cell.probability,
@@ -6328,9 +6371,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                         plannedDirection.guide.elevationDegrees
                     )
                 ))
-                // Penalize the selected spatial cell, not its inset motor
-                // guide. Fresh camera frames record the FOV actually covered.
-                spatialAtlas.recordUnproductiveVisit(to: plannedDirection.cell, at: now)
             }
             guard let direction = explorationWaypoint else { return }
             // Coverage cells are spherical directions, not yaw-only labels.
@@ -6356,7 +6396,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     ),
                     accelerationDegreesPerSecondSquared: 120
                 )
-            desired = (
+        desired = (
                 calibration.pitchCommand(
                     forPoseError: pitchError,
                     projection: .obsbotTiny2Lite
@@ -6369,28 +6409,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     ? "coverage_boundary_turn_curve"
                     : "coverage_exploration_curve_\(explorationWaypointIndex + 1)"
             )
-        } else {
-            if explorationWaypointStartedNS == nil {
-                explorationWaypointStartedNS = now
-            } else if let startedNS = explorationWaypointStartedNS,
-                      now >= startedNS + 1_500_000_000 {
-                nextScanDirection *= -1
-                explorationWaypointStartedNS = now
-                explorationWaypointIndex = (explorationWaypointIndex + 1) % 6
-            }
-            desired = (
-                0,
-                min(abs(initialPan), 60) * nextScanDirection * explorationPanPolarity,
-                "autonomous_scan_curve_\(explorationWaypointIndex + 1)"
-            )
-        }
         let velocity = smoothExploration.advance(
             towardPitch: desired.pitch,
             pan: desired.pan,
             at: now
         )
         sendSmoothExplorationVelocity(velocity, state: desired.state, at: now)
-        scheduleScanControlTick(initialPan: initialPan, generation: generation, afterMilliseconds: 50)
+        scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
     }
 
     private static let cameraGeometryCalibrationBearings: [GimbalRelativeBearing] = [
@@ -6485,11 +6510,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             cameraGeometryWaypointStableSinceNS = nil
         }
 
-        scheduleScanControlTick(
-            initialPan: 0,
-            generation: generation,
-            afterMilliseconds: 50
-        )
+        scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
     }
 
     private func beginBoundaryTurnIfNeeded(at monotonicNS: UInt64, pose: GimbalPose) {
@@ -6521,6 +6542,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             probability: 1
         )
         explorationWaypointStartedNS = monotonicNS
+        explorationWaypointSource = nil
         explorationWaypointDeadlineNS = monotonicNS + UInt64(
             SmoothExplorationDynamics.waypointTimeoutSeconds(
                 panErrorDegrees: targetPan - pose.panDegrees,
@@ -6596,6 +6618,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 Double(monotonicNS - startedNS) / 1_000_000
             )
         ))
+        if reached, !explorationBoundaryTurning, let source = explorationWaypointSource {
+            spatialAtlas.recordUnproductiveVisit(to: source, at: monotonicNS)
+        }
         if reached {
             explorationFailureCount = max(0, explorationFailureCount - 1)
         } else {
@@ -6612,6 +6637,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         explorationWaypointStartedNS = nil
         explorationWaypointDeadlineNS = nil
         explorationWaypointStartingPose = nil
+        explorationWaypointSource = nil
         panoramaWaypointStableSinceNS = nil
         explorationBoundaryTurning = false
         explorationWaypointIndex = (explorationWaypointIndex + 1) % 6
@@ -9329,6 +9355,13 @@ private func run(_ options: Options) throws {
     let liveDiagnostics = LiveDiagnosticsWriter(
         rootURL: options.outputURL.deletingLastPathComponent().deletingLastPathComponent()
     )
+    let l1CurrentFrameRelay = L1CurrentFrameRelay(
+        directoryURL: options.outputURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("volatile", isDirectory: true)
+    )
+    defer { l1CurrentFrameRelay.removeRetainedFrame() }
     let controlSettings: SOMAControlSettings
     do {
         controlSettings = try SOMAControlSettingsStore(fileURL: options.controlSettingsURL).load()
@@ -9466,13 +9499,14 @@ private func run(_ options: Options) throws {
     let liveCameraFrameRelay = options.l2LiveVoice && controlSettings.realtimeVoiceEnabled
         ? LiveCameraFrameRelay()
         : nil
-    let embodimentArbiter = options.embodimentShadowSocketURL.map { _ in
-        ShadowEmbodimentArbiter(
-            spatialAtlas: spatialAtlas,
-            panoramaStatus: panoramaStatus,
-            physicalActuationEnabled: options.allowEmbodimentMotorControl
-        )
-    }
+    // The L1 and L2 paths share this arbiter whether or not the external MCP
+    // socket is exposed. Transport availability must not change L1's semantic
+    // view of the scene or its lease contract with L0.
+    let embodimentArbiter = ShadowEmbodimentArbiter(
+        spatialAtlas: spatialAtlas,
+        panoramaStatus: panoramaStatus,
+        physicalActuationEnabled: options.allowEmbodimentMotorControl
+    )
     let l1AuxiliarySemanticBridge: L1AuxiliarySemanticBridge?
     if let pythonURL = options.l1AuxiliaryVLMPythonURL,
        let workerURL = options.l1AuxiliaryVLMWorkerURL,
@@ -10117,12 +10151,11 @@ private func run(_ options: Options) throws {
     // Gate for promoting a face to a registered anonymous identity: L1 reviews
     // the current frame and decides whether it is a real person worth tracking.
     let anonymousReviewBox = AnonymousReviewBox()
-    let liveFrameURL = options.outputURL
-        .deletingLastPathComponent()
-        .deletingLastPathComponent()
-        .appendingPathComponent("live-frame.jpg")
     anonymousReviewBox.reviewer = {
-        performL1AnonymousReview(frameURL: liveFrameURL, onHealth: { state, message in
+        guard let frame = l1CurrentFrameRelay.currentResource(at: monotonicNanoseconds()) else {
+            return true
+        }
+        return performL1AnonymousReview(frameURL: URL(fileURLWithPath: frame.localPath), onHealth: { state, message in
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
@@ -10132,6 +10165,9 @@ private func run(_ options: Options) throws {
             ))
         })
     }
+    let l1EmbodimentRelay = L1EmbodimentToolRelay()
+    defer { l1EmbodimentRelay.stop() }
+    let l1EmbodimentTools = L1EmbodimentToolGateway(relay: l1EmbodimentRelay)
     let l1ToolDefinitions: [OllamaToolDefinition] = [
         .init(function: .init(name: "get_person_context", description: "Read the stored context, rapport, and preferences for a person (needs entity_id). Use when you need to recall who this person is before deciding how to engage.", parameters: .init(properties: [
             "entity_id": .init(type: "string", description: "The person's entity_id from present_entity_ids"),
@@ -10163,10 +10199,6 @@ private func run(_ options: Options) throws {
             "acquired_fact": .init(type: "string", description: "Optional: the concrete fact you learned, e.g. their preferred name or a hobby"),
             "reason": .init(type: "string", description: "Why you are resolving this information need")
         ], required: ["motive_id", "reason"]))),
-        .init(function: .init(name: "orient_camera", description: "Turn the camera to face a direction. Prefer behavior_directive unless you specifically need to look elsewhere now.", parameters: .init(properties: [
-            "direction": .init(type: "string", description: "Compass direction or target to face"),
-            "reason": .init(type: "string", description: "Why you are reorienting the camera")
-        ], required: ["direction", "reason"]))),
         .init(function: .init(name: "web_search", description: "Search the web and return recent snippets. Use when you are genuinely curious about a topic or need current information relevant to an opening — not for facts the packet already has.", parameters: .init(properties: [
             "query": .init(type: "string", description: "The search query"),
             "max_results": .init(type: "string", description: "Max results (1-10, default 5)"),
@@ -10176,8 +10208,11 @@ private func run(_ options: Options) throws {
             "url": .init(type: "string", description: "The URL to fetch"),
             "reason": .init(type: "string", description: "Why you are fetching this page")
         ], required: ["url", "reason"])))
-    ]
-    let l1ToolExecutor: @Sendable (String, String) -> String = { [weak attentionGimbalBridge] name, arguments in
+    ] + l1EmbodimentTools.definitions
+    let l1ToolExecutor: @Sendable (String, String) -> String = { [l1EmbodimentTools] name, arguments in
+        if let result = l1EmbodimentTools.execute(name: name, arguments: arguments) {
+            return result
+        }
         switch name {
         case "get_person_context":
             guard let data = arguments.data(using: .utf8),
@@ -10231,9 +10266,6 @@ private func run(_ options: Options) throws {
                 motiveID: motiveID,
                 acquiredFact: args["acquired_fact"] as? String
             )
-        case "orient_camera":
-            attentionGimbalBridge?.resumeCoverageScan(priority: .l2)
-            return #"{"ok":true,"orient_requested":true}"#
         case "web_search":
             guard let data = arguments.data(using: .utf8),
                   let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -10316,23 +10348,7 @@ private func run(_ options: Options) throws {
                 )]
             },
             currentFrameProvider: {
-                let frameURL = options.outputURL
-                    .deletingLastPathComponent()
-                    .deletingLastPathComponent()
-                    .appendingPathComponent("live-frame.jpg")
-                guard FileManager.default.isReadableFile(atPath: frameURL.path),
-                      let attributes = try? FileManager.default.attributesOfItem(atPath: frameURL.path),
-                      let size = attributes[.size] as? NSNumber,
-                      size.intValue > 0,
-                      size.intValue <= 2 * 1_024 * 1_024 else {
-                    return nil
-                }
-                return L1VisualResource(
-                    resourceID: "current_frame",
-                    projection: .currentView,
-                    localPath: frameURL.path,
-                    expiresAt: Date().addingTimeInterval(5)
-                )
+                l1CurrentFrameRelay.currentResource(at: monotonicNanoseconds())
             },
             socialContactPatternProvider: {
                 conversationContact.contactPattern(at: monotonicNanoseconds())
@@ -10460,6 +10476,7 @@ private func run(_ options: Options) throws {
                     // embodiment, but cannot become a serial gate for speech.
                     liveVoiceLauncher?.startProactiveOpening(
                         context: context,
+                        opening: opening,
                         personEntityID: decision.entityID,
                         at: completedNS
                     )
@@ -10501,14 +10518,25 @@ private func run(_ options: Options) throws {
             onBehaviorDirective: { [weak attentionGimbalBridge] directive, origin, atNS in
                 switch directive.action {
                 case .resumeScanning, .seekPeople:
-                    if origin == .auxiliaryWake,
-                       attentionGimbalBridge?.hasVerifiedFaceLock(at: atNS) == true {
+                    // Periodic L1 awareness is advisory: a verified L0 face
+                    // lock is fresher motor evidence and must not be released
+                    // just because a background thought asks to keep looking.
+                    // Explicit L1/L2 embodiment requests use their dedicated
+                    // authority path instead of this passive callback.
+                    if attentionGimbalBridge?.hasVerifiedFaceLock(at: atNS) == true {
+                        let originName: String
+                        switch origin {
+                        case .awareness:
+                            originName = "awareness"
+                        case .auxiliaryWake:
+                            originName = "auxiliary_wake"
+                        }
                         writer.write(RuntimeEvent(
                             event: "source.health",
                             monotonicNS: atNS,
                             source: "l1_situation",
                             state: "behavior_directive_deferred",
-                            message: "origin=auxiliary_wake; reason=verified_face_lock"
+                            message: "origin=\(originName); reason=verified_face_lock"
                         ))
                         return
                     }
@@ -10535,6 +10563,11 @@ private func run(_ options: Options) throws {
             },
             toolDefinitions: l1ToolDefinitions,
             toolExecutor: l1ToolExecutor,
+            toolVisualResourceProvider: { toolName in
+                toolName == "capture_target_view"
+                    ? l1EmbodimentTools.consumeCaptureVisual()
+                    : []
+            },
             onCuriosityNeeds: { needs in
                 l1CuriosityCollector.registerTopics(from: needs)
             },
@@ -10578,7 +10611,6 @@ private func run(_ options: Options) throws {
         embodimentMotorAdapter = nil
     }
     if let embodimentViewCaptureStore,
-       let embodimentArbiter,
        let embodimentMotorAdapter {
         embodimentViewCaptureStore.setTerminalHandler { [weak embodimentArbiter, weak embodimentMotorAdapter] requestID, succeeded in
             _ = embodimentArbiter?.completeMotorGoal(
@@ -10592,11 +10624,22 @@ private func run(_ options: Options) throws {
         }
     }
     defer { embodimentMotorAdapter?.stop() }
+    l1EmbodimentRelay.install(
+        submitter: { request in
+            let decision = embodimentArbiter.submit(request, at: monotonicNanoseconds())
+            writer.write(EmbodimentShadowTraceEvent(decision))
+            embodimentMotorAdapter?.submit(request, decision: decision)
+            return decision
+        },
+        snapshotProvider: {
+            embodimentArbiter.snapshot(at: monotonicNanoseconds())
+        },
+        captureResultProvider: { requestID, monotonicNS in
+            embodimentViewCaptureStore?.result(requestID: requestID, at: monotonicNS)
+        }
+    )
     let embodimentShadowServer: EmbodimentShadowSocketServer?
     if let socketURL = options.embodimentShadowSocketURL {
-        guard let embodimentArbiter else {
-            throw RuntimeError.configuration("Embodiment arbiter initialization failed")
-        }
         let server = EmbodimentShadowSocketServer(
             socketURL: socketURL,
             arbiter: embodimentArbiter,
@@ -10791,14 +10834,12 @@ private func run(_ options: Options) throws {
         embodimentShadowServer = nil
     }
     defer { embodimentShadowServer?.stop() }
-    let embodimentSceneBridge = embodimentArbiter.map {
-        EmbodimentSceneBridge(
-            arbiter: $0,
-            writer: writer,
-            onSnapshot: { embodimentMotorAdapter?.update($0) }
-        )
-    }
-    defer { embodimentSceneBridge?.stop() }
+    let embodimentSceneBridge = EmbodimentSceneBridge(
+        arbiter: embodimentArbiter,
+        writer: writer,
+        onSnapshot: { embodimentMotorAdapter?.update($0) }
+    )
+    defer { embodimentSceneBridge.stop() }
     let publisher = BeliefPublisher(writer: writer) { belief, reason in
         attentionGimbalBridge?.ingest(belief, reason: reason)
     }
@@ -10813,7 +10854,7 @@ private func run(_ options: Options) throws {
         panoramaCompositor: panoramaCompositor,
         onSceneCandidates: { candidates, monotonicNS in
             conversationContact.observe(candidates, at: monotonicNS)
-            embodimentSceneBridge?.submit(candidates, at: monotonicNS)
+            embodimentSceneBridge.submit(candidates, at: monotonicNS)
             attentionGimbalBridge?.ingestSceneCandidates(candidates, at: monotonicNS)
             liveDiagnostics.recordSceneCandidates(candidates, at: monotonicNS)
         },
@@ -10828,6 +10869,7 @@ private func run(_ options: Options) throws {
         },
         onCameraFrame: { pixelBuffer, captureNS in
             liveCameraFrameRelay?.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
+            l1CurrentFrameRelay.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
             liveDiagnostics.recordCameraFrame(pixelBuffer, at: captureNS)
         },
         onIdentityDecision: { decision, faceRect, isPrimaryFace, monotonicNS in
@@ -10851,6 +10893,16 @@ private func run(_ options: Options) throws {
                 confidence: decision.confidence,
                 to: identityStateURL
             )
+            // The presence coordinator intentionally emits only arrival,
+            // replacement, and departure transitions. L1 needs the continuous
+            // recognized samples as its freshness signal, otherwise a stable
+            // person disappears from L1's three-second presence window after
+            // the initial arrival transition.
+            l1ThoughtRelay.observe(
+                decision,
+                label: identityDiagnosticLabel(for: decision, administrator: controlSettings.administrator),
+                at: monotonicNS
+            )
             for update in identityPresence.observe(decision, at: monotonicNS) {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .arrived(identity) = update.transition {
@@ -10872,13 +10924,6 @@ private func run(_ options: Options) throws {
                         state: "verified_presence",
                         message: "recognized_local_profile; metadata_disclosure=local_only"
                     ))
-                }
-                if let l1Decision = update.l1Decision {
-                    l1ThoughtRelay.observe(
-                        l1Decision,
-                        label: identityDiagnosticLabel(for: decision, administrator: controlSettings.administrator),
-                        at: monotonicNS
-                    )
                 }
             }
         },

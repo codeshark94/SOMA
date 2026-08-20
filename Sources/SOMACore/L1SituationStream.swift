@@ -16,7 +16,7 @@ public struct L1ModelConfiguration: Codable, Equatable, Sendable {
     public init(
         situationDeadlineMilliseconds: UInt64 = 20_000,
         consolidationDeadlineMilliseconds: UInt64 = 60_000,
-        spokenOpeningTendency: Double = 0.5
+        spokenOpeningTendency: Double = 0.7
     ) {
         precondition(situationDeadlineMilliseconds > 0)
         precondition(consolidationDeadlineMilliseconds >= situationDeadlineMilliseconds)
@@ -56,12 +56,22 @@ public struct L1VisualResource: Codable, Equatable, Sendable {
     public let projection: L1VisualProjection
     public let localPath: String
     public let expiresAt: Date
+    /// This describes when the camera observed the view, not when the backing
+    /// file was atomically written.
+    public let capturedAt: Date?
 
-    public init(resourceID: String, projection: L1VisualProjection, localPath: String, expiresAt: Date) {
+    public init(
+        resourceID: String,
+        projection: L1VisualProjection,
+        localPath: String,
+        expiresAt: Date,
+        capturedAt: Date? = nil
+    ) {
         self.resourceID = String(resourceID.prefix(256))
         self.projection = projection
         self.localPath = localPath
         self.expiresAt = expiresAt
+        self.capturedAt = capturedAt
     }
 }
 
@@ -313,13 +323,25 @@ public struct L1ThoughtState: Codable, Equatable, Sendable {
         self.workingHypothesis = String(
             workingHypothesis.trimmingCharacters(in: .whitespacesAndNewlines).prefix(512)
         )
-        self.streamOfConsciousness = String(
-            streamOfConsciousness.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2_000)
+        self.streamOfConsciousness = Self.boundedUTF8(
+            streamOfConsciousness.trimmingCharacters(in: .whitespacesAndNewlines),
+            maximumBytes: 4_096
         )
     }
 
     private static func unit(_ value: Double) -> Double {
         value.isFinite ? min(max(value, 0), 1) : 0
+    }
+
+    private static func boundedUTF8(_ value: String, maximumBytes: Int) -> String {
+        var result = ""
+        result.reserveCapacity(min(value.count, maximumBytes))
+        for character in value {
+            let next = String(character)
+            guard result.utf8.count + next.utf8.count <= maximumBytes else { break }
+            result.append(character)
+        }
+        return result
     }
 }
 
@@ -480,7 +502,7 @@ public struct L1SituationRequest: Codable, Equatable, Sendable {
         behaviorContext: L1BehaviorContext? = nil,
         curiosityContext: String? = nil,
         personPreferences: String? = nil,
-        spokenOpeningTendency: Double = 0.5,
+        spokenOpeningTendency: Double = 0.7,
         recalledEpisodes: [String] = [],
         perceptionAgeSeconds: Double = 0,
         priorCycleAgeSeconds: Double = 0
@@ -874,7 +896,7 @@ public enum L1SituationResponseDecoder {
                   !raw.workingHypothesis.isEmpty,
                   raw.workingHypothesis.utf8.count <= 512,
                   !raw.workingHypothesis.contains("\n"),
-                  (raw.streamOfConsciousness?.utf8.count ?? 0) <= 2_000,
+                  (raw.streamOfConsciousness?.utf8.count ?? 0) <= 4_096,
                   Set(raw.activeMotiveIDs).isSubset(of: Set(request.informationNeeds.map(\.motiveID))) else {
                 throw L1InferenceError.invalidResponse(["invalid thought state"])
             }
@@ -890,13 +912,22 @@ public enum L1SituationResponseDecoder {
         } else {
             thoughtState = nil
         }
+        // Social openings and behavioral directives have different authority
+        // and different failure semantics.  A model can correctly decide that
+        // there is no social action while still asking the body to resume a
+        // stalled exploration.  Treat common JSON-null spellings as an absent
+        // social decision, rather than letting a schema spelling error discard
+        // the independent behavioral directive with the rest of the frame.
+        let socialActionRaw = payload.action
+        let actionIsAbsent = socialActionRaw == nil || socialActionRaw == "null"
         let decision: L1SocialDecision?
         if request.socialOpportunity == nil {
             // Behavior-awareness pass: any social decision the model emits is
             // irrelevant (we only consume behaviorDirective) and must not
             // invalidate the frame.
             decision = nil
-        } else if let action = payload.action {
+        } else if let action = socialActionRaw,
+                  !actionIsAbsent {
             guard let opportunity = request.socialOpportunity,
                   let socialAction = L1SocialAction(rawValue: action),
                   let confidence = payload.confidence,
@@ -929,13 +960,17 @@ public enum L1SituationResponseDecoder {
                 evidenceIDs: payload.evidenceIDs,
                 openingContent: opening
             )
-        } else {
-            guard payload.opening == nil,
-                  payload.confidence == nil,
-                  payload.rationale == nil else {
-                throw L1InferenceError.invalidResponse(["social fields require an action"])
+        } else if actionIsAbsent {
+            // `confidence` and `rationale` describe the situation frame as a
+            // whole when there is no social action.  They are deliberately not
+            // coerced into a social decision.  An opening, on the other hand,
+            // is inseparable from a spoken action and remains invalid here.
+            guard payload.opening == nil else {
+                throw L1InferenceError.invalidResponse(["social opening requires an action"])
             }
             decision = nil
+        } else {
+            throw L1InferenceError.invalidResponse(["invalid social decision"])
         }
         let behaviorDirective: L1BehaviorDirective?
         if let raw = payload.behaviorDirective,
@@ -977,14 +1012,62 @@ public enum L1SituationResponseDecoder {
     private static func normalizedJSON(_ data: Data) -> Data {
         let text = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.hasPrefix("```"),
-              let firstNewline = text.firstIndex(of: "\n"),
-              text.hasSuffix("```") else {
-            return data
+        let json: String
+        if text.hasPrefix("```"),
+           let firstNewline = text.firstIndex(of: "\n"),
+           text.hasSuffix("```") {
+            let contentStart = text.index(after: firstNewline)
+            let contentEnd = text.index(text.endIndex, offsetBy: -3)
+            json = String(text[contentStart..<contentEnd]
+                .trimmingCharacters(in: .whitespacesAndNewlines))
+        } else {
+            json = text
         }
-        let contentStart = text.index(after: firstNewline)
-        let contentEnd = text.index(text.endIndex, offsetBy: -3)
-        return Data(text[contentStart..<contentEnd].trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+        guard let end = firstJSONObjectEnd(in: json) else {
+            return Data(json.utf8)
+        }
+        let afterObject = json.index(after: end)
+        let trailing = json[afterObject...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A duplicate closing delimiter is an unambiguous transport artifact:
+        // retain the complete first object, but leave any other trailing text
+        // to JSONDecoder so malformed model output stays rejected.
+        guard !trailing.isEmpty, trailing.allSatisfy({ $0 == "}" }) else {
+            return Data(json.utf8)
+        }
+        return Data(json[...end].utf8)
+    }
+
+    private static func firstJSONObjectEnd(in text: String) -> String.Index? {
+        guard text.first == "{" else { return nil }
+        var depth = 0
+        var insideString = false
+        var escaped = false
+        for index in text.indices {
+            let character = text[index]
+            if insideString {
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    insideString = false
+                }
+                continue
+            }
+            switch character {
+            case "\"":
+                insideString = true
+            case "{":
+                depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 { return index }
+            default:
+                break
+            }
+        }
+        return nil
     }
 
     private static func isNaturalOpening(_ text: String) -> Bool {

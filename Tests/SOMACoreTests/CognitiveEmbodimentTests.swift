@@ -639,7 +639,7 @@ final class CognitiveEmbodimentTests: XCTestCase {
                 lastSeenMilliseconds: 0
             )
         ], at: now + 2)
-        guard case let .track(_, reference, sceneID, bearing, observed, _, _) = coordinator.update(
+        guard case let .track(_, reference, sceneID, bearing, observed, _, _, _) = coordinator.update(
             snapshot: arbiter.snapshot(at: now + 3),
             at: now + 3
         ) else {
@@ -649,6 +649,114 @@ final class CognitiveEmbodimentTests: XCTestCase {
         XCTAssertEqual(sceneID, "scene:cup")
         XCTAssertEqual(bearing.azimuthDegrees, 35)
         XCTAssertTrue(observed)
+    }
+
+    func testRegistrationBindsImmediatelyToAlreadyObservedSceneEvidence() {
+        let now: UInt64 = 45_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        _ = arbiter.updateScene([
+            EmbodimentSceneEntity(
+                sceneID: "scene:book",
+                kind: .object,
+                label: "book",
+                confidence: 0.88,
+                observedThisFrame: true,
+                actionEligible: true,
+                bearing: .init(azimuthDegrees: -18, elevationDegrees: 4),
+                spatialConfidence: 0.9,
+                lastSeenMilliseconds: 0
+            )
+        ], at: now)
+        let registration = shadowRequest(
+            id: "register-visible-book",
+            layer: .l1,
+            owner: "l1:context",
+            priority: 60,
+            now: now + 1,
+            operation: .registerTarget(SemanticTargetRegistration(
+                targetReference: "target:book",
+                sceneID: "scene:book",
+                label: "book",
+                expectedKind: .object
+            ))
+        )
+        let decision = arbiter.submit(registration, at: now + 1)
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(
+            decision.snapshot.targetBindings.first?.status,
+            .bound,
+            "registration must bind against the current scene, not wait for another frame"
+        )
+        XCTAssertEqual(decision.snapshot.targetBindings.first?.sceneID, "scene:book")
+    }
+
+    func testTrackFramingProducesCompositionAwareIntent() {
+        let now: UInt64 = 46_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        _ = arbiter.updateScene([
+            EmbodimentSceneEntity(
+                sceneID: "scene:lamp",
+                kind: .object,
+                label: "lamp",
+                confidence: 0.9,
+                observedThisFrame: true,
+                actionEligible: true,
+                bearing: .init(azimuthDegrees: 20, elevationDegrees: 3),
+                spatialConfidence: 0.9,
+                lastSeenMilliseconds: 0
+            )
+        ], at: now)
+        let registration = shadowRequest(
+            id: "register-lamp",
+            layer: .l1,
+            owner: "l1:composition",
+            priority: 60,
+            now: now + 1,
+            operation: .registerTarget(SemanticTargetRegistration(
+                targetReference: "target:lamp",
+                sceneID: "scene:lamp",
+                label: "lamp",
+                expectedKind: .object
+            ))
+        )
+        _ = arbiter.submit(registration, at: now + 1)
+        let framing = NormalizedRect(x: 0.68, y: 0.40, width: 0.12, height: 0.12)
+        let request = shadowRequest(
+            id: "frame-lamp-right",
+            layer: .l1,
+            owner: "l1:composition",
+            priority: 60,
+            now: now + 2,
+            operation: .trackTarget(TrackTargetGoal(
+                targetReference: "target:lamp",
+                framing: framing,
+                motionStyle: .smooth
+            ))
+        )
+        var coordinator = EmbodimentMotorCoordinator()
+        guard case let .track(_, _, _, _, _, emittedFraming, _, _) = coordinator.apply(
+            request: request,
+            decision: arbiter.submit(request, at: now + 2),
+            at: now + 2
+        ) else {
+            return XCTFail("grounded composition target did not reach the L0 motor coordinator")
+        }
+        XCTAssertEqual(emittedFraming, framing)
+
+        let projection = CameraProjectionModel.pinhole(horizontalFieldOfViewDegrees: 86)
+        let centered = projection.cameraBearing(
+            placing: .init(azimuthDegrees: 20, elevationDegrees: 3),
+            at: .init(x: 0.44, y: 0.44, width: 0.12, height: 0.12),
+            poseProjection: .obsbotTiny2Lite
+        )
+        let rightFramed = projection.cameraBearing(
+            placing: .init(azimuthDegrees: 20, elevationDegrees: 3),
+            at: framing,
+            poseProjection: .obsbotTiny2Lite
+        )
+        XCTAssertNotNil(centered)
+        XCTAssertNotNil(rightFramed)
+        XCTAssertNotEqual(centered?.azimuthDegrees, rightFramed?.azimuthDegrees)
     }
 
     func testPhysicalReleaseIsOwnerScoped() {

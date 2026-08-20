@@ -2223,6 +2223,47 @@ final class PredictiveWorldModelTests: XCTestCase {
         )
     }
 
+    func testCoverageFieldInhibitsReturnToTheJustExploredRegion() {
+        let start: UInt64 = 13_000_000_000
+        let origin = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
+        var field = SpatialCoverageField()
+        let selected = SpatialCoverageDirection(
+            bearing: GimbalRelativeBearing(azimuthDegrees: -144, elevationDegrees: -39),
+            probability: 1
+        )
+        let nearbyBearing = GimbalRelativeBearing(azimuthDegrees: -144, elevationDegrees: -26)
+        let probabilityBefore = field.explorationProbability(
+            for: nearbyBearing,
+            from: origin,
+            at: start + 1_000_000_000,
+            temperature: 1
+        )
+        field.recordUnproductiveVisit(to: selected, at: start)
+        // The nearby cell receives inhibition of return in addition to its
+        // ordinary information value; a distant, otherwise equivalent cell is
+        // left available for the next posterior draw.
+        let probabilityAfter = field.explorationProbability(
+            for: nearbyBearing,
+            from: origin,
+            at: start + 1_000_000_000,
+            temperature: 1
+        )
+        XCTAssertLessThan(probabilityAfter ?? 1, probabilityBefore ?? 0)
+        let probabilityAfterDecay = field.explorationProbability(
+            for: nearbyBearing,
+            from: origin,
+            at: start + 76_000_000_000,
+            temperature: 1
+        )
+        XCTAssertGreaterThan(probabilityAfterDecay ?? 0, probabilityAfter ?? 1)
+        XCTAssertNotNil(field.sampleNextDirection(
+            from: origin,
+            at: start + 1_000_000_000,
+            temperature: 1,
+            uniform: 0.5
+        ))
+    }
+
     func testPanStallRecoveryRecentersOnlyAfterBothDirectionsFail() {
         var recovery = PanStallRecovery()
         XCTAssertEqual(

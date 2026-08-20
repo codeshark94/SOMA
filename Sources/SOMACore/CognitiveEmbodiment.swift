@@ -823,6 +823,7 @@ public final class ShadowEmbodimentArbiter: @unchecked Sendable {
                 layer: request.layer,
                 expiresAtNS: request.lease.expiresAtNS
             )
+            refreshTargetBindings()
             return decision(
                 request: request,
                 status: .accepted,
@@ -956,16 +957,8 @@ public final class ShadowEmbodimentArbiter: @unchecked Sendable {
             }
             return lhs.sceneID < rhs.sceneID
         }.prefix(maximumSnapshotSceneEntities))
-        let registrations = targets.values
-            .map(\.registration)
-            .sorted { $0.targetReference < $1.targetReference }
-        targetBindings = bindingEngine.resolve(
-            registrations: registrations,
-            entities: entities
-        )
+        refreshTargetBindings()
         spatialAtlas.updateScene(entities)
-        let activeReferences = Set(registrations.map(\.targetReference))
-        bindingFingerprints = bindingFingerprints.filter { activeReferences.contains($0.key) }
         var changed: [SemanticTargetBinding] = []
         for binding in targetBindings {
             let fingerprint = bindingFingerprint(binding)
@@ -975,6 +968,21 @@ public final class ShadowEmbodimentArbiter: @unchecked Sendable {
             }
         }
         return changed
+    }
+
+    /// Resolve bindings whenever either side of the relation changes. This
+    /// lets a registration bind to already-observed scene evidence immediately
+    /// instead of waiting for a later camera frame.
+    private func refreshTargetBindings() {
+        let registrations = targets.values
+            .map(\.registration)
+            .sorted { $0.targetReference < $1.targetReference }
+        targetBindings = bindingEngine.resolve(
+            registrations: registrations,
+            entities: sceneEntities
+        )
+        let activeReferences = Set(registrations.map(\.targetReference))
+        bindingFingerprints = bindingFingerprints.filter { activeReferences.contains($0.key) }
     }
 
     private func claimMotor(

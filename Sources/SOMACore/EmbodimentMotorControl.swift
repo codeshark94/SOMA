@@ -18,6 +18,7 @@ public enum EmbodimentMotorIntent: Equatable, Sendable {
         sceneID: String,
         bearing: GimbalRelativeBearing,
         observedThisFrame: Bool,
+        framing: NormalizedRect?,
         motionStyle: EmbodimentMotionStyle,
         expiresAtNS: UInt64
     )
@@ -152,6 +153,7 @@ public struct EmbodimentMotorCoordinator: Sendable {
             intent = groundedTargetIntent(
                 requestID: request.requestID,
                 targetReference: goal.targetReference,
+                framing: goal.framing,
                 motionStyle: goal.motionStyle,
                 reacquireIfOccluded: goal.reacquireIfOccluded,
                 expiresAtNS: request.lease.expiresAtNS,
@@ -207,6 +209,7 @@ public struct EmbodimentMotorCoordinator: Sendable {
     private func groundedTargetIntent(
         requestID: String,
         targetReference: String,
+        framing: NormalizedRect?,
         motionStyle: EmbodimentMotionStyle,
         reacquireIfOccluded: Bool,
         expiresAtNS: UInt64,
@@ -231,6 +234,7 @@ public struct EmbodimentMotorCoordinator: Sendable {
             sceneID: sceneID,
             bearing: bearing,
             observedThisFrame: entity.observedThisFrame,
+            framing: framing,
             motionStyle: motionStyle,
             expiresAtNS: expiresAtNS
         )
@@ -270,8 +274,11 @@ public struct EmbodimentMotorCoordinator: Sendable {
         switch intent {
         case let .orient(requestID, bearing, tolerance, style, expiresAtNS, reason):
             return "orient|\(requestID)|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(bucket(tolerance))|\(style.rawValue)|\(expiresAtNS)|\(reason)"
-        case let .track(requestID, reference, sceneID, bearing, observed, style, expiresAtNS):
-            return "track|\(requestID)|\(reference)|\(sceneID)|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(observed)|\(style.rawValue)|\(expiresAtNS)"
+        case let .track(requestID, reference, sceneID, bearing, observed, framing, style, expiresAtNS):
+            let composition = framing.map {
+                "\(bucket($0.centerX))|\(bucket($0.centerY))|\(bucket($0.width))|\(bucket($0.height))"
+            } ?? "center"
+            return "track|\(requestID)|\(reference)|\(sceneID)|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(observed)|\(composition)|\(style.rawValue)|\(expiresAtNS)"
         case let .capture(requestID, reference, sceneID, bearing, fieldOfView, expiresAtNS):
             return "capture|\(requestID)|\(reference ?? "none")|\(sceneID ?? "none")|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(bucket(fieldOfView))|\(expiresAtNS)"
         case let .explore(requestID, policy, expiresAtNS):

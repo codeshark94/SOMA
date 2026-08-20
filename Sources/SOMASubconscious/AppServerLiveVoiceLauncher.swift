@@ -106,6 +106,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 initialContext: context.map(Self.contextText) ?? "",
                 preferredLanguageTag: context?.preferredLanguageTag,
                 languageStartInstruction: context?.languageStartInstruction,
+                proactiveOpeningText: nil,
                 proactiveOpeningTrigger: nil,
                 personEntityID: personEntityID,
                 interactionAuthority: context?.interactionAuthority,
@@ -119,6 +120,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     /// transcript or a substitute for the normal conversation gate.
     func startProactiveOpening(
         context: CodexInteractionContext?,
+        opening: L1PurposefulOpening,
         personEntityID: UUID,
         at monotonicNS: UInt64
     ) {
@@ -126,13 +128,19 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             guard let self, !stopped else { return }
             guard gate.beginLaunch(at: monotonicNS) else { return }
             let base = context.map(Self.contextText) ?? ""
-            let directive = "This is a closed-purpose L1-initiated interaction. The supplied objective and completion condition are private conversational orientation, never text to recite or a checklist to expose. Form your own one brief, natural opening only if it serves that objective, then listen. After each reply, respond to what the participant actually said; let their answer determine the next conversational step. Surface a relevant information need only when it naturally fits the evolving conversation, and stop pursuing the objective once it is answered or declined. Do not dump multiple questions, narrate a plan, replace the opening with a generic greeting or offer of help, or invent another motive. If the purpose cannot be preserved, remain silent."
+            let exactOpening = opening.question.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !exactOpening.isEmpty else {
+                gate.fail(at: monotonicNS)
+                return
+            }
+            let directive = "This is a closed-purpose L1-initiated interaction. The supplied objective and completion condition are private conversational orientation, never text to recite or a checklist to expose. L1 has already selected the one natural opening in the participant's preferred language. Deliver that exact opening once, then listen. After each reply, respond to what the participant actually said; let their answer determine the next conversational step. Surface a relevant information need only when it naturally fits the evolving conversation, and stop pursuing the objective once it is answered or declined. Do not dump multiple questions, narrate a plan, replace the opening with a generic greeting or offer of help, or invent another motive. If the purpose cannot be preserved, remain silent."
             launch(
                 authorization: "l1_social_opening",
                 initialContext: String([base, directive].filter { !$0.isEmpty }.joined(separator: "\n\n").prefix(24_000)),
                 preferredLanguageTag: context?.preferredLanguageTag,
                 languageStartInstruction: context?.languageStartInstruction,
-                proactiveOpeningTrigger: "Controller event, not user speech: L1 has authorized a private conversation objective in the developer context. If that objective supports a natural opening now, speak exactly one brief opening question, then listen.",
+                proactiveOpeningText: String(exactOpening.prefix(1_024)),
+                proactiveOpeningTrigger: "Controller event, not user speech: deliver the exact L1-authored opening in the startup developer context now, then listen.",
                 personEntityID: personEntityID,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
@@ -265,6 +273,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         initialContext: String,
         preferredLanguageTag: String?,
         languageStartInstruction: String?,
+        proactiveOpeningText: String?,
         proactiveOpeningTrigger: String?,
         personEntityID: UUID?,
         interactionAuthority: SOMAInteractionAuthority?,
@@ -337,6 +346,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             "initialContext": String(initialContext.prefix(24_000)),
             "preferredLanguageTag": preferredLanguageTag ?? "",
             "languageStartInstruction": languageStartInstruction ?? "",
+            "proactiveOpeningText": proactiveOpeningText ?? "",
             "proactiveOpeningTrigger": proactiveOpeningTrigger ?? "",
             "interactionAuthority": interactionAuthority?.rawValue ?? "",
             "codexSandbox": somaEnvString("SOMA_L2_CODEX_SANDBOX", default: "danger-full-access"),

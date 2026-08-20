@@ -4,6 +4,57 @@ import XCTest
 @testable import SOMACore
 
 final class L1SituationStreamTests: XCTestCase {
+    func testStreamOfConsciousnessKeepsSubstantiveReflectionWithinABoundedUTF8Envelope() {
+        let reflection = String(repeating: "I am integrating this change with the prior situation. ", count: 60)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let state = L1ThoughtState(
+            socialAvailability: 0.5,
+            curiosityPressure: 0.4,
+            interruptionCost: 0.3,
+            relationshipUncertainty: 0.2,
+            activeMotiveIDs: [],
+            workingHypothesis: "The situation merits a considered response.",
+            streamOfConsciousness: reflection
+        )
+        XCTAssertEqual(state.streamOfConsciousness, reflection)
+        XCTAssertGreaterThan(state.streamOfConsciousness.utf8.count, 2_000)
+
+        let request = fixtureRequest()
+        let decoded = try? L1SituationResponseDecoder.decode(Data("""
+        {
+          "summary": "The situation needs a careful interpretation.",
+          "uncertainty": 0.3,
+          "evidence_ids": ["scene:1"],
+          "thought_state": {
+            "social_availability": 0.5,
+            "curiosity_pressure": 0.4,
+            "interruption_cost": 0.3,
+            "relationship_uncertainty": 0.2,
+            "active_motive_ids": [],
+            "working_hypothesis": "The situation merits a considered response.",
+            "stream_of_consciousness": "\(reflection)"
+          },
+          "action": null,
+          "confidence": null,
+          "rationale": null,
+          "opening": null
+        }
+        """.utf8), for: request)
+        XCTAssertEqual(decoded?.thoughtState?.streamOfConsciousness, reflection)
+
+        let overlong = L1ThoughtState(
+            socialAvailability: 0.5,
+            curiosityPressure: 0.4,
+            interruptionCost: 0.3,
+            relationshipUncertainty: 0.2,
+            activeMotiveIDs: [],
+            workingHypothesis: "The situation merits a considered response.",
+            streamOfConsciousness: String(repeating: "é", count: 2_100)
+        )
+        XCTAssertLessThanOrEqual(overlong.streamOfConsciousness.utf8.count, 4_096)
+        XCTAssertTrue(overlong.streamOfConsciousness.hasPrefix("é"))
+    }
+
     func testContactEpisodeRecordsObservedResponseAndClosureWithoutInventingIntent() {
         var episode = L1ConversationContactEpisode()
         XCTAssertFalse(episode.observeFinalizedTurn(role: .assistant))
@@ -157,6 +208,7 @@ final class L1SituationStreamTests: XCTestCase {
     }
 
     func testAttachedCurrentVisualResourceIsValidSituationEvidence() throws {
+        let capturedAt = Date(timeIntervalSince1970: 9)
         let request = L1SituationRequest(
             observedAt: Date(timeIntervalSince1970: 10),
             evidenceIDs: ["behavior:1"],
@@ -166,10 +218,12 @@ final class L1SituationStreamTests: XCTestCase {
                     resourceID: "current_frame",
                     projection: .currentView,
                     localPath: "/private/tmp/current-frame.jpg",
-                    expiresAt: Date(timeIntervalSince1970: 60)
+                    expiresAt: Date(timeIntervalSince1970: 60),
+                    capturedAt: capturedAt
                 ),
             ]
         )
+        XCTAssertEqual(request.visuals.first?.capturedAt, capturedAt)
         let frame = L1SituationFrame(
             cycleID: request.cycleID,
             summary: "The attached view grounds the current assessment.",
@@ -287,6 +341,72 @@ final class L1SituationStreamTests: XCTestCase {
         """.utf8)
 
         XCTAssertThrowsError(try L1SituationResponseDecoder.decode(json, for: request))
+    }
+
+    func testNeutralSocialActionDoesNotDiscardIndependentBehaviorDirective() throws {
+        let person = UUID()
+        let opportunity = L1SocialOpportunity(
+            entityID: person,
+            observedAtNS: 1_000,
+            recognitionConfidence: 0.94,
+            availableActions: [.remainSilent, .nonverbalInvitation, .spokenOpening]
+        )
+        let request = L1SituationRequest(
+            observedAt: Date(timeIntervalSince1970: 10),
+            evidenceIDs: ["scene:1"],
+            beliefSummary: "A familiar person was recently observed.",
+            presentEntityIDs: [person],
+            socialOpportunity: opportunity
+        )
+        let json = Data("""
+        {
+          "summary": "The current view is not a person, so exploration should continue.",
+          "uncertainty": 0.2,
+          "evidence_ids": ["scene:1"],
+          "action": "null",
+          "confidence": 0.9,
+          "rationale": "The visual target is not suitable for social engagement.",
+          "opening": null,
+          "behavior_directive": {"action": "resume_scanning", "rationale": "Continue looking for a person."}
+        }
+        """.utf8)
+
+        let frame = try L1SituationResponseDecoder.decode(json, for: request)
+        XCTAssertNil(frame.socialDecision)
+        XCTAssertEqual(frame.behaviorDirective?.action, .resumeScanning)
+    }
+
+    func testNeutralSocialActionRecoversOnlyAnExtraClosingDelimiter() throws {
+        let person = UUID()
+        let opportunity = L1SocialOpportunity(
+            entityID: person,
+            observedAtNS: 1_000,
+            recognitionConfidence: 0.94,
+            availableActions: [.remainSilent]
+        )
+        let request = L1SituationRequest(
+            observedAt: Date(timeIntervalSince1970: 10),
+            evidenceIDs: ["scene:1"],
+            beliefSummary: "A non-person scene target has held attention.",
+            presentEntityIDs: [person],
+            socialOpportunity: opportunity
+        )
+        let repaired = Data("""
+        {"summary":"Resume exploration.","uncertainty":0.2,"evidence_ids":["scene:1"],"action":null,"confidence":0.9,"rationale":"The target is non-social.","opening":null,"behavior_directive":{"action":"seek_people","rationale":"Find a person."}}}
+        """.utf8)
+        let frame = try L1SituationResponseDecoder.decode(repaired, for: request)
+        XCTAssertNil(frame.socialDecision)
+        XCTAssertEqual(frame.behaviorDirective?.action, .seekPeople)
+
+        let invalidAction = Data("""
+        {"summary":"Invalid action.","uncertainty":0.2,"evidence_ids":["scene:1"],"action":"remain_silent ","confidence":0.9,"rationale":"Malformed social action.","opening":null}
+        """.utf8)
+        XCTAssertThrowsError(try L1SituationResponseDecoder.decode(invalidAction, for: request))
+
+        let trailingProse = Data("""
+        {"summary":"Invalid tail.","uncertainty":0.2,"evidence_ids":["scene:1"],"action":null,"opening":null} ignored
+        """.utf8)
+        XCTAssertThrowsError(try L1SituationResponseDecoder.decode(trailingProse, for: request))
     }
 
     func testGemmaOpeningSelectsAnInformationMotiveWithNaturalWording() throws {

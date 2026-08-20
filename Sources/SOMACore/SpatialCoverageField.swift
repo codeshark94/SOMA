@@ -311,8 +311,18 @@ public struct SpatialCoverageField: Sendable {
         var placeLastUpdatedNS: UInt64?
     }
 
+    /// A recent self-directed look is weak negative evidence for looking
+    /// immediately beside the same place again. This is separate from image
+    /// coverage: it remains useful while the camera is moving or a frame is
+    /// temporarily unavailable.
+    private struct ExplorationVisit: Sendable {
+        let bearing: GimbalRelativeBearing
+        let monotonicNS: UInt64
+    }
+
     private var cells: [Cell]
     private let kinematicEnvelope: GimbalKinematicEnvelope
+    private var recentExplorationVisits: [ExplorationVisit] = []
 
     public init(
         kinematicEnvelope: GimbalKinematicEnvelope = .obsbotTiny2Lite,
@@ -517,6 +527,25 @@ public struct SpatialCoverageField: Sendable {
         return nil // explicit no-exploration alternative
     }
 
+    /// Internal observability for deterministic policy checks. Production
+    /// callers select through `sampleNextDirection` instead of treating this
+    /// posterior mass as a directive.
+    func explorationProbability(
+        for bearing: GimbalRelativeBearing,
+        from pose: GimbalPose,
+        at monotonicNS: UInt64,
+        temperature: Double
+    ) -> Double? {
+        guard let index = cells.indices.first(where: { cells[$0].bearing == bearing }) else {
+            return nil
+        }
+        return directionDistribution(
+            from: pose,
+            at: monotonicNS,
+            temperature: temperature
+        ).probabilities[index]
+    }
+
     /// A full look at a selected direction without an acquired target is
     /// evidence against immediately spending another exploration pulse there.
     public mutating func recordUnproductiveVisit(
@@ -524,10 +553,24 @@ public struct SpatialCoverageField: Sendable {
         at monotonicNS: UInt64? = nil
     ) {
         guard let index = cells.indices.first(where: { cells[$0].bearing == direction.bearing }) else { return }
-        cells[index].unproductiveVisits += 1
-        cells[index].lastUnproductiveNS = monotonicNS
+        let visitNS = monotonicNS
             ?? cells[index].lastObservedNS
             ?? cells[index].lastUnproductiveNS
+            ?? 0
+        cells[index].unproductiveVisits += 1
+        cells[index].lastUnproductiveNS = visitNS
+        // Keep only the short-lived spatial context needed for inhibition of
+        // return. The longer-lived information value is already represented
+        // by the coverage and place-memory fields above.
+        recentExplorationVisits.removeAll {
+            visitNS >= $0.monotonicNS && visitNS - $0.monotonicNS > 75_000_000_000
+        }
+        recentExplorationVisits.append(
+            ExplorationVisit(bearing: direction.bearing, monotonicNS: visitNS)
+        )
+        if recentExplorationVisits.count > 8 {
+            recentExplorationVisits.removeFirst(recentExplorationVisits.count - 8)
+        }
     }
 
     private func directionDistribution(
@@ -560,6 +603,10 @@ public struct SpatialCoverageField: Sendable {
             } ?? 0
             let effectiveFailures = Double(cell.unproductiveVisits) * exp(-failureAgeSeconds / 300)
             let failurePenalty = exp(-0.7 * effectiveFailures)
+            let returnInhibition = recentExplorationInhibition(
+                for: cell.bearing,
+                at: monotonicNS
+            )
             // Prefer a natural eye-level scan. With a weak divisor the
             // exploration regularly dives to a low cell and sweeps nose-down,
             // which reads as "tucking the head and turning". A stronger
@@ -569,7 +616,11 @@ public struct SpatialCoverageField: Sendable {
             let boundaryClearance = min(route.panClearanceDegrees / 20, route.pitchClearanceDegrees / 12)
             let boundaryComfort = 0.55 + 0.45 * min(max(boundaryClearance, 0), 1)
             return pow(
-                max(0.001, observationNeed * exp(-routeDistance / 120) * failurePenalty * elevationComfort * boundaryComfort),
+                max(
+                    0.001,
+                    observationNeed * exp(-routeDistance / 120) * failurePenalty
+                        * (1 - 0.85 * returnInhibition) * elevationComfort * boundaryComfort
+                ),
                 inverseTemperature
             )
         }
@@ -601,6 +652,28 @@ public struct SpatialCoverageField: Sendable {
             placeNeed = max(evidenceNeed, cell.placeConflict)
         }
         return min(max(0.20 * novelty + 0.45 * panoramaNeed + 0.35 * placeNeed, 0), 1)
+    }
+
+    /// Inhibition of return is local on the viewing sphere and decays over
+    /// time. It makes a no-target scan leave a just-examined region while
+    /// allowing that region to become useful again once the room may have
+    /// changed.
+    private func recentExplorationInhibition(
+        for bearing: GimbalRelativeBearing,
+        at monotonicNS: UInt64
+    ) -> Double {
+        recentExplorationVisits.reduce(0) { strongest, visit in
+            let ageSeconds: Double
+            if monotonicNS >= visit.monotonicNS {
+                ageSeconds = Double(monotonicNS - visit.monotonicNS) / 1_000_000_000
+            } else {
+                ageSeconds = 0
+            }
+            let temporalDecay = exp(-ageSeconds / 35)
+            let distance = sphericalDistanceDegrees(bearing, visit.bearing)
+            let spatialFalloff = exp(-0.5 * pow(distance / 30, 2))
+            return max(strongest, temporalDecay * spatialFalloff)
+        }
     }
 
     public func snapshot(at monotonicNS: UInt64) -> [SphericalAtlasCell] {
@@ -698,11 +771,24 @@ public struct SpatialCoverageField: Sendable {
     }
 
     private func sphericalDistanceDegrees(_ bearing: GimbalRelativeBearing, pose: GimbalPose) -> Double {
-        let azimuthDelta = angularDifference(bearing.azimuthDegrees, pose.panDegrees) * .pi / 180
-        let bearingElevation = bearing.elevationDegrees * .pi / 180
-        let poseElevation = pose.pitchDegrees * .pi / 180
-        let cosine = sin(bearingElevation) * sin(poseElevation)
-            + cos(bearingElevation) * cos(poseElevation) * cos(azimuthDelta)
+        sphericalDistanceDegrees(
+            bearing,
+            GimbalRelativeBearing(
+                azimuthDegrees: pose.panDegrees,
+                elevationDegrees: pose.pitchDegrees
+            )
+        )
+    }
+
+    private func sphericalDistanceDegrees(
+        _ lhs: GimbalRelativeBearing,
+        _ rhs: GimbalRelativeBearing
+    ) -> Double {
+        let azimuthDelta = angularDifference(lhs.azimuthDegrees, rhs.azimuthDegrees) * .pi / 180
+        let lhsElevation = lhs.elevationDegrees * .pi / 180
+        let rhsElevation = rhs.elevationDegrees * .pi / 180
+        let cosine = sin(lhsElevation) * sin(rhsElevation)
+            + cos(lhsElevation) * cos(rhsElevation) * cos(azimuthDelta)
         return acos(min(1, max(-1, cosine))) * 180 / .pi
     }
 }

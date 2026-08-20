@@ -109,7 +109,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l1IdleCadenceSeconds: Double = 150,
         l1CuriosityCollectionEnabled: Bool = true,
         l1CollectionIntervalHours: Double = 24,
-        l1SpokenOpeningTendency: Double = 0.5,
+        l1SpokenOpeningTendency: Double = 0.7,
         l1DefaultLanguage: String = "ko",
         l0E2BWakeScore: Double = 0.65,
         l0E2BWakeConfidence: Double = 0.55,
@@ -227,7 +227,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l1IdleCadenceSeconds = try values.decodeIfPresent(Double.self, forKey: .l1IdleCadenceSeconds) ?? 150
         l1CuriosityCollectionEnabled = try values.decodeIfPresent(Bool.self, forKey: .l1CuriosityCollectionEnabled) ?? true
         l1CollectionIntervalHours = try values.decodeIfPresent(Double.self, forKey: .l1CollectionIntervalHours) ?? 24
-        l1SpokenOpeningTendency = min(max(try values.decodeIfPresent(Double.self, forKey: .l1SpokenOpeningTendency) ?? 0.5, 0), 1)
+        l1SpokenOpeningTendency = min(max(try values.decodeIfPresent(Double.self, forKey: .l1SpokenOpeningTendency) ?? 0.7, 0), 1)
         l1DefaultLanguage = try values.decodeIfPresent(String.self, forKey: .l1DefaultLanguage) ?? "ko"
         l0E2BWakeScore = min(max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeScore) ?? 0.65, 0), 1)
         l0E2BWakeConfidence = min(max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeConfidence) ?? 0.55, 0), 1)
@@ -310,7 +310,7 @@ public struct SOMAEnvStore: Sendable {
             l1IdleCadenceSeconds: doubleValue(values["SOMA_L1_IDLE_CADENCE_SECONDS"], default: 150),
             l1CuriosityCollectionEnabled: boolValue(values["SOMA_L1_CURIOSITY_ENABLED"], default: true),
             l1CollectionIntervalHours: doubleValue(values["SOMA_L1_CURIOSITY_INTERVAL_HOURS"], default: 24),
-            l1SpokenOpeningTendency: doubleValue(values["SOMA_L1_SPOKEN_OPENING_TENDENCY"], default: 0.5),
+            l1SpokenOpeningTendency: doubleValue(values["SOMA_L1_SPOKEN_OPENING_TENDENCY"], default: 0.7),
             l1DefaultLanguage: values["SOMA_L1_DEFAULT_LANGUAGE"] ?? "ko",
             l0E2BWakeScore: doubleValue(values["SOMA_L0_E2B_WAKE_SCORE"], default: 0.65),
             l0E2BWakeConfidence: doubleValue(values["SOMA_L0_E2B_WAKE_CONFIDENCE"], default: 0.55),
