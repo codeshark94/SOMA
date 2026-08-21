@@ -1559,8 +1559,11 @@ private final class ConversationContactRuntime: @unchecked Sendable {
     func authorizeSpeechOnset(at monotonicNS: UInt64) -> ConversationOpeningAuthorization? {
         lock.lock()
         defer { lock.unlock() }
-        let directContact = directedContactHistory.snapshot(at: monotonicNS).eyeContactActive
-        return gate.authorizeSpeechOnset(at: monotonicNS, directContact: directContact)
+        // The caller has already established a current, verified visual
+        // anchor through LiveConversationVisualAdmission. Gaze remains useful
+        // social evidence for L1, but must not become a second, independent
+        // admission gate for a person who has just spoken to SOMA.
+        return gate.authorizeSpeechOnset(at: monotonicNS, directContact: true)
     }
 
     func markConversationOpened(at monotonicNS: UInt64) {
@@ -1976,7 +1979,7 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
     case "configured":
         return ("configured", "status=ready")
     case "wake":
-        let allowedCauses: Set<String> = ["recognized_person", "behavior_awareness", "auxiliary_wake"]
+        let allowedCauses: Set<String> = ["recognized_person", "behavior_awareness", "auxiliary_wake", "temporal_context"]
         let cause = value("cause").flatMap { allowedCauses.contains($0) ? $0 : nil } ?? "situational_change"
         return ("wake", "cause=\(cause)")
     case "deliberating":
@@ -2272,6 +2275,21 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             self.sceneID = sceneID
             targetAzimuthDegrees = bearing.azimuthDegrees
             targetElevationDegrees = bearing.elevationDegrees
+            fieldOfViewDegrees = fieldOfView
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            self.expiresAtNS = expiresAtNS
+        case let .captureCurrent(requestID, fieldOfView, expiresAtNS):
+            self.requestID = requestID
+            action = "capture_current"
+            reason = "capture_view_current_frame"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
             fieldOfViewDegrees = fieldOfView
             observedThisFrame = nil
             framingCenterX = nil
@@ -4268,27 +4286,33 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         target: AttentionTarget?,
         at monotonicNS: UInt64
     ) {
-        let signature = "\(decision.state.rawValue)|\(decision.permitsNativeSocialTracking)|\(decision.permitsExternalSocialReframing)"
-        if signature != lastAttentionDecisionSignature {
-            lastAttentionDecisionSignature = signature
+        let attentionStateSignature = "\(decision.state.rawValue)|\(decision.permitsNativeSocialTracking)|\(decision.permitsExternalSocialReframing)"
+        let focusSignature = "\(attentionStateSignature)|\(decision.sceneID ?? "none")|\(target?.kind.rawValue ?? "none")|\(target?.label ?? "none")|\(target?.isFaceMotorTarget == true)"
+        if focusSignature != lastAttentionDecisionSignature {
+            lastAttentionDecisionSignature = focusSignature
             behaviorAttentionState = decision.state.rawValue
-            behaviorTargetLabel = target?.label
-            behaviorTargetConfidence = target?.confidence ?? 0
-            behaviorIsFaceTarget = target?.isFaceMotorTarget ?? false
             behaviorChangedAtNS = monotonicNS
             recentAttentionStates.append(decision.state.rawValue)
             if recentAttentionStates.count > 16 {
                 recentAttentionStates.removeFirst(recentAttentionStates.count - 16)
             }
         }
+        // A behavioral-state transition is much slower than visual evidence.
+        // Always project the latest target into L1 context so a stale
+        // face-shaped candidate cannot masquerade as the current focus after
+        // L0 has already returned to exploration.
+        behaviorTargetLabel = target?.label
+        behaviorTargetConfidence = target?.confidence ?? 0
+        behaviorIsFaceTarget = target?.isFaceMotorTarget ?? false
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNS,
             source: "l0_attention_controller",
             state: decision.state.rawValue,
             message: String(
-                format: "scene_id=%@; posterior_probability=%.3f; native_social_tracking=%@",
+                format: "scene_id=%@; target=%@; posterior_probability=%.3f; native_social_tracking=%@",
                 decision.sceneID ?? "none",
+                target?.label ?? "none",
                 decision.posteriorProbability,
                 decision.permitsNativeSocialTracking ? "eligible" : (decision.permitsExternalSocialReframing ? "social_reframe" : "not_eligible")
             )
@@ -5354,6 +5378,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             )
             cognitiveMotionHolding = false
             startCognitiveMotionLoop()
+        case let .captureCurrent(requestID, fieldOfView, expiresAtNS):
+            embodimentViewCaptureStore?.prepareCurrent(
+                requestID: requestID,
+                fieldOfViewDegrees: fieldOfView,
+                leaseExpiresAtNS: expiresAtNS,
+                cameraPose: poseStore.current(maximumAgeNS: 600_000_000) ?? poseStore.lastKnown(),
+                at: now
+            )
         case let .explore(requestID, policy, expiresAtNS):
             claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
             cognitiveMotionMode = .exploration(policy: policy)
@@ -8153,7 +8185,7 @@ private final class FaceLockDiagnosticRecorder: @unchecked Sendable {
 
     private let directoryURL: URL
     private let ioQueue = DispatchQueue(label: "soma.subconscious.face-lock-diagnostics", qos: .utility)
-    private let context = CIContext(options: nil)
+    private let context = CIContext(options: [.cacheIntermediates: false])
     private let admissionLock = NSLock()
     private let sampleIntervalNS: UInt64 = 500_000_000
     private let faceCandidateIntervalNS: UInt64 = 100_000_000
@@ -8194,14 +8226,16 @@ private final class FaceLockDiagnosticRecorder: @unchecked Sendable {
                 self.encoding = false
                 self.admissionLock.unlock()
             }
-            let image = CIImage(cvPixelBuffer: retainedPixelBuffer.value)
-            let outputURL = self.directoryURL.appendingPathComponent(outputName)
-            try? self.context.writeJPEGRepresentation(
-                of: image,
-                to: outputURL,
-                colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-                options: [:]
-            )
+            autoreleasepool {
+                let image = CIImage(cvPixelBuffer: retainedPixelBuffer.value)
+                let outputURL = self.directoryURL.appendingPathComponent(outputName)
+                try? self.context.writeJPEGRepresentation(
+                    of: image,
+                    to: outputURL,
+                    colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    options: [:]
+                )
+            }
             let images = ((try? FileManager.default.contentsOfDirectory(
                 at: self.directoryURL,
                 includingPropertiesForKeys: nil
@@ -8247,8 +8281,8 @@ private final class FaceLockDiagnosticRecorder: @unchecked Sendable {
 
 private final class VisionWorker: @unchecked Sendable {
     private enum DetectionOutcome {
-        case candidates([VisualObservation])
-        case miss
+        case candidates([VisualObservation], diagnostics: [VisualObservation])
+        case miss(diagnostics: [VisualObservation])
     }
 
     private let mailbox = LatestFrameMailbox()
@@ -8269,6 +8303,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let neuralFaceDetector: ANEFaceDetector?
     private let faceIdentityRuntime: FaceIdentityRuntime?
     private let onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)?
+    private let onDiagnosticFrame: ((CVPixelBuffer, [VisualObservation], UInt64) -> Void)?
     private let onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)?
     private let systemFaceVerificationWorker: SystemFaceVerificationWorker
     private let stateLock = NSLock()
@@ -8320,6 +8355,7 @@ private final class VisionWorker: @unchecked Sendable {
         onSceneCandidates: (([SceneCandidate], UInt64) -> Void)? = nil,
         onCoverage: ((GimbalPose, Double, GimbalPoseProjection, CameraProjectionModel, UInt64) -> Void)? = nil,
         onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)? = nil,
+        onDiagnosticFrame: ((CVPixelBuffer, [VisualObservation], UInt64) -> Void)? = nil,
         onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64) -> Void)? = nil,
         onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)? = nil,
         onFatalVisionFailure: (() -> Void)? = nil,
@@ -8337,6 +8373,7 @@ private final class VisionWorker: @unchecked Sendable {
         self.onSceneCandidates = onSceneCandidates
         self.onCoverage = onCoverage
         self.onCameraFrame = onCameraFrame
+        self.onDiagnosticFrame = onDiagnosticFrame
         self.onFatalVisionFailure = onFatalVisionFailure
         self.onIdentityPresenceEvidence = onIdentityPresenceEvidence
         self.systemFaceVerificationWorker = SystemFaceVerificationWorker(
@@ -8506,7 +8543,7 @@ private final class VisionWorker: @unchecked Sendable {
         do {
             outcome = try detect(in: frame.pixelBuffer, captureNS: frame.captureNS)
         } catch {
-            outcome = .miss
+            outcome = .miss(diagnostics: [])
         }
 
         let completedNS = monotonicNanoseconds()
@@ -8523,7 +8560,7 @@ private final class VisionWorker: @unchecked Sendable {
             )
         }
         switch outcome {
-        case let .candidates(candidates):
+        case let .candidates(candidates, diagnosticCandidates):
             let sceneCandidates = sceneField.ingest(
                 candidates,
                 at: completedNS,
@@ -8544,6 +8581,7 @@ private final class VisionWorker: @unchecked Sendable {
             ))
             writeSceneCandidates(sceneCandidates, at: completedNS)
             onSceneCandidates?(sceneCandidates, completedNS)
+            onDiagnosticFrame?(frame.pixelBuffer, diagnosticCandidates, frame.captureNS)
             submitPanorama(
                 frame,
                 sceneCandidates: sceneCandidates,
@@ -8616,8 +8654,9 @@ private final class VisionWorker: @unchecked Sendable {
                 captureToBeliefMS: captureToBeliefMS
             ))
             publisher.publish(belief, reason: observation.source.rawValue, force: true)
-        case .miss:
+        case let .miss(diagnosticCandidates):
             let sceneCandidates = sceneField.ingest([], at: completedNS)
+            onDiagnosticFrame?(frame.pixelBuffer, diagnosticCandidates, frame.captureNS)
             submitPanorama(
                 frame,
                 sceneCandidates: sceneCandidates,
@@ -8677,9 +8716,8 @@ private final class VisionWorker: @unchecked Sendable {
             }
             return candidate.observation.rect
         }
-        panoramaCompositor?.submit(
-            pixelBuffer: frame.pixelBuffer,
-            captureNS: frame.exposureNS,
+        panoramaCompositor?.submitContext(
+            frameNS: frame.captureNS,
             horizontalFieldOfViewDegrees: projection.horizontalFieldOfViewDegrees,
             fieldOfViewMode: projection.fieldOfViewMode,
             cameraProjectionModel: projection.cameraProjectionModel,
@@ -8694,6 +8732,9 @@ private final class VisionWorker: @unchecked Sendable {
         systemFaceVerificationWorker.submit(pixelBuffer: pixelBuffer, captureNS: captureNS)
         sceneEnrichmentWorker.submit(pixelBuffer: pixelBuffer, captureNS: captureNS)
         var candidates: [VisualObservation] = []
+        // The diagnostic overlay is a measurement display, not SceneField
+        // state. Retain only observations whose model input was this buffer.
+        var diagnosticCandidates: [VisualObservation] = []
         if let neuralFaceDetector {
             let now = monotonicNanoseconds()
             if now >= nextFaceNS {
@@ -8701,6 +8742,7 @@ private final class VisionWorker: @unchecked Sendable {
                 do {
                     let faces = try neuralFaceDetector.detect(in: pixelBuffer)
                     candidates += faces
+                    diagnosticCandidates += faces
                     counters.neuralFaceInference()
                     recordFaceInferenceSuccess(at: monotonicNanoseconds())
                 } catch {
@@ -8717,12 +8759,16 @@ private final class VisionWorker: @unchecked Sendable {
             if faceVerificationNow >= enrichment.captureNS,
                faceVerificationNow - enrichment.captureNS <= 750_000_000 {
                 candidates += enrichment.candidates
+                if enrichment.captureNS == captureNS {
+                    diagnosticCandidates += enrichment.candidates
+                }
                 if let objectInferenceMS = enrichment.objectInferenceMS {
                     counters.neuralEngineInference(inferenceMS: objectInferenceMS)
                 }
             }
         }
         var newlyVerifiedFaces: [SystemFaceEvidence] = []
+        var verificationCaptureNS: UInt64?
         if let verification = systemFaceVerificationWorker.latestResult(),
            verification.captureNS > lastAppliedFaceVerificationCaptureNS {
             // Consume each mailbox result exactly once. A result that reached
@@ -8730,6 +8776,7 @@ private final class VisionWorker: @unchecked Sendable {
             lastAppliedFaceVerificationCaptureNS = verification.captureNS
             if faceVerificationNow >= verification.captureNS,
                faceVerificationNow - verification.captureNS <= 750_000_000 {
+                verificationCaptureNS = verification.captureNS
                 newlyVerifiedFaces = verification.faces
                 faceConfirmationLease.record(verification.faces.map(\.rect), at: verification.captureNS)
                 directedContactEvidence = verification.faces
@@ -8741,7 +8788,7 @@ private final class VisionWorker: @unchecked Sendable {
         // A newly completed landmark result may rescue an ANE miss, but stale
         // System Vision geometry never becomes a steering measurement.
         let aneFaceRects = candidates.filter { isFaceCandidate($0) }.map(\.rect)
-        candidates += newlyVerifiedFaces.compactMap { evidence in
+        let systemFaceCandidates: [VisualObservation] = newlyVerifiedFaces.compactMap { evidence in
             guard !aneFaceRects.contains(where: { Self.faceEvidenceMatches(evidence.rect, $0) }) else {
                 return nil
             }
@@ -8755,6 +8802,10 @@ private final class VisionWorker: @unchecked Sendable {
                 isFaceVerified: true,
                 isEyeContactEligible: evidence.directedEyeContact
             )
+        }
+        candidates += systemFaceCandidates
+        if verificationCaptureNS == captureNS {
+            diagnosticCandidates += systemFaceCandidates
         }
         candidates = facePersonFusion.fuse(candidates, at: faceVerificationNow)
         let directedContactFreshnessNS = UInt64(somaEnvDouble(
@@ -8791,6 +8842,25 @@ private final class VisionWorker: @unchecked Sendable {
                     || (candidate.source == .neuralFaceDetector && independentlyVerified),
                 isFaceVerified: independentlyVerified,
                 isEyeContactEligible: directedEyeContact
+            )
+        }
+        diagnosticCandidates = diagnosticCandidates.map { candidate in
+            guard isFaceCandidate(candidate) else { return candidate }
+            let independentlyVerified = candidate.isFaceVerified
+                || faceConfirmationLease.permits(candidate.rect, at: faceVerificationNow)
+            return VisualObservation(
+                rect: candidate.rect,
+                confidence: candidate.confidence,
+                source: candidate.source,
+                kind: candidate.kind,
+                label: candidate.label,
+                attentionWeight: candidate.attentionWeight,
+                posteriorProbability: candidate.posteriorProbability,
+                sceneID: candidate.sceneID,
+                stabilityMilliseconds: candidate.stabilityMilliseconds,
+                isActionEligible: candidate.isActionEligible,
+                isFaceVerified: independentlyVerified,
+                isEyeContactEligible: candidate.isEyeContactEligible
             )
         }
         for candidate in candidates where isFaceCandidate(candidate) && candidate.isFaceVerified {
@@ -8917,9 +8987,9 @@ private final class VisionWorker: @unchecked Sendable {
             force: rawFaceCount > 0
         )
         guard !candidates.isEmpty else {
-            return .miss
+            return .miss(diagnostics: diagnosticCandidates)
         }
-        return .candidates(candidates)
+        return .candidates(candidates, diagnostics: diagnosticCandidates)
     }
 
     private func recordFaceInferenceSuccess(at monotonicNS: UInt64) {
@@ -9302,14 +9372,43 @@ private final class PanoramaPlaceMemoryPersistence: @unchecked Sendable {
 /// process, as reported by the kernel. RSS alone hides compressed pages, which
 /// is exactly how the IOSurface leak looked "small" while the machine was
 /// thrashing.
-private func currentPhysicalFootprintBytes() -> UInt64 {
+private struct TaskMemorySnapshot {
+    let physicalFootprint: UInt64
+    let resident: UInt64
+    let internalBytes: UInt64
+    let externalBytes: UInt64
+    let reusableBytes: UInt64
+    let compressed: UInt64
+    let purgeableNonvolatile: UInt64
+    let purgeableVolatile: UInt64
+    let graphicsFootprint: UInt64
+    let neuralFootprint: UInt64
+
+    var diagnosticMessage: String {
+        func megabytes(_ value: UInt64) -> UInt64 { value / 1_000_000 }
+        return "phys_footprint=\(megabytes(physicalFootprint))MB; resident=\(megabytes(resident))MB; internal=\(megabytes(internalBytes))MB; external=\(megabytes(externalBytes))MB; reusable=\(megabytes(reusableBytes))MB; compressed=\(megabytes(compressed))MB; purgeable_nonvolatile=\(megabytes(purgeableNonvolatile))MB; purgeable_volatile=\(megabytes(purgeableVolatile))MB; graphics=\(megabytes(graphicsFootprint))MB; neural=\(megabytes(neuralFootprint))MB"
+    }
+}
+
+private func currentTaskMemorySnapshot() -> TaskMemorySnapshot? {
     var info = task_vm_info()
     var count = mach_msg_type_number_t(MemoryLayout<task_vm_info>.size / MemoryLayout<natural_t>.size)
     let result = withUnsafeMutablePointer(to: &info) { pointer in
         pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
     }
-    guard result == KERN_SUCCESS else { return 0 }
-    return UInt64(info.phys_footprint)
+    guard result == KERN_SUCCESS else { return nil }
+    return TaskMemorySnapshot(
+        physicalFootprint: UInt64(info.phys_footprint),
+        resident: UInt64(info.resident_size),
+        internalBytes: UInt64(info.internal),
+        externalBytes: UInt64(info.external),
+        reusableBytes: UInt64(info.reusable),
+        compressed: UInt64(info.compressed),
+        purgeableNonvolatile: UInt64(max(0, info.ledger_purgeable_nonvolatile)),
+        purgeableVolatile: UInt64(max(0, info.ledger_purgeable_volatile)),
+        graphicsFootprint: UInt64(max(0, info.ledger_tag_graphics_footprint)),
+        neuralFootprint: UInt64(max(0, info.ledger_tag_neural_footprint))
+    )
 }
 
 private func run(_ options: Options) throws {
@@ -9338,16 +9437,29 @@ private func run(_ options: Options) throws {
     // footprint (models + buffers) and far below the leak trajectory.
     let footprintLimitBytes: UInt64 = 12 * 1_000_000_000
     Task {
+        var warningWasReported = false
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 30_000_000_000)
-            let footprint = currentPhysicalFootprintBytes()
-            guard footprint > footprintLimitBytes else { continue }
+            guard let memory = currentTaskMemorySnapshot() else { continue }
+            if memory.physicalFootprint <= 8 * 1_000_000_000 {
+                warningWasReported = false
+            } else if !warningWasReported {
+                warningWasReported = true
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "memory_watchdog",
+                    state: "warning",
+                    message: memory.diagnosticMessage
+                ))
+            }
+            guard memory.physicalFootprint > footprintLimitBytes else { continue }
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
                 source: "memory_watchdog",
                 state: "critical",
-                message: "phys_footprint=\(footprint / 1_000_000)MB > limit=\(footprintLimitBytes / 1_000_000)MB; exiting for launchd restart"
+                message: "\(memory.diagnosticMessage); limit=\(footprintLimitBytes / 1_000_000)MB; exiting_for_launchd_restart=true"
             ))
             exit(0)
         }
@@ -9397,8 +9509,8 @@ private func run(_ options: Options) throws {
         .appendingPathComponent("identity-current.json")
     let liveSessionCapabilities = SOMASessionCapabilityStore()
     let spatialAtlas = SphericalSceneAtlasStore()
-    let placeEmbeddingEncoder = PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder
-    let placeEmbeddingRevision = VNGenerateImageFeaturePrintRequest().revision
+    let placeEmbeddingEncoder = PanoramaPlaceEmbedding.cpuSpatialSignatureEncoder
+    let placeEmbeddingRevision = 1
     let placeMemoryPersistence = options.panoramaPlaceMemoryURL.map { memoryURL in
         PanoramaPlaceMemoryPersistence(
             url: memoryURL,
@@ -9692,6 +9804,11 @@ private func run(_ options: Options) throws {
             }
         )
     }
+    if let panoramaCompositor {
+        l1CurrentFrameRelay.setEncodedFrameObserver { jpeg, captureNS in
+            panoramaCompositor.submitEncodedJPEG(jpeg, captureNS: captureNS)
+        }
+    }
     defer {
         panoramaCompositor?.stop()
         placeMemoryPersistence?.flush(at: monotonicNanoseconds())
@@ -9702,7 +9819,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "panorama",
             state: "configured",
-            message: "projection=equirectangular_band; resolution=1024x256; elevation=-45...45; max_hz=4; pose_wait_ms=125; max_pose_distance_ms=120; max_bracket_ms=200; registration=vision_translation; photometric=opencv_channels; seam=opencv_feather; place_encoder=\(placeEmbeddingEncoder); place_revision=\(placeEmbeddingRevision); rolling_output=\(String(outputURL.path.prefix(192)))"
+            message: "projection=equirectangular_band; resolution=1024x256; elevation=-45...45; max_hz=4; pose_wait_ms=125; max_pose_distance_ms=120; max_bracket_ms=200; registration=lucas_kanade_cpu; photometric=cpu_channel_gain; seam=quality_weighted; place_encoder=\(placeEmbeddingEncoder); place_revision=\(placeEmbeddingRevision); rolling_output=\(String(outputURL.path.prefix(192)))"
         ))
     }
     if let cameraGeometryCalibration {
@@ -9973,7 +10090,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: "embodiment_mcp_ready",
-                    message: "capture_view_and_identity_tools_available"
+                    message: "capability_preflight=get_embodiment_state; capture_view_and_identity_tools_available"
                 ))
             case let .embodimentMCPUnavailable(reason):
                 writer.write(RuntimeEvent(
@@ -9982,6 +10099,14 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "embodiment_mcp_unavailable",
                     message: String(reason.prefix(192))
+                ))
+            case let .embodimentMCPCall(tool, status, error):
+                writer.write(RuntimeEvent(
+                    event: "l2.mcp",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: status,
+                    message: "tool=\(tool); error=\(error ?? "none")"
                 ))
             case let .contextRejected(reason):
                 writer.write(RuntimeEvent(
@@ -10142,7 +10267,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=mcp_capture_view_on_demand; mcp_status_checked=on_session_start; text_context=startup_context_plus_explicit_updates"
+            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=auto_injected_at_session_and_speech_onset; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=on_session_start; text_context=startup_context_plus_explicit_updates"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -10301,6 +10426,12 @@ private func run(_ options: Options) throws {
                 let nowNS = monotonicNanoseconds()
                 let atlas = spatialAtlas.snapshot(at: nowNS)
                 let panorama = panoramaStatus.snapshot()
+                let placeIdentity = spaceCoordinator.currentIdentity
+                let placeAffiliation = l1MemoryContext.cachedPlaceAffiliation(
+                    spaceID: placeIdentity.id,
+                    label: placeIdentity.label,
+                    isStable: placeIdentity.label != nil
+                )
                 let expiresAt = Date().addingTimeInterval(60)
                 let visualOffers: [L1VisualResourceOffer]
                 if let panorama,
@@ -10321,7 +10452,8 @@ private func run(_ options: Options) throws {
                         reachableCoverageFraction: panorama?.reachableCoverageFraction ?? 0,
                         reachableQualityCoverageFraction: panorama?.reachableQualityCoverageFraction ?? 0,
                         placeRevisits: panorama?.placeRevisits ?? 0,
-                        activeSceneEntityCount: atlas.entities.count
+                        activeSceneEntityCount: atlas.entities.count,
+                        placeAffiliation: placeAffiliation
                     ),
                     dailyWorldMemory: dailyWorldMemoryRelay.snapshot(),
                     visualResourceOffers: visualOffers
@@ -10458,7 +10590,7 @@ private func run(_ options: Options) throws {
                         authority: interactionAuthority,
                         at: completedNS
                     )
-                    let context = l1ProactiveInteractionContext(
+                    guard let context = l1ProactiveInteractionContext(
                         request: request,
                         decision: decision,
                         purpose: opening,
@@ -10470,7 +10602,16 @@ private func run(_ options: Options) throws {
                         personMemoryMission: l1MemoryContext.cachedPersonMemoryMission(
                             for: decision.entityID
                         )
-                    )
+                    ) else {
+                        writer.write(RuntimeEvent(
+                            event: "source.health",
+                            monotonicNS: completedNS,
+                            source: "l2_live_voice",
+                            state: "context_rejected",
+                            message: "proactive_interaction_context_invalid"
+                        ))
+                        return
+                    }
                     // L1 owns social initiation and transfers directly to the
                     // conversation runtime. L0 may mirror the outcome through
                     // embodiment, but cannot become a serial gate for speech.
@@ -10856,7 +10997,6 @@ private func run(_ options: Options) throws {
             conversationContact.observe(candidates, at: monotonicNS)
             embodimentSceneBridge.submit(candidates, at: monotonicNS)
             attentionGimbalBridge?.ingestSceneCandidates(candidates, at: monotonicNS)
-            liveDiagnostics.recordSceneCandidates(candidates, at: monotonicNS)
         },
         onCoverage: { pose, horizontalFieldOfViewDegrees, poseProjection, cameraProjectionModel, monotonicNS in
             attentionGimbalBridge?.ingestCoverage(
@@ -10870,7 +11010,13 @@ private func run(_ options: Options) throws {
         onCameraFrame: { pixelBuffer, captureNS in
             liveCameraFrameRelay?.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
             l1CurrentFrameRelay.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
-            liveDiagnostics.recordCameraFrame(pixelBuffer, at: captureNS)
+        },
+        onDiagnosticFrame: { pixelBuffer, candidates, captureNS in
+            liveDiagnostics.recordVisionFrame(
+                pixelBuffer,
+                candidates: candidates,
+                at: captureNS
+            )
         },
         onIdentityDecision: { decision, faceRect, isPrimaryFace, monotonicNS in
             presentIdentityRoster.record(decision, at: monotonicNS)
@@ -11025,6 +11171,20 @@ private func run(_ options: Options) throws {
             } ?? activeLanguage.recent()
                 ?? somaEnvString("SOMA_L1_DEFAULT_LANGUAGE", default: "ko")
             let languageStartInstruction = l1LanguageInstructions.directive(for: preferredLanguageTag)
+            let personPreferenceDirectives = recognizedPersonEntityID.map {
+                l1MemoryContext.personPreferenceDirectives(for: $0)
+            } ?? ""
+            let interactionIdentityReference = personContextAvailable
+                ? l2IdentityReference(
+                    base: identityPresence.interactionReference(),
+                    explicitPreferences: personPreferenceDirectives
+                )
+                : nil
+            let interactionMemorySummaries = (recognizedPersonEntityID.map {
+                l1MemoryContext.cachedPersonMemorySummaries(for: $0)
+            } ?? []) + (personPreferenceDirectives.isEmpty
+                ? []
+                : ["Explicit person preferences: \(personPreferenceDirectives)"])
             if evidence.active, evidence.changed, openingAuthorization == nil {
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
@@ -11040,9 +11200,9 @@ private func run(_ options: Options) throws {
                     authority: interactionParticipant.authority,
                     at: completedNS
                 )
-                let context = speechInteractionContext(
+                guard let context = speechInteractionContext(
                     from: belief,
-                    identityReference: personContextAvailable ? identityPresence.interactionReference() : nil,
+                    identityReference: interactionIdentityReference,
                     participant: interactionParticipant,
                     personContextAvailable: personContextAvailable,
                     sessionCapability: sessionCapability,
@@ -11051,13 +11211,20 @@ private func run(_ options: Options) throws {
                     },
                     preferredLanguageTag: preferredLanguageTag,
                     languageStartInstruction: languageStartInstruction,
-                    memorySummaries: recognizedPersonEntityID.map {
-                        l1MemoryContext.cachedPersonMemorySummaries(for: $0)
-                    } ?? [],
+                    memorySummaries: interactionMemorySummaries,
                     pendingInformationNeeds: recognizedPersonEntityID.map {
                         l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(1).map(\.question)
                     } ?? []
-                )
+                ) else {
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: completedNS,
+                        source: "l2_live_voice",
+                        state: "context_rejected",
+                        message: "speech_interaction_context_invalid"
+                    ))
+                    return
+                }
                 liveVoiceLauncher?.startIfNeeded(
                     authorization: openingAuthorization.rawValue,
                     context: context,
@@ -11073,7 +11240,7 @@ private func run(_ options: Options) throws {
                 )
                 guard let context = speechInteractionContext(
                     from: belief,
-                    identityReference: personContextAvailable ? identityPresence.interactionReference() : nil,
+                    identityReference: interactionIdentityReference,
                     participant: interactionParticipant,
                     personContextAvailable: personContextAvailable,
                     sessionCapability: sessionCapability,
@@ -11082,9 +11249,7 @@ private func run(_ options: Options) throws {
                     },
                     preferredLanguageTag: preferredLanguageTag,
                     languageStartInstruction: languageStartInstruction,
-                    memorySummaries: recognizedPersonEntityID.map {
-                        l1MemoryContext.cachedPersonMemorySummaries(for: $0)
-                    } ?? [],
+                    memorySummaries: interactionMemorySummaries,
                     pendingInformationNeeds: recognizedPersonEntityID.map {
                         l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(1).map(\.question)
                     } ?? []
@@ -11498,7 +11663,7 @@ private func speechInteractionContext(
     let situationSummary = targetSummary
     let missionSummaries = pendingInformationNeeds.isEmpty ? nil :
         "Acquisition mission — gently try to learn in conversation: \(pendingInformationNeeds.joined(separator: " | "))"
-    return try? CodexInteractionContext(
+    return makeL2InteractionContext(
         situationSummary: situationSummary,
         identityReference: identityReference,
         personEntityID: participant?.entityID,
@@ -11512,6 +11677,64 @@ private func speechInteractionContext(
         memorySummaries: memorySummaries,
         embodimentSummary: "Camera policy is \(belief.policy.rawValue); interaction readiness is \(String(format: "%.2f", belief.readyProbability))."
     )
+}
+
+/// Builds the deliberately bounded semantic projection sent to L2. Local
+/// memory is open-ended, while a live interaction packet is not: a single
+/// verbose recollection must never discard the current person's voice turn.
+private func makeL2InteractionContext(
+    situationSummary: String? = nil,
+    identityReference: String? = nil,
+    personEntityID: UUID? = nil,
+    personContextAvailable: Bool? = nil,
+    sessionCapability: String? = nil,
+    interactionAuthority: SOMAInteractionAuthority? = nil,
+    personMemoryMission: PersonContextMission? = nil,
+    preferredLanguageTag: String? = nil,
+    languageStartInstruction: String? = nil,
+    rapportSummary: String? = nil,
+    activeTaskSummaries: [String] = [],
+    memorySummaries: [String] = [],
+    embodimentSummary: String? = nil,
+    privacyScope: String = "interaction_scoped"
+) -> CodexInteractionContext? {
+    func text(_ value: String?, maximumCount: Int) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return String(normalized.prefix(maximumCount))
+    }
+
+    func list(_ values: [String], maximumItems: Int, maximumCount: Int) -> [String] {
+        Array(values.compactMap { text($0, maximumCount: maximumCount) }.prefix(maximumItems))
+    }
+
+    return try? CodexInteractionContext(
+        situationSummary: text(situationSummary, maximumCount: 8_192),
+        identityReference: text(identityReference, maximumCount: 512),
+        personEntityID: personEntityID,
+        personContextAvailable: personContextAvailable,
+        sessionCapability: sessionCapability,
+        interactionAuthority: interactionAuthority,
+        personMemoryMission: personMemoryMission,
+        preferredLanguageTag: text(preferredLanguageTag, maximumCount: 35),
+        languageStartInstruction: text(languageStartInstruction, maximumCount: 1_024),
+        rapportSummary: text(rapportSummary, maximumCount: 2_048),
+        activeTaskSummaries: list(activeTaskSummaries, maximumItems: 16, maximumCount: 1_024),
+        memorySummaries: list(memorySummaries, maximumItems: 24, maximumCount: 1_024),
+        embodimentSummary: text(embodimentSummary, maximumCount: 2_048),
+        privacyScope: text(privacyScope, maximumCount: 96) ?? "interaction_scoped"
+    )
+}
+
+private func l2IdentityReference(
+    base: String?,
+    explicitPreferences: String
+) -> String? {
+    guard let base else { return nil }
+    let preferences = explicitPreferences.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !preferences.isEmpty else { return base }
+    return String((base + ". Explicit stored preferences: " + preferences).prefix(512))
 }
 
 private func l1ProactiveInteractionContext(
@@ -11548,7 +11771,7 @@ private func l1ProactiveInteractionContext(
     let preferences = request.personPreferences.map {
         "The person's explicitly stated durable preferences — honor these as binding rules in how you engage them: \($0)"
     }
-    return try? CodexInteractionContext(
+    return makeL2InteractionContext(
         situationSummary: situation,
         identityReference: identity,
         personEntityID: decision.entityID,

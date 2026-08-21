@@ -1,18 +1,15 @@
 # Bundled models
 
-## Apple Vision Feature Print
+## CPU spatial place signature
 
-SOMA uses the system `VNGenerateImageFeaturePrintRequest` only on stable,
-human-free panorama frames, at most once per second on the utility compositor
-queue. The encoder revision and element count are stored with every normalized
-Float32 scene embedding; a mismatch is rejected rather than compared. The
-embedding supports fixed-base spherical place familiarity and change evidence,
+SOMA derives a normalized 12×8 RGB spatial signature from stable, human-free
+panorama frames. The signature is a local CPU feature, not a learned identity
+model: it supports fixed-base spherical place familiarity and change evidence,
 not face identity, object identity, dialogue, or direct motor authority.
 
-This model is supplied by macOS rather than bundled in the repository. Apple
-does not expose a per-request Neural Engine placement guarantee for this Vision
-operation, so SOMA records its revision, attempts, failures, and latency without
-claiming ANE execution. Optional cross-session storage contains only bounded
+Its encoder name, revision, and element count are stored with every bounded
+Float32 embedding. A signature from a different encoder or revision is rejected
+rather than compared. Optional cross-session storage contains only these
 embeddings and scalar spherical-cell statistics in an owner-only local file;
 no camera pixels or scene entities are included.
 

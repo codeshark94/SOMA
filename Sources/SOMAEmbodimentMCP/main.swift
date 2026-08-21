@@ -186,6 +186,7 @@ private struct PersonContextArguments: Codable {
 
 private final class EmbodimentMCPServer {
     private let socketURL: URL
+    private let sessionAuthorization: String?
     private var initialized = false
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
@@ -194,6 +195,7 @@ private final class EmbodimentMCPServer {
 
     init(socketURL: URL) {
         self.socketURL = socketURL
+        self.sessionAuthorization = Self.environmentSessionAuthorization()
         decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         encoder = JSONEncoder()
@@ -278,8 +280,7 @@ private final class EmbodimentMCPServer {
 
     private func callTool(name: String, arguments: [String: Any]) throws -> EmbodimentIPCReply {
         let sessionAuthorization = try sessionAuthorization(for: name, arguments: arguments)
-        var toolArguments = arguments
-        toolArguments.removeValue(forKey: "session_token")
+        let toolArguments = arguments
         switch name {
         case "get_embodiment_state", "list_scene_entities", "get_spatial_map":
             guard toolArguments.isEmpty else {
@@ -356,7 +357,8 @@ private final class EmbodimentMCPServer {
                 socketURL: socketURL
             )
             guard name == "capture_view", initial.ok else { return initial }
-            guard initial.snapshot?.physicalActuationEnabled == true else {
+            let capture: CaptureArguments = try decode(toolArguments)
+            guard capture.goal.requestsCurrentFrame || initial.snapshot?.physicalActuationEnabled == true else {
                 return EmbodimentIPCReply(
                     ok: false,
                     error: "capture_view_requires_physical_l0_adapter",
@@ -468,17 +470,13 @@ private final class EmbodimentMCPServer {
         arguments: [String: Any]
     ) throws -> String? {
         guard protectedToolNames.contains(toolName) else { return nil }
-        guard let token = arguments["session_token"] as? String else {
-            throw ServerFailure.invalidArguments("\(toolName) requires session_token from the current SOMA interaction context")
+        guard arguments["session_token"] == nil else {
+            throw ServerFailure.invalidArguments("session_token is managed by the active SOMA interaction")
         }
-        let normalized = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalized.count == 36,
-              normalized.unicodeScalars.allSatisfy({
-                  CharacterSet.alphanumerics.contains($0) || $0 == "-"
-              }) else {
-            throw ServerFailure.invalidArguments("session_token is invalid")
+        guard let sessionAuthorization else {
+            throw ServerFailure.invalidArguments("\(toolName) is unavailable outside an active SOMA interaction")
         }
-        return normalized
+        return sessionAuthorization
     }
 
     private func decode<T: Decodable>(_ arguments: [String: Any]) throws -> T {
@@ -741,7 +739,7 @@ private final class EmbodimentMCPServer {
                 "control": controlSchema(),
                 "policy": explorationPolicySchema(),
             ], required: ["control", "policy"])),
-            tool("capture_view", "Align a contextual view, capture the next settled frame, and return it as MCP image content plus a short-lived local resource link.", objectSchema([
+            tool("capture_view", "Capture a view and return it as MCP image content plus a short-lived local resource link. Use goal.current_frame=true for the immediate current camera frame without moving the gimbal; use target_reference or bearing only when a reframed view is needed.", objectSchema([
                 "control": controlSchema(),
                 "goal": captureGoalSchema(),
             ], required: ["control", "goal"])),
@@ -759,24 +757,12 @@ private final class EmbodimentMCPServer {
         _ name: String,
         _ description: String,
         _ inputSchema: [String: Any],
-        readOnly: Bool = false,
-        requiresSessionAuthorization: Bool = true
+        readOnly: Bool = false
     ) -> [String: Any] {
-        var schema = inputSchema
-        if requiresSessionAuthorization {
-            // session_token is an implementation detail injected by the SOMA
-            // interaction context, not a semantic argument the model must
-            // reason about. It stays in properties (so the client can supply
-            // it) but is not listed as required; L0 still rejects a protected
-            // call that arrives without a valid token.
-            var properties = schema["properties"] as? [String: Any] ?? [:]
-            properties["session_token"] = stringSchema(maxLength: 128)
-            schema["properties"] = properties
-        }
         return [
             "name": name,
             "description": description,
-            "inputSchema": schema,
+            "inputSchema": inputSchema,
             "annotations": [
                 "readOnlyHint": readOnly,
                 "destructiveHint": false,
@@ -784,6 +770,19 @@ private final class EmbodimentMCPServer {
                 "openWorldHint": false,
             ],
         ]
+    }
+
+    private static func environmentSessionAuthorization() -> String? {
+        guard let value = ProcessInfo.processInfo.environment["SOMA_SESSION_TOKEN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              value.count == 36,
+              value.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || $0 == "-"
+              }) else {
+            return nil
+        }
+        return value
     }
 
     private func controlSchema() -> [String: Any] {
@@ -884,10 +883,12 @@ private final class EmbodimentMCPServer {
             "target_reference": stringSchema(maxLength: 96),
             "bearing": bearingSchema(),
             "field_of_view_degrees": numberSchema(minimum: 5, maximum: 120),
+            "current_frame": ["type": "boolean", "const": true],
         ], required: [])
         schema["anyOf"] = [
             ["required": ["target_reference"]],
             ["required": ["bearing"]],
+            ["required": ["current_frame"]],
         ]
         return schema
     }

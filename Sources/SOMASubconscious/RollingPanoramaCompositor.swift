@@ -1,20 +1,16 @@
-import CoreImage
-import CoreVideo
 import Foundation
 import SOMACore
 import SOMAOpenCV
-import Vision
 
-private final class PanoramaPixelBuffer: @unchecked Sendable {
-    let value: CVPixelBuffer
-
-    init(_ value: CVPixelBuffer) {
-        self.value = value
-    }
+private struct PanoramaCameraSnapshot: Sendable {
+    let data: Data
+    let width: Int
+    let height: Int
+    let bytesPerRow: Int
 }
 
 private enum PanoramaCompositorError: Error {
-    case unsupportedFeaturePrint
+    case unsupportedCameraData
 }
 
 private struct CameraGeometryCaptureRecord: Encodable {
@@ -35,7 +31,7 @@ private struct CameraGeometryCaptureRecord: Encodable {
 /// the compositor waits for the attitude sample after its exposure timestamp.
 final class RollingPanoramaCompositor: @unchecked Sendable {
     private struct Pending: Sendable {
-        let pixelBuffer: PanoramaPixelBuffer
+        let jpeg: Data
         let captureNS: UInt64
         let horizontalFieldOfViewDegrees: Double
         let fieldOfViewMode: Int
@@ -43,8 +39,15 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         let dynamicVisionRects: [SOMACore.NormalizedRect]
     }
 
+    private struct PendingContext: Sendable {
+        let horizontalFieldOfViewDegrees: Double
+        let fieldOfViewMode: Int
+        let cameraProjectionModel: CameraProjectionModel
+        let dynamicVisionRects: [SOMACore.NormalizedRect]
+    }
+
     private struct AlignmentReference: Sendable {
-        let pixelBuffer: PanoramaPixelBuffer
+        let camera: PanoramaCameraSnapshot
         let pose: GimbalPose
         let cameraProjectionModel: CameraProjectionModel
     }
@@ -73,8 +76,6 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     private let onHealth: @Sendable (String, String) -> Void
     private let queue = DispatchQueue(label: "soma.panorama.compositor", qos: .utility)
     private let admissionLock = NSLock()
-    private let imageContext = CIContext(options: [.useSoftwareRenderer: false])
-    private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     private let width = 1024
     private let height = 256
     private let minimumElevationDegrees = -45.0
@@ -86,15 +87,21 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     private let minimumProjectionQuality = 0.45
     private let stationaryProjectionRefreshNS: UInt64 = 2_000_000_000
     private let stationaryProjectionDistanceDegrees = 1.25
-    private let placeEmbeddingEncoder = PanoramaPlaceEmbedding.appleVisionFeaturePrintEncoder
-    private let placeEmbeddingRevision = VNGenerateImageFeaturePrintRequest().revision
+    private let placeEmbeddingEncoder = PanoramaPlaceEmbedding.cpuSpatialSignatureEncoder
+    private let placeEmbeddingRevision = 1
     private var pending: Pending?
+    private var pendingContexts: [UInt64: PendingContext] = [:]
+    private var pendingJPEGs: [UInt64: Data] = [:]
     private var drainScheduled = false
     private var accepting = true
     private var nextAdmissionNS: UInt64 = 0
     private var pixels: [UInt8]
     private var qualities: [Float]
     private var acceptedFrames: UInt64 = 0
+    private var inputContextCount: UInt64 = 0
+    private var inputJPEGCount: UInt64 = 0
+    private var inputMatchedCount: UInt64 = 0
+    private var inputDecodeFailures: UInt64 = 0
     private var lowQualityRejectedFrames: UInt64 = 0
     private var poseInterpolationMisses: UInt64 = 0
     private var poseMissReasons: [String: UInt64] = [:]
@@ -187,41 +194,52 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         writeSnapshot(at: DispatchTime.now().uptimeNanoseconds)
     }
 
-    func submit(
-        pixelBuffer: CVPixelBuffer,
-        captureNS: UInt64,
+    func submitContext(
+        frameNS: UInt64,
         horizontalFieldOfViewDegrees: Double,
         fieldOfViewMode: Int,
         cameraProjectionModel: CameraProjectionModel,
         dynamicVisionRects: [SOMACore.NormalizedRect]
     ) {
         admissionLock.lock()
-        guard accepting, captureNS >= nextAdmissionNS else {
+        guard accepting else {
             admissionLock.unlock()
             return
         }
-        nextAdmissionNS = captureNS + admissionIntervalNS
-        pending = Pending(
-            pixelBuffer: PanoramaPixelBuffer(pixelBuffer),
-            captureNS: captureNS,
+        pendingContexts[frameNS] = PendingContext(
             horizontalFieldOfViewDegrees: horizontalFieldOfViewDegrees,
             fieldOfViewMode: fieldOfViewMode,
             cameraProjectionModel: cameraProjectionModel,
             dynamicVisionRects: Array(dynamicVisionRects.prefix(32))
         )
-        guard !drainScheduled else {
+        inputContextCount += 1
+        trimPendingInputsLocked()
+        let shouldSchedule = admitExactPairLocked(at: frameNS)
+        admissionLock.unlock()
+        if shouldSchedule { scheduleDrain() }
+    }
+
+    func submitEncodedJPEG(_ jpeg: Data, captureNS: UInt64) {
+        guard !jpeg.isEmpty, jpeg.count <= 2_000_000 else { return }
+        admissionLock.lock()
+        guard accepting else {
             admissionLock.unlock()
             return
         }
-        drainScheduled = true
+        pendingJPEGs[captureNS] = jpeg
+        inputJPEGCount += 1
+        trimPendingInputsLocked()
+        let shouldSchedule = admitExactPairLocked(at: captureNS)
         admissionLock.unlock()
-        scheduleDrain()
+        if shouldSchedule { scheduleDrain() }
     }
 
     func stop() {
         admissionLock.lock()
         accepting = false
         pending = nil
+        pendingContexts.removeAll()
+        pendingJPEGs.removeAll()
         admissionLock.unlock()
         queue.sync {}
         try? geometryCaptureManifest?.close()
@@ -230,6 +248,40 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     private func scheduleDrain() {
         queue.asyncAfter(deadline: .now() + .milliseconds(poseWaitMilliseconds)) { [weak self] in
             self?.drain()
+        }
+    }
+
+    private func admitExactPairLocked(at captureNS: UInt64) -> Bool {
+        guard captureNS >= nextAdmissionNS,
+              let context = pendingContexts.removeValue(forKey: captureNS),
+              let jpeg = pendingJPEGs.removeValue(forKey: captureNS) else {
+            return false
+        }
+        nextAdmissionNS = captureNS + admissionIntervalNS
+        inputMatchedCount += 1
+        pending = Pending(
+            jpeg: jpeg,
+            captureNS: captureNS,
+            horizontalFieldOfViewDegrees: context.horizontalFieldOfViewDegrees,
+            fieldOfViewMode: context.fieldOfViewMode,
+            cameraProjectionModel: context.cameraProjectionModel,
+            dynamicVisionRects: context.dynamicVisionRects
+        )
+        guard !drainScheduled else { return false }
+        drainScheduled = true
+        return true
+    }
+
+    private func trimPendingInputsLocked() {
+        let maximumPendingContexts = 128
+        let maximumPendingJPEGs = 8
+        if pendingContexts.count > maximumPendingContexts {
+            let stale = pendingContexts.keys.sorted().prefix(pendingContexts.count - maximumPendingContexts)
+            for key in stale { pendingContexts.removeValue(forKey: key) }
+        }
+        if pendingJPEGs.count > maximumPendingJPEGs {
+            let stale = pendingJPEGs.keys.sorted().prefix(pendingJPEGs.count - maximumPendingJPEGs)
+            for key in stale { pendingJPEGs.removeValue(forKey: key) }
         }
     }
 
@@ -250,6 +302,11 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     }
 
     private func process(_ frame: Pending) {
+        guard let camera = decodeCameraJPEG(frame.jpeg) else {
+            inputDecodeFailures += 1
+            onHealth("decode_error", "format=jpeg")
+            return
+        }
         let resolution = poseAtCapture(frame.captureNS)
         guard let estimate = resolution.estimate else {
             poseInterpolationMisses += 1
@@ -268,12 +325,8 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
            poseDistanceDegrees(estimate.pose, lastPose) < stationaryProjectionDistanceDegrees {
             return
         }
-        guard CVPixelBufferGetPixelFormatType(frame.pixelBuffer.value) == kCVPixelFormatType_32BGRA else {
-            onHealth("unsupported_pixel_format", "expected=32BGRA")
-            return
-        }
-        let sourceWidth = CVPixelBufferGetWidth(frame.pixelBuffer.value)
-        let sourceHeight = CVPixelBufferGetHeight(frame.pixelBuffer.value)
+        let sourceWidth = camera.width
+        let sourceHeight = camera.height
         ensureReachableMask(cameraProjectionModel: frame.cameraProjectionModel)
         let motionQuality = PanoramaObservationQuality.motionQuality(
             angularVelocityDegreesPerSecond: estimate.angularVelocityDegreesPerSecond
@@ -305,6 +358,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         // needed to correct it.
         captureGeometryFrameIfNeeded(
             frame,
+            camera: camera,
             pose: estimate.pose,
             angularVelocityDegreesPerSecond: estimate.angularVelocityDegreesPerSecond,
             motionQuality: motionQuality
@@ -312,7 +366,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         let alignment: AlignmentOutcome
         if frame.dynamicVisionRects.isEmpty {
             alignment = align(
-                frame.pixelBuffer,
+                camera,
                 measuredPose: estimate.pose,
                 horizontalFieldOfViewDegrees: frame.horizontalFieldOfViewDegrees,
                 cameraProjectionModel: frame.cameraProjectionModel,
@@ -366,7 +420,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         }
         if frame.dynamicVisionRects.isEmpty {
             alignmentReference = AlignmentReference(
-                pixelBuffer: frame.pixelBuffer,
+                camera: camera,
                 pose: estimate.pose,
                 cameraProjectionModel: frame.cameraProjectionModel
             )
@@ -376,15 +430,12 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
            frame.captureNS >= nextPlaceObservationNS,
            frame.dynamicVisionRects.isEmpty {
             nextPlaceObservationNS = frame.captureNS + placeObservationIntervalNS
-            placeEmbedding = makePlaceEmbedding(from: frame.pixelBuffer.value)
+            placeEmbedding = makePlaceEmbedding(from: camera)
         } else {
             placeEmbedding = nil
         }
-        CVPixelBufferLockBaseAddress(frame.pixelBuffer.value, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(frame.pixelBuffer.value, .readOnly) }
-        guard let baseAddress = CVPixelBufferGetBaseAddress(frame.pixelBuffer.value) else { return }
-        let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(frame.pixelBuffer.value)
-        let source = baseAddress.assumingMemoryBound(to: UInt8.self)
+        let sourceBytesPerRow = camera.bytesPerRow
+        let source = camera.data
         var incomingPixels = [UInt8](repeating: 0, count: pixels.count)
         var incomingQualities = [Float](repeating: 0, count: qualities.count)
         var maskedThisFrame: UInt64 = 0
@@ -590,7 +641,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     }
 
     private func align(
-        _ current: PanoramaPixelBuffer,
+        _ current: PanoramaCameraSnapshot,
         measuredPose: GimbalPose,
         horizontalFieldOfViewDegrees: Double,
         cameraProjectionModel: CameraProjectionModel,
@@ -598,8 +649,8 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         height: Int
     ) -> AlignmentOutcome {
         guard let reference = alignmentReference,
-              CVPixelBufferGetWidth(reference.pixelBuffer.value) == width,
-              CVPixelBufferGetHeight(reference.pixelBuffer.value) == height,
+              reference.camera.width == width,
+              reference.camera.height == height,
               reference.cameraProjectionModel == cameraProjectionModel else {
             return AlignmentOutcome(estimate: nil, attempted: false)
         }
@@ -614,30 +665,37 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         alignmentAttempts += 1
         let refinement: PanoramaPoseAlignment
         do {
-            let request = VNTranslationalImageRegistrationRequest(
-                targetedCVPixelBuffer: current.value,
-                orientation: .up,
-                options: [:]
-            )
-            try VNImageRequestHandler(
-                cvPixelBuffer: reference.pixelBuffer.value,
-                orientation: .up,
-                options: [:]
-            ).perform([request])
-            guard let observation = request.results?.first else {
-                throw PanoramaCompositorError.unsupportedFeaturePrint
+            let opticalFlow = try reference.camera.data.withUnsafeBytes { referenceBytes in
+                try current.data.withUnsafeBytes { currentBytes in
+                guard let referenceBaseAddress = referenceBytes.baseAddress,
+                      let currentBaseAddress = currentBytes.baseAddress else {
+                    throw PanoramaCompositorError.unsupportedCameraData
+                }
+                return soma_lucas_kanade_translation_bgra(
+                    referenceBaseAddress.assumingMemoryBound(to: UInt8.self),
+                    Int32(reference.camera.bytesPerRow),
+                    currentBaseAddress.assumingMemoryBound(to: UInt8.self),
+                    Int32(current.bytesPerRow),
+                    Int32(width),
+                    Int32(height)
+                )
+                }
             }
-            let transform = observation.alignmentTransform
+            guard opticalFlow.success != 0 else {
+                // Insufficient stable texture is absence of visual refinement,
+                // not disagreement with the capture-aligned attitude.
+                return AlignmentOutcome(estimate: nil, attempted: false)
+            }
             refinement = PanoramaPoseRefinement.refine(
                 previousPose: reference.pose,
                 currentPose: measuredPose,
-                alignmentTranslationX: Double(transform.tx),
-                alignmentTranslationY: Double(transform.ty),
+                alignmentTranslationX: Double(opticalFlow.translation_x),
+                alignmentTranslationY: Double(opticalFlow.translation_y),
                 imageWidth: width,
                 imageHeight: height,
                 horizontalFieldOfViewDegrees: horizontalFieldOfViewDegrees,
                 cameraProjectionModel: cameraProjectionModel,
-                confidence: Double(observation.confidence),
+                confidence: Double(opticalFlow.confidence),
                 poseProjection: poseProjection
             )
         } catch {
@@ -663,7 +721,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         return AlignmentOutcome(estimate: refinement, attempted: true)
     }
 
-    private func makePlaceEmbedding(from pixelBuffer: CVPixelBuffer) -> PanoramaPlaceEmbedding? {
+    private func makePlaceEmbedding(from camera: PanoramaCameraSnapshot) -> PanoramaPlaceEmbedding? {
         let startedNS = DispatchTime.now().uptimeNanoseconds
         placeEmbeddingAttempts += 1
         defer {
@@ -672,30 +730,49 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
             maximumPlaceEmbeddingMilliseconds = max(maximumPlaceEmbeddingMilliseconds, elapsed)
         }
         do {
-            let request = VNGenerateImageFeaturePrintRequest()
-            request.revision = placeEmbeddingRevision
-            try VNImageRequestHandler(
-                cvPixelBuffer: pixelBuffer,
-                orientation: .up,
-                options: [:]
-            ).perform([request])
-            guard let observation = request.results?.first,
-                  observation.elementType == .float,
-                  observation.elementCount >= 8,
-                  observation.elementCount <= PanoramaPlaceEmbedding.maximumElementCount,
-                  observation.data.count == observation.elementCount * MemoryLayout<Float>.size else {
-                throw PanoramaCompositorError.unsupportedFeaturePrint
+            let columns = 12
+            let rows = 8
+            let samplesPerAxis = 4
+            guard camera.width >= columns,
+                  camera.height >= rows,
+                  camera.bytesPerRow >= camera.width * 4 else {
+                throw PanoramaCompositorError.unsupportedCameraData
             }
-            var values = [Float](repeating: 0, count: observation.elementCount)
-            _ = values.withUnsafeMutableBytes { destination in
-                observation.data.copyBytes(to: destination)
+            var values: [Float] = []
+            values.reserveCapacity(columns * rows * 3)
+            for row in 0..<rows {
+                for column in 0..<columns {
+                    var red = 0.0
+                    var green = 0.0
+                    var blue = 0.0
+                    for sampleY in 0..<samplesPerAxis {
+                        let sourceY = min(
+                            camera.height - 1,
+                            (row * samplesPerAxis + sampleY) * camera.height / (rows * samplesPerAxis)
+                        )
+                        for sampleX in 0..<samplesPerAxis {
+                            let sourceX = min(
+                                camera.width - 1,
+                                (column * samplesPerAxis + sampleX) * camera.width / (columns * samplesPerAxis)
+                            )
+                            let index = sourceY * camera.bytesPerRow + sourceX * 4
+                            blue += Double(camera.data[index])
+                            green += Double(camera.data[index + 1])
+                            red += Double(camera.data[index + 2])
+                        }
+                    }
+                    let sampleCount = Double(samplesPerAxis * samplesPerAxis * 255)
+                    values.append(Float(red / sampleCount))
+                    values.append(Float(green / sampleCount))
+                    values.append(Float(blue / sampleCount))
+                }
             }
             guard let embedding = PanoramaPlaceEmbedding(
                 encoder: placeEmbeddingEncoder,
                 revision: placeEmbeddingRevision,
                 values: values
             ) else {
-                throw PanoramaCompositorError.unsupportedFeaturePrint
+                throw PanoramaCompositorError.unsupportedCameraData
             }
             if placeEmbeddingFailureActive {
                 onHealth("place_embedding_recovered", "encoder=\(placeEmbeddingEncoder); revision=\(placeEmbeddingRevision)")
@@ -717,6 +794,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
 
     private func captureGeometryFrameIfNeeded(
         _ frame: Pending,
+        camera: PanoramaCameraSnapshot,
         pose: GimbalPose,
         angularVelocityDegreesPerSecond: Double,
         motionQuality: Double
@@ -739,24 +817,18 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         }
         let filename = String(format: "frame-%03d-%llu.jpg", geometryCapturedFrames, frame.captureNS)
         let destination = geometryCaptureDirectoryURL.appendingPathComponent(filename)
-        let image = CIImage(cvPixelBuffer: frame.pixelBuffer.value)
-        guard let jpeg = imageContext.jpegRepresentation(
-            of: image,
-            colorSpace: colorSpace,
-            options: [:]
-        ) else {
+        guard writeJPEG(camera, to: destination) else {
             onHealth("geometry_capture_encode_error", "index=\(geometryCapturedFrames)")
             return
         }
         do {
-            try jpeg.write(to: destination, options: .atomic)
             let record = CameraGeometryCaptureRecord(
                 filename: filename,
                 captureNS: frame.captureNS,
                 panDegrees: pose.panDegrees,
                 pitchDegrees: pose.pitchDegrees,
-                imageWidth: CVPixelBufferGetWidth(frame.pixelBuffer.value),
-                imageHeight: CVPixelBufferGetHeight(frame.pixelBuffer.value),
+                imageWidth: camera.width,
+                imageHeight: camera.height,
                 fovMode: frame.fieldOfViewMode,
                 reportedHorizontalFieldOfViewDegrees: frame.horizontalFieldOfViewDegrees,
                 angularVelocityDegreesPerSecond: angularVelocityDegreesPerSecond
@@ -813,20 +885,11 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     }
 
     private func writeSnapshot(at monotonicNS: UInt64) {
-        let bitmap = Data(pixels)
-        let image = CIImage(
-            bitmapData: bitmap,
-            bytesPerRow: width * 4,
-            size: CGSize(width: width, height: height),
-            format: .RGBA8,
-            colorSpace: colorSpace
-        )
-        guard let jpeg = imageContext.jpegRepresentation(of: image, colorSpace: colorSpace, options: [:]) else {
+        guard writePanoramaJPEG(to: outputURL) else {
             onHealth("encode_error", "format=equirectangular_jpeg")
             return
         }
         do {
-            try jpeg.write(to: outputURL, options: .atomic)
             revision += 1
             lastWriteNS = monotonicNS
             lastUpdatedNS = monotonicNS
@@ -841,11 +904,86 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         }
     }
 
+    private func decodeCameraJPEG(_ jpeg: Data) -> PanoramaCameraSnapshot? {
+        let maximumDimension = 640
+        let maximumBytes = maximumDimension * maximumDimension * 4
+        let destinationCapacity = Int32(maximumBytes)
+        var decoded = [UInt8](repeating: 0, count: maximumBytes)
+        let result = jpeg.withUnsafeBytes { encoded in
+            decoded.withUnsafeMutableBytes { destination in
+                guard let encodedBase = encoded.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let destinationBase = destination.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return SOMAJPEGDecodeResult(success: 0, width: 0, height: 0, bytes_per_row: 0)
+                }
+                return soma_decode_jpeg_bgra(
+                    encodedBase,
+                    Int32(jpeg.count),
+                    destinationBase,
+                    destinationCapacity
+                )
+            }
+        }
+        guard result.success != 0,
+              result.width > 0,
+              result.height > 0,
+              result.width <= maximumDimension,
+              result.height <= maximumDimension,
+              result.bytes_per_row >= result.width * 4 else {
+            return nil
+        }
+        let byteCount = Int(result.bytes_per_row) * Int(result.height)
+        guard byteCount <= decoded.count else { return nil }
+        decoded.removeSubrange(byteCount..<decoded.count)
+        return PanoramaCameraSnapshot(
+            data: Data(decoded),
+            width: Int(result.width),
+            height: Int(result.height),
+            bytesPerRow: Int(result.bytes_per_row)
+        )
+    }
+
+    private func writePanoramaJPEG(to destination: URL) -> Bool {
+        pixels.withUnsafeBufferPointer { source in
+            guard let baseAddress = source.baseAddress else { return false }
+            return destination.path.withCString { path in
+                soma_write_jpeg_4channel(
+                    baseAddress,
+                    Int32(width * 4),
+                    Int32(width),
+                    Int32(height),
+                    0,
+                    0,
+                    path
+                ) != 0
+            }
+        }
+    }
+
+    private func writeJPEG(_ camera: PanoramaCameraSnapshot, to destination: URL) -> Bool {
+        camera.data.withUnsafeBytes { source in
+            guard let baseAddress = source.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return false
+            }
+            return destination.path.withCString { path in
+                soma_write_jpeg_4channel(
+                    baseAddress,
+                    Int32(camera.bytesPerRow),
+                    Int32(camera.width),
+                    Int32(camera.height),
+                    1,
+                    0,
+                    path
+                ) != 0
+            }
+        }
+    }
+
     private func publishStatus(state: String) {
         statusStore.update(makeStatus(state: state))
     }
 
     private func makeStatus(state: String) -> PanoramaMapStatus {
+        let inputCounters = inputCountersSnapshot()
         let covered = qualities.reduce(into: 0) { count, quality in
             if quality > 0 { count += 1 }
         }
@@ -873,6 +1011,10 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
             elevationIncreasesBottomToTop: true,
             revision: revision,
             acceptedFrames: acceptedFrames,
+            inputContextCount: inputCounters.contexts,
+            inputJPEGCount: inputCounters.jpegs,
+            inputMatchedCount: inputCounters.matched,
+            inputDecodeFailures: inputDecodeFailures,
             lowQualityRejectedFrames: lowQualityRejectedFrames,
             poseInterpolationMisses: poseInterpolationMisses,
             poseMissReasons: poseMissReasons,
@@ -930,6 +1072,16 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
                 : placeEmbeddingTotalMilliseconds / Double(placeEmbeddingAttempts),
             maximumPlaceEmbeddingMilliseconds: maximumPlaceEmbeddingMilliseconds,
             lastUpdatedNS: lastUpdatedNS
+        )
+    }
+
+    private func inputCountersSnapshot() -> (contexts: UInt64, jpegs: UInt64, matched: UInt64) {
+        admissionLock.lock()
+        defer { admissionLock.unlock() }
+        return (
+            contexts: inputContextCount,
+            jpegs: inputJPEGCount,
+            matched: inputMatchedCount
         )
     }
 }

@@ -21,6 +21,9 @@ public enum L1AuxiliaryWakeReason: String, Codable, CaseIterable, Sendable {
     case presentedObject = "presented_object"
     case unexpectedChange = "unexpected_change"
     case ambiguity
+    /// A time-integrated situation estimate, produced locally from multiple
+    /// advisory cues rather than supplied by the VLM for one frame.
+    case temporalContext = "temporal_context"
     case none
 }
 
@@ -250,6 +253,207 @@ public struct L1AuxiliarySemanticInterruptGate: Sendable {
         default:
             return false
         }
+    }
+}
+
+/// The coarse interpretation whose persistence may be worth a conscious L1
+/// reassessment. This is intentionally about context, not a motor target.
+public enum L1AuxiliaryTemporalTheme: String, Codable, CaseIterable, Sendable {
+    case socialAvailability = "social_availability"
+    case sceneRelevance = "scene_relevance"
+    case unresolvedChange = "unresolved_change"
+}
+
+/// Integrates a sequence of local semantic cues into a bounded, one-shot
+/// request for L1 to reconsider the situation. It has no command path: the
+/// returned interrupt remains advisory evidence for the primary L1 stream.
+///
+/// A stable context needs both elapsed time and repeated evidence. The latent
+/// probability decays continuously between cues, resets when its coarse theme
+/// changes or sampling has a long gap, and uses hysteresis after emission so a
+/// static scene cannot repeatedly wake L1.
+public struct L1AuxiliaryTemporalSituationGate: Sendable {
+    private struct Observation: Sendable {
+        let theme: L1AuxiliaryTemporalTheme
+        let probability: Double
+        let confidence: Double
+    }
+
+    private struct State: Sendable {
+        let theme: L1AuxiliaryTemporalTheme
+        let startedNS: UInt64
+        var lastNS: UInt64
+        var posterior: Double
+        var confidence: Double
+        var samples: Int
+        var latched: Bool
+    }
+
+    private let minimumPosterior: Double
+    private let minimumConfidence: Double
+    private let minimumEvidenceNS: UInt64
+    private let integrationTimeConstantNS: UInt64
+    private let maximumGapNS: UInt64
+    private let releasePosterior: Double
+    private let minimumObservation: Double
+    private var state: State?
+
+    public init(
+        minimumPosterior: Double = 0.62,
+        minimumConfidence: Double = 0.55,
+        minimumEvidenceMilliseconds: UInt64 = 6_000,
+        integrationTimeConstantMilliseconds: UInt64 = 6_000,
+        maximumGapMilliseconds: UInt64 = 12_000,
+        releasePosterior: Double = 0.35,
+        minimumObservation: Double = 0.20
+    ) {
+        self.minimumPosterior = min(max(minimumPosterior, 0), 1)
+        self.minimumConfidence = min(max(minimumConfidence, 0), 1)
+        minimumEvidenceNS = max(minimumEvidenceMilliseconds, 1) * 1_000_000
+        integrationTimeConstantNS = max(integrationTimeConstantMilliseconds, 1) * 1_000_000
+        maximumGapNS = max(maximumGapMilliseconds, minimumEvidenceMilliseconds) * 1_000_000
+        self.releasePosterior = min(max(releasePosterior, 0), self.minimumPosterior)
+        self.minimumObservation = min(max(minimumObservation, 0), 1)
+    }
+
+    /// Adds one completed local cue. A returned value is a request to reason,
+    /// never permission to move, speak, or mutate memory.
+    public mutating func recommend(_ cue: L1AuxiliarySemanticCue) -> L1AuxiliarySemanticInterrupt? {
+        let now = cue.completedNS
+        guard now > 0 else { return nil }
+        guard let observation = observation(from: cue) else {
+            decayWithoutObservation(at: now)
+            return nil
+        }
+
+        guard var state,
+              now > state.lastNS,
+              state.theme == observation.theme,
+              now - state.lastNS <= maximumGapNS else {
+            self.state = State(
+                theme: observation.theme,
+                startedNS: now,
+                lastNS: now,
+                posterior: 0,
+                confidence: observation.confidence,
+                samples: 1,
+                latched: false
+            )
+            return nil
+        }
+
+        let elapsedNS = now - state.lastNS
+        let retention = exp(-Double(elapsedNS) / Double(integrationTimeConstantNS))
+        state.posterior = state.posterior * retention + observation.probability * (1 - retention)
+        state.confidence = state.confidence * retention + observation.confidence * (1 - retention)
+        state.lastNS = now
+        state.samples += 1
+
+        if state.latched {
+            if state.posterior <= releasePosterior {
+                state.latched = false
+            }
+            self.state = state
+            return nil
+        }
+
+        let durationNS = now - state.startedNS
+        guard durationNS >= minimumEvidenceNS,
+              state.samples >= 2,
+              state.posterior >= minimumPosterior,
+              state.confidence >= minimumConfidence else {
+            self.state = state
+            return nil
+        }
+
+        state.latched = true
+        self.state = state
+        let durationMS = durationNS / 1_000_000
+        let posterior = String(format: "%.2f", state.posterior)
+        let evidence = String(
+            "temporal_theme=\(state.theme.rawValue); duration_ms=\(durationMS); posterior=\(posterior); \(cue.summary)".prefix(160)
+        )
+        return L1AuxiliarySemanticInterrupt(
+            requestID: cue.requestID,
+            captureNS: cue.captureNS,
+            completedNS: now,
+            situation: cue.situation,
+            reason: .temporalContext,
+            score: state.posterior,
+            confidence: state.confidence,
+            evidence: evidence
+        )
+    }
+
+    /// A high-confidence one-frame semantic interrupt already received an L1
+    /// cycle. Latch its current theme so the temporal path cannot immediately
+    /// duplicate that same episode.
+    public mutating func markHandled(_ cue: L1AuxiliarySemanticCue) {
+        guard let observation = observation(from: cue), cue.completedNS > 0 else {
+            return
+        }
+        state = State(
+            theme: observation.theme,
+            startedNS: cue.completedNS,
+            lastNS: cue.completedNS,
+            posterior: observation.probability,
+            confidence: observation.confidence,
+            samples: 1,
+            latched: true
+        )
+    }
+
+    private mutating func decayWithoutObservation(at now: UInt64) {
+        guard var state, now > state.lastNS else { return }
+        let elapsedNS = now - state.lastNS
+        if elapsedNS > maximumGapNS {
+            self.state = nil
+            return
+        }
+        let retention = exp(-Double(elapsedNS) / Double(integrationTimeConstantNS))
+        state.posterior *= retention
+        state.lastNS = now
+        if state.latched, state.posterior <= releasePosterior {
+            state.latched = false
+        }
+        self.state = state
+    }
+
+    private func observation(from cue: L1AuxiliarySemanticCue) -> Observation? {
+        let approachSignal: Double = cue.approach == .approaching ? 0.85 : 0
+        let gestureSignal: Double = cue.gesture == .none ? 0 : 0.90
+        let socialAvailability = max(
+            cue.eyeContact,
+            cue.engagement * 0.80,
+            approachSignal,
+            gestureSignal
+        )
+        let social = cue.socialPresence * socialAvailability
+
+        let transition = cue.situation == .sceneTransition
+            ? max(cue.novelty, 0.40)
+            : 0
+        let objectRelevance = cue.conversationValue * (0.40 + 0.60 * cue.novelty)
+        let scene = max(transition, objectRelevance)
+
+        let uncertainty = cue.situation == .uncertain
+            ? cue.novelty * (1 - cue.confidence)
+            : 0
+
+        let ranked: [(L1AuxiliaryTemporalTheme, Double)] = [
+            (.socialAvailability, social),
+            (.sceneRelevance, scene),
+            (.unresolvedChange, uncertainty),
+        ]
+        guard let strongest = ranked.max(by: { $0.1 < $1.1 }),
+              strongest.1 >= minimumObservation else {
+            return nil
+        }
+        return Observation(
+            theme: strongest.0,
+            probability: min(max(strongest.1, 0), 1),
+            confidence: cue.confidence
+        )
     }
 }
 

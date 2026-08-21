@@ -2532,5 +2532,111 @@ final class PredictiveWorldModelTests: XCTestCase {
             reason: .directSocialBid
         )))
     }
+
+    func testL1AuxiliaryTemporalSituationWakeRequiresPersistentEvidenceAndLatchesOneEpisode() {
+        func cue(
+            at monotonicNS: UInt64,
+            socialPresence: Double = 0.95,
+            eyeContact: Double = 0.95,
+            engagement: Double = 0.90,
+            novelty: Double = 0.10,
+            conversationValue: Double = 0,
+            situation: L1AuxiliarySituation = .ambient,
+            confidence: Double = 0.90
+        ) -> L1AuxiliarySemanticCue {
+            L1AuxiliarySemanticCue(
+                requestID: monotonicNS,
+                captureNS: monotonicNS,
+                completedNS: monotonicNS,
+                source: "test",
+                summary: "bounded temporal evidence",
+                novelty: novelty,
+                socialPresence: socialPresence,
+                attentionHint: socialPresence > 0 ? .person : .none,
+                situation: situation,
+                wakeReason: .none,
+                wakeScore: 0.1,
+                confidence: confidence,
+                eyeContact: eyeContact,
+                engagement: engagement,
+                conversationValue: conversationValue,
+                inferenceMS: 100
+            )
+        }
+
+        let start: UInt64 = 50_000_000_000
+        var gate = L1AuxiliaryTemporalSituationGate()
+        XCTAssertNil(gate.recommend(cue(at: start)))
+        XCTAssertNil(gate.recommend(cue(at: start + 5_000_000_000)))
+        let interrupt = gate.recommend(cue(at: start + 10_000_000_000))
+        XCTAssertEqual(interrupt?.reason, .temporalContext)
+        XCTAssertGreaterThanOrEqual(interrupt?.score ?? 0, 0.62)
+        XCTAssertTrue(interrupt?.evidence.contains("temporal_theme=social_availability") ?? false)
+
+        XCTAssertNil(gate.recommend(cue(at: start + 15_000_000_000)))
+        XCTAssertNil(gate.recommend(cue(at: start + 20_000_000_000)))
+
+        // A quiet interval discharges the latch; a new sustained episode may
+        // later make one fresh proposal.
+        XCTAssertNil(gate.recommend(cue(
+            at: start + 25_000_000_000,
+            socialPresence: 0,
+            eyeContact: 0,
+            engagement: 0
+        )))
+        XCTAssertNil(gate.recommend(cue(
+            at: start + 30_000_000_000,
+            socialPresence: 0,
+            eyeContact: 0,
+            engagement: 0
+        )))
+        XCTAssertNil(gate.recommend(cue(at: start + 35_000_000_000)))
+        XCTAssertNotNil(gate.recommend(cue(at: start + 40_000_000_000)))
+
+        var alreadyHandled = L1AuxiliaryTemporalSituationGate()
+        alreadyHandled.markHandled(cue(at: start))
+        XCTAssertNil(alreadyHandled.recommend(cue(at: start + 5_000_000_000)))
+        XCTAssertNil(alreadyHandled.recommend(cue(at: start + 10_000_000_000)))
+
+        var gapReset = L1AuxiliaryTemporalSituationGate()
+        XCTAssertNil(gapReset.recommend(cue(at: start)))
+        XCTAssertNil(gapReset.recommend(cue(at: start + 20_000_000_000)))
+        XCTAssertNil(gapReset.recommend(cue(at: start + 25_000_000_000)))
+        XCTAssertNotNil(gapReset.recommend(cue(at: start + 30_000_000_000)))
+    }
+
+    func testL1AuxiliaryTemporalSituationWakeDoesNotCombineDifferentContexts() {
+        func cue(
+            at monotonicNS: UInt64,
+            social: Bool,
+            scene: Bool
+        ) -> L1AuxiliarySemanticCue {
+            L1AuxiliarySemanticCue(
+                requestID: monotonicNS,
+                captureNS: monotonicNS,
+                completedNS: monotonicNS,
+                source: "test",
+                summary: "bounded temporal evidence",
+                novelty: scene ? 0.95 : 0.1,
+                socialPresence: social ? 0.95 : 0,
+                attentionHint: social ? .person : (scene ? .object : .none),
+                situation: scene ? .sceneTransition : .ambient,
+                wakeReason: .none,
+                wakeScore: 0.1,
+                confidence: 0.90,
+                eyeContact: social ? 0.95 : 0,
+                engagement: social ? 0.90 : 0,
+                conversationValue: scene ? 0.95 : 0,
+                inferenceMS: 100
+            )
+        }
+
+        let start: UInt64 = 60_000_000_000
+        var gate = L1AuxiliaryTemporalSituationGate()
+        XCTAssertNil(gate.recommend(cue(at: start, social: true, scene: false)))
+        XCTAssertNil(gate.recommend(cue(at: start + 5_000_000_000, social: false, scene: true)))
+        XCTAssertNil(gate.recommend(cue(at: start + 10_000_000_000, social: true, scene: false)))
+        XCTAssertNil(gate.recommend(cue(at: start + 15_000_000_000, social: true, scene: false)))
+    }
 }
 #endif

@@ -4,6 +4,22 @@ import XCTest
 @testable import SOMACore
 
 final class L1SituationStreamTests: XCTestCase {
+    func testProactiveOpeningControllerEventDoesNotIntroduceACompetingSpokenLanguage() {
+        let opening = "승엽님, 평소에 특별히 관심 있거나 즐겨 하시는 취미가 있으신가요?"
+        let event = LiveVoiceOpeningControllerEvent.make(opening: opening, languageTag: "ko-KR")
+
+        XCTAssertEqual(event, """
+        ⟦SOMA_EXACT_OPENING language=ko-kr delivery=once_then_listen⟧
+        \(opening)
+        ⟦/SOMA_EXACT_OPENING⟧
+        """)
+        XCTAssertFalse(event?.contains("Controller event, not user speech") == true)
+    }
+
+    func testProactiveOpeningControllerEventRejectsBlankOpening() {
+        XCTAssertNil(LiveVoiceOpeningControllerEvent.make(opening: " \n ", languageTag: "ko"))
+    }
+
     func testStreamOfConsciousnessKeepsSubstantiveReflectionWithinABoundedUTF8Envelope() {
         let reflection = String(repeating: "I am integrating this change with the prior situation. ", count: 60)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -108,6 +124,34 @@ final class L1SituationStreamTests: XCTestCase {
         )
         XCTAssertEqual(memory.topics.count, 1)
         XCTAssertEqual(memory.topics.first?.tags, ["science", "research"])
+    }
+
+    func testPlaceAffiliationContextKeepsPlaceEvidenceSeparateUntilConfirmed() {
+        let placeID = UUID()
+        let unresolved = L1PlaceAffiliationContext(
+            spaceID: placeID,
+            label: "  studio  ",
+            isStable: true,
+            unassignedObservationCount: 3
+        )
+        XCTAssertEqual(unresolved.label, "studio")
+        XCTAssertTrue(unresolved.affiliationUnresolved)
+        XCTAssertEqual(unresolved.unassignedObservationCount, 3)
+
+        let confirmed = L1PlaceAffiliationContext(
+            spaceID: placeID,
+            label: "studio",
+            isStable: true,
+            ownerEntityID: UUID(),
+            unassignedObservationCount: 0
+        )
+        XCTAssertFalse(confirmed.affiliationUnresolved)
+
+        let spatial = L1SpatialContext(
+            panoramaAvailable: false,
+            placeAffiliation: unresolved
+        )
+        XCTAssertEqual(spatial.placeAffiliation, unresolved)
     }
 
     func testContactHistoryIsBoundedAndNewestFirstForL1() {

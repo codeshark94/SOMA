@@ -217,6 +217,17 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(restored, context)
     }
 
+    func testInteractionContextRetainsBoundedProactiveIdentityDescription() throws {
+        let description = "locally recognized person; do not infer an identity beyond supplied context. Person context is available only through the supplied local MCP reference. Explicit stored preferences: Address this person as \"승엽\"."
+        let context = try CodexInteractionContext(
+            identityReference: description,
+            personEntityID: UUID(),
+            sessionCapability: UUID().uuidString.lowercased(),
+            interactionAuthority: .administrator
+        )
+        XCTAssertEqual(context.identityReference, description)
+    }
+
     func testCodexAccountBridgeRejectsAnInvalidDecodedTurn() throws {
         let json = """
         {"schemaVersion":1,"turn":{"interactionID":"interaction","turnID":"turn","transcript":"   ","speechStartedAtNS":20,"transcriptFinalizedAtNS":10,"evidenceIDs":[]},"context":{"activeTaskSummaries":[],"memorySummaries":[],"privacyScope":"interaction_scoped"}}

@@ -97,6 +97,40 @@ public struct L1VisualResourceOffer: Codable, Equatable, Sendable {
     }
 }
 
+/// The stable, local identifier of the place currently surrounding SOMA. It
+/// is deliberately a relationship *question*, not an attribution: observations
+/// stay attached to this place until a person explicitly establishes their
+/// affiliation with it.
+public struct L1PlaceAffiliationContext: Codable, Equatable, Sendable {
+    public let spaceID: UUID
+    public let label: String?
+    public let isStable: Bool
+    public let ownerEntityID: UUID?
+    public let unassignedObservationCount: Int
+
+    public init(
+        spaceID: UUID,
+        label: String? = nil,
+        isStable: Bool,
+        ownerEntityID: UUID? = nil,
+        unassignedObservationCount: Int = 0
+    ) {
+        self.spaceID = spaceID
+        let normalized = label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.label = normalized.isEmpty ? nil : String(normalized.prefix(64))
+        self.isStable = isStable
+        self.ownerEntityID = ownerEntityID
+        self.unassignedObservationCount = min(max(unassignedObservationCount, 0), 200)
+    }
+
+    /// A stable place with no known affiliation is a durable situational gap.
+    /// It becomes a social motive only when L1 is considering a person; it is
+    /// never itself an instruction to interrupt or to attribute objects.
+    public var affiliationUnresolved: Bool {
+        isStable && ownerEntityID == nil
+    }
+}
+
 /// Scalar spatial context that helps L1 reason about the current place and
 /// coverage without automatically disclosing a camera image or panorama.
 public struct L1SpatialContext: Codable, Equatable, Sendable {
@@ -106,6 +140,7 @@ public struct L1SpatialContext: Codable, Equatable, Sendable {
     public let reachableQualityCoverageFraction: Double
     public let placeRevisits: UInt64
     public let activeSceneEntityCount: Int
+    public let placeAffiliation: L1PlaceAffiliationContext?
 
     public init(
         panoramaAvailable: Bool,
@@ -113,7 +148,8 @@ public struct L1SpatialContext: Codable, Equatable, Sendable {
         reachableCoverageFraction: Double = 0,
         reachableQualityCoverageFraction: Double = 0,
         placeRevisits: UInt64 = 0,
-        activeSceneEntityCount: Int = 0
+        activeSceneEntityCount: Int = 0,
+        placeAffiliation: L1PlaceAffiliationContext? = nil
     ) {
         self.panoramaAvailable = panoramaAvailable
         self.panoramaRevision = panoramaRevision
@@ -121,6 +157,7 @@ public struct L1SpatialContext: Codable, Equatable, Sendable {
         self.reachableQualityCoverageFraction = Self.unit(reachableQualityCoverageFraction)
         self.placeRevisits = placeRevisits
         self.activeSceneEntityCount = min(max(activeSceneEntityCount, 0), 256)
+        self.placeAffiliation = placeAffiliation
     }
 
     private static func unit(_ value: Double) -> Double {
@@ -237,6 +274,7 @@ public enum L1InformationMotiveSource: String, Codable, Equatable, Sendable {
     case retainedMemoryGap = "retained_memory_gap"
     case initialSocialOrientation = "initial_social_orientation"
     case interestDiscovery = "interest_discovery"
+    case placeAffiliation = "place_affiliation"
 }
 
 /// An information motive for a recognized person. The goal is not a script:

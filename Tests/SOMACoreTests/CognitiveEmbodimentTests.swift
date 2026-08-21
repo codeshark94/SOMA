@@ -526,7 +526,7 @@ final class CognitiveEmbodimentTests: XCTestCase {
             GimbalKinematicEnvelope.obsbotTiny2Lite
         )
         XCTAssertEqual(snapshot.panorama?.revision, 2)
-        XCTAssertEqual(snapshot.panorama?.schemaVersion, 7)
+        XCTAssertEqual(snapshot.panorama?.schemaVersion, 8)
         XCTAssertEqual(snapshot.panorama?.coverageFraction ?? 0, 0.4, accuracy: 0.000_001)
     }
 
@@ -857,6 +857,34 @@ final class CognitiveEmbodimentTests: XCTestCase {
         XCTAssertEqual(
             coordinator.complete(requestID: capture.requestID),
             .release(requestID: capture.requestID, reason: "capture_completed")
+        )
+    }
+
+    func testCurrentFrameCaptureDoesNotClaimOrPreemptTheMotorLease() {
+        let now: UInt64 = 70_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let current = shadowRequest(
+            id: "capture-current",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 100,
+            now: now,
+            durationMilliseconds: 2_000,
+            operation: .captureView(CaptureViewGoal(currentFrame: true))
+        )
+
+        let decision = arbiter.submit(current, at: now)
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "current_frame_capture_ready")
+        XCTAssertNil(decision.snapshot.activeRequestID)
+        XCTAssertEqual(
+            coordinator.apply(request: current, decision: decision, at: now),
+            .captureCurrent(
+                requestID: current.requestID,
+                fieldOfViewDegrees: 70,
+                expiresAtNS: current.lease.expiresAtNS
+            )
         )
     }
 

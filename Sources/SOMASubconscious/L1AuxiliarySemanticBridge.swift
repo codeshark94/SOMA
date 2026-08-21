@@ -75,6 +75,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private let onInterrupt: @Sendable (L1AuxiliarySemanticInterrupt) -> Void
     private var admission = L1AuxiliarySemanticAdmissionGate()
     private var interruptGate: L1AuxiliarySemanticInterruptGate
+    private var temporalSituationGate = L1AuxiliaryTemporalSituationGate()
     private var pending: Pending?
     private var inFlight = false
     private var ready = false
@@ -202,14 +203,19 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         inFlight = true
         requestSequence += 1
         let requestID = requestSequence
-        let image = CIImage(cvPixelBuffer: pending.pixelBuffer.value)
-            .transformed(by: CGAffineTransform(scaleX: 0.4, y: 0.4))
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let jpeg = imageContext.jpegRepresentation(
+        let jpeg: Data? = autoreleasepool {
+            let image = CIImage(cvPixelBuffer: pending.pixelBuffer.value)
+                .transformed(by: CGAffineTransform(scaleX: 0.4, y: 0.4))
+            guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+                return nil
+            }
+            return imageContext.jpegRepresentation(
                 of: image,
                 colorSpace: colorSpace,
                 options: [:]
-              ) else {
+            )
+        }
+        guard let jpeg else {
             inFlight = false
             onHealth("encode_error", "request_id=\(requestID)")
             pump()
@@ -307,6 +313,9 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             )
             onCue(cue)
             if let recommendation = interruptGate.recommend(cue) {
+                temporalSituationGate.markHandled(cue)
+                onInterrupt(recommendation)
+            } else if let recommendation = temporalSituationGate.recommend(cue) {
                 onInterrupt(recommendation)
             }
         case "error":

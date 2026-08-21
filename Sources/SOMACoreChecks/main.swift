@@ -2378,6 +2378,52 @@ require(
     "L1 auxiliary did not re-admit a persistent proposal after its debounce interval"
 )
 
+func l1AuxiliaryTemporalCue(
+    at monotonicNS: UInt64,
+    socialPresence: Double = 0.95,
+    eyeContact: Double = 0.95,
+    engagement: Double = 0.90
+) -> L1AuxiliarySemanticCue {
+    L1AuxiliarySemanticCue(
+        requestID: monotonicNS,
+        captureNS: monotonicNS,
+        completedNS: monotonicNS,
+        source: "core-check",
+        summary: "bounded temporal evidence",
+        novelty: 0.1,
+        socialPresence: socialPresence,
+        attentionHint: socialPresence > 0 ? .person : .none,
+        situation: .ambient,
+        wakeReason: .none,
+        wakeScore: 0.1,
+        confidence: 0.90,
+        eyeContact: eyeContact,
+        engagement: engagement,
+        inferenceMS: 100
+    )
+}
+var l1AuxiliaryTemporalGate = L1AuxiliaryTemporalSituationGate()
+let temporalStart = l1AuxiliaryStart + 20_000_000_000
+require(
+    l1AuxiliaryTemporalGate.recommend(l1AuxiliaryTemporalCue(at: temporalStart)) == nil,
+    "one temporal cue emitted an L1 wake"
+)
+require(
+    l1AuxiliaryTemporalGate.recommend(l1AuxiliaryTemporalCue(at: temporalStart + 5_000_000_000)) == nil,
+    "short temporal evidence emitted an L1 wake"
+)
+let temporalInterrupt = l1AuxiliaryTemporalGate.recommend(
+    l1AuxiliaryTemporalCue(at: temporalStart + 10_000_000_000)
+)
+require(
+    temporalInterrupt?.reason == .temporalContext,
+    "persistent temporal evidence did not emit the temporal-context wake"
+)
+require(
+    l1AuxiliaryTemporalGate.recommend(l1AuxiliaryTemporalCue(at: temporalStart + 15_000_000_000)) == nil,
+    "latched temporal context emitted a duplicate L1 wake"
+)
+
 let importanceModel = EventImportanceModel()
 func importanceDecision(_ id: String, _ features: EventImportanceFeatures) -> EventImportanceDecision {
     importanceModel.evaluate(

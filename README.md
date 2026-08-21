@@ -83,13 +83,16 @@ layers are connected, but they are not interchangeable.
 | Layer | Time scale | What it does | What it may control |
 | --- | --- | --- | --- |
 | **L0 · subconscious** | Video/audio cadence | Captures sensor evidence, follows a verified face, keeps target continuity, estimates voice activity, maintains spatial coverage, and executes the final motor policy | The only path to SDK motion, stabilization, limits, watchdogs, and immediate stops |
-| **L0.5 · local semantic helper** | Sparse asynchronous inference | Supplies optional low-latency semantic cues to L1 without blocking L0 | No independent motor, speech, identity, or memory authority |
+| **L0.5 · local semantic helper** | Sparse asynchronous inference and temporal evidence integration | Supplies optional semantic cues and context-change wake proposals to L1 without blocking L0 | No independent motor, speech, identity, or memory authority |
 | **L1 · situation stream** | Event-driven, broad context | Interprets a situation using memory, rapport, spatial context, unresolved questions, and permitted world context; forms curiosity and social hypotheses | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through leased MCP goals |
 | **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and user-requested work | The same semantic embodiment interface as L1; never raw SDK velocity |
 
 L0.5 is intentionally a supporting process inside the L1 path, not a fourth
 mind. Its job is to make slow contextual reasoning more perceptive without
-weakening the real-time loop.
+weakening the real-time loop. It can emit an immediate, evidence-bounded wake
+for a clear event, or accumulate a short time-series of social availability,
+scene relevance, and unresolved change before asking L1 to reconsider the
+situation once. Neither path controls movement or conversation directly.
 
 ```mermaid
 flowchart LR

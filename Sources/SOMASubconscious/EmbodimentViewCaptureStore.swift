@@ -24,6 +24,7 @@ final class EmbodimentViewCaptureStore: @unchecked Sendable {
         let targetReference: String?
         let sceneID: String?
         let requestedBearing: GimbalRelativeBearing?
+        let isCurrentFrame: Bool
         let fieldOfViewDegrees: Double
         let leaseExpiresAtNS: UInt64
         let createdAtNS: UInt64
@@ -98,6 +99,7 @@ final class EmbodimentViewCaptureStore: @unchecked Sendable {
             targetReference: targetReference,
             sceneID: sceneID,
             requestedBearing: bearing,
+            isCurrentFrame: false,
             fieldOfViewDegrees: min(max(fieldOfViewDegrees, 5), cameraHorizontalFieldOfViewDegrees),
             leaseExpiresAtNS: leaseExpiresAtNS,
             createdAtNS: monotonicNS,
@@ -109,6 +111,45 @@ final class EmbodimentViewCaptureStore: @unchecked Sendable {
             "requested",
             "request_id=\(String(requestID.prefix(96))); target=\(String((targetReference ?? "bearing").prefix(96)))"
         )
+    }
+
+    /// Arms the next incoming camera sample without requiring an alignment or
+    /// a motor lease. The capture is intentionally one-shot, so it cannot
+    /// retain a pixel buffer or accumulate camera resources between requests.
+    func prepareCurrent(
+        requestID: String,
+        fieldOfViewDegrees: Double,
+        leaseExpiresAtNS: UInt64,
+        cameraPose: GimbalPose?,
+        at monotonicNS: UInt64
+    ) {
+        lock.lock()
+        cleanupLocked(at: monotonicNS)
+        if let existing = entries[requestID], existing.state != .pendingAlignment {
+            lock.unlock()
+            return
+        }
+        entries[requestID] = Entry(
+            requestID: requestID,
+            targetReference: nil,
+            sceneID: nil,
+            requestedBearing: nil,
+            isCurrentFrame: true,
+            fieldOfViewDegrees: min(max(fieldOfViewDegrees, 5), cameraHorizontalFieldOfViewDegrees),
+            leaseExpiresAtNS: leaseExpiresAtNS,
+            createdAtNS: monotonicNS,
+            state: .awaitingFrame,
+            alignedAtNS: monotonicNS,
+            cameraBearing: cameraPose.map {
+                GimbalRelativeBearing(
+                    azimuthDegrees: $0.panDegrees,
+                    elevationDegrees: $0.pitchDegrees
+                )
+            }
+        )
+        evictLocked()
+        lock.unlock()
+        onHealth("current_frame_requested", "request_id=\(String(requestID.prefix(96)))")
     }
 
     func fail(
@@ -124,6 +165,7 @@ final class EmbodimentViewCaptureStore: @unchecked Sendable {
             targetReference: nil,
             sceneID: nil,
             requestedBearing: nil,
+            isCurrentFrame: false,
             fieldOfViewDegrees: cameraHorizontalFieldOfViewDegrees,
             leaseExpiresAtNS: leaseExpiresAtNS,
             createdAtNS: monotonicNS,
@@ -173,7 +215,7 @@ final class EmbodimentViewCaptureStore: @unchecked Sendable {
         guard let selected = entries.values
             .filter({ entry in
                 entry.state == .awaitingFrame
-                    && entry.alignedAtNS.map { captureNS >= $0 } == true
+                    && (entry.isCurrentFrame || entry.alignedAtNS.map { captureNS >= $0 } == true)
                     && captureNS < entry.leaseExpiresAtNS
             })
             .min(by: { $0.createdAtNS < $1.createdAtNS }) else {
@@ -229,24 +271,26 @@ final class EmbodimentViewCaptureStore: @unchecked Sendable {
         let outputURL = directoryURL.appendingPathComponent(name)
         let temporaryURL = directoryURL.appendingPathComponent(".\(name).tmp")
         do {
-            let source = CIImage(cvPixelBuffer: retained.value)
-            let crop = centerCrop(
-                source.extent,
-                requestedHorizontalFieldOfViewDegrees: entry.fieldOfViewDegrees
-            )
-            let normalized = source
-                .cropped(to: crop)
-                .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
-                .transformed(by: CGAffineTransform(
-                    scaleX: 640 / crop.width,
-                    y: 360 / crop.height
-                ))
-            try context.writeJPEGRepresentation(
-                of: normalized,
-                to: temporaryURL,
-                colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-                options: [:]
-            )
+            try autoreleasepool {
+                let source = CIImage(cvPixelBuffer: retained.value)
+                let crop = centerCrop(
+                    source.extent,
+                    requestedHorizontalFieldOfViewDegrees: entry.fieldOfViewDegrees
+                )
+                let normalized = source
+                    .cropped(to: crop)
+                    .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
+                    .transformed(by: CGAffineTransform(
+                        scaleX: 640 / crop.width,
+                        y: 360 / crop.height
+                    ))
+                try context.writeJPEGRepresentation(
+                    of: normalized,
+                    to: temporaryURL,
+                    colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    options: [:]
+                )
+            }
             try FileManager.default.moveItem(at: temporaryURL, to: outputURL)
             guard chmod(outputURL.path, S_IRUSR | S_IWUSR) == 0 else {
                 throw CocoaError(.fileWriteNoPermission)

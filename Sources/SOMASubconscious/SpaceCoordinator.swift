@@ -71,6 +71,17 @@ final class SpaceCoordinator: @unchecked Sendable {
         return state.currentLabel != nil
     }
 
+    /// Reads the room identity atomically so a cognitive packet cannot combine
+    /// a room ID from one transition with a label from another.
+    var currentIdentity: Identity {
+        lock.lock(); defer { lock.unlock() }
+        return Identity(
+            id: state.currentSpaceID,
+            label: state.currentLabel,
+            lastClassifiedAt: state.lastClassifiedAt
+        )
+    }
+
     /// Called on each empty-room cue with the current background frame. Feeds
     /// the accumulation window and, once enough stable background has built up
     /// and the reclassify interval has elapsed, triggers an L1 classification.

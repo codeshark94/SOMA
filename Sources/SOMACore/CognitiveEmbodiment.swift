@@ -306,18 +306,25 @@ public struct CaptureViewGoal: Codable, Equatable, Sendable {
     public let targetReference: String?
     public let bearing: GimbalRelativeBearing?
     public let fieldOfViewDegrees: Double?
+    /// Captures the next camera frame without moving the gimbal. This is a
+    /// sensor read rather than a motor goal, so it never preempts L0 tracking.
+    public let currentFrame: Bool?
 
     public init(
         targetReference: String? = nil,
         bearing: GimbalRelativeBearing? = nil,
-        fieldOfViewDegrees: Double? = nil
+        fieldOfViewDegrees: Double? = nil,
+        currentFrame: Bool = false
     ) {
         self.targetReference = targetReference.map { String($0.prefix(96)) }
         self.bearing = bearing
         self.fieldOfViewDegrees = fieldOfViewDegrees.map {
             $0.isFinite ? min(max($0, 5), 120) : 70
         }
+        self.currentFrame = currentFrame ? true : nil
     }
+
+    public var requestsCurrentFrame: Bool { currentFrame == true }
 }
 
 public enum EmbodimentViewCaptureState: String, Codable, Sendable {
@@ -613,8 +620,11 @@ public struct CognitiveEmbodimentRequest: Codable, Equatable, Sendable {
                 throw CognitiveEmbodimentError.invalidExplorationPolicy
             }
         case let .captureView(goal):
-            guard goal.targetReference.map({ $0.count <= 96 && isNonBlank($0) }) == true
-                    || goal.bearing.map(isBearing) == true,
+            let hasTarget = goal.targetReference.map({ $0.count <= 96 && isNonBlank($0) }) == true
+            let hasBearing = goal.bearing.map(isBearing) == true
+            guard (goal.requestsCurrentFrame
+                    ? !hasTarget && !hasBearing
+                    : hasTarget || hasBearing),
                   goal.fieldOfViewDegrees.map({ $0.isFinite && $0 >= 5 && $0 <= 120 }) ?? true else {
                 throw CognitiveEmbodimentError.invalidCaptureGoal
             }
@@ -661,10 +671,12 @@ public extension CognitiveEmbodimentOperation {
 
     var claimsMotorLease: Bool {
         switch self {
-        case .trackTarget, .orient, .explore, .captureView, .express:
-            true
+        case .trackTarget, .orient, .explore, .express:
+            return true
+        case let .captureView(goal):
+            return !goal.requestsCurrentFrame
         case .registerTarget, .removeTarget, .setAttentionPolicy, .release:
-            false
+            return false
         }
     }
 }
@@ -895,6 +907,14 @@ public final class ShadowEmbodimentArbiter: @unchecked Sendable {
                 )
             }
             return claimMotor(request, at: monotonicNS)
+        case let .captureView(goal) where goal.requestsCurrentFrame:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: "current_frame_capture_ready",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
         case .orient, .explore, .captureView, .express:
             return claimMotor(request, at: monotonicNS)
         case .release:

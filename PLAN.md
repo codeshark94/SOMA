@@ -142,7 +142,13 @@ contains only a scene summary, novelty, social-presence probability, advisory
 attention hint, bounded situation/wake hypotheses, confidence, and timing. A
 deterministic gate emits a scalar `l1.auxiliary.wake_proposal` only when the
 situation and wake reason agree, wake score is at least 0.65, and confidence is
-at least 0.55; identical recommendations are suppressed for five seconds.
+at least 0.55; identical recommendations are suppressed for five seconds. A
+separate temporal gate integrates completed cues rather than reinterpreting any
+single frame. It tracks the strongest of social availability, scene relevance,
+and unresolved change with continuous decay, requires at least two samples and
+six seconds of evidence, and latches after one `temporal_context` proposal until
+the evidence dissipates or the context changes. This is an L1 reconsideration
+request, not a new periodic cadence or an L0 command.
 
 E2B cannot by itself select or suppress a target, change a face lock, claim the camera owner,
 move the gimbal, speak, identify a person, retrieve memory, or invoke L1. The

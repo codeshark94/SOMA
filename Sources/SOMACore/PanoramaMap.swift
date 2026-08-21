@@ -243,9 +243,9 @@ public struct PanoramaPoseAlignment: Equatable, Sendable {
     }
 }
 
-/// Converts Vision's current-to-reference pixel translation into a bounded
-/// correction of the capture-aligned gimbal pose. The previous measured pose
-/// anchors every pair, so registration errors cannot accumulate as odometry.
+/// Converts current-minus-reference pixel translation into a bounded correction
+/// of the capture-aligned gimbal pose. The previous measured pose anchors every
+/// pair, so registration errors cannot accumulate as odometry.
 public enum PanoramaPoseRefinement {
     public static func refine(
         previousPose: GimbalPose,
@@ -587,6 +587,10 @@ public struct PanoramaMapStatus: Codable, Equatable, Sendable {
     public let elevationIncreasesBottomToTop: Bool
     public let revision: UInt64
     public let acceptedFrames: UInt64
+    public let inputContextCount: UInt64
+    public let inputJPEGCount: UInt64
+    public let inputMatchedCount: UInt64
+    public let inputDecodeFailures: UInt64
     public let lowQualityRejectedFrames: UInt64
     public let poseInterpolationMisses: UInt64
     public let poseMissReasons: [String: UInt64]
@@ -635,6 +639,10 @@ public struct PanoramaMapStatus: Codable, Equatable, Sendable {
         elevationIncreasesBottomToTop: Bool = true,
         revision: UInt64,
         acceptedFrames: UInt64,
+        inputContextCount: UInt64 = 0,
+        inputJPEGCount: UInt64 = 0,
+        inputMatchedCount: UInt64 = 0,
+        inputDecodeFailures: UInt64 = 0,
         lowQualityRejectedFrames: UInt64 = 0,
         poseInterpolationMisses: UInt64,
         poseMissReasons: [String: UInt64] = [:],
@@ -671,7 +679,7 @@ public struct PanoramaMapStatus: Codable, Equatable, Sendable {
         maximumPlaceEmbeddingMilliseconds: Double = 0,
         lastUpdatedNS: UInt64?
     ) {
-        schemaVersion = 7
+        schemaVersion = 8
         self.state = String(state.prefix(48))
         self.imagePath = imagePath
         self.metadataPath = metadataPath
@@ -683,6 +691,10 @@ public struct PanoramaMapStatus: Codable, Equatable, Sendable {
         self.elevationIncreasesBottomToTop = elevationIncreasesBottomToTop
         self.revision = revision
         self.acceptedFrames = acceptedFrames
+        self.inputContextCount = inputContextCount
+        self.inputJPEGCount = inputJPEGCount
+        self.inputMatchedCount = min(inputMatchedCount, min(inputContextCount, inputJPEGCount))
+        self.inputDecodeFailures = min(inputDecodeFailures, inputMatchedCount)
         self.lowQualityRejectedFrames = lowQualityRejectedFrames
         self.poseInterpolationMisses = poseInterpolationMisses
         self.poseMissReasons = poseMissReasons

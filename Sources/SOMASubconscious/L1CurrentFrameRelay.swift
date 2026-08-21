@@ -1,24 +1,19 @@
-import CoreImage
 import CoreVideo
 import Foundation
 import SOMACore
-
-private final class L1CurrentFramePixelBuffer: @unchecked Sendable {
-    let value: CVPixelBuffer
-
-    init(_ value: CVPixelBuffer) {
-        self.value = value
-    }
-}
+import SOMAOpenCV
 
 /// Holds one short-lived camera image for L1 reasoning independently of the
 /// menu-bar diagnostics. Closing the panel must never turn L1's visual context
 /// into an old screenshot.
 final class L1CurrentFrameRelay: @unchecked Sendable {
-    private struct Pending: @unchecked Sendable {
-        let pixelBuffer: L1CurrentFramePixelBuffer
+    private struct Pending: Sendable {
+        let pixels: Data
         let capturedAtNS: UInt64
         let capturedAt: Date
+        let bytesPerRow: Int32
+        let width: Int32
+        let height: Int32
     }
 
     private struct Latest: Sendable {
@@ -30,17 +25,22 @@ final class L1CurrentFrameRelay: @unchecked Sendable {
     private let directoryURL: URL
     private let lock = NSLock()
     private let encodeQueue = DispatchQueue(label: "soma.l1.current-frame", qos: .utility)
-    private let imageContext = CIContext(options: [.cacheIntermediates: false])
-    private let admissionIntervalNS: UInt64 = 750_000_000
+    private let l1AdmissionIntervalNS: UInt64 = 750_000_000
+    private let panoramaAdmissionIntervalNS: UInt64 = 250_000_000
     private let freshnessWindowNS: UInt64 = 2_000_000_000
     private let maximumJPEGBytes = 2_000_000
-    private let maximumImageDimension = 640.0
+    private let maximumImageDimension: Int32 = 640
+    // OBSBOT can deliver a 3840×2160 BGRA surface (about 33.2 MB). The
+    // bounded CPU handoff must cover that source while still rejecting an
+    // implausibly large camera allocation.
+    private let maximumSourceBytes = 48_000_000
 
     private var nextAdmissionNS: UInt64 = 0
     private var pending: Pending?
     private var latest: Latest?
     private var encoding = false
     private var activeSnapshots: [URL: Date] = [:]
+    private var encodedFrameObserver: (@Sendable (Data, UInt64) -> Void)?
 
     init(directoryURL: URL) {
         self.directoryURL = directoryURL
@@ -49,23 +49,37 @@ final class L1CurrentFrameRelay: @unchecked Sendable {
             at: directoryURL,
             includingPropertiesForKeys: nil
         )) ?? []
-        for file in stale where file.lastPathComponent.hasPrefix("l1-frame-") {
+        for file in stale where file.lastPathComponent.hasPrefix("l1-frame-")
+            || file.lastPathComponent == "l1-current-latest.jpg" {
             try? FileManager.default.removeItem(at: file)
         }
     }
 
     func record(pixelBuffer: CVPixelBuffer, capturedAtNS: UInt64, capturedAt: Date = Date()) {
         lock.lock()
+        let admissionIntervalNS = encodedFrameObserver == nil
+            ? l1AdmissionIntervalNS
+            : panoramaAdmissionIntervalNS
         guard capturedAtNS >= nextAdmissionNS else {
             lock.unlock()
             return
         }
         nextAdmissionNS = capturedAtNS &+ admissionIntervalNS
-        pending = Pending(
-            pixelBuffer: L1CurrentFramePixelBuffer(pixelBuffer),
+        lock.unlock()
+
+        // AVCapture owns this IOSurface. Copy it while handling this admission
+        // and release the surface before any asynchronous JPEG work begins.
+        // The CPU copy is rate-limited (4 Hz only while panorama is enabled).
+        guard let frame = copyToCPUMemory(
+            pixelBuffer: pixelBuffer,
             capturedAtNS: capturedAtNS,
             capturedAt: capturedAt
-        )
+        ) else {
+            return
+        }
+
+        lock.lock()
+        pending = frame
         guard !encoding else {
             lock.unlock()
             return
@@ -73,6 +87,16 @@ final class L1CurrentFrameRelay: @unchecked Sendable {
         encoding = true
         lock.unlock()
         encodeQueue.async { [weak self] in self?.drain() }
+    }
+
+    /// Delivers the already-throttled local JPEG to another local consumer.
+    /// The observer receives bytes only; it never receives a camera-owned
+    /// CVPixelBuffer or participates in the capture queue.
+    func setEncodedFrameObserver(_ observer: (@Sendable (Data, UInt64) -> Void)?) {
+        lock.lock()
+        encodedFrameObserver = observer
+        nextAdmissionNS = 0
+        lock.unlock()
     }
 
     func currentResource(at monotonicNS: UInt64) -> L1VisualResource? {
@@ -123,7 +147,8 @@ final class L1CurrentFrameRelay: @unchecked Sendable {
                 at: directoryURL,
                 includingPropertiesForKeys: nil
             )) ?? []
-            for file in files where file.lastPathComponent.hasPrefix("l1-frame-") {
+            for file in files where file.lastPathComponent.hasPrefix("l1-frame-")
+                || file.lastPathComponent == "l1-current-latest.jpg" {
                 try? FileManager.default.removeItem(at: file)
             }
         }
@@ -147,27 +172,67 @@ final class L1CurrentFrameRelay: @unchecked Sendable {
     }
 
     private func encode(_ frame: Pending) {
-        let source = CIImage(cvPixelBuffer: frame.pixelBuffer.value)
-        let extent = source.extent
-        guard extent.width > 0,
-              extent.height > 0,
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
-            return
+        var encoded = [UInt8](repeating: 0, count: maximumJPEGBytes)
+        let result = frame.pixels.withUnsafeBytes { source in
+            encoded.withUnsafeMutableBytes { destination in
+                guard let sourceBase = source.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let destinationBase = destination.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return SOMAJPEGEncodeResult(success: 0, encoded_length: 0)
+                }
+                return soma_encode_jpeg_4channel(
+                    sourceBase,
+                    frame.bytesPerRow,
+                    frame.width,
+                    frame.height,
+                    1,
+                    maximumImageDimension,
+                    destinationBase,
+                    Int32(destination.count)
+                )
+            }
         }
-        let scale = min(1, maximumImageDimension / max(extent.width, extent.height))
-        let image = scale < 1
-            ? source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            : source
-        guard let jpeg = imageContext.jpegRepresentation(
-            of: image,
-            colorSpace: colorSpace,
-            options: [:]
-        ), jpeg.count <= maximumJPEGBytes else {
-            return
-        }
+        guard result.success != 0,
+              result.encoded_length > 0,
+              result.encoded_length <= encoded.count else { return }
+        let jpeg = Data(encoded.prefix(Int(result.encoded_length)))
         lock.lock()
         latest = Latest(capturedAtNS: frame.capturedAtNS, capturedAt: frame.capturedAt, jpeg: jpeg)
+        let observer = encodedFrameObserver
         lock.unlock()
+        observer?(jpeg, frame.capturedAtNS)
+    }
+
+    private func copyToCPUMemory(
+        pixelBuffer: CVPixelBuffer,
+        capturedAtNS: UInt64,
+        capturedAt: Date
+    ) -> Pending? {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+            return nil
+        }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let byteCount = bytesPerRow.multipliedReportingOverflow(by: height)
+        guard width > 0,
+              height > 0,
+              bytesPerRow >= width * 4,
+              !byteCount.overflow,
+              byteCount.partialValue > 0,
+              byteCount.partialValue <= maximumSourceBytes else {
+            return nil
+        }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        return Pending(
+            pixels: Data(bytes: baseAddress, count: byteCount.partialValue),
+            capturedAtNS: capturedAtNS,
+            capturedAt: capturedAt,
+            bytesPerRow: Int32(bytesPerRow),
+            width: Int32(width),
+            height: Int32(height)
+        )
     }
 
     private func purgeExpiredSnapshotsLocked(at date: Date) {

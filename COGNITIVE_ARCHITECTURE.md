@@ -84,9 +84,13 @@ SituationFrame
   interaction_recommendation, natural_language_summary
 ```
 
-Human presence and a recognized identity raise the allowed L1 sampling cadence
-because social context changes quickly. They create a social-deliberation
-opportunity, not a speech trigger. Every such L1 cycle may conclude
+Human presence and a recognized identity create a social-deliberation
+opportunity, not a speech trigger. The same configured L1 reasoning cadence
+governs this deliberation and baseline awareness. Local visual input may also
+interrupt that baseline: a credible discrete event can wake L1 immediately,
+while the local helper separately integrates social availability, scene
+relevance, and unresolved change over a short interval before issuing one
+latched temporal-context request. Every such L1 cycle may conclude
 `remain_silent`, `nonverbal_invitation`, or `spoken_opening`; only an explicit,
 grounded L1 decision can take the latter two paths. A locally validated social
 admission can open a voice conversation; the bounded response window after

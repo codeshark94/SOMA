@@ -30,6 +30,11 @@ public enum EmbodimentMotorIntent: Equatable, Sendable {
         fieldOfViewDegrees: Double,
         expiresAtNS: UInt64
     )
+    case captureCurrent(
+        requestID: String,
+        fieldOfViewDegrees: Double,
+        expiresAtNS: UInt64
+    )
     case explore(
         requestID: String,
         policy: ExplorationPolicyGoal,
@@ -65,6 +70,16 @@ public struct EmbodimentMotorCoordinator: Sendable {
         at monotonicNS: UInt64
     ) -> EmbodimentMotorIntent? {
         guard decision.status != .rejected else { return nil }
+
+        if case let .captureView(goal) = request.operation,
+           goal.requestsCurrentFrame,
+           decision.status == .accepted {
+            return .captureCurrent(
+                requestID: request.requestID,
+                fieldOfViewDegrees: goal.fieldOfViewDegrees ?? 70,
+                expiresAtNS: request.lease.expiresAtNS
+            )
+        }
 
         if case .release = request.operation {
             guard activeRequest?.lease.ownerID == request.lease.ownerID else { return nil }
@@ -160,7 +175,13 @@ public struct EmbodimentMotorCoordinator: Sendable {
                 snapshot: snapshot
             )
         case let .captureView(goal):
-            if let bearing = goal.bearing {
+            if goal.requestsCurrentFrame {
+                intent = .captureCurrent(
+                    requestID: request.requestID,
+                    fieldOfViewDegrees: goal.fieldOfViewDegrees ?? 70,
+                    expiresAtNS: request.lease.expiresAtNS
+                )
+            } else if let bearing = goal.bearing {
                 intent = .capture(
                     requestID: request.requestID,
                     targetReference: nil,
@@ -281,6 +302,8 @@ public struct EmbodimentMotorCoordinator: Sendable {
             return "track|\(requestID)|\(reference)|\(sceneID)|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(observed)|\(composition)|\(style.rawValue)|\(expiresAtNS)"
         case let .capture(requestID, reference, sceneID, bearing, fieldOfView, expiresAtNS):
             return "capture|\(requestID)|\(reference ?? "none")|\(sceneID ?? "none")|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(bucket(fieldOfView))|\(expiresAtNS)"
+        case let .captureCurrent(requestID, fieldOfView, expiresAtNS):
+            return "capture_current|\(requestID)|\(bucket(fieldOfView))|\(expiresAtNS)"
         case let .explore(requestID, policy, expiresAtNS):
             return "explore|\(requestID)|\(policy.mode.rawValue)|\(expiresAtNS)"
         case let .express(requestID, expression, expiresAtNS):

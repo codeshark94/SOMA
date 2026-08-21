@@ -16,6 +16,7 @@ public enum SphericalPlaceMemoryError: Error, LocalizedError {
 /// model or OS revision change cannot silently merge unrelated places.
 public struct PanoramaPlaceEmbedding: Codable, Equatable, Sendable {
     public static let appleVisionFeaturePrintEncoder = "apple_vision_feature_print"
+    public static let cpuSpatialSignatureEncoder = "cpu_spatial_signature"
     public static let maximumElementCount = 4_096
 
     public let encoder: String

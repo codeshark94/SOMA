@@ -43,7 +43,11 @@ public struct CodexInteractionContext: Codable, Equatable, Sendable {
         privacyScope: String = "interaction_scoped"
     ) throws {
         self.situationSummary = try Self.optional(situationSummary, maximumCount: 8_192)
-        self.identityReference = try Self.optional(identityReference, maximumCount: 128)
+        // Identity context is a bounded local semantic description, not a
+        // biometric payload. A normal L1 proactive description can exceed a
+        // short identifier limit; rejecting it would discard the complete
+        // interaction packet, including its live-session capability.
+        self.identityReference = try Self.optional(identityReference, maximumCount: 512)
         self.personEntityID = personEntityID
         self.personContextAvailable = personContextAvailable ?? (personEntityID != nil)
         if let sessionCapability {

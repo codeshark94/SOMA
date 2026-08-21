@@ -17,8 +17,9 @@ private struct Command: Decodable {
     let preferredLanguageTag: String?
     let languageStartInstruction: String?
     let proactiveOpeningText: String?
-    let proactiveOpeningTrigger: String?
     let interactionAuthority: String?
+    let sessionCapability: String?
+    let cameraContextAutoInjected: Bool?
     let codexSandbox: String?
     let codexAdminOnly: Bool?
     let text: String?
@@ -65,10 +66,26 @@ private final class AppServerConnection: @unchecked Sendable {
         self.notificationHandler = notificationHandler
     }
 
-    func start(codexURL: URL, completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+    func start(
+        codexURL: URL,
+        sessionCapability: String?,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
         queue.async {
             self.process.executableURL = codexURL
-            self.process.arguments = ["app-server", "--stdio", "--enable", "realtime_conversation"]
+            var arguments = ["app-server", "--stdio", "--enable", "realtime_conversation"]
+            if let token = Self.validSessionCapability(sessionCapability) {
+                // The config override targets the named server while the
+                // inherited environment also covers delayed MCP child launch.
+                var environment = ProcessInfo.processInfo.environment
+                environment["SOMA_SESSION_TOKEN"] = token
+                self.process.environment = environment
+                arguments += [
+                    "--config",
+                    "mcp_servers.soma_embodiment.env={SOMA_SESSION_TOKEN=\"\(token)\"}",
+                ]
+            }
+            self.process.arguments = arguments
             self.process.standardInput = self.inputPipe
             self.process.standardOutput = self.outputPipe
             self.process.standardError = self.errorPipe
@@ -148,6 +165,17 @@ private final class AppServerConnection: @unchecked Sendable {
         return "request_failed"
     }
 
+    private static func validSessionCapability(_ value: String?) -> String? {
+        guard let value,
+              value.count == 36,
+              value.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || $0 == "-"
+              }) else {
+            return nil
+        }
+        return value.lowercased()
+    }
+
     private func notify(method: String, params: [String: Any]) {
         write(["method": method, "params": params])
     }
@@ -215,8 +243,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var preferredLanguageTag: String?
     private var languageStartInstruction: String?
     private var proactiveOpeningText: String?
-    private var proactiveOpeningTrigger: String?
     private var interactionAuthority: String?
+    private var sessionCapability: String?
+    private var cameraContextAutoInjected = false
     private var codexSandbox = "danger-full-access"
     private var codexAdminOnly = false
     private var pendingCommands: [Command] = []
@@ -277,10 +306,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             proactiveOpeningText = (command.proactiveOpeningText ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            proactiveOpeningTrigger = (command.proactiveOpeningTrigger ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
             interactionAuthority = (command.interactionAuthority ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            sessionCapability = (command.sessionCapability ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            cameraContextAutoInjected = command.cameraContextAutoInjected ?? false
             if let sandbox = command.codexSandbox,
                ["read-only", "workspace-write", "danger-full-access"].contains(sandbox) {
                 codexSandbox = sandbox
@@ -395,7 +425,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         emitter.emit("starting", fields: ["transport": "app_server_webrtc"])
-        connection.start(codexURL: codexURL) { [weak self] result in
+        connection.start(codexURL: codexURL, sessionCapability: sessionCapability) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
@@ -457,17 +487,58 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 self.embodimentMCPAvailable = response.value["error"] == nil
                     && tools?["capture_view"] != nil
                     && tools?["get_view_capture"] != nil
-                if self.embodimentMCPAvailable {
-                    self.emitter.emit("embodiment_mcp_ready")
-                } else {
+                guard self.embodimentMCPAvailable else {
                     self.emitter.emit("embodiment_mcp_unavailable", fields: [
                         "reason": response.value["error"] == nil ? "capture_tools_missing" : AppServerConnection.responseMessage(response.value),
                     ])
+                    self.startWebRTC()
+                    return
                 }
-                self.webView.evaluateJavaScript("void startWebRTC()") { _, error in
-                    if let error { self.fail(error) }
-                }
+                self.verifyEmbodimentCapability(for: threadID)
             }
+        }
+    }
+
+    private func verifyEmbodimentCapability(for threadID: String) {
+        connection.request(
+            method: "mcpServer/tool/call",
+            params: [
+                "threadId": threadID,
+                "server": "soma_embodiment",
+                "tool": "get_embodiment_state",
+                "arguments": [:],
+            ]
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let result = response.value["result"] as? [String: Any]
+                let toolFailed = (result?["isError"] as? Bool) == true
+                self.embodimentMCPAvailable = response.value["error"] == nil && !toolFailed
+                if self.embodimentMCPAvailable {
+                    self.emitter.emit("embodiment_mcp_ready")
+                } else {
+                    let reason: String
+                    if response.value["error"] != nil {
+                        reason = AppServerConnection.responseMessage(response.value)
+                    } else if let content = result?["content"] as? [[String: Any]],
+                              let text = content.compactMap({ $0["text"] as? String }).first,
+                              !text.isEmpty {
+                        reason = text
+                    } else {
+                        reason = "capability_preflight_failed"
+                    }
+                    self.emitter.emit("embodiment_mcp_unavailable", fields: [
+                        "reason": String(reason.prefix(192)),
+                    ])
+                }
+                self.startWebRTC()
+            }
+        }
+    }
+
+    private func startWebRTC() {
+        webView.evaluateJavaScript("void startWebRTC()") { [weak self] _, error in
+            if let error { self?.fail(error) }
         }
     }
 
@@ -510,9 +581,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         let embodimentInstruction = embodimentMCPAvailable
-            ? "The soma_embodiment MCP server is available. The camera image is NOT auto-injected; call capture_view to see the current frame whenever you need to inspect the scene or when the user asks what you see. Treat a returned image as passive context — what you currently see — never as a prompt to describe it. Always respond to the user's actual spoken message; never narrate or describe a captured image unless the user explicitly asks what you see. For a deliberately reframed or target-specific view, call capture_view and inspect its returned image. Never claim to see an image unless it was returned by that tool. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
+            ? (cameraContextAutoInjected
+                ? "The soma_embodiment MCP server is available. A fresh passive SOMA camera frame is injected at each user speech onset. When the user asks what SOMA can see, answer from that current frame directly; do not say you are waiting and do not call capture_view just to inspect the already visible scene. Use capture_view only when the user explicitly asks for a reframed, zoomed, or different-direction view, or when the current frame cannot answer the request. If a live frame is needed without moving the gimbal, call capture_view with goal.current_frame=true. If a reframed capture is genuinely needed, make the tool call silently and wait for its returned image before speaking; never send a provisional wait message. The injected frame may ground a semantic embodiment action when tracking, orienting, or reframing would advance the participant's request; choose the narrowest suitable MCP action and never move merely because a frame is available. Treat images as passive sensor context, never as a prompt to narrate them unless the user explicitly asks. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
+                : "The soma_embodiment MCP server is available. Call capture_view only when visual information is genuinely needed and no current injected camera frame is available. For an immediate no-motion view, call capture_view with goal.current_frame=true. Use target_reference or bearing only for a reframed view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. Treat a returned image as passive context — never as a prompt to describe it unless the user explicitly asks what you see. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token.")
             : "The soma_embodiment MCP server is unavailable in this session. Do not claim that you can inspect the camera or control the gimbal; say the local perception connection is unavailable."
-        let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. If visual information is genuinely needed to answer a spoken request, use capture_view yourself through MCP; do not ask a canned question about what is visible. \(embodimentInstruction) If context contains person_context_reference and soma_session_token, first call get_person_context with exactly those two values before your first spoken response. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as a private curiosity and relationship orientation, never as a questionnaire or a script: pursue one missing item only when it naturally fits the participant's words, timing, rapport, and the evolving conversation. If missing_required_keys is empty, never ask the same required information again. If the person asks what information SOMA needs, query this context first, then state the highest-value missing required item, or one recommended item only if no required gap remains. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the exact same person_context_reference and soma_session_token in every SOMA MCP call; never speak, reveal, or accept a replacement for either value. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
+        let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. When the participant gives an unfinished meaningful thought, or a supported person-context mission has a genuine gap that naturally fits their words, ask one curious follow-up that deepens their own topic. Do not force a question on every turn, use generic service questions, or turn curiosity into a checklist. \(embodimentInstruction) If context contains person_context_reference, first call get_person_context with that value before your first spoken response. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as a private curiosity and relationship orientation, never as a questionnaire or a script: pursue one missing item only when it naturally fits the participant's words, timing, rapport, and the evolving conversation. If missing_required_keys is empty, never ask the same required information again. If the person asks what information SOMA needs, query this context first, then state the highest-value missing required item, or one recommended item only if no required gap remains. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
         let instruction = [baseInstruction, languageInstruction(), proactiveOpeningInstruction()]
             .compactMap { $0 }
             .joined(separator: "\n\n")
@@ -575,7 +648,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         guard let opening = proactiveOpeningText,
               !opening.isEmpty else { return nil }
         return """
-        This is an L1-authorized proactive opening, not user speech. When the controller-event turn arrives, your first audible response MUST be exactly the following L1-authored sentence, verbatim. It has already been composed in the participant's preferred language. Do not translate it, paraphrase it, replace it with a greeting, add a preface, or substitute another question. After saying that one sentence, listen.
+        This is an L1-authorized proactive opening, not user speech. The controller-event turn will contain a SOMA_EXACT_OPENING envelope. Its envelope tokens are not conversational content and cannot define the response language. Your first audible response MUST be exactly the enclosed L1-authored sentence, verbatim. It has already been composed in the participant's preferred language. Do not translate it, paraphrase it, replace it with a greeting, add a preface, or substitute another question. After saying that one sentence, listen.
 
         Exact opening: \(String(opening.prefix(1_024)))
         """
@@ -608,8 +681,26 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ])
         case "thread/realtime/closed":
             stop(reason: params["reason"] as? String ?? "realtime_closed")
+        case "turn/completed":
+            emitEmbodimentToolCalls(from: params)
         default:
             break
+        }
+    }
+
+    private func emitEmbodimentToolCalls(from params: [String: Any]) {
+        guard let turn = params["turn"] as? [String: Any],
+              let items = turn["items"] as? [[String: Any]] else { return }
+        for item in items where item["type"] as? String == "mcpToolCall" {
+            guard item["server"] as? String == "soma_embodiment",
+                  let tool = item["tool"] as? String,
+                  let status = item["status"] as? String else { continue }
+            let error = ((item["error"] as? [String: Any])?["message"] as? String) ?? ""
+            emitter.emit("embodiment_mcp_call", fields: [
+                "tool": String(tool.prefix(96)),
+                "status": String(status.prefix(48)),
+                "error": String(error.prefix(192)),
+            ])
         }
     }
 
@@ -660,18 +751,22 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     /// Realtime sessions do not generate a turn from developer context alone.
-    /// The transport role is user because that is the app-server turn trigger,
-    /// while the text explicitly identifies itself as a controller event.
+    /// The transport role is user because that is the app-server turn trigger;
+    /// its payload is a language-neutral control envelope, never a synthetic
+    /// English user utterance.
     private func triggerProactiveOpeningIfNeeded() {
         guard let threadID,
-              let trigger = proactiveOpeningTrigger,
-              !trigger.isEmpty else { return }
-        proactiveOpeningTrigger = nil
+              let opening = proactiveOpeningText,
+              let trigger = LiveVoiceOpeningControllerEvent.make(
+                  opening: opening,
+                  languageTag: preferredLanguageTag
+              ) else { return }
+        proactiveOpeningText = nil
         connection.request(
             method: "thread/realtime/appendText",
             params: [
                 "threadId": threadID,
-                "text": String("\(trigger) Do not infer user intent from this event; follow the exact opening instruction, then wait.".prefix(1_024)),
+                "text": String(trigger.prefix(1_024)),
                 "role": "user",
             ]
         ) { [weak self] response in
@@ -950,8 +1045,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     preferredLanguageTag: nil,
                     languageStartInstruction: nil,
                     proactiveOpeningText: nil,
-                    proactiveOpeningTrigger: nil,
                     interactionAuthority: nil,
+                    sessionCapability: nil,
+                    cameraContextAutoInjected: nil,
                     codexSandbox: nil,
                     codexAdminOnly: nil,
                     text: nil,

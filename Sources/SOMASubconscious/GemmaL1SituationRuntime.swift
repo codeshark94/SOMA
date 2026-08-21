@@ -258,6 +258,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private var personContextByPersonID: [UUID: PersonContextSnapshot] = [:]
     private var personMemorySummariesByPersonID: [UUID: [String]] = [:]
     private var personInfoNeedsByPersonID: [UUID: [PersistedInformationNeed]] = [:]
+    private let placeAffiliationLock = NSLock()
+    private var placeAffiliationBySpaceID: [UUID: L1PlaceAffiliationContext] = [:]
     private let conversationLock = NSLock()
     private var activeConversations: [String: ActiveConversation] = [:]
     /// Every durable consequence of a finalized Live turn joins this group.
@@ -294,7 +296,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
 
     func context(
         for entityID: UUID,
-        createPseudonymousEntity: Bool = false
+        createPseudonymousEntity: Bool = false,
+        placeAffiliation: L1PlaceAffiliationContext? = nil
     ) async -> L1MemoryContext {
         guard let store else {
             return L1MemoryContext(
@@ -425,6 +428,26 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     informationGoal: goal,
                     expectedInformationGain: 0.64
                 ))
+            }
+            if let placeAffiliation,
+               placeAffiliation.affiliationUnresolved {
+                let currentPlace = await refreshedPlaceAffiliation(placeAffiliation, at: now)
+                if currentPlace.affiliationUnresolved {
+                    let goal = "Understand this person's relationship to the current place and its recurring objects before treating place observations as personal context."
+                    let expectedInformationGain = currentPlace.unassignedObservationCount > 0 ? 0.82 : 0.58
+                    let motiveID = await ensureInformationNeed(
+                        question: goal,
+                        targetEntityID: entityID,
+                        expectedInformationGain: expectedInformationGain,
+                        sourceID: "l1_place_affiliation"
+                    )
+                    needs.append(L1InformationNeed(
+                        motiveID: motiveID ?? UUID(),
+                        source: .placeAffiliation,
+                        informationGoal: goal,
+                        expectedInformationGain: expectedInformationGain
+                    ))
+                }
             }
             // Human conversation has balance: do not barrage the person with
             // every open question at once. Surface only the highest-value needs,
@@ -799,6 +822,49 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
+    /// Uses the encrypted memory store as the source of truth for affiliation
+    /// and caches only the compact scalar projection needed by L1 packets.
+    func cachedPlaceAffiliation(
+        spaceID: UUID,
+        label: String?,
+        isStable: Bool
+    ) -> L1PlaceAffiliationContext {
+        let cached = placeAffiliationLock.withLock {
+            placeAffiliationBySpaceID[spaceID]
+        }
+        guard let cached else {
+            return L1PlaceAffiliationContext(
+                spaceID: spaceID,
+                label: label,
+                isStable: isStable
+            )
+        }
+        return L1PlaceAffiliationContext(
+            spaceID: spaceID,
+            label: label ?? cached.label,
+            isStable: isStable,
+            ownerEntityID: cached.ownerEntityID,
+            unassignedObservationCount: cached.unassignedObservationCount
+        )
+    }
+
+    private func refreshedPlaceAffiliation(
+        _ context: L1PlaceAffiliationContext,
+        at date: Date
+    ) async -> L1PlaceAffiliationContext {
+        let refreshed = L1PlaceAffiliationContext(
+            spaceID: context.spaceID,
+            label: context.label,
+            isStable: context.isStable,
+            ownerEntityID: await spaceOwner(spaceID: context.spaceID, at: date),
+            unassignedObservationCount: await pendingSpaceObjectCount(spaceID: context.spaceID, at: date)
+        )
+        placeAffiliationLock.withLock {
+            placeAffiliationBySpaceID[context.spaceID] = refreshed
+        }
+        return refreshed
+    }
+
     /// A stable neutral entity representing the robot's home space. Recognized
     /// objects seen while no person is engaged are bound here first; they are
     /// promoted to a person's taste profile only once the space owner is learned
@@ -844,6 +910,9 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 ),
                 at: date
             )
+            placeAffiliationLock.withLock {
+                placeAffiliationBySpaceID.removeValue(forKey: spaceID)
+            }
             return true
         } catch {
             onHealth("space_object_store_failed", String(error.localizedDescription.prefix(192)))
@@ -933,6 +1002,16 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 promoted += 1
             }
             onHealth("space_owner_set", "owner=\(ownerEntityID.uuidString.lowercased()); space=\(spaceID.uuidString.lowercased()); promoted=\(promoted)")
+            placeAffiliationLock.withLock {
+                let prior = placeAffiliationBySpaceID[spaceID]
+                placeAffiliationBySpaceID[spaceID] = L1PlaceAffiliationContext(
+                    spaceID: spaceID,
+                    label: prior?.label,
+                    isStable: prior?.isStable ?? false,
+                    ownerEntityID: ownerEntityID,
+                    unassignedObservationCount: 0
+                )
+            }
             return true
         } catch {
             onHealth("space_owner_set_failed", String(error.localizedDescription.prefix(192)))
@@ -2218,12 +2297,12 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
         let requestData = try encoder.encode(request)
         let requestJSON = String(decoding: requestData, as: UTF8.self)
         return """
-        You are SOMA's L1 situational reasoner. Infer a concise social situation from the bounded packet below. Do not claim unseen facts. A social decision is optional and never imperative. If an opportunity exists, choose only an allowed action. Treat an enrolled identity and a locally pseudonymous recurring person as equally eligible for social consideration; a missing name is not a reason to default to silence. Weigh social availability, curiosity, interruption cost, rapport, the scalar spatial context, and the daily world memory, then actively consider a brief, grounded opening when it would be welcome. Never fabricate identities beyond packet IDs or invent raw conversation. Never output camera controls directly: any embodiment action must go through the provided tools, never through the final JSON.
+        You are SOMA's L1 situational reasoner. Infer a concise social situation from the bounded packet below. Do not claim unseen facts. A social decision is optional and never imperative. If an opportunity exists, choose only an allowed action. Treat an enrolled identity and a locally pseudonymous recurring person as equally eligible for social consideration; a missing name is not a reason to default to silence. Weigh social availability, curiosity, interruption cost, rapport, the scalar spatial context, and the daily world memory when deciding whether to initiate a new spoken opening from silence. A current or recent conversation means the person has already engaged: interruption cost must never suppress L1's curiosity updates, memory work, or context supplied to that ongoing conversation. Never fabricate identities beyond packet IDs or invent raw conversation. Never output camera controls directly: any embodiment action must go through the provided tools, never through the final JSON.
 
         You have tools available. Call a tool ONLY when it is genuinely necessary to answer a situational question — e.g. you need the person's stored context, need to inspect a specific visual target, or want to record an observation. Never call a tool gratuitously. Every tool call MUST include a "reason" field in its arguments explaining why you are calling it (a short justification). Do not call a tool just because it exists. IMPORTANT: the person's stored context, rapport, and preferences are ALREADY included in the packet you receive (memory projections and rapport are pre-loaded). Do NOT call get_person_context to re-fetch what the packet already provides; only call it when you genuinely need a detail that is absent from the packet. For a deliberate visual question, first call inspect_scene, register an observed scene_id as a semantic target, and then use track_attention_target or capture_target_view. A target-specific tool request is semantic only: L0 owns calibrated spherical aim, route planning, pose feedback, limits, stopping, and the physical camera. set_target_attention records a probabilistic L1 interest policy; it does not itself move the camera. Do not use orient_attention or explore_attention for routine social beats, generic scanning, or speculation. Prefer the final JSON behavior_directive for routine camera/social beats rather than the embodiment tools. After tools, still return the situation JSON.
         Return the situation JSON as your final message: no Markdown, prose, alternate field names, or omitted required fields. Copy at least one supplied evidence ID into evidence_ids; never emit an empty evidence_ids array. Use this exact shape, replacing values only:
         {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence","stream_of_consciousness":"continuous first-person inner monologue, as long as the reasoning requires"},"action":null,"confidence":null,"rationale":null,"opening":null,"behavior_directive":{"action":null,"rationale":null},"requested_visual_resource_ids":[],"memory_proposals":[]}
-        memory_proposals is optional and usually empty for facts: only add a fact proposal when you have genuinely learned or resolved something durable about the person present or the situation — a stable fact about them, a task they asked for, or a notable episode (kinds episode|person_fact|relationship|task|correction), with a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never invent a fact from speculation. open_question is different: whenever you find yourself genuinely wanting to know something more about the person present or the situation — their story, tastes, plans, work, how they use this space, what they are building — record it as an open_question proposal whose summary is the exact question. These accumulate into your pending information needs: the questions you will follow up on in later conversation. Curiosity is a quiet background drive, not a script: propose at most one open_question per cycle, and skip cycles where nothing genuinely puzzles you. Whenever you notice something you do not yet know about the person present or the situation — even a small concrete detail (their story, tastes, plans, work, habits, how they use this space, what they are building) — record it as an open_question whose summary is the exact natural question. Only record questions that remain meaningful later: durable curiosity that a future conversation can still resolve. Never record moment-bound questions (e.g. "what are you looking at right now?", "why did you just do that?") — those are only valid in the moment and lose all meaning once stored; ask them live in conversation or skip them. Never propose a question whose answer you already have, and never a generic or service question. Keep curiosity_pressure low (0.1-0.3) by default; raise it only for something genuinely novel. Curiosity may justify a gentle opening only after it has become a supplied durable information_need and the person is socially available; it must never become a rigid questionnaire or override a clear need for privacy.
+        memory_proposals is optional and usually empty for facts: only add a fact proposal when you have genuinely learned or resolved something durable about the person present or the situation — a stable fact about them, a task they asked for, or a notable episode (kinds episode|person_fact|relationship|task|correction), with a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never invent a fact from speculation. open_question is different: whenever you find yourself genuinely wanting to know something more about the person present or the situation — their story, tastes, plans, work, how they use this space, what they are building — record it as an open_question proposal whose summary is the exact question. These accumulate into your pending information needs: the questions you will follow up on in later conversation. Curiosity is a quiet background drive, not a script: propose at most one open_question per cycle, and skip cycles where nothing genuinely puzzles you. Whenever you notice something you do not yet know about the person present or the situation — even a small concrete detail (their story, tastes, plans, work, habits, how they use this space, what they are building) — record it as an open_question whose summary is the exact natural question. Only record questions that remain meaningful later: durable curiosity that a future conversation can still resolve. Never record moment-bound questions (e.g. "what are you looking at right now?", "why did you just do that?") — those are only valid in the moment and lose all meaning once stored; ask them live in conversation or skip them. Never propose a question whose answer you already have, and never a generic or service question. A place_affiliation motive means that the stable current place is not yet related to the present person. Treat it as a real but low-pressure relational uncertainty: let the current scene and rapport determine whether to explore it naturally, never ask a bureaucratic ownership question, never infer affiliation, and do not attribute place observations to the person until explicit confirmation is recorded. Keep curiosity_pressure low (0.1-0.3) by default; raise it only for something genuinely novel. Curiosity may justify a gentle opening only after it has become a supplied durable information_need and the person is socially available; it must never become a rigid questionnaire or override a clear need for privacy.
         When behavior_context is present it is the ONLY basis for behavior_directive, and it is independent of any social decision (which may still be null). If action is null, emit the JSON value null (never the string "null"); confidence and rationale may still describe the situation but do not create a social action. If behavior_context.recognized_identity is present, you are looking at that known person; name them in your stream of consciousness. If the camera has been held on a non-face, non-person target for a long time (fixation_seconds high while target is not a verified face, scan inactive), recommend resume_scanning or, if no person is being pursued, seek_people. Recommend acknowledge_person ONLY when behavior_context.acknowledgment_pending is true; when it is false the greeting has already been delivered for this presence, so a repeated directive would be a silent no-op — recommend keep_observing or null instead. Otherwise recommend keep_observing, or null when no behavioral change is warranted. Never turn a momentary low-confidence object into a directive; only sustained fixation warrants one.
         The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness in English as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is an observable L1 reflection, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Let the stream take exactly the space its reasoning needs: a quiet unchanged state may need one clear sentence; a change, ambiguity, memory connection, competing motive, or pending action should unfold through as many connected sentences as needed to make the transition intelligible. Do not compress a real chain of reasoning into a slogan, and do not pad or repeat thoughts merely to sound deep. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. Do not turn an empty relationship field, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact. A supplied information_need is a real, durable conversational purpose — not an emergency that must be ignored until it becomes urgent. When the person is available and contact_history does not show a recent unanswered opening or a request for privacy, you may choose one gentle spoken opening that advances exactly one supplied information_need. Do not treat seeing a laptop, phone, or other ordinary personal object by itself as proof the person must not be interrupted: weigh current visual evidence together with the direct temporal contact_pattern and relationship context. A spoken opening is a deliberate, low-pressure social act: permitted only as one question that can reduce exactly one supplied information_need, and only when the moment genuinely fits (right rapport, fresh observation, not a redundant greeting). Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
         contact_pattern is a compact L0 temporal signal. A sustained or repeated directed gaze can make a person more socially available; a single passing glance does not. It is context, never an instruction to speak, and does not replace the need for a concrete purpose.
@@ -2449,11 +2528,10 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private let memoryContextRefreshNS: UInt64 = 60_000_000_000
     // Situation reasoning is gated by the social-opportunity scheduler, whose
     // opening delay (0.5-2.4s) only elapses if we keep re-polling it. A
-    // 2s tick lets a due opening fire promptly while the actual inference stays
-    // throttled to deliberationIntervalNS below.
+    // 2s tick lets a due opportunity fire promptly while the shared L1 cadence
+    // bounds model inference.
     private let reassessIntervalNS: UInt64 = 2_000_000_000
     private let presenceCurrentNS: UInt64 = 3_000_000_000
-    private let deliberationIntervalNS: UInt64 = 45_000_000_000
     /// Minimum interval between auxiliary-wake-triggered behavior passes. It
     /// matches the interrupt gate's 5s debounce so a burst of E2B wake proposals
     /// cannot flood the reasoner beyond the periodic cadence.
@@ -2463,11 +2541,18 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
     private var consolidationIntervalNS: UInt64 {
         UInt64(somaEnvDouble("SOMA_L1_CONSOLIDATION_SECONDS", default: 600) * 1_000_000_000)
     }
-    /// The periodic L1 baseline awareness pass runs at the idle interval. A
-    /// present person is handled by the E2B auxiliary wake path, not by
-    /// tightening this timer. Configurable via SOMA_L1_IDLE_CADENCE_SECONDS.
-    private var idleBehaviorAwarenessIntervalNS: UInt64 {
-        UInt64(somaEnvDouble("SOMA_L1_IDLE_CADENCE_SECONDS", default: 150) * 1_000_000_000)
+    /// One configured baseline governs both person-context deliberation and
+    /// no-person awareness. Local-vision interrupts are event-driven and use
+    /// their own debounce.
+    private var reasoningCadenceNS: UInt64 {
+        let environment = ProcessInfo.processInfo.environment
+        let configuredValue = environment["SOMA_L1_REASONING_CADENCE_SECONDS"]
+            ?? environment["SOMA_L1_IDLE_CADENCE_SECONDS"]
+        let seconds = min(max(
+            configuredValue.flatMap(Double.init) ?? 150,
+            30
+        ), 600)
+        return UInt64(seconds * 1_000_000_000)
     }
 
     init(
@@ -2555,13 +2640,11 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         rescheduleBehaviorAwareness(timer)
     }
 
-    /// One-shot rescheduling. The periodic baseline awareness pass always runs
-    /// at the idle interval; responsiveness to a present person is provided by
-    /// the E2B auxiliary wake path (wakeFromAuxiliary), not by tightening this
-    /// periodic timer. This keeps the local model from being called every 30s
-    /// on a busy room and lets E2B decide when a prompt pass is warranted.
+    /// One-shot rescheduling at the same configured cadence used for a present
+    /// person. Local visual interrupts remain responsive without changing this
+    /// baseline.
     private func rescheduleBehaviorAwareness(_ timer: DispatchSourceTimer) {
-        let seconds = Double(idleBehaviorAwarenessIntervalNS) / 1_000_000_000
+        let seconds = Double(reasoningCadenceNS) / 1_000_000_000
         timer.schedule(deadline: .now() + seconds, repeating: .never)
     }
 
@@ -2619,9 +2702,11 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             guard contextLookupsInFlight.insert(entityID).inserted else { return }
             Task { [weak self] in
                 guard let self else { return }
+                let placeAffiliation = self.runtimeContext().spatialContext?.placeAffiliation
                 let context = await memoryContext.context(
                     for: entityID,
-                    createPseudonymousEntity: identityKind == .pseudonymous
+                    createPseudonymousEntity: identityKind == .pseudonymous,
+                    placeAffiliation: placeAffiliation
                 )
                 queue.async { [weak self] in
                     guard let self, !stopped else { return }
@@ -2802,7 +2887,7 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
         // Presence keeps a compact L1 working state alive. The one-in-flight
         // transport coalesces slow responses; social appropriateness comes
         // from the per-person contact history, not a fixed elapsed-time gate.
-        nextDeliberationNS[entityID] = monotonicNS + deliberationIntervalNS
+        nextDeliberationNS[entityID] = monotonicNS + reasoningCadenceNS
         let evidenceID = "identity:\(entityID.uuidString.lowercased()):\(monotonicNS)"
         let beliefSummary: String
         switch identityKind {
@@ -2898,9 +2983,17 @@ final class L1PresenceThoughtStream: @unchecked Sendable {
             priorCycleAgeSeconds: priorCycleAgeSeconds
         )
         lastBehaviorDeliberationNS = monotonicNS
+        let wakeCause: String
+        if auxiliaryWake?.reason == .temporalContext {
+            wakeCause = "temporal_context"
+        } else if auxiliaryWake != nil {
+            wakeCause = "auxiliary_wake"
+        } else {
+            wakeCause = "behavior_awareness"
+        }
         onHealth(
             "wake",
-            "cause=\(auxiliaryWake == nil ? "behavior_awareness" : "auxiliary_wake"); cycle=\(request.cycleID.uuidString.lowercased()); attention=\(behavior.attentionState); fixation=\(String(format: "%.1f", behavior.fixationSeconds))s; scan=\(behavior.scanActive ? "on" : "off"); face=\(behavior.isFaceTarget ? "yes" : "no"); identity=\(behavior.recognizedIdentity ?? "none")"
+            "cause=\(wakeCause); cycle=\(request.cycleID.uuidString.lowercased()); attention=\(behavior.attentionState); fixation=\(String(format: "%.1f", behavior.fixationSeconds))s; scan=\(behavior.scanActive ? "on" : "off"); face=\(behavior.isFaceTarget ? "yes" : "no"); identity=\(behavior.recognizedIdentity ?? "none")"
         )
         reasoner.submit(request)
     }

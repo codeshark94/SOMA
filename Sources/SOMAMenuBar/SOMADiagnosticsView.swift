@@ -1,11 +1,12 @@
 import AppKit
 import Foundation
+import SOMACore
 import SwiftUI
 
 /// Live diagnostic panel model. Polls the files that the runtime's
-/// `LiveDiagnosticsWriter` emits while the panel is open. Each file is only
-/// decoded again when its content actually changed, and the panel goes fully
-/// blank when the runtime is stopped.
+/// `LiveDiagnosticsWriter` emits while the panel is open. One manifest names
+/// the image and detections from the same capture, so the panel never overlays
+/// a delayed inference on a newer image.
 final class SOMADiagnosticsModel: ObservableObject {
     struct Rect: Decodable, Sendable {
         let x: Double
@@ -56,6 +57,7 @@ final class SOMADiagnosticsModel: ObservableObject {
                 case "recognized_person": title = "Recognized person triggered deliberation"
                 case "behavior_awareness": title = "Reviewing current attention state"
                 case "auxiliary_wake": title = "Reconsidering a visual event"
+                case "temporal_context": title = "Reconsidering an evolving situation"
                 default: title = "Reviewing a new situation"
                 }
                 return .init(category: "L1 WAKE", title: title, detail: "Comparing relationship memory with the current scene.")
@@ -209,19 +211,31 @@ final class SOMADiagnosticsModel: ObservableObject {
     @Published var thoughts: [Thought] = []
     @Published var captureLagSeconds: Double = 0
 
-    private let frameURL: URL
-    private let visionURL: URL
+    /// The diagnostic panel deliberately exposes curated cognitive cards rather
+    /// than its raw runtime JSON. Copy the same presentation that is on screen
+    /// so a shared report cannot accidentally contain hidden fields.
+    var displayedThoughtLog: String {
+        thoughts
+            .map { thought in
+                let presentation = thought.presentation
+                return [presentation.category, presentation.title, presentation.detail]
+                    .joined(separator: " · ")
+            }
+            .joined(separator: "\n\n")
+    }
+
+    private let manifestURL: URL
+    private let frameDirectoryURL: URL
     private let thoughtsURL: URL
     private var timer: Timer?
     /// Max log lines kept in memory for the panel.
     private let maxThoughts = 300
-    private var frameStamp: FileStamp?
-    private var visionStamp: FileStamp?
+    private var manifestStamp: FileStamp?
     private var thoughtsStamp: FileStamp?
 
     init(runtimeRoot: URL) {
-        self.frameURL = runtimeRoot.appendingPathComponent("live-frame.jpg")
-        self.visionURL = runtimeRoot.appendingPathComponent("live-vision.json")
+        self.manifestURL = runtimeRoot.appendingPathComponent("live-diagnostic-frame.json")
+        self.frameDirectoryURL = runtimeRoot.appendingPathComponent("live-diagnostic-frames", isDirectory: true)
         self.thoughtsURL = runtimeRoot.appendingPathComponent("live-thoughts.jsonl")
     }
 
@@ -247,18 +261,17 @@ final class SOMADiagnosticsModel: ObservableObject {
         candidates = []
         thoughts = []
         captureLagSeconds = 0
-        frameStamp = nil
-        visionStamp = nil
+        manifestStamp = nil
         thoughtsStamp = nil
     }
 
     func refresh() {
-        let frame = stamp(of: frameURL)
-        // The runtime writes a fresh frame continuously while live. A frame
-        // file missing or untouched for ~3s means SOMA is stopped.
+        let manifest = stamp(of: manifestURL)
+        // The writer commits the manifest only after it has written both the
+        // image and the vision data for one capture.
         let live: Bool
-        if let frame {
-            live = frame.size > 0 && (Date().timeIntervalSince1970 - frame.modifiedAt) < 3.0
+        if let manifest {
+            live = manifest.size > 0 && (Date().timeIntervalSince1970 - manifest.modifiedAt) < 3.0
         } else {
             live = false
         }
@@ -268,24 +281,36 @@ final class SOMADiagnosticsModel: ObservableObject {
         }
         guard live else { return }
 
-        if frame != frameStamp {
-            frameStamp = frame
-            frameImage = NSImage(contentsOf: frameURL)
-        }
-        if let vision = stamp(of: visionURL), vision != visionStamp {
-            visionStamp = vision
-            if let data = try? Data(contentsOf: visionURL),
-               let snapshot = try? JSONDecoder().decode(VisionSnapshot.self, from: data) {
-                candidates = snapshot.candidates
-                if snapshot.capturedAtNS > 0 {
-                    let now = DispatchTime.now().uptimeNanoseconds
-                    captureLagSeconds = Double(now - snapshot.capturedAtNS) / 1_000_000_000
-                }
-            }
+        if manifest != manifestStamp {
+            manifestStamp = manifest
+            loadDiagnosticFramePair()
         }
         if let thought = stamp(of: thoughtsURL), thought != thoughtsStamp {
             thoughtsStamp = thought
             thoughts = loadThoughts()
+        }
+    }
+
+    private func loadDiagnosticFramePair() {
+        guard let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(LiveDiagnosticsFrameManifest.self, from: data),
+              manifest.containsOnlyFilenames,
+              manifest.filenamesMatchGeneration else {
+            return
+        }
+        let frameURL = frameDirectoryURL.appendingPathComponent(manifest.frameFilename)
+        let visionURL = frameDirectoryURL.appendingPathComponent(manifest.visionFilename)
+        guard let image = NSImage(contentsOf: frameURL),
+              let snapshotData = try? Data(contentsOf: visionURL),
+              let snapshot = try? JSONDecoder().decode(VisionSnapshot.self, from: snapshotData),
+              snapshot.capturedAtNS == manifest.capturedAtNS else {
+            return
+        }
+        frameImage = image
+        candidates = snapshot.candidates
+        if manifest.capturedAtNS > 0 {
+            let now = DispatchTime.now().uptimeNanoseconds
+            captureLagSeconds = Double(now - manifest.capturedAtNS) / 1_000_000_000
         }
     }
 
@@ -337,6 +362,7 @@ final class SOMADiagnosticsModel: ObservableObject {
 struct SOMADiagnosticsView: View {
     @ObservedObject var model: SOMADiagnosticsModel
     @State private var didInitialScroll = false
+    @State private var didCopyThoughtLog = false
 
     private static let aspect: CGFloat = 16.0 / 9.0
 
@@ -358,11 +384,16 @@ struct SOMADiagnosticsView: View {
                 Text("Cognitive stream · latest \(model.thoughts.count) events")
                     .font(.subheadline)
                 Spacer()
-                if model.isLive && model.captureLagSeconds > 0 {
-                    Text(String(format: "Frame lag %.1fs", model.captureLagSeconds))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Button {
+                    copyDisplayedThoughtLog()
+                } label: {
+                    Image(systemName: didCopyThoughtLog ? "checkmark" : "doc.on.doc")
+                        .imageScale(.medium)
                 }
+                .buttonStyle(.plain)
+                .help("Copy displayed log")
+                .accessibilityLabel("Copy displayed log")
+                .disabled(model.thoughts.isEmpty)
             }
             .padding(.horizontal)
 
@@ -371,6 +402,9 @@ struct SOMADiagnosticsView: View {
         .frame(width: 760, height: 640)
         .onAppear { model.start() }
         .onDisappear { model.stop() }
+        .onChange(of: model.thoughts.last?.id) { _ in
+            didCopyThoughtLog = false
+        }
     }
 
     private var cameraView: some View {
@@ -428,6 +462,17 @@ struct SOMADiagnosticsView: View {
                             .foregroundStyle(.white.opacity(0.7))
                     }
                 }
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if model.isLive && model.captureLagSeconds > 0 {
+                Text(String(format: "Frame lag %.1fs", model.captureLagSeconds))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.9))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.black.opacity(0.55), in: Capsule())
+                    .padding(8)
             }
         }
     }
@@ -499,6 +544,15 @@ struct SOMADiagnosticsView: View {
                 }
             }
         }
+    }
+
+    private func copyDisplayedThoughtLog() {
+        let text = model.displayedThoughtLog
+        guard !text.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        didCopyThoughtLog = true
     }
 
     private func color(for state: String) -> Color {

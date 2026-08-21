@@ -49,12 +49,11 @@ if [[ -f "$soma_env_file" ]]; then
 fi
 soma_l1_aux_python=${SOMA_L05_VLM_PYTHON:-"$HOME/Library/Application Support/SOMA/venvs/l05/bin/python"}
 soma_l1_aux_model=${SOMA_L05_VLM_MODEL:-"$HOME/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit"}
-soma_video_id=${SOMA_VIDEO_ID:-}
-soma_audio_id=${SOMA_AUDIO_ID:-}
-if [[ -z "$soma_video_id" || -z "$soma_audio_id" ]]; then
-  print -u2 -r -- 'SOMA_VIDEO_ID and SOMA_AUDIO_ID must be set in ~/Library/Application Support/SOMA/.env. Run soma-probe --list-formats first.'
-  exit 64
-fi
+# The Control Center owns the layer configuration file and intentionally does
+# not persist hardware identifiers.  `auto` selects the connected OBSBOT by
+# name in the runtime; explicit IDs remain an override for multi-camera setups.
+soma_video_id=${SOMA_VIDEO_ID:-auto}
+soma_audio_id=${SOMA_AUDIO_ID:-auto}
 
 # Install the SwiftPM product into one real app bundle so camera, microphone,
 # and speech-recognition TCC grants share a stable signed identity.
@@ -91,15 +90,27 @@ if [[ "${SOMA_ENABLE_L2_LIVE_VOICE:-1}" == "1" ]]; then
   soma_live_voice_args=(--l2-live-voice)
 fi
 
+soma_panorama_args=()
+# The OBSBOT UVC stream has shown unbounded IOSurface allocation under
+# continuous panorama sampling. Keep the autonomous runtime stable by default;
+# enable this experimental path only for an explicitly supervised sweep.
+if [[ "${SOMA_ENABLE_PANORAMA:-0}" == "1" ]]; then
+  soma_panorama_args=(
+    --panorama-output "$soma_runtime_root/panorama/panorama-latest.jpg"
+    --panorama-place-memory "$soma_runtime_root/panorama/place-memory.json"
+  )
+fi
+
 soma_motion_args=()
-if [[ "${SOMA_ENABLE_MOTION:-0}" == "1" ]]; then
-  soma_external_calibration=${SOMA_EXTERNAL_GIMBAL_CALIBRATION:-}
-  if [[ -z "$soma_external_calibration" || ! -f "$soma_external_calibration" ]]; then
-    print -u2 -r -- 'SOMA_ENABLE_MOTION=1 requires SOMA_EXTERNAL_GIMBAL_CALIBRATION to name an existing calibration file.'
+if [[ "${SOMA_ENABLE_MOTION:-1}" == "1" ]]; then
+  soma_external_calibration=${SOMA_EXTERNAL_GIMBAL_CALIBRATION:-"$soma_root/artifacts/subconscious/p7-reactive-robust-r8-calibration-20260814.json"}
+  if [[ ! -f "$soma_external_calibration" ]]; then
+    print -u2 -r -- 'SOMA external-gimbal calibration is unavailable.'
     exit 64
   fi
   soma_motion_args=(
     --allow-embodiment-motor-control
+    --embodiment-shadow-socket "$soma_runtime_root/ipc/embodiment-shadow.sock"
     --embodiment-view-directory "$soma_runtime_root/views"
     --allow-camera-motion
     --native-gimbal-helper "$soma_root/.build/soma-live/native/soma-native-track"
@@ -126,8 +137,6 @@ exec "$soma_binary" \
   "${soma_l05_vlm_args[@]}" \
   "${soma_geometry_args[@]}" \
   "${soma_live_voice_args[@]}" \
-  --embodiment-shadow-socket "$soma_runtime_root/ipc/embodiment-shadow.sock" \
-  --panorama-output "$soma_runtime_root/panorama/panorama-latest.jpg" \
-  --panorama-place-memory "$soma_runtime_root/panorama/place-memory.json" \
+  "${soma_panorama_args[@]}" \
   --soma-settings "$HOME/Library/Application Support/SOMA/settings.json" \
   "${soma_motion_args[@]}"

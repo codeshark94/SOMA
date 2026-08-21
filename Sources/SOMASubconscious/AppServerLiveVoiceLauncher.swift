@@ -14,6 +14,7 @@ enum AppServerLiveVoiceEvent: Sendable {
     case visualContextRejected(reason: String)
     case embodimentMCPReady
     case embodimentMCPUnavailable(reason: String)
+    case embodimentMCPCall(tool: String, status: String, error: String?)
     case inputAccepted(characters: Int)
     case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
     case preparingResponse
@@ -30,6 +31,9 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let characters: Int?
     let role: String?
     let text: String?
+    let tool: String?
+    let status: String?
+    let error: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -38,6 +42,9 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case characters
         case role
         case text
+        case tool
+        case status
+        case error
     }
 }
 
@@ -53,6 +60,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let projectDirectory: String
     private let voice: SOMARealtimeVoice
     private let currentCameraImageDataURI: (@Sendable () -> String?)?
+    private let cameraContextAutoInjection: Bool
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
     var onInject: (@Sendable (String, String, String) -> Void)?
     private var gate = LiveVoiceLaunchGate()
@@ -85,6 +93,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             ?? FileManager.default.currentDirectoryPath
         self.voice = voice
         self.currentCameraImageDataURI = currentCameraImageDataURI
+        cameraContextAutoInjection = somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: true)
         self.onEvent = onEvent
     }
 
@@ -104,10 +113,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             launch(
                 authorization: String(authorization.prefix(64)),
                 initialContext: context.map(Self.contextText) ?? "",
+                sessionCapability: context?.sessionCapability,
                 preferredLanguageTag: context?.preferredLanguageTag,
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningText: nil,
-                proactiveOpeningTrigger: nil,
                 personEntityID: personEntityID,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
@@ -137,10 +146,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             launch(
                 authorization: "l1_social_opening",
                 initialContext: String([base, directive].filter { !$0.isEmpty }.joined(separator: "\n\n").prefix(24_000)),
+                sessionCapability: context?.sessionCapability,
                 preferredLanguageTag: context?.preferredLanguageTag,
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningText: String(exactOpening.prefix(1_024)),
-                proactiveOpeningTrigger: "Controller event, not user speech: deliver the exact L1-authored opening in the startup developer context now, then listen.",
                 personEntityID: personEntityID,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
@@ -228,7 +237,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         } else {
             preRoll.append(chunk)
             preRollDurationNS &+= durationNS
-            while preRollDurationNS > 1_000_000_000, preRoll.count > 1 {
+            // Idle capture keeps only a short volatile lookback. Once a live
+            // session is launching, retain the entire initiating utterance
+            // through the App Server/WebRTC startup interval so the person
+            // never has to repeat themselves while waiting for SOMA to wake.
+            let retentionNS: UInt64 = gate.phase == .starting
+                ? 8_000_000_000
+                : 1_000_000_000
+            while preRollDurationNS > retentionNS, preRoll.count > 1 {
                 preRollDurationNS -= preRoll.removeFirst().durationNS
             }
         }
@@ -271,10 +287,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private func launch(
         authorization: String,
         initialContext: String,
+        sessionCapability: String?,
         preferredLanguageTag: String?,
         languageStartInstruction: String?,
         proactiveOpeningText: String?,
-        proactiveOpeningTrigger: String?,
         personEntityID: UUID?,
         interactionAuthority: SOMAInteractionAuthority?,
         at monotonicNS: UInt64
@@ -344,11 +360,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         guard send([
             "type": "start",
             "initialContext": String(initialContext.prefix(24_000)),
+            "sessionCapability": sessionCapability ?? "",
             "preferredLanguageTag": preferredLanguageTag ?? "",
             "languageStartInstruction": languageStartInstruction ?? "",
             "proactiveOpeningText": proactiveOpeningText ?? "",
-            "proactiveOpeningTrigger": proactiveOpeningTrigger ?? "",
             "interactionAuthority": interactionAuthority?.rawValue ?? "",
+            "cameraContextAutoInjected": cameraContextAutoInjection,
             "codexSandbox": somaEnvString("SOMA_L2_CODEX_SANDBOX", default: "danger-full-access"),
             "codexAdminOnly": somaEnvBool("SOMA_L2_CODEX_ADMIN_ONLY", default: false),
         ], reportFailure: false) else {
@@ -380,6 +397,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 activeThreadID = event.threadID
                 gate.observeActive()
                 armInactivityTimeout(at: DispatchTime.now().uptimeNanoseconds)
+                // Establish visual context before replaying the initiating
+                // utterance, so the first L2 turn sees the same live scene
+                // from which it may choose a semantic motor action.
+                enqueueCurrentCameraImageIfEnabled(force: true)
                 let buffered = preRoll
                 preRoll.removeAll(keepingCapacity: true)
                 preRollDurationNS = 0
@@ -392,7 +413,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         "role": pendingContext.role,
                     ])
                 }
-                enqueueCurrentCameraImageIfEnabled(force: true)
                 onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
             case "audio_input_progress":
                 guard !inputTransportReported else { continue }
@@ -418,6 +438,15 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.embodimentMCPReady)
             case "embodiment_mcp_unavailable":
                 onEvent(.embodimentMCPUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
+            case "embodiment_mcp_call":
+                let tool = String((event.tool ?? "unknown").prefix(96))
+                let status = String((event.status ?? "unknown").prefix(48))
+                let error = event.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+                onEvent(.embodimentMCPCall(
+                    tool: tool,
+                    status: status,
+                    error: error?.isEmpty == false ? String(error!.prefix(192)) : nil
+                ))
             case "input_transcript_ready":
                 recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.inputAccepted(characters: max(0, event.characters ?? 0)))
@@ -538,11 +567,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ])
     }
 
-    /// Camera frames are pulled on demand by L2 via the capture_view MCP tool
-    /// by default, so the injected image is never mistaken for the user's turn.
-    /// Set SOMA_L2_AUTO_INJECT_CAMERA=1 to restore per-turn auto-injection.
+    /// A current camera frame is transient context for each user turn. The
+    /// explicit environment override exists for supervised privacy testing.
     private func enqueueCurrentCameraImageIfEnabled(force: Bool) {
-        guard somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: false) else { return }
+        guard cameraContextAutoInjection else { return }
         enqueueCurrentCameraImage(force: force)
     }
 
@@ -550,7 +578,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     /// artifact or person-memory record. The relay already bounds the JPEG
     /// cadence; this guard prevents an audio transport retry from duplicating
     /// the same visual item in one instant.
-    private func enqueueCurrentCameraImage(force: Bool) {        guard active,
+    private func enqueueCurrentCameraImage(force: Bool) {
+        guard active,
               let currentCameraImageDataURI,
               let dataURI = currentCameraImageDataURI(),
               dataURI.utf8.count <= 4 * 1_048_576 else { return }
@@ -624,7 +653,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         if context.personContextAvailable, let value = context.personEntityID {
             lines.append("person_context_reference: \(value.uuidString.lowercased())")
         }
-        if let value = context.sessionCapability { lines.append("soma_session_token: \(value)") }
         if let value = context.interactionAuthority { lines.append("interaction_authority: \(value.rawValue)") }
         if let value = context.personMemoryMission {
             lines.append("person_memory_mission_required: \(value.missingRequiredKeys.joined(separator: ","))")
@@ -667,7 +695,7 @@ func testAppServerLiveVoiceLauncher() -> String {
             semaphore.signal()
         case .launchRequested, .inputTransportStarted, .outputPlaybackReady, .proactiveOpeningTriggered, .hearingUser,
              .contextAppended, .contextRejected, .visualContextAttached, .visualContextRejected,
-             .embodimentMCPReady, .embodimentMCPUnavailable, .inputAccepted,
+             .embodimentMCPReady, .embodimentMCPUnavailable, .embodimentMCPCall, .inputAccepted,
              .transcriptFinalized, .preparingResponse, .responding, .responseCompleted, .ended:
             break
         }

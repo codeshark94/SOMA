@@ -10,8 +10,8 @@ private final class LiveDiagnosticsRetainedBuffer: @unchecked Sendable {
 
 /// Writes a compact, live-updating diagnostic bundle that the menu-bar
 /// Diagnostic panel reads in real time:
-///   live-frame.jpg        current downscaled camera frame
-///   live-vision.json      latest scene candidates (boxes / labels / confidence)
+///   live-diagnostic-frame.json       manifest for one image/detection pair
+///   live-diagnostic-frames/          immutable image/detection pairs
 ///   live-thoughts.jsonl   recent L1 situation events (ring buffer)
 /// Writing is active only while the menu bar keeps a `live-diagnostics.enabled`
 /// flag file present, so idle runtime costs nothing.
@@ -48,9 +48,17 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     /// same frame; this carries the resolved display semantics until one
     /// representative box is selected.
     private struct DisplayCandidate: Sendable {
-        let candidate: SceneCandidate
+        let observation: VisualObservation
+        let faceVerified: Bool
         let label: String
         let identity: String?
+    }
+
+    private struct PendingFrame: @unchecked Sendable {
+        let buffer: LiveDiagnosticsRetainedBuffer
+        let candidates: [VisualObservation]
+        let captureNS: UInt64
+        let identity: IdentityInfo?
     }
 
     struct Thought: Encodable, Sendable {
@@ -59,10 +67,9 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         let message: String
     }
 
-    private let rootURL: URL
     private let flagURL: URL
-    private let frameURL: URL
-    private let visionURL: URL
+    private let manifestURL: URL
+    private let frameDirectoryURL: URL
     private let thoughtsURL: URL
 
     private let lock = NSLock()
@@ -70,15 +77,13 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     private let imageContext = CIContext(options: [.cacheIntermediates: false])
     private let frameIntervalNS: UInt64 = 100_000_000
     private let maxFrameDimension = 640.0
+    private let retainedDiagnosticFramePairs = 10
     private let maxThoughts = 400
     private let encoder = JSONEncoder()
 
     private var nextFrameNS: UInt64 = 0
-    private var nextSnapshotNS: UInt64 = 0
-    private var pendingFrame: LiveDiagnosticsRetainedBuffer?
+    private var pendingFrame: PendingFrame?
     private var encoding = false
-    private var latestCandidates: [Candidate] = []
-    private var latestCaptureNS: UInt64 = 0
     private var latestIdentity: IdentityInfo?
     private var thoughts: [Thought] = []
     /// Set whenever the ring buffer gains events that have not been written to
@@ -88,10 +93,9 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     private var thoughtsDirty = false
 
     init(rootURL: URL) {
-        self.rootURL = rootURL
         self.flagURL = rootURL.appendingPathComponent("live-diagnostics.enabled")
-        self.frameURL = rootURL.appendingPathComponent("live-frame.jpg")
-        self.visionURL = rootURL.appendingPathComponent("live-vision.json")
+        self.manifestURL = rootURL.appendingPathComponent("live-diagnostic-frame.json")
+        self.frameDirectoryURL = rootURL.appendingPathComponent("live-diagnostic-frames", isDirectory: true)
         self.thoughtsURL = rootURL.appendingPathComponent("live-thoughts.jsonl")
     }
 
@@ -100,74 +104,32 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         FileManager.default.fileExists(atPath: flagURL.path)
     }
 
-    func recordCameraFrame(_ pixelBuffer: CVPixelBuffer, at captureNS: UInt64) {
+    /// Publishes detections with the exact camera buffer that produced them.
+    /// The panel never combines a newer preview image with an older inference.
+    func recordVisionFrame(
+        _ pixelBuffer: CVPixelBuffer,
+        candidates: [VisualObservation],
+        at captureNS: UInt64
+    ) {
         guard isActive else { return }
         lock.lock()
+        let identity = latestIdentity
         guard captureNS >= nextFrameNS else {
             lock.unlock()
             return
         }
         nextFrameNS = captureNS &+ frameIntervalNS
-        pendingFrame = LiveDiagnosticsRetainedBuffer(pixelBuffer)
+        pendingFrame = PendingFrame(
+            buffer: LiveDiagnosticsRetainedBuffer(pixelBuffer),
+            candidates: candidates,
+            captureNS: captureNS,
+            identity: identity
+        )
         let shouldStart = !encoding
         if shouldStart { encoding = true }
         lock.unlock()
         if shouldStart {
             queue.async { [weak self] in self?.drainFrames() }
-        }
-    }
-
-    func recordSceneCandidates(_ candidates: [SceneCandidate], at captureNS: UInt64) {
-        guard isActive else { return }
-        // SceneField intentionally retains old tracks for spatial memory and
-        // re-acquisition. The panel is a view of this camera frame, so drawing
-        // retained tracks here made a box lag behind the image after a turn.
-        // Only a current observation may produce a panel box.
-        let present = candidates
-            .filter {
-                $0.observedThisFrame
-                    && ($0.observation.kind != .unknown || $0.observation.label != nil)
-            }
-        lock.lock()
-        let identity = latestIdentity
-        let display = present.map { candidate -> DisplayCandidate in
-            let rect = candidate.observation.rect
-            let identityLabel = matchedIdentityLabel(
-                for: rect,
-                identity: identity,
-                at: captureNS
-            )
-            let baseLabel = candidate.observation.label ?? candidate.observation.kind.rawValue
-            // A body box enclosing an identified face is still the same human.
-            let label = (identityLabel != nil && baseLabel != "face") ? "person" : baseLabel
-            return DisplayCandidate(candidate: candidate, label: label, identity: identityLabel)
-        }
-        let current = display
-            .sorted(by: Self.preferredDisplayOrder)
-            .reduce(into: [DisplayCandidate]()) { accepted, candidate in
-                guard !accepted.contains(where: { Self.representsSameEntity($0, candidate) }) else {
-                    return
-                }
-                accepted.append(candidate)
-            }
-        latestCandidates = current.map { display in
-            let candidate = display.candidate
-            let rect = candidate.observation.rect
-            return Candidate(
-                label: display.label,
-                confidence: candidate.observation.confidence,
-                rect: Rect(x: rect.x, y: rect.y, width: rect.width, height: rect.height),
-                faceVerified: candidate.faceVerificationEligible,
-                identity: display.identity
-            )
-        }
-        latestCaptureNS = captureNS
-        let shouldWrite = captureNS >= nextSnapshotNS
-        if shouldWrite { nextSnapshotNS = captureNS &+ frameIntervalNS }
-        let snapshotData = shouldWrite ? try? encoder.encode(VisionSnapshot(capturedAtNS: latestCaptureNS, candidates: latestCandidates)) : nil
-        lock.unlock()
-        if let snapshotData {
-            try? snapshotData.write(to: visionURL, options: .atomic)
         }
     }
 
@@ -226,13 +188,13 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         let lhsRank = displayRank(lhs)
         let rhsRank = displayRank(rhs)
         if lhsRank != rhsRank { return lhsRank > rhsRank }
-        return lhs.candidate.observation.confidence > rhs.candidate.observation.confidence
+        return lhs.observation.confidence > rhs.observation.confidence
     }
 
     private static func displayRank(_ candidate: DisplayCandidate) -> Int {
-        if candidate.candidate.faceVerificationEligible { return 4 }
+        if candidate.faceVerified { return 4 }
         if candidate.label == "face" { return 3 }
-        if candidate.candidate.observation.kind == .human { return 2 }
+        if candidate.observation.kind == .human { return 2 }
         return 1
     }
 
@@ -242,8 +204,8 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
            lhsIdentity == rhsIdentity {
             return true
         }
-        let lhsObservation = lhs.candidate.observation
-        let rhsObservation = rhs.candidate.observation
+        let lhsObservation = lhs.observation
+        let rhsObservation = rhs.observation
         let bothHuman = lhsObservation.kind == .human && rhsObservation.kind == .human
         if bothHuman,
            (lhs.label == "face" || rhs.label == "face"),
@@ -300,7 +262,7 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         }
     }
 
-    private func takePendingFrame() -> LiveDiagnosticsRetainedBuffer? {
+    private func takePendingFrame() -> PendingFrame? {
         lock.lock()
         defer { lock.unlock() }
         guard let frame = pendingFrame else {
@@ -311,8 +273,8 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         return frame
     }
 
-    private func encodeFrame(_ buffer: LiveDiagnosticsRetainedBuffer) {
-        let source = CIImage(cvPixelBuffer: buffer.value)
+    private func encodeFrame(_ frame: PendingFrame) {
+        let source = CIImage(cvPixelBuffer: frame.buffer.value)
         let extent = source.extent
         guard extent.width > 0, extent.height > 0,
               let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
@@ -329,8 +291,39 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         ) else {
             return
         }
-        try? jpeg.write(to: frameURL, options: Data.WritingOptions.atomic)
-        writeVisionSnapshot()
+        let snapshot = visionSnapshot(
+            from: frame.candidates,
+            identity: frame.identity,
+            captureNS: frame.captureNS
+        )
+        guard let snapshotData = try? encoder.encode(snapshot) else { return }
+        let generation = frame.captureNS
+        let frameFilename = "frame-\(generation).jpg"
+        let visionFilename = "vision-\(generation).json"
+        let manifest = LiveDiagnosticsFrameManifest(
+            generation: generation,
+            capturedAtNS: frame.captureNS,
+            frameFilename: frameFilename,
+            visionFilename: visionFilename
+        )
+        guard let manifestData = try? encoder.encode(manifest) else { return }
+        try? FileManager.default.createDirectory(
+            at: frameDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        let frameURL = frameDirectoryURL.appendingPathComponent(frameFilename)
+        let visionURL = frameDirectoryURL.appendingPathComponent(visionFilename)
+        do {
+            try jpeg.write(to: frameURL, options: .atomic)
+            try snapshotData.write(to: visionURL, options: .atomic)
+            // The manifest is committed last. Its referenced files are already
+            // complete, so the panel can atomically swap one matching pair.
+            try manifestData.write(to: manifestURL, options: .atomic)
+        } catch {
+            return
+        }
+        pruneDiagnosticFrames()
+        flushThoughtsIfNeeded()
     }
 
     // MARK: - JSON snapshots
@@ -340,10 +333,8 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         try? lines.joined(separator: "\n").write(to: thoughtsURL, atomically: true, encoding: .utf8)
     }
 
-    func writeVisionSnapshot() {
+    private func flushThoughtsIfNeeded() {
         lock.lock()
-        let snapshot = VisionSnapshot(capturedAtNS: latestCaptureNS, candidates: latestCandidates)
-        let data = try? encoder.encode(snapshot)
         let dirtyThoughts: [String]?
         if thoughtsDirty {
             dirtyThoughts = thoughts.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
@@ -352,11 +343,83 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
             dirtyThoughts = nil
         }
         lock.unlock()
-        guard let data else { return }
-        try? data.write(to: visionURL, options: .atomic)
-        // Runs on the same serial queue as writeThoughts, so ordering is safe.
         if let dirtyThoughts {
             writeThoughts(dirtyThoughts)
         }
+    }
+
+    private func visionSnapshot(
+        from candidates: [VisualObservation],
+        identity: IdentityInfo?,
+        captureNS: UInt64
+    ) -> VisionSnapshot {
+        // These are raw observations produced from this exact buffer. L0's
+        // SceneField may merge delayed results or smooth geometry for control,
+        // neither of which belongs on a pixel-accurate diagnostic overlay.
+        let present = candidates.filter {
+            $0.kind != .unknown || $0.label != nil
+        }
+        let display = present.map { candidate -> DisplayCandidate in
+            let rect = candidate.rect
+            let identityLabel = matchedIdentityLabel(
+                for: rect,
+                identity: identity,
+                at: captureNS
+            )
+            let baseLabel = candidate.label ?? candidate.kind.rawValue
+            let label = (identityLabel != nil && baseLabel != "face") ? "person" : baseLabel
+            return DisplayCandidate(
+                observation: candidate,
+                faceVerified: candidate.isFaceVerified,
+                label: label,
+                identity: identityLabel
+            )
+        }
+        let current = display
+            .sorted(by: Self.preferredDisplayOrder)
+            .reduce(into: [DisplayCandidate]()) { accepted, candidate in
+                guard !accepted.contains(where: { Self.representsSameEntity($0, candidate) }) else {
+                    return
+                }
+                accepted.append(candidate)
+            }
+        let panelCandidates = current.map { display in
+            let candidate = display.observation
+            let rect = candidate.rect
+            return Candidate(
+                label: display.label,
+                confidence: candidate.confidence,
+                rect: Rect(x: rect.x, y: rect.y, width: rect.width, height: rect.height),
+                faceVerified: display.faceVerified,
+                identity: display.identity
+            )
+        }
+        return VisionSnapshot(capturedAtNS: captureNS, candidates: panelCandidates)
+    }
+
+    private func pruneDiagnosticFrames() {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: frameDirectoryURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        let pairs = Dictionary(grouping: entries, by: Self.diagnosticGeneration)
+        let generations = pairs.keys.compactMap { $0 }.sorted(by: >)
+        for generation in generations.dropFirst(retainedDiagnosticFramePairs) {
+            for url in pairs[generation] ?? [] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    private static func diagnosticGeneration(for url: URL) -> UInt64? {
+        let filename = url.lastPathComponent
+        let prefixes = ["frame-", "vision-"]
+        guard let prefix = prefixes.first(where: { filename.hasPrefix($0) }) else { return nil }
+        let suffix = filename.dropFirst(prefix.count)
+        guard let numeric = suffix.split(separator: ".", maxSplits: 1).first else { return nil }
+        return UInt64(numeric)
     }
 }

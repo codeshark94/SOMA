@@ -32,8 +32,10 @@ let package = Package(
             linkerSettings: [
                 .unsafeFlags(["-L", "/opt/homebrew/opt/opencv/lib"]),
                 .linkedLibrary("opencv_core"),
+                .linkedLibrary("opencv_features"),
+                .linkedLibrary("opencv_imgcodecs"),
                 .linkedLibrary("opencv_imgproc"),
-                .linkedLibrary("opencv_stitching"),
+                .linkedLibrary("opencv_video"),
             ]
         ),
         .executableTarget(name: "SOMAProbe"),

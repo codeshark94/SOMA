@@ -778,7 +778,7 @@ private struct SOMASettingsView: View {
                 HStack {
                     Text("Reasoning cadence")
                     Spacer()
-                    Stepper("Every \(Int(model.envSettings.l1IdleCadenceSeconds)) s", value: l1IdleCadenceBinding, in: 30...600, step: 15)
+                    Stepper("Every \(Int(model.envSettings.l1ReasoningCadenceSeconds)) s", value: l1ReasoningCadenceBinding, in: 30...600, step: 15)
                 }
                 Text("L1 reasons on a single unified cadence; local vision wakes provide the responsive, event-driven path.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -1048,10 +1048,10 @@ private struct SOMASettingsView: View {
         )
     }
 
-    private var l1IdleCadenceBinding: Binding<Double> {
+    private var l1ReasoningCadenceBinding: Binding<Double> {
         Binding(
-            get: { model.envSettings.l1IdleCadenceSeconds },
-            set: { model.envSettings.l1IdleCadenceSeconds = max(30, $0) }
+            get: { model.envSettings.l1ReasoningCadenceSeconds },
+            set: { model.envSettings.l1ReasoningCadenceSeconds = min(max(30, $0), 600) }
         )
     }
 

@@ -22,6 +22,11 @@ soma_launch_agents="$HOME/Library/LaunchAgents"
 soma_menu_bar_plist="$soma_launch_agents/com.soma.menu-bar.plist"
 soma_reactive_plist="$soma_launch_agents/com.soma.reactive-l0.plist"
 
+# Installation is a deployment boundary: rebuild the shared staging directory
+# before copying so an earlier local artifact cannot silently replace newer
+# source changes in the signed app.
+/usr/bin/env swift build --package-path "$soma_root" --scratch-path "$soma_root/.build/soma-live"
+
 if [[ ! -x "$soma_source_binary" ]]; then
   print -u2 "missing SOMA source binary: $soma_source_binary"
   exit 2
@@ -69,7 +74,25 @@ chmod 755 "$soma_menu_bar"
 chmod 755 "$soma_embodiment"
 
 if ! /usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -Fq "$soma_codesign_identity"; then
-  soma_codesign_identity='-'
+  # A local persistent certificate can be usable by codesign while omitted by
+  # `find-identity` because it is not anchored in Apple's trust hierarchy.
+  # Probe the matching certificate fingerprints instead of silently changing
+  # every installed build to an ad-hoc identity.
+  soma_codesign_label="$soma_codesign_identity"
+  soma_codesign_identity=''
+  while IFS= read -r soma_candidate_identity; do
+    [[ -n "$soma_candidate_identity" ]] || continue
+    if /usr/bin/codesign --dryrun --force --sign "$soma_candidate_identity" \
+      --timestamp=none "$soma_source_binary" >/dev/null 2>&1; then
+      soma_codesign_identity="$soma_candidate_identity"
+      break
+    fi
+  done < <(
+    /usr/bin/security find-certificate -a -c "$soma_codesign_label" -Z \
+      "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null \
+      | /usr/bin/awk '/SHA-1 hash:/ { print $3 }'
+  )
+  [[ -n "$soma_codesign_identity" ]] || soma_codesign_identity='-'
 fi
 /usr/bin/codesign --force --deep --sign "$soma_codesign_identity" \
   --identifier com.soma.subconscious --timestamp=none "$soma_app_root"
