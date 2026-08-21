@@ -53,6 +53,43 @@ struct OllamaGenerateResponse: Decodable {
     }
 }
 
+/// Cloud-backed models may wrap an otherwise valid JSON object in a Markdown
+/// fence despite a JSON-format request. Normalize that transport decoration
+/// before decoding, without attempting to repair malformed model output.
+func decodeOllamaJSONObject<Payload: Decodable>(
+    _ type: Payload.Type,
+    from content: String
+) -> Payload? {
+    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+    let unfenced: String
+    if trimmed.hasPrefix("```") {
+        var lines = trimmed.split(separator: "\n", omittingEmptySubsequences: false)
+        lines.removeFirst()
+        if let last = lines.last,
+           last.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("```") {
+            lines.removeLast()
+        }
+        unfenced = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    } else {
+        unfenced = trimmed
+    }
+    let candidates = [unfenced, trimmed].compactMap { candidate -> String? in
+        guard let first = candidate.firstIndex(of: "{"),
+              let last = candidate.lastIndex(of: "}"),
+              first <= last else {
+            return nil
+        }
+        return String(candidate[first...last])
+    }
+    for candidate in candidates {
+        if let data = candidate.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(Payload.self, from: data) {
+            return decoded
+        }
+    }
+    return nil
+}
+
 /// A tool definition passed to Ollama's /api/chat tool-calling.
 struct OllamaToolDefinition: Encodable {
     let type: String = "function"
@@ -241,8 +278,37 @@ public struct PersistedInformationNeed: Codable, Equatable, Sendable {
     }
 }
 final class L1MemoryContextProvider: @unchecked Sendable {
+    private static let obsoletePlaceAffiliationQuestion =
+        "Understand this person's relationship to the current place and its recurring objects before treating place observations as personal context."
+    private static let conversationFactKeys: Set<String> = [
+        "interests",
+        "work_context",
+        "ongoing_project",
+        "personal_context",
+    ]
+
+    private struct ConversationMemoryConsolidation: Decodable {
+        enum Kind: String, Decodable {
+            case personFact = "person_fact"
+            case task
+            case openQuestion = "open_question"
+        }
+
+        struct Memory: Decodable {
+            let kind: Kind
+            let key: String?
+            let summary: String
+            let confidence: Double?
+        }
+
+        let narrative: String
+        let salience: Double?
+        let memories: [Memory]?
+    }
+
     private struct ActiveConversation {
         let archiver: ConversationTranscriptArchiver
+        let turnWriteBarrier: ConversationTurnWriteBarrier
         let startedAt: Date
         let personEntityID: UUID?
         var socialEpisode: L1ConversationContactEpisode
@@ -316,10 +382,20 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             if createPseudonymousEntity {
                 try await ensurePseudonymousEntity(entityID, in: store, at: now)
             }
-            let records = try await store.query(
+            var records = try await store.query(
                 .init(relatedTo: [entityID], limit: 96),
                 at: now
             )
+            if await retireObsoletePlaceAffiliationNeeds(
+                in: records,
+                for: entityID,
+                at: now
+            ) > 0 {
+                records = try await store.query(
+                    .init(relatedTo: [entityID], limit: 96),
+                    at: now
+                )
+            }
             let allowed = records.filter {
                 $0.disclosure == .remoteSummaryAllowed
                     && $0.sensitivity != .biometric
@@ -429,26 +505,6 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     expectedInformationGain: 0.64
                 ))
             }
-            if let placeAffiliation,
-               placeAffiliation.affiliationUnresolved {
-                let currentPlace = await refreshedPlaceAffiliation(placeAffiliation, at: now)
-                if currentPlace.affiliationUnresolved {
-                    let goal = "Understand this person's relationship to the current place and its recurring objects before treating place observations as personal context."
-                    let expectedInformationGain = currentPlace.unassignedObservationCount > 0 ? 0.82 : 0.58
-                    let motiveID = await ensureInformationNeed(
-                        question: goal,
-                        targetEntityID: entityID,
-                        expectedInformationGain: expectedInformationGain,
-                        sourceID: "l1_place_affiliation"
-                    )
-                    needs.append(L1InformationNeed(
-                        motiveID: motiveID ?? UUID(),
-                        source: .placeAffiliation,
-                        informationGoal: goal,
-                        expectedInformationGain: expectedInformationGain
-                    ))
-                }
-            }
             // Human conversation has balance: do not barrage the person with
             // every open question at once. Surface only the highest-value needs,
             // capped, so the robot gently pursues one or two things rather than
@@ -495,6 +551,31 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 recalledEpisodes: []
             )
         }
+    }
+
+    private func retireObsoletePlaceAffiliationNeeds(
+        in records: [CognitiveMemoryRecord],
+        for entityID: UUID,
+        at date: Date
+    ) async -> Int {
+        let obsoleteIDs = records.compactMap { record -> UUID? in
+            guard case let .openQuestion(question) = record.payload,
+                  question.targetEntityID == entityID,
+                  question.status == .open,
+                  question.question == Self.obsoletePlaceAffiliationQuestion,
+                  record.provenance.contains(where: { $0.sourceID == "l1_place_affiliation" }) else {
+                return nil
+            }
+            return record.id
+        }
+        var retired = 0
+        for motiveID in obsoleteIDs where await resolveInformationNeed(motiveID: motiveID, at: date) {
+            retired += 1
+        }
+        if retired > 0 {
+            onHealth("place_affiliation_need_retired", "count=\(retired)")
+        }
+        return retired
     }
 
     /// Semantically recalls the most relevant past episodes by embedding the
@@ -628,14 +709,13 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
-    /// Records a durable narrative episode for a finished conversation. Gathers
-    /// the finalized turns, asks L1 to produce a short "what happened" summary
-    /// plus a salience score, and stores it as an `EpisodeMemory` so later
-    /// semantic recall can reference shared history.
+    /// Records a durable narrative episode only after every finalized turn is
+    /// available. The same consolidation pass extracts explicit durable facts,
+    /// tasks, and genuine open questions from the conversation.
     @discardableResult
     func recordEpisode(
         personEntityID: UUID,
-        interactionID: UUID,
+        archiver: ConversationTranscriptArchiver,
         startedAt: Date,
         endedAt: Date,
         reason: String,
@@ -643,10 +723,11 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     ) async -> Bool {
         guard let store else { return false }
         do {
-            let turns = try await store.query(
-                .init(kinds: [.conversationTurn], relatedTo: [interactionID], limit: 200),
-                at: date
-            )
+            let turns = try await archiver.pending(at: date)
+            guard !turns.isEmpty else {
+                onHealth("episode_consolidation_deferred", "reason=no_finalized_turns")
+                return false
+            }
             let transcript = turns
                 .sorted { lhs, rhs in
                     guard case let .conversationTurn(l) = lhs.payload,
@@ -659,18 +740,29 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     return text.isEmpty ? nil : "\(turn.role.rawValue): \(text)"
                 }
                 .joined(separator: "\n")
-            let (narrative, salience) = await summarizeEpisode(
+            guard !transcript.isEmpty else {
+                onHealth("episode_consolidation_deferred", "reason=empty_finalized_turns")
+                return false
+            }
+            guard let consolidation = await summarizeEpisode(
                 transcript: transcript,
                 reason: reason
-            )
-            let boundedNarrative = String(narrative.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1_200))
-            let summary = boundedNarrative.isEmpty
-                ? "Conversation with person \(personEntityID.uuidString.prefix(8))"
-                : boundedNarrative
-            _ = try await store.insert(
+            ) else {
+                onHealth("episode_consolidation_deferred", "reason=model_response_unavailable")
+                return false
+            }
+            let boundedNarrative = String(consolidation.narrative.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1_200))
+            guard !boundedNarrative.isEmpty else {
+                onHealth("episode_consolidation_deferred", "reason=empty_narrative")
+                return false
+            }
+            let salience = min(max(consolidation.salience ?? 0.5, 0), 1)
+            let interactionID = await archiver.interactionID
+            let threadID = await archiver.threadID
+            let episode = try await store.insert(
                 CognitiveMemoryDraft(
                     tier: .mediumTerm,
-                    summary: String(summary.prefix(320)),
+                    summary: String(boundedNarrative.prefix(320)),
                     payload: .episode(EpisodeMemory(
                         startedAt: startedAt,
                         endedAt: endedAt,
@@ -694,7 +786,32 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 ),
                 at: date
             )
-            onHealth("episode_recorded", "chars=\(boundedNarrative.count); salience=\(String(format: "%.2f", salience))")
+            let result = try await persistConversationMemories(
+                consolidation.memories ?? [],
+                personEntityID: personEntityID,
+                threadID: threadID,
+                at: date
+            )
+            let derivedIDs = [episode.id] + result.derivedMemoryIDs
+            for turn in turns {
+                _ = try await archiver.markConsolidated(
+                    recordID: turn.id,
+                    derivedMemoryIDs: derivedIDs,
+                    at: date
+                )
+            }
+            cachePersonContext(try await store.personContext(for: personEntityID, at: date))
+            let pendingNeeds = await pendingInformationNeeds(
+                for: personEntityID,
+                at: date,
+                respectCooldown: false
+            )
+            cacheInformationNeeds(pendingNeeds, for: personEntityID)
+            warmContext(for: personEntityID)
+            onHealth(
+                "conversation_memory_consolidated",
+                "turns=\(turns.count); episode_chars=\(boundedNarrative.count); facts=\(result.facts); tasks=\(result.tasks); questions=\(result.questions)"
+            )
             return true
         } catch {
             onHealth("episode_record_failed", String(error.localizedDescription.prefix(192)))
@@ -702,20 +819,102 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
-    /// Asks L1 to condense a finished conversation into a short narrative and a
-    /// salience score. Returns an empty narrative on any failure so the caller
-    /// can still record a minimal episode.
-    private func summarizeEpisode(transcript: String, reason: String) async -> (narrative: String, salience: Double) {
+    private struct PersistedConversationMemoryResult {
+        var derivedMemoryIDs: [UUID] = []
+        var facts = 0
+        var tasks = 0
+        var questions = 0
+    }
+
+    private func persistConversationMemories(
+        _ memories: [ConversationMemoryConsolidation.Memory],
+        personEntityID: UUID,
+        threadID: String,
+        at date: Date
+    ) async throws -> PersistedConversationMemoryResult {
+        guard let store else { return .init() }
+        var result = PersistedConversationMemoryResult()
+        for memory in memories.prefix(6) {
+            let summary = String(memory.summary.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1_024))
+            let confidence = min(max(memory.confidence ?? 0, 0), 1)
+            guard !summary.isEmpty, confidence >= 0.70 else { continue }
+            switch memory.kind {
+            case .personFact:
+                guard let rawKey = memory.key?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                      Self.conversationFactKeys.contains(rawKey) else {
+                    continue
+                }
+                _ = try await store.setExplicitPersonFact(
+                    personEntityID: personEntityID,
+                    key: rawKey,
+                    value: summary,
+                    sourceID: "l1_conversation_consolidation:\(threadID)",
+                    at: date
+                )
+                result.facts += 1
+            case .task:
+                let record = try await store.insert(
+                    CognitiveMemoryDraft(
+                        tier: .mediumTerm,
+                        summary: summary,
+                        payload: .task(TaskMemory(title: summary, status: .active, ownerEntityID: personEntityID)),
+                        confidence: confidence,
+                        provenance: [MemoryProvenance(
+                            source: .consolidation,
+                            sourceID: "l1_conversation_consolidation:\(threadID)",
+                            observedAt: date,
+                            evidenceIDs: ["conversation:\(threadID)"],
+                            modelID: "gemma4:31b-cloud"
+                        )],
+                        sensitivity: .personal,
+                        disclosure: .remoteSummaryAllowed,
+                        expiresAt: date.addingTimeInterval(30 * 24 * 60 * 60)
+                    ),
+                    at: date
+                )
+                result.derivedMemoryIDs.append(record.id)
+                result.tasks += 1
+            case .openQuestion:
+                if let id = await ensureInformationNeed(
+                    question: summary,
+                    targetEntityID: personEntityID,
+                    expectedInformationGain: confidence,
+                    sourceID: "l1_conversation_consolidation"
+                ) {
+                    result.derivedMemoryIDs.append(id)
+                    result.questions += 1
+                }
+            }
+        }
+        return result
+    }
+
+    /// Asks L1 to turn a finished conversation into a privacy-preserving
+    /// episode plus only explicitly supported person-context additions.
+    private func summarizeEpisode(
+        transcript: String,
+        reason: String
+    ) async -> ConversationMemoryConsolidation? {
         let boundedTranscript = String(transcript.prefix(6_000))
-        guard !boundedTranscript.isEmpty else { return ("", 0.5) }
+        guard !boundedTranscript.isEmpty else { return nil }
         let prompt = """
-        You are SOMA's memory consolidator. Condense the following finished conversation into a short, neutral narrative of what happened (who, what, outcome) in 1-3 sentences. Do not include raw quotes or sensitive identifiers. Also rate its salience (importance for remembering) from 0.0 to 1.0.
+        You are SOMA's memory consolidator. Turn this finished conversation into a short, neutral memory. The original transcript stays local: never quote it and never include sensitive identifiers.
+
+        Return one 1-3 sentence narrative of what happened and its importance (salience 0.0...1.0). Then emit only durable information explicitly stated by the user or jointly resolved in the conversation. Do not infer facts from tone, appearance, the room, or a single gesture. Do not emit a relationship score: contact history is stored separately.
+
+        For each memory, use exactly one kind:
+        - person_fact: a stable fact stated by the user. key must be interests, work_context, ongoing_project, or personal_context.
+        - task: an active task the user explicitly asked SOMA to remember or work on.
+        - open_question: a meaningful unresolved question that a future conversation can naturally answer.
+
+        Omit memories when the transcript does not support them. Never duplicate information already said in the same conversation. Do not turn casual filler, momentary states, or model guesses into memory.
         Closure reason: \(reason.isEmpty ? "conversation ended" : reason)
         Transcript:
         \(boundedTranscript)
-        Return strict JSON only: {"narrative":"...","salience":0.7}
+        Return strict JSON only:
+        {"narrative":"...","salience":0.7,"memories":[{"kind":"person_fact","key":"interests","summary":"...","confidence":0.9}]}
         """
-        guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return ("", 0.5) }
+        guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -724,22 +923,22 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             "prompt": prompt,
             "stream": false,
             "format": "json",
-            "options": ["temperature": 0.2, "num_predict": 220],
+            "options": ["temperature": 0.2, "num_predict": 360],
         ])
         request.timeoutInterval = 20
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
             guard let outer = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let content = outer["response"] as? String,
-                  let contentData = content.data(using: .utf8),
-                  let parsed = try JSONSerialization.jsonObject(with: contentData) as? [String: Any] else {
-                return ("", 0.5)
+                  let decoded = decodeOllamaJSONObject(ConversationMemoryConsolidation.self, from: content) else {
+                return nil
             }
-            let narrative = (parsed["narrative"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let salience = min(max((parsed["salience"] as? Double) ?? 0.5, 0), 1)
-            return (narrative, salience)
+            guard !decoded.narrative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return decoded
         } catch {
-            return ("", 0.5)
+            return nil
         }
     }
 
@@ -925,6 +1124,18 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     /// deleted as they are promoted, so a repeat call re-promotes only objects
     /// added since.
     @discardableResult
+    func associateRecognizedPersonWithUnassignedSpace(
+        _ personEntityID: UUID,
+        spaceID: UUID,
+        at date: Date = Date()
+    ) async -> Bool {
+        if let existing = await spaceOwner(spaceID: spaceID, at: date) {
+            return existing == personEntityID
+        }
+        return await setSpaceOwner(personEntityID, spaceID: spaceID, at: date)
+    }
+
+    @discardableResult
     func setSpaceOwner(
         _ ownerEntityID: UUID,
         spaceID: UUID,
@@ -1105,7 +1316,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
-    /// Pending (open) information needs scoped to a person, newest first. Needs
+    /// Pending (open) information needs scoped to a person, highest expected
+    /// information gain first. Needs
     /// still inside their cooldown window are withheld so the robot does not
     /// re-ask the same thing every conversation. `respectCooldown: false`
     /// reports the full open set — used when the person explicitly asks what
@@ -1131,11 +1343,16 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 expectedInformationGain: q.expectedInformationGain,
                 createdAt: record.updatedAt
             )
+        }.sorted {
+            if $0.expectedInformationGain != $1.expectedInformationGain {
+                return $0.expectedInformationGain > $1.expectedInformationGain
+            }
+            return $0.createdAt > $1.createdAt
         }
     }
 
-    /// Pending (open) information needs across all people, newest first, with
-    /// cooldown withheld.
+    /// Pending (open) information needs across all people, ordered by expected
+    /// information gain, with cooldown withheld.
     func allPendingInformationNeeds(
         at date: Date = Date(),
         respectCooldown: Bool = true
@@ -1152,6 +1369,11 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 expectedInformationGain: q.expectedInformationGain,
                 createdAt: record.updatedAt
             )
+        }.sorted {
+            if $0.expectedInformationGain != $1.expectedInformationGain {
+                return $0.expectedInformationGain > $1.expectedInformationGain
+            }
+            return $0.createdAt > $1.createdAt
         }
     }
 
@@ -1204,11 +1426,13 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
-    /// Marks an open information need resolved and, when an acquired fact is
-    /// supplied, persists it to the target person's durable profile.
+    /// Persists an acquired fact to the target person's durable profile before
+    /// closing its open information need. A failed fact write leaves the need
+    /// open, so the answer can never be lost by marking its motive complete.
     @discardableResult
     func resolveInformationNeed(
         motiveID: UUID,
+        expectedTargetEntityID: UUID? = nil,
         acquiredFact: String? = nil,
         at date: Date = Date()
     ) async -> Bool {
@@ -1216,8 +1440,16 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         do {
             guard let previous = try await store.record(id: motiveID, at: date),
                   case let .openQuestion(q) = previous.payload,
-                  q.status == .open else {
+                  q.status == .open,
+                  expectedTargetEntityID == nil || q.targetEntityID == expectedTargetEntityID else {
                 return false
+            }
+            if let fact = acquiredFact?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !fact.isEmpty {
+                guard let targetEntityID = q.targetEntityID,
+                      await storePersonFact(fact, for: targetEntityID, at: date) else {
+                    return false
+                }
             }
             _ = try await store.correct(
                 id: motiveID,
@@ -1239,10 +1471,13 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 reason: "information_need_resolved",
                 at: date
             )
-            if let fact = acquiredFact?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !fact.isEmpty,
-               let targetEntityID = q.targetEntityID {
-                _ = await storePersonFact(fact, for: targetEntityID, at: date)
+            if let targetEntityID = q.targetEntityID {
+                let remaining = await pendingInformationNeeds(
+                    for: targetEntityID,
+                    at: date,
+                    respectCooldown: false
+                )
+                cacheInformationNeeds(remaining, for: targetEntityID)
             }
             onHealth("info_need_resolved", "motive=\(motiveID.uuidString.lowercased())")
             return true
@@ -1255,23 +1490,27 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     /// Consume L1's model-proposed memory suggestions and persist those that
     /// clear the confidence bar. Person-linked kinds are bound to the recognized
     /// person when one is present; otherwise they degrade to a generic episode.
+    @discardableResult
     func proposeMemories(
         _ proposals: [L1MemoryProposal],
         personEntityID: UUID?,
         at date: Date = Date()
-    ) async {
-        guard let store else { return }
+    ) async -> [UUID] {
+        guard let store else { return [] }
+        var storedIDs: [UUID] = []
         for proposal in proposals where proposal.confidence >= 0.55 {
             do {
-                _ = try await store.insert(
+                let record = try await store.insert(
                     Self.draft(from: proposal, personEntityID: personEntityID, at: date),
                     at: date
                 )
+                storedIDs.append(record.id)
                 onHealth("memory_proposal_stored", "kind=\(proposal.kind.rawValue)")
             } catch {
                 onHealth("memory_proposal_store_failed", String(error.localizedDescription.prefix(192)))
             }
         }
+        return storedIDs
     }
 
     private static func draft(
@@ -1294,7 +1533,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             let pid = personEntityID ?? UUID()
             payload = .personFact(PersonFactMemory(
                 personEntityID: pid,
-                key: "proposed_fact",
+                key: stableFactKey(for: summary),
                 value: summary
             ))
             tier = .mediumTerm
@@ -1321,7 +1560,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 status: .active,
                 ownerEntityID: personEntityID
             ))
-            tier = .shortTerm
+            tier = .mediumTerm
         default: // episode and correction degrade to a narrative episode
             payload = .episode(EpisodeMemory(
                 startedAt: date,
@@ -1342,6 +1581,18 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             disclosure: .remoteSummaryAllowed,
             expiresAt: date.addingTimeInterval(30 * 24 * 60 * 60)
         )
+    }
+
+    private static func stableFactKey(for value: String) -> String {
+        var hash: UInt64 = 1_469_598_103_934_665_603
+        for byte in value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: .current
+        ).utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return "learned_fact_\(String(hash, radix: 16))"
     }
 
     /// Keeps exact Live Voice turns on this Mac until a higher-layer memory
@@ -1366,6 +1617,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     participantEntityIDs: personEntityID.map { [$0] } ?? [],
                     retentionSeconds: transcriptRetentionSeconds
                 ),
+                turnWriteBarrier: ConversationTurnWriteBarrier(),
                 startedAt: Date(),
                 personEntityID: personEntityID,
                 socialEpisode: L1ConversationContactEpisode()
@@ -1390,6 +1642,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             activeConversations[normalizedThreadID] = updated
             firstParticipantResponseEntityID = updated.personEntityID
         }
+        active?.turnWriteBarrier.beginWrite()
         conversationLock.unlock()
         guard let active else {
             onHealth("conversation_turn_unassociated", "role=\(role.rawValue); chars=\(normalizedText.count)")
@@ -1410,7 +1663,10 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
         writeGroup.enter()
         Task { [self, active, normalizedThreadID, normalizedText, role, date, writeGroup] in
-            defer { writeGroup.leave() }
+            defer {
+                active.turnWriteBarrier.finishWrite()
+                writeGroup.leave()
+            }
             do {
                 _ = try await active.archiver.append(
                     role: role,
@@ -1442,6 +1698,9 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         let active = normalizedThreadID.flatMap { takeActiveConversation(threadID: $0) }
         let participantID = active?.personEntityID ?? personEntityID
         guard let participantID else { return true }
+        if let active {
+            await active.turnWriteBarrier.waitUntilDrained()
+        }
         let boundedReason = String(reason.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
         let kind = active?.socialEpisode.closureKind(interrupted: interrupted)
             ?? (interrupted ? .conversationInterrupted : .conversationEnded)
@@ -1454,7 +1713,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         if let active {
             await recordEpisode(
                 personEntityID: participantID,
-                interactionID: active.archiver.interactionID,
+                archiver: active.archiver,
                 startedAt: active.startedAt,
                 endedAt: date,
                 reason: boundedReason,
@@ -1462,6 +1721,76 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             )
         }
         return contactRecorded
+    }
+
+    /// Recovers encrypted turns left pending by a prior process exit. Recovery
+    /// uses the same transcript-to-memory path as a normal session closure, so
+    /// a restart never turns an otherwise valid conversation into lost context.
+    func recoverPendingConversationMemories(at date: Date = Date()) async {
+        guard let store else { return }
+        struct Recovery: Sendable {
+            let interactionID: UUID
+            let threadID: String
+            let personEntityID: UUID
+            var startedAt: Date
+            var endedAt: Date
+        }
+        do {
+            let pendingTurns = try await store.query(
+                .init(tiers: [.shortTerm], kinds: [.conversationTurn], limit: 500),
+                at: date
+            )
+            var recoveries: [UUID: Recovery] = [:]
+            for record in pendingTurns {
+                guard case let .conversationTurn(turn) = record.payload,
+                      turn.consolidationState == .pending,
+                      let personEntityID = turn.participantEntityIDs.first else {
+                    continue
+                }
+                if var existing = recoveries[turn.interactionID] {
+                    existing.startedAt = min(existing.startedAt, turn.finalizedAt)
+                    existing.endedAt = max(existing.endedAt, turn.finalizedAt)
+                    recoveries[turn.interactionID] = existing
+                } else {
+                    recoveries[turn.interactionID] = Recovery(
+                        interactionID: turn.interactionID,
+                        threadID: turn.threadID,
+                        personEntityID: personEntityID,
+                        startedAt: turn.finalizedAt,
+                        endedAt: turn.finalizedAt
+                    )
+                }
+            }
+            let ordered = recoveries.values.sorted { $0.endedAt < $1.endedAt }
+            guard !ordered.isEmpty else { return }
+            onHealth("conversation_memory_recovery_started", "sessions=\(ordered.count)")
+            var consolidated = 0
+            for recovery in ordered.prefix(8) {
+                let archiver = ConversationTranscriptArchiver(
+                    store: store,
+                    interactionID: recovery.interactionID,
+                    threadID: recovery.threadID,
+                    participantEntityIDs: [recovery.personEntityID],
+                    retentionSeconds: transcriptRetentionSeconds
+                )
+                if await recordEpisode(
+                    personEntityID: recovery.personEntityID,
+                    archiver: archiver,
+                    startedAt: recovery.startedAt,
+                    endedAt: recovery.endedAt,
+                    reason: "recovered_after_restart",
+                    at: date
+                ) {
+                    consolidated += 1
+                }
+            }
+            onHealth(
+                "conversation_memory_recovery_finished",
+                "sessions=\(ordered.count); consolidated=\(consolidated)"
+            )
+        } catch {
+            onHealth("conversation_memory_recovery_failed", String(error.localizedDescription.prefix(192)))
+        }
     }
 
     /// The service's synchronous shutdown path must not abandon a recorded
@@ -2303,6 +2632,7 @@ final class GemmaL1SituationRuntime: @unchecked Sendable {
         Return the situation JSON as your final message: no Markdown, prose, alternate field names, or omitted required fields. Copy at least one supplied evidence ID into evidence_ids; never emit an empty evidence_ids array. Use this exact shape, replacing values only:
         {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence","stream_of_consciousness":"continuous first-person inner monologue, as long as the reasoning requires"},"action":null,"confidence":null,"rationale":null,"opening":null,"behavior_directive":{"action":null,"rationale":null},"requested_visual_resource_ids":[],"memory_proposals":[]}
         memory_proposals is optional and usually empty for facts: only add a fact proposal when you have genuinely learned or resolved something durable about the person present or the situation — a stable fact about them, a task they asked for, or a notable episode (kinds episode|person_fact|relationship|task|correction), with a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never invent a fact from speculation. open_question is different: whenever you find yourself genuinely wanting to know something more about the person present or the situation — their story, tastes, plans, work, how they use this space, what they are building — record it as an open_question proposal whose summary is the exact question. These accumulate into your pending information needs: the questions you will follow up on in later conversation. Curiosity is a quiet background drive, not a script: propose at most one open_question per cycle, and skip cycles where nothing genuinely puzzles you. Whenever you notice something you do not yet know about the person present or the situation — even a small concrete detail (their story, tastes, plans, work, habits, how they use this space, what they are building) — record it as an open_question whose summary is the exact natural question. Only record questions that remain meaningful later: durable curiosity that a future conversation can still resolve. Never record moment-bound questions (e.g. "what are you looking at right now?", "why did you just do that?") — those are only valid in the moment and lose all meaning once stored; ask them live in conversation or skip them. Never propose a question whose answer you already have, and never a generic or service question. A place_affiliation motive means that the stable current place is not yet related to the present person. Treat it as a real but low-pressure relational uncertainty: let the current scene and rapport determine whether to explore it naturally, never ask a bureaucratic ownership question, never infer affiliation, and do not attribute place observations to the person until explicit confirmation is recorded. Keep curiosity_pressure low (0.1-0.3) by default; raise it only for something genuinely novel. Curiosity may justify a gentle opening only after it has become a supplied durable information_need and the person is socially available; it must never become a rigid questionnaire or override a clear need for privacy.
+        Spatial rule: coverage, panorama revisits, room labels, active-scene counts, and unresolved place affiliation are mapping signals, not evidence of a particular object, preference, owner, or relationship. Never create an open question, spoken opening, or attribution from those signals alone. A question about an object or this space is permitted only when the supplied memory or visual evidence names that exact object and states the observed detail; otherwise do not mention the object or space. Space-bound observations are promoted locally after a recognized person is associated with the space, and that promotion is never itself a conversational topic.
         When behavior_context is present it is the ONLY basis for behavior_directive, and it is independent of any social decision (which may still be null). If action is null, emit the JSON value null (never the string "null"); confidence and rationale may still describe the situation but do not create a social action. If behavior_context.recognized_identity is present, you are looking at that known person; name them in your stream of consciousness. If the camera has been held on a non-face, non-person target for a long time (fixation_seconds high while target is not a verified face, scan inactive), recommend resume_scanning or, if no person is being pursued, seek_people. Recommend acknowledge_person ONLY when behavior_context.acknowledgment_pending is true; when it is false the greeting has already been delivered for this presence, so a repeated directive would be a silent no-op — recommend keep_observing or null instead. Otherwise recommend keep_observing, or null when no behavioral change is warranted. Never turn a momentary low-confidence object into a directive; only sustained fixation warrants one.
         The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness in English as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is an observable L1 reflection, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Let the stream take exactly the space its reasoning needs: a quiet unchanged state may need one clear sentence; a change, ambiguity, memory connection, competing motive, or pending action should unfold through as many connected sentences as needed to make the transition intelligible. Do not compress a real chain of reasoning into a slogan, and do not pad or repeat thoughts merely to sound deep. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. Do not turn an empty relationship field, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact. A supplied information_need is a real, durable conversational purpose — not an emergency that must be ignored until it becomes urgent. When the person is available and contact_history does not show a recent unanswered opening or a request for privacy, you may choose one gentle spoken opening that advances exactly one supplied information_need. Do not treat seeing a laptop, phone, or other ordinary personal object by itself as proof the person must not be interrupted: weigh current visual evidence together with the direct temporal contact_pattern and relationship context. A spoken opening is a deliberate, low-pressure social act: permitted only as one question that can reduce exactly one supplied information_need, and only when the moment genuinely fits (right rapport, fresh observation, not a redundant greeting). Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
         contact_pattern is a compact L0 temporal signal. A sustained or repeated directed gaze can make a person more socially available; a single passing glance does not. It is context, never an instruction to speak, and does not replace the need for a concrete purpose.

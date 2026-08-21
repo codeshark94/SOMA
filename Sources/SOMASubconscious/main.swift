@@ -2010,9 +2010,11 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
         return ("behavior_directive", "action=\(action)")
     case "discarded", "decision_rejected", "opening_suppressed":
         return (state, "reason=policy_or_context_guard")
-    case "memory_ready", "memory_consolidated", "memory_proposal_stored", "daily_world_memory_stored", "person_fact_stored", "person_preference_captured":
+    case "memory_ready", "memory_consolidated", "conversation_memory_consolidated", "conversation_memory_recovery_finished", "memory_proposal_stored", "daily_world_memory_stored", "person_fact_stored", "person_preference_captured":
         return ("memory_updated", "status=stored")
-    case "memory_unavailable", "memory_consolidation_failed", "memory_proposal_store_failed", "daily_world_memory_store_failed", "person_fact_store_failed", "person_preference_capture_failed":
+    case "conversation_memory_recovery_started", "episode_consolidation_deferred":
+        return ("memory_deferred", "status=awaiting_consolidation")
+    case "conversation_memory_recovery_failed", "memory_unavailable", "memory_consolidation_failed", "memory_proposal_store_failed", "daily_world_memory_store_failed", "person_fact_store_failed", "person_preference_capture_failed":
         return ("memory_deferred", "status=storage_unavailable")
     default:
         return nil
@@ -2111,6 +2113,26 @@ private final class L1AuxiliaryWakeRelay: @unchecked Sendable {
     }
 }
 
+/// Passes an auxiliary semantic verdict to the L0 owner. The L0 owner still
+/// checks recency and scene identity before it can release a fixation.
+private final class L1AuxiliaryHumanVerdictRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: (@Sendable (L1AuxiliarySemanticCue) -> Void)?
+
+    func record(_ cue: L1AuxiliarySemanticCue) {
+        lock.lock()
+        let active = sink
+        lock.unlock()
+        active?(cue)
+    }
+
+    func attach(_ sink: @escaping @Sendable (L1AuxiliarySemanticCue) -> Void) {
+        lock.lock()
+        self.sink = sink
+        lock.unlock()
+    }
+}
+
 private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
     let event = "l1.auxiliary.semantic"
     let requestID: UInt64
@@ -2118,6 +2140,7 @@ private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
     let captureNS: UInt64
     let source: String
     let summary: String
+    let targetID: String?
     let novelty: Double
     let socialPresence: Double
     let attentionHint: L1AuxiliaryAttentionHint
@@ -2140,6 +2163,7 @@ private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
         captureNS = cue.captureNS
         source = cue.source
         summary = cue.summary
+        targetID = cue.targetID
         novelty = cue.novelty
         socialPresence = cue.socialPresence
         attentionHint = cue.attentionHint
@@ -3736,6 +3760,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         queue.async { [weak self] in self?.apply(belief, reason: reason) }
     }
 
+    /// The auxiliary model can reject only the human hypothesis that produced
+    /// its frame. It cannot acquire a target or issue a motor command.
+    func ingestSemanticHumanVerdict(_ cue: L1AuxiliarySemanticCue) {
+        queue.async { [weak self] in
+            self?.applySemanticHumanVerdict(cue)
+        }
+    }
+
     func ingestSceneCandidates(_ candidates: [SceneCandidate], at monotonicNS: UInt64) {
         queue.async { [weak self] in
             self?.spatialAtlas.updateScene(candidates.map(EmbodimentSceneEntity.init))
@@ -3992,15 +4024,23 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // pending, not-yet-device-confirmed start still yields to the
             // shorter social gap so a false start cannot hold the gimbal
             // forever.
-            let retainNativeThroughDetectorGap = faceLock.permitsMotor(at: now)
+            // A face lease is a geometric continuity aid, not evidence that a
+            // person is still in view. Keep it only while fresh face evidence
+            // (or a device-confirmed native track) remains within its own
+            // loss window. Previously the controller received the lease bit
+            // alone, so a stale person hypothesis could indefinitely suppress
+            // exploration after the camera was no longer seeing a person.
+            let socialEvidenceFresh = nativeTrackingActive
+                ? !nativeTrustContinuity.confirmsLoss(at: now)
+                : !socialTrackingContinuity.confirmsLoss(at: now)
+            let socialFixationSupported = faceLock.permitsMotor(at: now)
+                && socialEvidenceFresh
+            let retainNativeThroughDetectorGap = socialFixationSupported
                 && nativeOwnsSocialTracking
-                && (nativeTrackingActive
-                    ? !nativeTrustContinuity.confirmsLoss(at: now)
-                    : !socialTrackingContinuity.confirmsLoss(at: now))
             let decision = attentionController.advance(
                 belief: belief,
                 evidence: .visualLoss,
-                socialFixationPermitted: faceLock.permitsMotor(at: now),
+                socialFixationPermitted: socialFixationSupported,
                 nativeSocialTrackingActive: retainNativeThroughDetectorGap
             )
             recordAttentionDecision(decision, target: belief.target, at: now)
@@ -4055,7 +4095,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let decision = attentionController.advance(
             belief: belief,
             evidence: .visualObservation,
-            socialFixationPermitted: faceLock.permitsInitialMotor(at: now),
+            socialFixationPermitted: faceLock.permitsInitialMotor(at: now)
+                && (nativeTrackingActive
+                    ? !nativeTrustContinuity.confirmsLoss(at: now)
+                    : !socialTrackingContinuity.confirmsLoss(at: now)),
             nativeSocialTrackingPermitted: faceLock.permitsInitialMotor(at: now),
             nativeSocialTrackingActive: nativeTrackingActive || nativeTrackingStartPending
         )
@@ -5012,6 +5055,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         // false-positive) face lock for the cooldown window so the coverage
         // scan actually runs instead of instantly re-latching.
         faceFixationCooldownUntilNS = monotonicNS + faceFixationReleaseCooldownNS
+        let nativeAction = gate.invalidate()
+        apply(nativeAction, at: monotonicNS, target: nil, reason: reason)
         sendExternalStop(state: reason, at: monotonicNS)
         resumeCoverageScan(priority: priority)
         writer.write(RuntimeEvent(
@@ -5020,6 +5065,42 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             source: "l0_auxiliary_release",
             state: reason,
             message: "Released a fixation judged to be wrong; resumed coverage scan (priority \(priority))"
+        ))
+    }
+
+    private func applySemanticHumanVerdict(_ cue: L1AuxiliarySemanticCue) {
+        let now = monotonicNanoseconds()
+        let strongNonHumanVerdict = cue.confidence >= 0.75
+            && cue.socialPresence <= 0.20
+            && cue.attentionHint != .person
+            && cue.reaction != .engage
+        guard strongNonHumanVerdict,
+              cue.captureNS <= now,
+              now - cue.captureNS <= 8_000_000_000,
+              activeCognitiveMotorRequestID == nil,
+              let targetID = cue.targetID,
+              faceLock.sceneID == targetID,
+              faceLock.permitsMotor(at: now) else {
+            return
+        }
+        releaseWrongFixation(
+            reason: "semantic_nonhuman_veto",
+            at: now,
+            priority: .l0
+        )
+        let detail = String(
+            format: "scene_id=%@; cue_age_ms=%.0f; social_presence=%.2f; confidence=%.2f",
+            targetID,
+            Double(now - cue.captureNS) / 1_000_000,
+            cue.socialPresence,
+            cue.confidence
+        )
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: now,
+            source: "l0_auxiliary_release",
+            state: "semantic_nonhuman_veto",
+            message: detail
         ))
     }
 
@@ -9531,6 +9612,7 @@ private func run(_ options: Options) throws {
     placeMemoryPersistence?.restore()
     let panoramaStatus = PanoramaMapStatusStore()
     let auxiliaryWakeRelay = L1AuxiliaryWakeRelay()
+    let auxiliaryHumanVerdictRelay = L1AuxiliaryHumanVerdictRelay()
     let l1AuxiliaryBridgeBox = L1AuxiliaryBridgeBox()
     let poseStoreBox = PoseStoreBox()
     let memoryContextBox = MemoryContextBox()
@@ -9641,6 +9723,7 @@ private func run(_ options: Options) throws {
             },
             onCue: { cue in
                 writer.write(L1AuxiliarySemanticTraceEvent(cue))
+                auxiliaryHumanVerdictRelay.record(cue)
                 // Parallel object recognition: when L1's visual helper flags an
                 // object (presented to the robot, or encountered while scanning
                 // an environment with no dominant person) that is worth talking
@@ -9895,6 +9978,9 @@ private func run(_ options: Options) throws {
         attentionGimbalBridge?.recognizedPersonEntityIDProvider = {
             identityPresence.recognizedPersonEntityID()
         }
+        auxiliaryHumanVerdictRelay.attach { cue in
+            attentionGimbalBridge?.ingestSemanticHumanVerdict(cue)
+        }
     } else {
         attentionGimbalBridge = nil
     }
@@ -9942,6 +10028,9 @@ private func run(_ options: Options) throws {
         transcriptRetentionSeconds: somaEnvDouble("SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS", default: 24) * 60 * 60
     )
     memoryContextBox.provider = l1MemoryContext
+    Task {
+        await l1MemoryContext.recoverPendingConversationMemories()
+    }
     if let administratorID = controlSettings.administrator?.entityID {
         l1MemoryContext.warmContext(for: administratorID)
         Task {
@@ -10091,6 +10180,22 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "embodiment_mcp_ready",
                     message: "capability_preflight=get_embodiment_state; capture_view_and_identity_tools_available"
+                ))
+            case .personContextReady:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "person_context_ready",
+                    message: "capability_preflight=get_person_context; local_memory_binding=verified"
+                ))
+            case let .personContextUnavailable(reason):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "person_context_unavailable",
+                    message: String(reason.prefix(192))
                 ))
             case let .embodimentMCPUnavailable(reason):
                 writer.write(RuntimeEvent(
@@ -10267,7 +10372,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_v3; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=auto_injected_at_session_and_speech_onset; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=on_session_start; text_context=startup_context_plus_explicit_updates"
+            message: "transport=codex_app_server_webrtc_audio; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=auto_injected_on_local_vad_and_session_start; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_updates"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -10856,6 +10961,61 @@ private func run(_ options: Options) throws {
                 semaphore.wait()
                 return resultBox.get() ?? .failure(EmbodimentIPCError.timeout)
             },
+            informationNeedsProvider: { request in
+                let semaphore = DispatchSemaphore(value: 0)
+                let resultBox = SynchronousResultBox<InformationNeedsIPCResult>()
+                Task {
+                    switch request.operation {
+                    case .list:
+                        let needs = await l1MemoryContext.pendingInformationNeeds(
+                            for: request.personEntityID,
+                            respectCooldown: false
+                        )
+                        resultBox.set(.success(.init(items: needs.map {
+                            .init(
+                                motiveID: $0.motiveID,
+                                question: $0.question,
+                                expectedInformationGain: $0.expectedInformationGain
+                            )
+                        })))
+                    case .recordAnswer:
+                        guard let motiveID = request.motiveID,
+                              let acquiredFact = request.acquiredFact?.trimmingCharacters(in: .whitespacesAndNewlines),
+                              !acquiredFact.isEmpty else {
+                            resultBox.set(.failure(RuntimeError.unavailable("information_need_answer_missing")))
+                            semaphore.signal()
+                            return
+                        }
+                        let recorded = await l1MemoryContext.resolveInformationNeed(
+                            motiveID: motiveID,
+                            expectedTargetEntityID: request.personEntityID,
+                            acquiredFact: acquiredFact
+                        )
+                        guard recorded else {
+                            resultBox.set(.failure(RuntimeError.unavailable("information_need_not_open_for_person")))
+                            semaphore.signal()
+                            return
+                        }
+                        l1ThoughtRelay.invalidateMemoryContext(for: request.personEntityID)
+                        resultBox.set(.success(.init(recordedMotiveID: motiveID)))
+                    }
+                    semaphore.signal()
+                }
+                semaphore.wait()
+                let result = resultBox.get() ?? .failure(EmbodimentIPCError.timeout)
+                if case let .success(value) = result {
+                    writer.write(RuntimeEvent(
+                        event: "information_need.mcp",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "information_need_mcp",
+                        state: request.operation.rawValue,
+                        message: request.operation == .list
+                            ? "open_count=\(value.items.count)"
+                            : "recorded=true"
+                    ))
+                }
+                return result
+            },
             identityRosterProvider: { query in
                 let now = monotonicNanoseconds()
                 let presence = presentIdentityRoster.entries(at: now)
@@ -11057,6 +11217,24 @@ private func run(_ options: Options) throws {
                     // speech can surface recalled facts (e.g. recognized-object
                     // taste profile) even before the first L1 wake cycle.
                     l1MemoryContext.warmContext(for: identity.entityID)
+                    if identity.entityID == controlSettings.administrator?.entityID {
+                        let spaceID = spaceCoordinator.currentSpaceID
+                        Task {
+                            let associated = await l1MemoryContext
+                                .associateRecognizedPersonWithUnassignedSpace(
+                                    identity.entityID,
+                                    spaceID: spaceID
+                                )
+                            writer.write(RuntimeEvent(
+                                event: "l1.space_affiliation",
+                                monotonicNS: monotonicNanoseconds(),
+                                source: "l1_memory",
+                                state: associated ? "associated" : "already_associated_elsewhere",
+                                message: "space=\(spaceID.uuidString.lowercased())"
+                            ))
+                            l1MemoryContext.warmContext(for: identity.entityID)
+                        }
+                    }
                 }
                 if case let .departed(identity) = update.transition {
                     l1ThoughtRelay.depart(identity.entityID)
@@ -11213,7 +11391,7 @@ private func run(_ options: Options) throws {
                     languageStartInstruction: languageStartInstruction,
                     memorySummaries: interactionMemorySummaries,
                     pendingInformationNeeds: recognizedPersonEntityID.map {
-                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(1).map(\.question)
+                        Array(l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(8)).map(\.question)
                     } ?? []
                 ) else {
                     writer.write(RuntimeEvent(
@@ -11231,6 +11409,9 @@ private func run(_ options: Options) throws {
                     personEntityID: interactionParticipant.entityID,
                     at: completedNS
                 )
+            }
+            if evidence.changed {
+                liveVoiceLauncher?.observeVoiceActivity(evidence.active, at: completedNS)
             }
             if let speechInteraction {
                 let sessionCapability = liveSessionCapabilities.issue(
@@ -11251,7 +11432,7 @@ private func run(_ options: Options) throws {
                     languageStartInstruction: languageStartInstruction,
                     memorySummaries: interactionMemorySummaries,
                     pendingInformationNeeds: recognizedPersonEntityID.map {
-                        l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(1).map(\.question)
+                        Array(l1MemoryContext.cachedPendingInformationNeeds(for: $0).prefix(8)).map(\.question)
                     } ?? []
                 ) else { return }
                 let wake = openingAuthorization.flatMap {

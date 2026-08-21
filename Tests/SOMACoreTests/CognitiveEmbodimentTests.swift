@@ -374,6 +374,72 @@ final class CognitiveEmbodimentTests: XCTestCase {
         XCTAssertNil(reply.snapshot)
     }
 
+    func testInformationNeedsRoundTripAndAnswerRemainBoundToOnePerson() throws {
+        let suffix = UUID().uuidString.prefix(8)
+        let directory = URL(fileURLWithPath: "/private/tmp/soma-information-needs-ipc-\(suffix)", isDirectory: true)
+        let socketURL = directory.appendingPathComponent("shadow.sock")
+        let personID = UUID()
+        let motiveID = UUID()
+        let server = EmbodimentShadowSocketServer(
+            socketURL: socketURL,
+            informationNeedsProvider: { request in
+                guard request.personEntityID == personID else {
+                    return .failure(EmbodimentIPCError.permissionDenied)
+                }
+                switch request.operation {
+                case .list:
+                    guard request.motiveID == nil, request.acquiredFact == nil else {
+                        return .failure(EmbodimentIPCError.malformedMessage)
+                    }
+                    return .success(.init(items: [
+                        .init(
+                            motiveID: motiveID,
+                            question: "What kind of music do they enjoy?",
+                            expectedInformationGain: 0.91
+                        ),
+                    ]))
+                case .recordAnswer:
+                    guard request.motiveID == motiveID,
+                          request.acquiredFact == "They enjoy jazz." else {
+                        return .failure(EmbodimentIPCError.malformedMessage)
+                    }
+                    return .success(.init(recordedMotiveID: motiveID))
+                }
+            }
+        )
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let listed = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .informationNeeds,
+                informationNeeds: .init(operation: .list, personEntityID: personID)
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(listed.ok)
+        XCTAssertEqual(listed.informationNeeds?.items.map(\.motiveID), [motiveID])
+        XCTAssertEqual(listed.informationNeeds?.items.first?.expectedInformationGain, 0.91)
+
+        let recorded = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .informationNeeds,
+                informationNeeds: .init(
+                    operation: .recordAnswer,
+                    personEntityID: personID,
+                    motiveID: motiveID,
+                    acquiredFact: "They enjoy jazz."
+                )
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(recorded.ok)
+        XCTAssertEqual(recorded.informationNeeds?.recordedMotiveID, motiveID)
+    }
+
     func testSemanticTargetBindingPreservesExplicitSceneIdentityOffscreen() {
         var binder = SemanticTargetBindingEngine()
         let registration = SemanticTargetRegistration(

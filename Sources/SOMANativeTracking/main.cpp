@@ -409,6 +409,141 @@ bool configureFixedCameraZoom(const std::shared_ptr<Device> &device, Trace &trac
     return confirmed;
 }
 
+std::string audioProcessingValue(const std::optional<bool> &value) {
+    if (!value) return "unavailable";
+    return *value ? "on" : "off";
+}
+
+std::string audioProcessingValue(const std::optional<int> &value) {
+    return value ? std::to_string(*value) : "unavailable";
+}
+
+/// Tiny 2 Lite exposes three hardware noise-reduction intensities through
+/// OBSBOT Center. The medium level preserves conversational speech while
+/// avoiding aggressive suppression that can erase quiet turn onsets.
+void configureConversationAudioProcessing(const std::shared_ptr<Device> &device, Trace &trace) noexcept {
+    constexpr int kMediumNoiseReductionLevel = 2;
+    using GetAudioAGC = int (*)(Device *, bool &);
+    using GetAudioNoiseReduce = int (*)(Device *, bool &, int &);
+    using SetAudioNoiseReduce = int (*)(Device *, bool, int);
+    const auto getAudioAGC = reinterpret_cast<GetAudioAGC>(
+        dlsym(RTLD_DEFAULT, "__ZN6Device18cameraGetAudioAGCRERb")
+    );
+    const auto getAudioNoiseReduce = reinterpret_cast<GetAudioNoiseReduce>(
+        dlsym(RTLD_DEFAULT, "__ZN6Device26cameraGetAudioNoiseReduceRERbRi")
+    );
+    const auto setAudioNoiseReduce = reinterpret_cast<SetAudioNoiseReduce>(
+        dlsym(RTLD_DEFAULT, "__ZN6Device26cameraSetAudioNoiseReduceREbi")
+    );
+
+    std::optional<bool> agcBefore;
+    std::optional<bool> noiseBefore;
+    std::optional<int> noiseLevelBefore;
+    int statusBeforeResult = RM_RET_ERR;
+    int agcQueryBeforeResult = RM_RET_ERR;
+    int noiseQueryBeforeResult = RM_RET_ERR;
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        Device::CameraStatus status{};
+        statusBeforeResult = device->cameraGetCameraStatusU(status);
+        if (statusBeforeResult == RM_RET_OK) {
+            agcBefore = status.tiny.audio_auto_gain != 0;
+            noiseBefore = status.tiny.noise_cancellation != 0;
+        }
+        if (getAudioAGC) {
+            bool enabled = false;
+            agcQueryBeforeResult = getAudioAGC(device.get(), enabled);
+            if (agcQueryBeforeResult == RM_RET_OK) agcBefore = enabled;
+        }
+        if (getAudioNoiseReduce) {
+            bool enabled = false;
+            int level = 0;
+            noiseQueryBeforeResult = getAudioNoiseReduce(device.get(), enabled, level);
+            if (noiseQueryBeforeResult == RM_RET_OK) {
+                noiseBefore = enabled;
+                noiseLevelBefore = level;
+            }
+        }
+    }
+
+    int agcSetResult = RM_RET_OK;
+    int noiseSetResult = RM_RET_OK;
+    bool agcChanged = false;
+    bool noiseChanged = false;
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        if (agcBefore && !*agcBefore) {
+            try { agcSetResult = device->cameraSetAudioAutoGainU(true); } catch (...) { agcSetResult = RM_RET_ERR; }
+            agcChanged = agcSetResult == RM_RET_OK;
+        }
+        if (noiseBefore && !*noiseBefore && setAudioNoiseReduce) {
+            try {
+                noiseSetResult = setAudioNoiseReduce(device.get(), true, kMediumNoiseReductionLevel);
+            } catch (...) {
+                noiseSetResult = RM_RET_ERR;
+            }
+            noiseChanged = noiseSetResult == RM_RET_OK;
+        } else if (!setAudioNoiseReduce) {
+            noiseSetResult = RM_RET_ERR;
+        }
+    }
+
+    std::optional<bool> agcAfter;
+    std::optional<bool> noiseAfter;
+    std::optional<int> noiseLevelAfter;
+    int statusAfterResult = RM_RET_ERR;
+    int agcQueryAfterResult = RM_RET_ERR;
+    int noiseQueryAfterResult = RM_RET_ERR;
+    {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        Device::CameraStatus status{};
+        statusAfterResult = device->cameraGetCameraStatusU(status);
+        if (statusAfterResult == RM_RET_OK) {
+            agcAfter = status.tiny.audio_auto_gain != 0;
+            noiseAfter = status.tiny.noise_cancellation != 0;
+        }
+        if (getAudioAGC) {
+            bool enabled = false;
+            agcQueryAfterResult = getAudioAGC(device.get(), enabled);
+            if (agcQueryAfterResult == RM_RET_OK) agcAfter = enabled;
+        }
+        if (getAudioNoiseReduce) {
+            bool enabled = false;
+            int level = 0;
+            noiseQueryAfterResult = getAudioNoiseReduce(device.get(), enabled, level);
+            if (noiseQueryAfterResult == RM_RET_OK) {
+                noiseAfter = enabled;
+                noiseLevelAfter = level;
+            }
+        }
+    }
+
+    const bool agcReady = agcAfter.value_or(false);
+    const bool noiseReady = noiseAfter.value_or(false);
+    trace.event(
+        "audio.processing",
+        "firmware",
+        agcReady && noiseReady ? "conversation_profile_active" : "conversation_profile_partial",
+        agcReady && noiseReady ? RM_RET_OK : RM_RET_ERR,
+        "profile=conversation; agc_before=" + audioProcessingValue(agcBefore)
+            + "; agc_changed=" + (agcChanged ? "true" : "false")
+            + "; agc_set_result=" + std::to_string(agcSetResult)
+            + "; agc_after=" + audioProcessingValue(agcAfter)
+            + "; noise_before=" + audioProcessingValue(noiseBefore)
+            + "; noise_level_before=" + audioProcessingValue(noiseLevelBefore)
+            + "; noise_changed=" + (noiseChanged ? "true" : "false")
+            + "; noise_set_result=" + std::to_string(noiseSetResult)
+            + "; noise_after=" + audioProcessingValue(noiseAfter)
+            + "; noise_level_after=" + audioProcessingValue(noiseLevelAfter)
+            + "; status_results=" + std::to_string(statusBeforeResult)
+            + "," + std::to_string(statusAfterResult)
+            + "; direct_query_results=" + std::to_string(agcQueryBeforeResult)
+            + "," + std::to_string(agcQueryAfterResult)
+            + "," + std::to_string(noiseQueryBeforeResult)
+            + "," + std::to_string(noiseQueryAfterResult)
+    );
+}
+
 bool waitForMode(const std::shared_ptr<Device> &device, int expectedMode, int timeoutMilliseconds) {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMilliseconds);
     while (Clock::now() < deadline && !interrupted) {
@@ -1230,6 +1365,7 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
     constexpr auto externalWatchdog = std::chrono::milliseconds(700);
     if (!configureFixedCameraZoom(device, trace)) return 5;
     disableHandGestures(device, trace);
+    configureConversationAudioProcessing(device, trace);
     if (const auto fieldOfView = cameraHorizontalFieldOfViewDegrees(device)) emitHorizontalFieldOfView(*fieldOfView);
     if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
     IndicatorSession indicator(device, trace);

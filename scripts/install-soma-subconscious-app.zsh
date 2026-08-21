@@ -11,6 +11,11 @@ soma_menu_bar_source="$soma_build_root/soma-menu-bar"
 soma_embodiment_source="$soma_build_root/soma-embodiment"
 soma_subconscious_resources="$soma_build_root/SOMA_SOMASubconscious.bundle"
 soma_vad_resources="$soma_build_root/SOMA_SOMAVADModel.bundle"
+soma_native_source="$soma_root/Sources/SOMANativeTracking"
+soma_native_build_root="$soma_root/.build/soma-live/native"
+soma_native_binary="$soma_native_build_root/soma-native-track"
+soma_cmake=${SOMA_CMAKE:-}
+soma_tool_path='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
 soma_app_root=${SOMA_APP_ROOT:-"$HOME/Library/Application Support/SOMA/Applications/SOMA Subconscious.app"}
 soma_app_binary="$soma_app_root/Contents/MacOS/soma-subconscious"
 soma_codex_bridge="$soma_app_root/Contents/Helpers/soma-codex-bridge"
@@ -22,10 +27,20 @@ soma_launch_agents="$HOME/Library/LaunchAgents"
 soma_menu_bar_plist="$soma_launch_agents/com.soma.menu-bar.plist"
 soma_reactive_plist="$soma_launch_agents/com.soma.reactive-l0.plist"
 
+if [[ -z "$soma_cmake" ]]; then
+  soma_cmake=$(PATH="$soma_tool_path" command -v cmake 2>/dev/null || true)
+fi
+if [[ -z "$soma_cmake" || ! -x "$soma_cmake" ]]; then
+  print -u2 'missing CMake; set SOMA_CMAKE to the cmake executable path'
+  exit 2
+fi
+
 # Installation is a deployment boundary: rebuild the shared staging directory
 # before copying so an earlier local artifact cannot silently replace newer
 # source changes in the signed app.
 /usr/bin/env swift build --package-path "$soma_root" --scratch-path "$soma_root/.build/soma-live"
+"$soma_cmake" -S "$soma_native_source" -B "$soma_native_build_root"
+"$soma_cmake" --build "$soma_native_build_root" --parallel
 
 if [[ ! -x "$soma_source_binary" ]]; then
   print -u2 "missing SOMA source binary: $soma_source_binary"
@@ -44,8 +59,12 @@ if [[ ! -x "$soma_menu_bar_source" ]]; then
   exit 2
 fi
 if [[ ! -x "$soma_embodiment_source" ]]; then
-  print -u2 "missing SOMA embodiment MCP: $soma_embodiment_source"
-  exit 2
+    print -u2 "missing SOMA embodiment MCP: $soma_embodiment_source"
+    exit 2
+fi
+if [[ ! -x "$soma_native_binary" ]]; then
+    print -u2 "missing SOMA native gimbal/audio helper: $soma_native_binary"
+    exit 2
 fi
 for soma_resource_bundle in "$soma_subconscious_resources" "$soma_vad_resources"; do
   if [[ ! -d "$soma_resource_bundle" ]]; then
@@ -125,4 +144,9 @@ soma_render_launch_agent \
   "$soma_reactive_plist"
 /bin/launchctl bootout "gui/$(id -u)" "$soma_menu_bar_plist" >/dev/null 2>&1 || true
 /bin/launchctl bootstrap "gui/$(id -u)" "$soma_menu_bar_plist"
+if /bin/launchctl print "gui/$(id -u)/com.soma.reactive-l0" >/dev/null 2>&1; then
+  /bin/launchctl kickstart -k "gui/$(id -u)/com.soma.reactive-l0"
+else
+  /bin/launchctl bootstrap "gui/$(id -u)" "$soma_reactive_plist"
+fi
 print -r -- "$soma_app_binary"

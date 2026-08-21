@@ -55,9 +55,13 @@ soma_l1_aux_model=${SOMA_L05_VLM_MODEL:-"$HOME/Library/Application Support/SOMA/
 soma_video_id=${SOMA_VIDEO_ID:-auto}
 soma_audio_id=${SOMA_AUDIO_ID:-auto}
 
-# Install the SwiftPM product into one real app bundle so camera, microphone,
-# and speech-recognition TCC grants share a stable signed identity.
-"$soma_root/scripts/install-soma-subconscious-app.zsh" >/dev/null
+# Deployment owns installation and signing. The runtime launcher must only
+# execute that installed bundle: reinstalling from here would make a service
+# restart recursively rebuild and restart itself.
+if [[ ! -x "$soma_binary" ]]; then
+  print -u2 -r -- "SOMA application is not installed. Run $soma_root/scripts/install-soma-subconscious-app.zsh first."
+  exit 64
+fi
 # Derive the L1 /api/chat endpoint from the configured host unless it was set
 # explicitly (SOMA_L1_OLLAMA_ENDPOINT already resolves in the binary too).
 if [[ -n "${OLLAMA_HOST:-}" && -z "${SOMA_L1_OLLAMA_ENDPOINT:-}" ]]; then

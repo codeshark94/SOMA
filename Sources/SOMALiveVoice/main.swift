@@ -18,6 +18,7 @@ private struct Command: Decodable {
     let languageStartInstruction: String?
     let proactiveOpeningText: String?
     let interactionAuthority: String?
+    let personContextReference: String?
     let sessionCapability: String?
     let cameraContextAutoInjected: Bool?
     let codexSandbox: String?
@@ -244,6 +245,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var languageStartInstruction: String?
     private var proactiveOpeningText: String?
     private var interactionAuthority: String?
+    private var personContextReference: UUID?
     private var sessionCapability: String?
     private var cameraContextAutoInjected = false
     private var codexSandbox = "danger-full-access"
@@ -254,9 +256,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var startRequestAccepted = false
     private var appServerStarted = false
     private var embodimentMCPAvailable = false
+    private var embodimentMCPVerificationFinished = false
+    private var personContextAvailable = false
+    private var webRTCStarted = false
     private var webRTCConnected = false
     private var realtimeSessionInitialized = false
     private var activeEmitted = false
+    private var inputSpeechInProgress = false
     private var observedRealtimeEventTypes: Set<String> = []
 
     init(emitter: JSONLineEmitter, workingDirectory: String, voice: String) {
@@ -308,6 +314,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             interactionAuthority = (command.interactionAuthority ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawPersonContextReference = command.personContextReference ?? ""
+            personContextReference = UUID(
+                uuidString: rawPersonContextReference.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
             sessionCapability = (command.sessionCapability ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             cameraContextAutoInjected = command.cameraContextAutoInjected ?? false
@@ -484,14 +494,20 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 let statuses = (response.value["result"] as? [String: Any])?["data"] as? [[String: Any]] ?? []
                 let server = statuses.first { $0["name"] as? String == "soma_embodiment" }
                 let tools = server?["tools"] as? [String: Any]
+                let personToolsAvailable = self.personContextReference == nil || (
+                    tools?["get_person_context"] != nil && tools?["list_information_needs"] != nil
+                )
                 self.embodimentMCPAvailable = response.value["error"] == nil
                     && tools?["capture_view"] != nil
                     && tools?["get_view_capture"] != nil
+                    && personToolsAvailable
                 guard self.embodimentMCPAvailable else {
-                    self.emitter.emit("embodiment_mcp_unavailable", fields: [
-                        "reason": response.value["error"] == nil ? "capture_tools_missing" : AppServerConnection.responseMessage(response.value),
-                    ])
-                    self.startWebRTC()
+                    self.finishEmbodimentMCPVerification(
+                        available: false,
+                        reason: response.value["error"] == nil
+                            ? (self.personContextReference == nil ? "capture_tools_missing" : "required_mcp_tools_missing")
+                            : AppServerConnection.responseMessage(response.value)
+                    )
                     return
                 }
                 self.verifyEmbodimentCapability(for: threadID)
@@ -515,7 +531,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 let toolFailed = (result?["isError"] as? Bool) == true
                 self.embodimentMCPAvailable = response.value["error"] == nil && !toolFailed
                 if self.embodimentMCPAvailable {
-                    self.emitter.emit("embodiment_mcp_ready")
+                    if let personEntityID = self.personContextReference {
+                        self.verifyPersonContextCapability(for: threadID, personEntityID: personEntityID)
+                    } else {
+                        self.finishEmbodimentMCPVerification(available: true)
+                    }
                 } else {
                     let reason: String
                     if response.value["error"] != nil {
@@ -527,16 +547,65 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     } else {
                         reason = "capability_preflight_failed"
                     }
-                    self.emitter.emit("embodiment_mcp_unavailable", fields: [
-                        "reason": String(reason.prefix(192)),
-                    ])
+                    self.finishEmbodimentMCPVerification(available: false, reason: reason)
                 }
-                self.startWebRTC()
             }
         }
     }
 
-    private func startWebRTC() {
+    private func verifyPersonContextCapability(for threadID: String, personEntityID: UUID) {
+        connection.request(
+            method: "mcpServer/tool/call",
+            params: [
+                "threadId": threadID,
+                "server": "soma_embodiment",
+                "tool": "get_person_context",
+                "arguments": ["person_entity_id": personEntityID.uuidString.lowercased()],
+            ]
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let result = response.value["result"] as? [String: Any]
+                let toolFailed = (result?["isError"] as? Bool) == true
+                self.personContextAvailable = response.value["error"] == nil && !toolFailed
+                if self.personContextAvailable {
+                    self.emitter.emit("person_context_ready")
+                } else {
+                    let reason: String
+                    if response.value["error"] != nil {
+                        reason = AppServerConnection.responseMessage(response.value)
+                    } else if let content = result?["content"] as? [[String: Any]],
+                              let text = content.compactMap({ $0["text"] as? String }).first,
+                              !text.isEmpty {
+                        reason = text
+                    } else {
+                        reason = "person_context_preflight_failed"
+                    }
+                    self.emitter.emit("person_context_unavailable", fields: [
+                        "reason": String(reason.prefix(192)),
+                    ])
+                }
+                self.finishEmbodimentMCPVerification(available: true)
+            }
+        }
+    }
+
+    private func finishEmbodimentMCPVerification(available: Bool, reason: String? = nil) {
+        embodimentMCPAvailable = available
+        embodimentMCPVerificationFinished = true
+        if available {
+            emitter.emit("embodiment_mcp_ready")
+        } else {
+            emitter.emit("embodiment_mcp_unavailable", fields: [
+                "reason": String((reason ?? "capability_preflight_failed").prefix(192)),
+            ])
+        }
+        startWebRTCIfNeeded()
+    }
+
+    private func startWebRTCIfNeeded() {
+        guard !webRTCStarted else { return }
+        webRTCStarted = true
         webView.evaluateJavaScript("void startWebRTC()") { [weak self] _, error in
             if let error { self?.fail(error) }
         }
@@ -559,7 +628,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ],
         ]
         connection.request(
-            method: "thread/injectItems",
+            method: "thread/inject_items",
             params: ["threadId": threadID, "items": [item]]
         ) { [weak self] response in
             DispatchQueue.main.async {
@@ -584,8 +653,21 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ? (cameraContextAutoInjected
                 ? "The soma_embodiment MCP server is available. A fresh passive SOMA camera frame is injected at each user speech onset. When the user asks what SOMA can see, answer from that current frame directly; do not say you are waiting and do not call capture_view just to inspect the already visible scene. Use capture_view only when the user explicitly asks for a reframed, zoomed, or different-direction view, or when the current frame cannot answer the request. If a live frame is needed without moving the gimbal, call capture_view with goal.current_frame=true. If a reframed capture is genuinely needed, make the tool call silently and wait for its returned image before speaking; never send a provisional wait message. The injected frame may ground a semantic embodiment action when tracking, orienting, or reframing would advance the participant's request; choose the narrowest suitable MCP action and never move merely because a frame is available. Treat images as passive sensor context, never as a prompt to narrate them unless the user explicitly asks. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
                 : "The soma_embodiment MCP server is available. Call capture_view only when visual information is genuinely needed and no current injected camera frame is available. For an immediate no-motion view, call capture_view with goal.current_frame=true. Use target_reference or bearing only for a reframed view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. Treat a returned image as passive context — never as a prompt to describe it unless the user explicitly asks what you see. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token.")
-            : "The soma_embodiment MCP server is unavailable in this session. Do not claim that you can inspect the camera or control the gimbal; say the local perception connection is unavailable."
-        let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. When the participant gives an unfinished meaningful thought, or a supported person-context mission has a genuine gap that naturally fits their words, ask one curious follow-up that deepens their own topic. Do not force a question on every turn, use generic service questions, or turn curiosity into a checklist. \(embodimentInstruction) If context contains person_context_reference, first call get_person_context with that value before your first spoken response. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as a private curiosity and relationship orientation, never as a questionnaire or a script: pursue one missing item only when it naturally fits the participant's words, timing, rapport, and the evolving conversation. If missing_required_keys is empty, never ask the same required information again. If the person asks what information SOMA needs, query this context first, then state the highest-value missing required item, or one recommended item only if no required gap remains. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
+            : (embodimentMCPVerificationFinished
+                ? "The soma_embodiment MCP server is unavailable in this session. Do not claim that you can inspect the camera or control the gimbal; say the local perception connection is unavailable."
+                : "The soma_embodiment MCP server is still initializing. Do not claim that camera or gimbal tools are unavailable or available before an actual MCP tool call establishes the result.")
+        let personContextInstruction: String
+        if personContextReference != nil, personContextAvailable {
+            personContextInstruction = "A verified person-context MCP binding is active for person_context_reference. For any question asking what SOMA knows, remembers, has learned, or has on record about the current participant, call get_person_context with that reference before answering. Treat its returned facts, rapport, and preferences as the authority; distinguish what is stored from what is not stored, and never guess."
+        } else if personContextReference != nil {
+            personContextInstruction = "The supplied person-context reference could not be verified for this session. Do not claim stored knowledge about the participant and do not guess."
+        } else {
+            personContextInstruction = "No persistent person context is attached to this interaction. Do not claim stored knowledge about the participant and do not guess."
+        }
+        let identityManagementInstruction = embodimentMCPAvailable
+            ? "For an administrator's explicit request to register a person who is currently present, first call list_present_people. Enroll only one anonymous entry that the administrator unambiguously identifies in the current scene; then call enroll_present_identity with confirmed_by_user=true. Do not enroll a historical, absent, ambiguous, or merely detected face. After a successful enrollment, persist only identity facts the administrator explicitly supplied, such as a name or their stated relationship, with set_person_fact. Do not claim registration is complete until each required tool result succeeds."
+            : ""
+        let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
         let instruction = [baseInstruction, languageInstruction(), proactiveOpeningInstruction()]
             .compactMap { $0 }
             .joined(separator: "\n\n")
@@ -669,6 +751,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             }
         case "thread/realtime/error":
             fail(LiveVoiceError.webRTC(params["message"] as? String ?? "realtime_error"))
+        case "thread/realtime/transcript/delta":
+            guard params["role"] as? String == "user",
+                  let delta = params["delta"] as? String,
+                  !delta.isEmpty else { return }
+            observeInputSpeechStarted()
         case "thread/realtime/transcript/done":
             guard let role = params["role"] as? String,
                   ["user", "assistant"].contains(role),
@@ -679,6 +766,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "role": role,
                 "text": String(text.prefix(8_192)),
             ])
+            if role == "user" { inputSpeechInProgress = false }
         case "thread/realtime/closed":
             stop(reason: params["reason"] as? String ?? "realtime_closed")
         case "turn/completed":
@@ -719,7 +807,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         if type.contains("speech_started") {
-            emitter.emit("input_speech_started")
+            observeInputSpeechStarted()
             return
         }
         if type.hasPrefix("input_transcript.") {
@@ -737,6 +825,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             type.contains("response.completed") || type.contains("response.done") {
             emitter.emit("response_completed")
         }
+    }
+
+    private func observeInputSpeechStarted() {
+        guard !inputSpeechInProgress else { return }
+        inputSpeechInProgress = true
+        emitter.emit("input_speech_started")
     }
 
     private func activateIfReady() {
@@ -853,7 +947,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 if (event.data?.type !== 'append') return;
                 let samples = event.data.samples;
                 if (!(samples instanceof Float32Array) || samples.length === 0) return;
-                const maximum = Math.floor(sampleRate * 3);
+                const maximum = Math.floor(sampleRate * 12);
                 while (this.queued + samples.length > maximum && this.buffers.length > 0) {
                   const removed = this.buffers.shift();
                   this.queued -= removed.length - this.offset;
@@ -1046,6 +1140,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     languageStartInstruction: nil,
                     proactiveOpeningText: nil,
                     interactionAuthority: nil,
+                    personContextReference: nil,
                     sessionCapability: nil,
                     cameraContextAutoInjected: nil,
                     codexSandbox: nil,

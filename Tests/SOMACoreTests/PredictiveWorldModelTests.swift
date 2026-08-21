@@ -818,6 +818,44 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertFalse(continuity.confirmsLoss(at: start + 1_400_000_000))
     }
 
+    func testConfirmedFaceLossCannotKeepSocialAttentionWithoutFreshEvidence() {
+        let start: UInt64 = 6_875_000_000
+        var continuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 1_200)
+        continuity.recordObservation(at: start)
+        let faceBelief = PredictiveWorldModel().ingestVisual(
+            VisualObservation(
+                rect: NormalizedRect(x: 0.40, y: 0.25, width: 0.20, height: 0.30),
+                confidence: 0.92,
+                source: .neuralFaceDetector,
+                kind: .human,
+                label: "face",
+                posteriorProbability: 0.94,
+                sceneID: "face-before-loss",
+                isActionEligible: true
+            ),
+            at: start
+        )
+        var controller = SubconsciousAttentionController()
+        XCTAssertEqual(
+            controller.advance(
+                belief: faceBelief,
+                evidence: .visualObservation,
+                socialFixationPermitted: true
+            ).state,
+            .socialFixation
+        )
+
+        let socialEvidenceFresh = !continuity.confirmsLoss(at: start + 1_200_000_000)
+        XCTAssertFalse(socialEvidenceFresh)
+        let released = controller.advance(
+            belief: faceBelief,
+            evidence: .visualLoss,
+            socialFixationPermitted: socialEvidenceFresh
+        )
+        XCTAssertEqual(released.state, .exploration)
+        XCTAssertFalse(released.suppressesExploration)
+    }
+
     func testCompetingRawFaceCannotInterruptVerifiedFaceLock() {
         let start: UInt64 = 6_900_000_000
         var lock = FaceLockLease()
@@ -2489,6 +2527,30 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertFalse(gate.admit(context(at: start + 5_999_000_000, label: "face")))
         XCTAssertTrue(gate.admit(context(at: start + 6_000_000_000, label: "face")))
         XCTAssertTrue(gate.admit(context(at: start + 7_000_000_000, label: "face", surprise: 0.7)))
+    }
+
+    func testAuxiliaryFrameContextKeepsTheSourceHypothesisIdentity() throws {
+        let context = L1AuxiliaryFrameContext(
+            captureNS: 42_000_000_000,
+            trigger: "test",
+            surprise: 0,
+            informationGain: 0.2,
+            presenceProbability: 0.94,
+            voiceProbability: 0,
+            targetKind: .human,
+            targetID: "scene-face-17",
+            targetLabel: "face",
+            targetProbability: 0.94,
+            targetStatus: .tracked
+        )
+        XCTAssertEqual(context.targetID, "scene-face-17")
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                L1AuxiliaryFrameContext.self,
+                from: JSONEncoder().encode(context)
+            ).targetID,
+            "scene-face-17"
+        )
     }
 
     func testL1AuxiliarySemanticInterruptRequiresConsistentCredibleEvidenceAndDebounces() {

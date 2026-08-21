@@ -184,6 +184,33 @@ private struct PersonContextArguments: Codable {
     }
 }
 
+private struct InformationNeedsArguments: Codable {
+    let personEntityId: UUID
+    let motiveId: UUID?
+    let acquiredFact: String?
+
+    func request(for operation: InformationNeedsIPCOperation) throws -> InformationNeedsIPCRequest {
+        switch operation {
+        case .list:
+            guard motiveId == nil, acquiredFact == nil else {
+                throw ServerFailure.invalidArguments("list_information_needs requires only person_entity_id")
+            }
+        case .recordAnswer:
+            guard motiveId != nil,
+                  let fact = acquiredFact?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !fact.isEmpty else {
+                throw ServerFailure.invalidArguments("record_information_need_answer requires person_entity_id, motive_id, and acquired_fact")
+            }
+        }
+        return InformationNeedsIPCRequest(
+            operation: operation,
+            personEntityID: personEntityId,
+            motiveID: motiveId,
+            acquiredFact: acquiredFact
+        )
+    }
+}
+
 private final class EmbodimentMCPServer {
     private let socketURL: URL
     private let sessionAuthorization: String?
@@ -340,6 +367,17 @@ private final class EmbodimentMCPServer {
                 .init(
                     kind: .personContext,
                     personContext: try value.request(for: operation),
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        case "list_information_needs", "record_information_need_answer":
+            let value: InformationNeedsArguments = try decode(toolArguments)
+            let operation: InformationNeedsIPCOperation = name == "list_information_needs" ? .list : .recordAnswer
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .informationNeeds,
+                    informationNeeds: try value.request(for: operation),
                     sessionAuthorization: sessionAuthorization
                 ),
                 socketURL: socketURL
@@ -522,6 +560,8 @@ private final class EmbodimentMCPServer {
             if let context = reply.personContext { projected["person_context"] = try? jsonObject(context) }
         case "recall_episodes":
             projected["recalled_episodes"] = reply.recalledEpisodes ?? []
+        case "list_information_needs", "record_information_need_answer":
+            if let needs = reply.informationNeeds { projected["information_needs"] = try? jsonObject(needs) }
         case "capture_view":
             if let decision = reply.decision { projected["decision"] = try? jsonObject(decision) }
             if let resource = reply.viewResource { projected["view_resource"] = try? jsonObject(resource) }
@@ -631,6 +671,9 @@ private final class EmbodimentMCPServer {
             "set_person_rapport",
             "set_person_fact",
             "remove_person_fact",
+            "recall_episodes",
+            "list_information_needs",
+            "record_information_need_answer",
         ]
     }
 
@@ -643,6 +686,7 @@ private final class EmbodimentMCPServer {
         embodimentStateTools()
             + identityTools()
             + personContextTools()
+            + informationNeedTools()
             + embodimentControlTools()
     }
 
@@ -710,6 +754,19 @@ private final class EmbodimentMCPServer {
                 "person_entity_id": uuidSchema(),
                 "query": stringSchema(maxLength: 512),
             ], required: ["query"])),
+        ]
+    }
+
+    private func informationNeedTools() -> [[String: Any]] {
+        [
+            tool("list_information_needs", "Read L1's currently unresolved durable information needs for one person, sorted from highest expected information gain. Use this as the real curiosity queue; do not invent checklist items from an empty profile.", objectSchema([
+                "person_entity_id": uuidSchema(),
+            ], required: ["person_entity_id"]), readOnly: true),
+            tool("record_information_need_answer", "Store an explicitly learned answer as a durable person fact, then close that exact L1 information need in one MCP operation. Call only after the person actually answers; never infer, guess, or close a need because of an image or silence.", objectSchema([
+                "person_entity_id": uuidSchema(),
+                "motive_id": uuidSchema(),
+                "acquired_fact": stringSchema(maxLength: 1024),
+            ], required: ["person_entity_id", "motive_id", "acquired_fact"])),
         ]
     }
 

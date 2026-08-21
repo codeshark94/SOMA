@@ -70,6 +70,8 @@ public struct L1AuxiliaryFrameContext: Codable, Equatable, Sendable {
     public let presenceProbability: Double
     public let voiceProbability: Double
     public let targetKind: AttentionTargetKind?
+    /// Opaque scene identity of the visual hypothesis that caused this frame.
+    public let targetID: String?
     public let targetLabel: String?
     public let targetProbability: Double
     public let targetStatus: TargetStatus
@@ -82,6 +84,7 @@ public struct L1AuxiliaryFrameContext: Codable, Equatable, Sendable {
         presenceProbability = belief.presenceProbability
         voiceProbability = belief.voiceProbability
         targetKind = belief.target?.kind
+        targetID = belief.target?.id
         targetLabel = belief.target?.label
         targetProbability = belief.target?.posteriorProbability ?? 0
         targetStatus = belief.targetStatus
@@ -95,6 +98,7 @@ public struct L1AuxiliaryFrameContext: Codable, Equatable, Sendable {
         presenceProbability: Double,
         voiceProbability: Double,
         targetKind: AttentionTargetKind?,
+        targetID: String? = nil,
         targetLabel: String?,
         targetProbability: Double,
         targetStatus: TargetStatus
@@ -106,6 +110,7 @@ public struct L1AuxiliaryFrameContext: Codable, Equatable, Sendable {
         self.presenceProbability = presenceProbability
         self.voiceProbability = voiceProbability
         self.targetKind = targetKind
+        self.targetID = targetID
         self.targetLabel = targetLabel
         self.targetProbability = targetProbability
         self.targetStatus = targetStatus
@@ -124,6 +129,8 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
     public let summary: String
     public let novelty: Double
     public let socialPresence: Double
+    /// Opaque scene identity associated with the encoded frame, if available.
+    public let targetID: String?
     public let attentionHint: L1AuxiliaryAttentionHint
     public let situation: L1AuxiliarySituation
     public let wakeReason: L1AuxiliaryWakeReason
@@ -147,6 +154,7 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
         summary: String,
         novelty: Double,
         socialPresence: Double,
+        targetID: String? = nil,
         attentionHint: L1AuxiliaryAttentionHint,
         situation: L1AuxiliarySituation,
         wakeReason: L1AuxiliaryWakeReason,
@@ -169,6 +177,7 @@ public struct L1AuxiliarySemanticCue: Codable, Equatable, Sendable {
         self.summary = String(summary.prefix(160))
         self.novelty = min(max(novelty, 0), 1)
         self.socialPresence = min(max(socialPresence, 0), 1)
+        self.targetID = targetID
         self.attentionHint = attentionHint
         self.situation = situation
         self.wakeReason = wakeReason

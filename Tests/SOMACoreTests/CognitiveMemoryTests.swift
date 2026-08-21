@@ -347,6 +347,61 @@ final class CognitiveMemoryTests: XCTestCase {
         }
     }
 
+    func testCompactionRetainsRevisionTailAsAValidReplayBaseline() async throws {
+        let directory = temporaryDirectory("compacted-revision-tail")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let start = Date(timeIntervalSince1970: 5_500)
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let initial = try await store.insert(
+            taskDraft(
+                summary: "Revision-tail fixture 1",
+                status: .active,
+                tier: .shortTerm,
+                expiresAt: start.addingTimeInterval(60 * 60),
+                at: start
+            ),
+            at: start
+        )
+        var latest = initial
+        for revision in 2 ... 14 {
+            let updatedAt = start.addingTimeInterval(TimeInterval(revision))
+            latest = try await store.correct(
+                id: initial.id,
+                replacement: taskDraft(
+                    summary: "Revision-tail fixture \(revision)",
+                    status: .active,
+                    tier: .shortTerm,
+                    expiresAt: updatedAt.addingTimeInterval(60 * 60),
+                    at: updatedAt
+                ),
+                reason: "revision tail fixture update",
+                at: updatedAt
+            )
+        }
+        try await store.compact()
+        try await store.close()
+
+        let reopened = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let restored = try await reopened.record(id: initial.id, at: start.addingTimeInterval(20))
+        XCTAssertEqual(restored?.revision, latest.revision)
+        let nextAt = start.addingTimeInterval(30)
+        let next = try await reopened.correct(
+            id: initial.id,
+            replacement: taskDraft(
+                summary: "Revision-tail fixture 15",
+                status: .active,
+                tier: .shortTerm,
+                expiresAt: nextAt.addingTimeInterval(60 * 60),
+                at: nextAt
+            ),
+            reason: "revision tail continues after reopen",
+            at: nextAt
+        )
+        XCTAssertEqual(next.revision, 15)
+        try await reopened.close()
+    }
+
     func testRawL2TurnsRemainEncryptedUntilL1Consolidation() async throws {
         let directory = temporaryDirectory("conversation")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -397,6 +452,27 @@ final class CognitiveMemoryTests: XCTestCase {
         let pendingAfterConsolidation = try await archiver.pending(at: start.addingTimeInterval(1))
         XCTAssertTrue(pendingAfterConsolidation.isEmpty)
         try await store.close()
+    }
+
+    func testConversationTurnWriteBarrierWaitsForEveryQueuedTurn() async {
+        let barrier = ConversationTurnWriteBarrier()
+        barrier.beginWrite()
+        barrier.beginWrite()
+        XCTAssertFalse(barrier.isDrained)
+
+        let waiter = Task {
+            await barrier.waitUntilDrained()
+            return true
+        }
+        await Task.yield()
+
+        barrier.finishWrite()
+        XCTAssertFalse(barrier.isDrained)
+        barrier.finishWrite()
+
+        let drained = await waiter.value
+        XCTAssertTrue(drained)
+        XCTAssertTrue(barrier.isDrained)
     }
 
     func testRawConversationCannotBecomeRemoteOrLongTermMemory() async throws {

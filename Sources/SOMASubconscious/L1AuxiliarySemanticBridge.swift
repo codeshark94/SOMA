@@ -77,6 +77,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private var interruptGate: L1AuxiliarySemanticInterruptGate
     private var temporalSituationGate = L1AuxiliaryTemporalSituationGate()
     private var pending: Pending?
+    private var inFlightContext: L1AuxiliaryFrameContext?
     private var inFlight = false
     private var ready = false
     private var accepting = true
@@ -85,6 +86,14 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private var stderrBuffer = ""
     private var supersededFrames = 0
     private var intentionallyStopped = false
+    // Camera callbacks must never enqueue one retained IOSurface per frame.
+    // This mailbox admits only the newest buffer to the utility queue; the
+    // semantic admission gate still decides whether it becomes inference work.
+    private let submissionLock = NSLock()
+    private var latestSubmission: Pending?
+    private var submissionDrainScheduled = false
+    private var acceptingSubmissions = true
+    private var ingressSupersededFrames = 0
     private let frameLock = NSLock()
     private var lastJPEG: Data?
 
@@ -163,20 +172,35 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             }
             weakBridge.value?.queue.async { weakBridge.value?.consumeStderr(data) }
         }
-        onHealth("starting", "model=\(model); transport=jsonl_base64_jpeg; pending_capacity=1")
+        onHealth("starting", "model=\(model); transport=jsonl_base64_jpeg; mailbox_capacity=1; pending_capacity=1")
     }
 
     func submit(pixelBuffer: CVPixelBuffer, context: L1AuxiliaryFrameContext) {
-        let sendablePixelBuffer = L1AuxiliaryPixelBuffer(pixelBuffer)
-        queue.async { [weak self] in
-            guard let self, self.accepting, self.admission.admit(context) else { return }
-            if self.pending != nil { self.supersededFrames += 1 }
-            self.pending = Pending(pixelBuffer: sendablePixelBuffer, context: context)
-            self.pump()
+        let submission = Pending(
+            pixelBuffer: L1AuxiliaryPixelBuffer(pixelBuffer),
+            context: context
+        )
+        submissionLock.lock()
+        guard acceptingSubmissions else {
+            submissionLock.unlock()
+            return
         }
+        if latestSubmission != nil { ingressSupersededFrames += 1 }
+        latestSubmission = submission
+        guard !submissionDrainScheduled else {
+            submissionLock.unlock()
+            return
+        }
+        submissionDrainScheduled = true
+        submissionLock.unlock()
+        queue.async { [weak self] in self?.drainSubmittedFrames() }
     }
 
     func stop() {
+        submissionLock.lock()
+        acceptingSubmissions = false
+        latestSubmission = nil
+        submissionLock.unlock()
         queue.sync {
             guard accepting else { return }
             accepting = false
@@ -187,7 +211,10 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             try? input.close()
             output.readabilityHandler = nil
             errorOutput.readabilityHandler = nil
-            onHealth("stopped", "superseded_frames=\(supersededFrames)")
+            submissionLock.lock()
+            let totalSuperseded = supersededFrames + ingressSupersededFrames
+            submissionLock.unlock()
+            onHealth("stopped", "superseded_frames=\(totalSuperseded)")
         }
         guard process.isRunning else { return }
         let deadline = Date().addingTimeInterval(2)
@@ -197,10 +224,29 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         if process.isRunning { process.terminate() }
     }
 
+    private func drainSubmittedFrames() {
+        while true {
+            submissionLock.lock()
+            guard acceptingSubmissions, let submission = latestSubmission else {
+                submissionDrainScheduled = false
+                submissionLock.unlock()
+                return
+            }
+            latestSubmission = nil
+            submissionLock.unlock()
+
+            guard accepting, admission.admit(submission.context) else { continue }
+            if pending != nil { supersededFrames += 1 }
+            pending = submission
+            pump()
+        }
+    }
+
     private func pump() {
         guard accepting, ready, !inFlight, let pending else { return }
         self.pending = nil
         inFlight = true
+        inFlightContext = pending.context
         requestSequence += 1
         let requestID = requestSequence
         let jpeg: Data? = autoreleasepool {
@@ -217,6 +263,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         }
         guard let jpeg else {
             inFlight = false
+            inFlightContext = nil
             onHealth("encode_error", "request_id=\(requestID)")
             pump()
             return
@@ -235,6 +282,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             try input.write(contentsOf: data)
         } catch {
             inFlight = false
+            inFlightContext = nil
             onHealth("transport_error", String(error.localizedDescription.prefix(200)))
             pump()
         }
@@ -271,6 +319,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         case "result":
             defer {
                 inFlight = false
+                inFlightContext = nil
                 pump()
             }
             guard let requestID = envelope.requestID,
@@ -288,6 +337,11 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
                 onHealth("protocol_error", "incomplete_result")
                 return
             }
+            guard let requestContext = inFlightContext,
+                  requestContext.captureNS == captureNS else {
+                onHealth("protocol_error", "result_capture_mismatch")
+                return
+            }
             let cue = L1AuxiliarySemanticCue(
                 requestID: requestID,
                 captureNS: captureNS,
@@ -296,6 +350,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
                 summary: summary,
                 novelty: novelty,
                 socialPresence: socialPresence,
+                targetID: requestContext.targetID,
                 attentionHint: attentionHint,
                 situation: situation,
                 wakeReason: wakeReason,
@@ -320,6 +375,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             }
         case "error":
             inFlight = false
+            inFlightContext = nil
             onHealth("runtime_error", envelope.message ?? "worker_error")
             pump()
         default:

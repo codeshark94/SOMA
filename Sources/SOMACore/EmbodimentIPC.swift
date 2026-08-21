@@ -6,6 +6,7 @@ public enum EmbodimentIPCCommandKind: String, Codable, Sendable {
     case snapshot
     case captureResult = "capture_result"
     case personContext = "person_context"
+    case informationNeeds = "information_needs"
     case identityRoster = "identity_roster"
     case identityEnrollment = "identity_enrollment"
     case indicatorCalibration = "indicator_calibration"
@@ -64,6 +65,57 @@ public struct PersonContextIPCRequest: Codable, Equatable, Sendable {
         self.factValue = factValue.map { String($0.prefix(1_024)) }
         self.confirmedByUser = confirmedByUser
         self.query = query.map { String($0.prefix(512)) }
+    }
+}
+
+/// The L1-owned queue of durable information motives for one person. The
+/// queue is deliberately separate from the person profile: it tells L2 what
+/// remains useful to learn, while the profile holds only learned facts.
+public enum InformationNeedsIPCOperation: String, Codable, Sendable {
+    case list
+    case recordAnswer = "record_answer"
+}
+
+public struct InformationNeedsIPCRequest: Codable, Equatable, Sendable {
+    public let operation: InformationNeedsIPCOperation
+    public let personEntityID: UUID
+    public let motiveID: UUID?
+    public let acquiredFact: String?
+
+    public init(
+        operation: InformationNeedsIPCOperation,
+        personEntityID: UUID,
+        motiveID: UUID? = nil,
+        acquiredFact: String? = nil
+    ) {
+        self.operation = operation
+        self.personEntityID = personEntityID
+        self.motiveID = motiveID
+        self.acquiredFact = acquiredFact.map { String($0.prefix(1_024)) }
+    }
+}
+
+/// An interaction-safe projection of an L1 information motive. It exposes no
+/// local transcript, biometric, or hidden memory material.
+public struct InformationNeedIPCItem: Codable, Equatable, Sendable {
+    public let motiveID: UUID
+    public let question: String
+    public let expectedInformationGain: Double
+
+    public init(motiveID: UUID, question: String, expectedInformationGain: Double) {
+        self.motiveID = motiveID
+        self.question = String(question.prefix(512))
+        self.expectedInformationGain = min(max(expectedInformationGain, 0), 1)
+    }
+}
+
+public struct InformationNeedsIPCResult: Codable, Equatable, Sendable {
+    public let items: [InformationNeedIPCItem]
+    public let recordedMotiveID: UUID?
+
+    public init(items: [InformationNeedIPCItem] = [], recordedMotiveID: UUID? = nil) {
+        self.items = Array(items.prefix(32))
+        self.recordedMotiveID = recordedMotiveID
     }
 }
 
@@ -134,6 +186,7 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
     public let request: CognitiveEmbodimentRequest?
     public let requestID: String?
     public let personContext: PersonContextIPCRequest?
+    public let informationNeeds: InformationNeedsIPCRequest?
     public let identityRosterQuery: IdentityRosterQuery?
     public let identityEnrollment: IdentityEnrollmentIPCRequest?
     /// An opaque capability issued by the owning L0 process for one live
@@ -148,6 +201,7 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         request: CognitiveEmbodimentRequest? = nil,
         requestID: String? = nil,
         personContext: PersonContextIPCRequest? = nil,
+        informationNeeds: InformationNeedsIPCRequest? = nil,
         identityRosterQuery: IdentityRosterQuery? = nil,
         identityEnrollment: IdentityEnrollmentIPCRequest? = nil,
         sessionAuthorization: String? = nil,
@@ -157,6 +211,7 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         self.request = request
         self.requestID = requestID.map { String($0.prefix(96)) }
         self.personContext = personContext
+        self.informationNeeds = informationNeeds
         self.identityRosterQuery = identityRosterQuery
         self.identityEnrollment = identityEnrollment
         self.sessionAuthorization = sessionAuthorization.map { String($0.prefix(128)) }
@@ -171,6 +226,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
     public let snapshot: EmbodimentShadowSnapshot?
     public let viewResource: EmbodimentViewResource?
     public let personContext: PersonContextSnapshot?
+    public let informationNeeds: InformationNeedsIPCResult?
     public let identityRoster: IdentityRosterSnapshot?
     public let identityEnrollment: IdentityEnrollmentResult?
     public let recalledEpisodes: [String]?
@@ -182,6 +238,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         snapshot: EmbodimentShadowSnapshot? = nil,
         viewResource: EmbodimentViewResource? = nil,
         personContext: PersonContextSnapshot? = nil,
+        informationNeeds: InformationNeedsIPCResult? = nil,
         identityRoster: IdentityRosterSnapshot? = nil,
         identityEnrollment: IdentityEnrollmentResult? = nil,
         recalledEpisodes: [String]? = nil
@@ -192,6 +249,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         self.snapshot = snapshot
         self.viewResource = viewResource
         self.personContext = personContext
+        self.informationNeeds = informationNeeds
         self.identityRoster = identityRoster
         self.identityEnrollment = identityEnrollment
         self.recalledEpisodes = recalledEpisodes.map { Array($0.prefix(8)).map { String($0.prefix(1_200)) } }
@@ -238,6 +296,9 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     public typealias RecallEpisodesProvider = @Sendable (
         _ request: PersonContextIPCRequest
     ) -> Result<[String], Error>
+    public typealias InformationNeedsProvider = @Sendable (
+        _ request: InformationNeedsIPCRequest
+    ) -> Result<InformationNeedsIPCResult, Error>
     public typealias IdentityRosterProvider = @Sendable (
         _ query: IdentityRosterQuery
     ) -> Result<IdentityRosterSnapshot, Error>
@@ -259,6 +320,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let captureResultProvider: CaptureResultProvider
     private let personContextProvider: PersonContextProvider
     private let recallEpisodesProvider: RecallEpisodesProvider
+    private let informationNeedsProvider: InformationNeedsProvider
     private let identityRosterProvider: IdentityRosterProvider
     private let identityEnrollmentProvider: IdentityEnrollmentProvider
     private let indicatorCalibrationHandler: IndicatorCalibrationHandler
@@ -279,6 +341,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         captureResultProvider: @escaping CaptureResultProvider = { _, _ in nil },
         personContextProvider: @escaping PersonContextProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         recallEpisodesProvider: @escaping RecallEpisodesProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
+        informationNeedsProvider: @escaping InformationNeedsProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         identityRosterProvider: @escaping IdentityRosterProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         identityEnrollmentProvider: @escaping IdentityEnrollmentProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
@@ -291,6 +354,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.captureResultProvider = captureResultProvider
         self.personContextProvider = personContextProvider
         self.recallEpisodesProvider = recallEpisodesProvider
+        self.informationNeedsProvider = informationNeedsProvider
         self.identityRosterProvider = identityRosterProvider
         self.identityEnrollmentProvider = identityEnrollmentProvider
         self.indicatorCalibrationHandler = indicatorCalibrationHandler
@@ -387,6 +451,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 guard command.request == nil,
                       command.requestID == nil,
                       command.personContext == nil,
+                      command.informationNeeds == nil,
                       command.identityRosterQuery == nil,
                       command.identityEnrollment == nil,
                       command.indicatorPreset == nil else {
@@ -399,6 +464,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 guard let request = command.request,
                       command.requestID == nil,
                       command.personContext == nil,
+                      command.informationNeeds == nil,
                       command.identityRosterQuery == nil,
                       command.identityEnrollment == nil,
                       command.indicatorPreset == nil else {
@@ -416,6 +482,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             case .captureResult:
                 guard command.request == nil,
                       command.personContext == nil,
+                      command.informationNeeds == nil,
                       command.identityRosterQuery == nil,
                       command.identityEnrollment == nil,
                       command.indicatorPreset == nil,
@@ -443,6 +510,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             case .personContext:
                 guard command.request == nil,
                       command.requestID == nil,
+                      command.informationNeeds == nil,
                       command.identityRosterQuery == nil,
                       command.identityEnrollment == nil,
                       command.indicatorPreset == nil,
@@ -469,10 +537,40 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 case let .failure(error):
                     writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
                 }
+            case .informationNeeds:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil,
+                      let request = command.informationNeeds else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                switch request.operation {
+                case .list:
+                    guard request.motiveID == nil, request.acquiredFact == nil else {
+                        throw EmbodimentIPCError.malformedMessage
+                    }
+                case .recordAnswer:
+                    guard request.motiveID != nil,
+                          let fact = request.acquiredFact?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !fact.isEmpty else {
+                        throw EmbodimentIPCError.malformedMessage
+                    }
+                }
+                try authorize(command.sessionAuthorization, scope: .personContext(request.personEntityID))
+                switch informationNeedsProvider(request) {
+                case let .success(result):
+                    writeReply(.init(ok: true, informationNeeds: result), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
             case .identityRoster:
                 guard command.request == nil,
                       command.requestID == nil,
                       command.personContext == nil,
+                      command.informationNeeds == nil,
                       command.indicatorPreset == nil,
                       command.identityEnrollment == nil,
                       let query = command.identityRosterQuery else {
@@ -489,6 +587,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 guard command.request == nil,
                       command.requestID == nil,
                       command.personContext == nil,
+                      command.informationNeeds == nil,
                       command.identityRosterQuery == nil,
                       command.indicatorPreset == nil,
                       let request = command.identityEnrollment,
@@ -506,6 +605,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 guard command.request == nil,
                       command.requestID == nil,
                       command.personContext == nil,
+                      command.informationNeeds == nil,
                       command.identityRosterQuery == nil,
                       command.identityEnrollment == nil else {
                     throw EmbodimentIPCError.malformedMessage

@@ -14,6 +14,8 @@ enum AppServerLiveVoiceEvent: Sendable {
     case visualContextRejected(reason: String)
     case embodimentMCPReady
     case embodimentMCPUnavailable(reason: String)
+    case personContextReady
+    case personContextUnavailable(reason: String)
     case embodimentMCPCall(tool: String, status: String, error: String?)
     case inputAccepted(characters: Int)
     case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
@@ -31,7 +33,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let characters: Int?
     let role: String?
     let text: String?
-    let tool: String?
+        let tool: String?
     let status: String?
     let error: String?
 
@@ -71,6 +73,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var outputBuffer = Data()
     private var preRoll: [BufferedLiveAudio] = []
     private var preRollDurationNS: UInt64 = 0
+    private var initiatingTurn: [BufferedLiveAudio] = []
+    private var capturingInitiatingTurn = false
     private var audioAccumulator: [Float] = []
     private var audioAccumulatorSampleRate = 0
     private var pendingContext: (text: String, role: String)?
@@ -118,6 +122,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningText: nil,
                 personEntityID: personEntityID,
+                personContextReference: context?.personContextAvailable == true ? context?.personEntityID : nil,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
             )
@@ -151,6 +156,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningText: String(exactOpening.prefix(1_024)),
                 personEntityID: personEntityID,
+                personContextReference: context?.personContextAvailable == true ? context?.personEntityID : nil,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
             )
@@ -215,6 +221,27 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
+    /// Preserves the single utterance that caused this session to open.  The
+    /// live transport can take longer to establish than an ordinary sentence,
+    /// so replaying an undifferentiated rolling buffer would either lose its
+    /// beginning or submit ambient silence as the first turn.
+    func observeVoiceActivity(_ active: Bool, at _: UInt64) {
+        queue.async { [weak self] in
+            guard let self, !stopped else { return }
+            if active, self.active {
+                self.enqueueCurrentCameraImageIfEnabled(force: true)
+            }
+            guard gate.phase == .starting else { return }
+            if active {
+                guard !capturingInitiatingTurn else { return }
+                capturingInitiatingTurn = true
+                initiatingTurn = recentPreRoll(durationNS: 480_000_000)
+            } else {
+                capturingInitiatingTurn = false
+            }
+        }
+    }
+
     private func flushAudioAccumulator() {
         guard audioAccumulatorSampleRate > 0, !audioAccumulator.isEmpty else { return }
         let packet = audioAccumulator
@@ -237,17 +264,27 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         } else {
             preRoll.append(chunk)
             preRollDurationNS &+= durationNS
-            // Idle capture keeps only a short volatile lookback. Once a live
-            // session is launching, retain the entire initiating utterance
-            // through the App Server/WebRTC startup interval so the person
-            // never has to repeat themselves while waiting for SOMA to wake.
-            let retentionNS: UInt64 = gate.phase == .starting
-                ? 8_000_000_000
-                : 1_000_000_000
-            while preRollDurationNS > retentionNS, preRoll.count > 1 {
+            if capturingInitiatingTurn {
+                initiatingTurn.append(chunk)
+            }
+            // This is only lead-in for the VAD-confirmed initiating turn. The
+            // full turn is held separately, so background audio cannot evict
+            // the beginning of the user's actual utterance during startup.
+            while preRollDurationNS > 1_000_000_000, preRoll.count > 1 {
                 preRollDurationNS -= preRoll.removeFirst().durationNS
             }
         }
+    }
+
+    private func recentPreRoll(durationNS: UInt64) -> [BufferedLiveAudio] {
+        var selected: [BufferedLiveAudio] = []
+        var accumulated: UInt64 = 0
+        for chunk in preRoll.reversed() {
+            selected.append(chunk)
+            accumulated &+= chunk.durationNS
+            if accumulated >= durationNS { break }
+        }
+        return selected.reversed()
     }
 
     func stop() {
@@ -268,6 +305,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             activePersonEntityID = nil
             preRoll.removeAll(keepingCapacity: false)
             preRollDurationNS = 0
+            initiatingTurn.removeAll(keepingCapacity: false)
+            capturingInitiatingTurn = false
             audioAccumulator.removeAll(keepingCapacity: false)
             audioAccumulatorSampleRate = 0
             pendingContext = nil
@@ -292,6 +331,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         languageStartInstruction: String?,
         proactiveOpeningText: String?,
         personEntityID: UUID?,
+        personContextReference: UUID?,
         interactionAuthority: SOMAInteractionAuthority?,
         at monotonicNS: UInt64
     ) {
@@ -365,6 +405,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             "languageStartInstruction": languageStartInstruction ?? "",
             "proactiveOpeningText": proactiveOpeningText ?? "",
             "interactionAuthority": interactionAuthority?.rawValue ?? "",
+            "personContextReference": personContextReference?.uuidString.lowercased() ?? "",
             "cameraContextAutoInjected": cameraContextAutoInjection,
             "codexSandbox": somaEnvString("SOMA_L2_CODEX_SANDBOX", default: "danger-full-access"),
             "codexAdminOnly": somaEnvBool("SOMA_L2_CODEX_ADMIN_ONLY", default: false),
@@ -397,13 +438,17 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 activeThreadID = event.threadID
                 gate.observeActive()
                 armInactivityTimeout(at: DispatchTime.now().uptimeNanoseconds)
-                // Establish visual context before replaying the initiating
-                // utterance, so the first L2 turn sees the same live scene
-                // from which it may choose a semantic motor action.
-                enqueueCurrentCameraImageIfEnabled(force: true)
-                let buffered = preRoll
+                let buffered = initiatingTurn
                 preRoll.removeAll(keepingCapacity: true)
                 preRollDurationNS = 0
+                initiatingTurn.removeAll(keepingCapacity: true)
+                capturingInitiatingTurn = false
+                // A direct first-turn visual question needs the current frame
+                // before its audio is interpreted, not after transcription has
+                // already begun.
+                if !buffered.isEmpty {
+                    enqueueCurrentCameraImageIfEnabled(force: true)
+                }
                 for chunk in buffered { send(chunk) }
                 if let pendingContext {
                     self.pendingContext = nil
@@ -438,6 +483,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.embodimentMCPReady)
             case "embodiment_mcp_unavailable":
                 onEvent(.embodimentMCPUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
+            case "person_context_ready":
+                onEvent(.personContextReady)
+            case "person_context_unavailable":
+                onEvent(.personContextUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
             case "embodiment_mcp_call":
                 let tool = String((event.tool ?? "unknown").prefix(96))
                 let status = String((event.status ?? "unknown").prefix(48))
@@ -695,7 +744,8 @@ func testAppServerLiveVoiceLauncher() -> String {
             semaphore.signal()
         case .launchRequested, .inputTransportStarted, .outputPlaybackReady, .proactiveOpeningTriggered, .hearingUser,
              .contextAppended, .contextRejected, .visualContextAttached, .visualContextRejected,
-             .embodimentMCPReady, .embodimentMCPUnavailable, .embodimentMCPCall, .inputAccepted,
+             .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
+             .personContextUnavailable, .embodimentMCPCall, .inputAccepted,
              .transcriptFinalized, .preparingResponse, .responding, .responseCompleted, .ended:
             break
         }

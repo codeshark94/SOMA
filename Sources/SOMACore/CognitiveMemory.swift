@@ -1819,7 +1819,13 @@ public actor CognitiveMemoryStore {
                     throw CognitiveMemoryError.nonMonotonicUpdate(record.id)
                 }
                 if historyByID[record.id] == nil, record.revision != 1 {
-                    throw CognitiveMemoryError.revisionConflict(record.id)
+                    // A compacted journal intentionally retains only the tail
+                    // of a long revision chain. Its first retained record is
+                    // therefore a verified baseline, not necessarily revision
+                    // one; subsequent entries still have to be contiguous.
+                    guard entry.reason == "compacted" else {
+                        throw CognitiveMemoryError.revisionConflict(record.id)
+                    }
                 }
                 historyByID[record.id, default: []].append(record)
                 current[record.id] = record
@@ -1835,6 +1841,57 @@ public actor CognitiveMemoryStore {
             sequence = entry.sequence
         }
         return (sequence, current, historyByID)
+    }
+}
+
+/// Tracks outstanding transcript writes for one live conversation. A session
+/// must drain its own writes before a higher layer reads them for
+/// consolidation; otherwise an ending event can race ahead of the final turns.
+public final class ConversationTurnWriteBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pendingWrites = 0
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+
+    public init() {}
+
+    public var isDrained: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingWrites == 0
+    }
+
+    public func beginWrite() {
+        lock.lock()
+        pendingWrites += 1
+        lock.unlock()
+    }
+
+    public func finishWrite() {
+        lock.lock()
+        guard pendingWrites > 0 else {
+            lock.unlock()
+            return
+        }
+        pendingWrites -= 1
+        let waiters = pendingWrites == 0 ? drainWaiters : []
+        if pendingWrites == 0 {
+            drainWaiters.removeAll(keepingCapacity: false)
+        }
+        lock.unlock()
+        waiters.forEach { $0.resume() }
+    }
+
+    public func waitUntilDrained() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if pendingWrites == 0 {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            drainWaiters.append(continuation)
+            lock.unlock()
+        }
     }
 }
 
