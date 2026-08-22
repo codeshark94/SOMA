@@ -178,6 +178,32 @@ final class L1SituationStreamTests: XCTestCase {
         XCTAssertEqual(request.contactHistory.first?.purpose, "A Live voice conversation became active.")
     }
 
+    func testSocialRapportInferenceRewardsReciprocalAndRecentContact() {
+        let now = Date(timeIntervalSince1970: 50_000)
+        let reciprocal = L1SocialRapportEstimator.infer(from: [
+            .init(kind: .conversationOpened, occurredAt: now),
+            .init(kind: .participantResponded, occurredAt: now),
+            .init(kind: .conversationEnded, occurredAt: now),
+        ], at: now)
+        let unanswered = L1SocialRapportEstimator.infer(from: [
+            .init(kind: .conversationOpened, occurredAt: now),
+            .init(kind: .conversationEndedWithoutParticipantTurn, occurredAt: now),
+        ], at: now)
+        let distant = L1SocialRapportEstimator.infer(from: [
+            .init(kind: .conversationOpened, occurredAt: now.addingTimeInterval(-180 * 24 * 60 * 60)),
+            .init(kind: .participantResponded, occurredAt: now.addingTimeInterval(-180 * 24 * 60 * 60)),
+            .init(kind: .conversationEnded, occurredAt: now.addingTimeInterval(-180 * 24 * 60 * 60)),
+        ], at: now)
+
+        XCTAssertNotNil(reciprocal)
+        XCTAssertNotNil(unanswered)
+        XCTAssertNotNil(distant)
+        XCTAssertGreaterThan(reciprocal?.familiarity ?? 0, unanswered?.familiarity ?? 0)
+        XCTAssertGreaterThan(reciprocal?.interactionComfort ?? 0, unanswered?.interactionComfort ?? 0)
+        XCTAssertGreaterThan(reciprocal?.communicationAlignment ?? 0, unanswered?.communicationAlignment ?? 0)
+        XCTAssertGreaterThan(reciprocal?.familiarity ?? 0, distant?.familiarity ?? 0)
+    }
+
     func testRebasedSocialOpportunityPreservesModelEvidenceButRefreshesL0Authority() {
         let person = UUID()
         let opportunity = L1SocialOpportunity(

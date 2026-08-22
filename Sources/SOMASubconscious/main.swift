@@ -4043,6 +4043,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 socialFixationPermitted: socialFixationSupported,
                 nativeSocialTrackingActive: retainNativeThroughDetectorGap
             )
+            // A confirmed visual departure must release the geometric face
+            // latch as well as the attention state. FaceLockLease deliberately
+            // has no wall-clock expiry after independent verification, so
+            // retaining it after the continuity evidence expires leaves L0 in
+            // an impossible state: attention selects exploration while the
+            // motor admission still sees a permanent social lock.
+            if !socialEvidenceFresh {
+                releaseSocialFaceLock(at: now, reason: "visual_continuity_expired")
+            }
             recordAttentionDecision(decision, target: belief.target, at: now)
             if decision.suppressesExploration {
                 // Only a verified face lock is allowed a short detector gap.
@@ -4068,13 +4077,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 if socialRetentionDeadlineNS == nil {
                     socialRetentionDeadlineNS = now + socialRetentionWindowNS
                 } else if now >= socialRetentionDeadlineNS! {
-                    socialRetentionDeadlineNS = nil
-                    let wasVerified = faceLock.permitsMotor(at: now)
-                    faceLock.invalidate()
-                    if !wasVerified {
-                        faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
-                    }
-                    lastMotorTarget = nil
+                    releaseSocialFaceLock(at: now, reason: "retention_window_expired")
                     applyVisualLoss(belief, at: now)
                 }
                 return
@@ -4135,13 +4138,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             if socialRetentionDeadlineNS == nil {
                 socialRetentionDeadlineNS = now + socialRetentionWindowNS
             } else if now >= socialRetentionDeadlineNS! {
-                socialRetentionDeadlineNS = nil
-                let wasVerified = faceLock.permitsMotor(at: now)
-                faceLock.invalidate()
-                if !wasVerified {
-                    faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
-                }
-                lastMotorTarget = nil
+                releaseSocialFaceLock(at: now, reason: "retention_window_expired")
                 applyVisualLoss(belief, at: now)
             }
             return
@@ -4401,6 +4398,26 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         scanScheduledForEvidenceGeneration = nil
     }
 
+    private func releaseSocialFaceLock(at monotonicNS: UInt64, reason: String) {
+        let wasVerified = faceLock.permitsMotor(at: monotonicNS)
+        let hadFaceLock = faceLock.isActive(at: monotonicNS)
+        socialRetentionDeadlineNS = nil
+        guard hadFaceLock else { return }
+        faceLock.invalidate()
+        if !wasVerified {
+            faceFixationCooldownUntilNS = monotonicNS + faceFixationReleaseCooldownNS
+        }
+        lastMotorTarget = nil
+        activeSpatialFaceReacquisition = nil
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "attention_gimbal_bridge",
+            state: "social_face_lock_released",
+            message: "reason=\(reason); verified=\(wasVerified)"
+        ))
+    }
+
     /// The device-confirmed native lease (or a pending handoff) owns the
     /// gimbal. Competing L0 attention — a body candidate of the tracked
     /// person, a scene/object candidate, or a detector-ID transition — is
@@ -4534,14 +4551,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let evidenceGeneration = visualEvidenceGeneration
         guard scanScheduledForEvidenceGeneration != evidenceGeneration else { return }
         scanScheduledForEvidenceGeneration = evidenceGeneration
-        // The external gate measures absence from the first confirmed loss.
-        // Give it its full dwell before asking for coverage, otherwise a
-        // premature .none would consume this generation's only scan slot.
+        let now = monotonicNanoseconds()
+        // Social retention may reserve a longer local reacquisition window,
+        // while the actuator gate owns the canonical absence dwell. Taking the
+        // later of the two prevents the transport timer from racing either
+        // state machine at an exact timing boundary.
         let baseDelayMilliseconds: Int
         if let minimumDelayMilliseconds {
             baseDelayMilliseconds = minimumDelayMilliseconds
-        } else if faceLock.isActive(at: monotonicNanoseconds()),
-           faceLock.permitsMotor(at: monotonicNanoseconds()) {
+        } else if faceLock.isActive(at: now),
+           faceLock.permitsMotor(at: now) {
             // Keep the social identity latched while its remembered bearing
             // gets the first bounded recovery attempt. Broad coverage starts
             // only if that local attempt fails to put the face back in view.
@@ -4551,14 +4570,26 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         } else {
             baseDelayMilliseconds = 450
         }
-        let now = monotonicNanoseconds()
-        let startupDelayMilliseconds: Int
-        if explorationEligibleAfterNS > now {
-            startupDelayMilliseconds = Int((explorationEligibleAfterNS - now + 999_999) / 1_000_000)
-        } else {
-            startupDelayMilliseconds = 0
+        let baseDeadlineNS = now + UInt64(baseDelayMilliseconds) * 1_000_000
+        let gateDeadlineNS = autonomousScanEligibleAtNS() ?? now
+        let firstAttemptNS = max(baseDeadlineNS, explorationEligibleAfterNS, gateDeadlineNS)
+        scheduleScanAttempt(for: evidenceGeneration, noEarlierThan: firstAttemptNS)
+    }
+
+    private func autonomousScanEligibleAtNS() -> UInt64? {
+        if let externalGate {
+            return externalGate.nextScanEligibleAtNS
         }
-        let delayMilliseconds = max(baseDelayMilliseconds, startupDelayMilliseconds)
+        return idleExplorationGate?.nextScanEligibleAtNS
+    }
+
+    private func scheduleScanAttempt(
+        for evidenceGeneration: Int,
+        noEarlierThan deadlineNS: UInt64
+    ) {
+        let now = monotonicNanoseconds()
+        let remainingNS = deadlineNS > now ? deadlineNS - now : 0
+        let delayMilliseconds = max(1, Int((remainingNS + 999_999) / 1_000_000))
         queue.asyncAfter(deadline: .now() + .milliseconds(delayMilliseconds)) { [weak self] in
             guard let self,
                   self.visualEvidenceGeneration == evidenceGeneration,
@@ -4573,11 +4604,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // otherwise that stale callback can begin a sweep before the
             // first live face pass reaches the bridge.
             guard now >= self.explorationEligibleAfterNS else {
-                self.scanScheduledForEvidenceGeneration = nil
-                self.scheduleScanAfterContinuousVisualLoss()
+                self.scheduleScanAttempt(
+                    for: evidenceGeneration,
+                    noEarlierThan: self.explorationEligibleAfterNS
+                )
                 return
             }
-            guard !self.hasRecentObservedFace(at: now) else { return }
+            guard !self.hasRecentObservedFace(at: now) else {
+                self.scanScheduledForEvidenceGeneration = nil
+                return
+            }
             let action: ExternalGimbalAttentionAction
             if var externalGate = self.externalGate {
                 action = externalGate.beginScanIfEligible(at: now)
@@ -4586,6 +4622,23 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 action = idleExplorationGate.beginIfEligible(at: now)
                 self.idleExplorationGate = idleExplorationGate
             } else {
+                self.scanScheduledForEvidenceGeneration = nil
+                return
+            }
+            if action == .none {
+                // Dispatch timing is approximate while the absence deadline is
+                // monotonic. A timer that wakes fractionally early must remain
+                // armed rather than silently consuming this entire no-target
+                // interval. The next attempt is derived from the gate's state,
+                // so this cannot spin after a fresh target or disabled gate.
+                guard let gateDeadlineNS = self.autonomousScanEligibleAtNS() else {
+                    self.scanScheduledForEvidenceGeneration = nil
+                    return
+                }
+                self.scheduleScanAttempt(
+                    for: evidenceGeneration,
+                    noEarlierThan: max(gateDeadlineNS, now + 1_000_000)
+                )
                 return
             }
             self.apply(action, at: now, target: nil, reason: "visual_absence_timeout")
@@ -10278,7 +10331,7 @@ private func run(_ options: Options) throws {
                                 at: Date()
                             )
                             guard !recalled.isEmpty else { return }
-                            liveVoiceBox.launcher?.appendActiveContext(
+                            liveVoiceBox.launcher?.appendActiveContextDelta(
                                 "Recalled shared history relevant to the user's last message: "
                                     + recalled.joined(separator: " | ")
                             )
@@ -10372,7 +10425,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=auto_injected_on_local_vad_and_session_start; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_updates"
+            message: "transport=codex_app_server_webrtc_audio; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_updates_and_recall_deltas"
         ))
     } else {
         liveVoiceLauncher = nil

@@ -1417,21 +1417,50 @@ public actor CognitiveMemoryStore {
             }
 
         var facts: [String: String] = [:]
-        var rapport: RapportProfile?
+        var explicitRapport: RapportProfile?
+        var contactHistory: [L1SocialContactEvent] = []
         for record in records {
             switch record.payload {
             case let .personFact(value) where value.personEntityID == personEntityID:
                 if facts[value.key] == nil { facts[value.key] = value.value }
             case let .relationship(value) where value.personEntityID == personEntityID:
-                if rapport == nil { rapport = value.rapport }
+                if explicitRapport == nil,
+                   record.provenance.contains(where: { $0.source == .explicitUser }) {
+                    explicitRapport = value.rapport
+                }
+            case let .situation(value) where value.participantEntityIDs.contains(personEntityID):
+                guard value.state.hasPrefix("social_contact:"),
+                      let rawKind = value.state.split(separator: ":", maxSplits: 1).last,
+                      let kind = L1SocialContactKind(rawValue: String(rawKind)) else { continue }
+                contactHistory.append(L1SocialContactEvent(
+                    kind: kind,
+                    occurredAt: record.updatedAt,
+                    purpose: record.summary
+                ))
             default:
                 break
             }
         }
+        let inferredRapport = L1SocialRapportEstimator.infer(from: contactHistory, at: date)
+        let baseRapport = explicitRapport ?? inferredRapport
+        let explicitContactPreference = facts["proactive_contact"]
+            .flatMap(ProactiveContactPreference.init(rawValue:))
+        let contactPreference = explicitContactPreference
+            ?? explicitRapport?.proactiveContact
+            ?? inferredRapport?.proactiveContact
+            ?? .unknown
+        let rapport = baseRapport.map {
+            RapportProfile(
+                familiarity: $0.familiarity,
+                interactionComfort: $0.interactionComfort,
+                communicationAlignment: $0.communicationAlignment,
+                proactiveContact: contactPreference
+            )
+        }
         return PersonContextSnapshot(
             personEntityID: personEntityID,
             preferredLanguageTag: facts["preferred_language"],
-            proactiveContactPreference: rapport?.proactiveContact ?? .unknown,
+            proactiveContactPreference: contactPreference,
             rapport: rapport,
             facts: facts
         )

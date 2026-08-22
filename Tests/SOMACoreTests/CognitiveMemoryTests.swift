@@ -318,6 +318,61 @@ final class CognitiveMemoryTests: XCTestCase {
         try await store.close()
     }
 
+    func testPersonContextDerivesRapportFromReciprocalContactAndPreservesExplicitOverride() async throws {
+        let directory = temporaryDirectory("social-rapport")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let personID = UUID()
+        let start = Date(timeIntervalSince1970: 5_000)
+
+        for (offset, kind) in [
+            L1SocialContactKind.conversationOpened,
+            .participantResponded,
+            .conversationEnded,
+        ].enumerated() {
+            let observedAt = start.addingTimeInterval(TimeInterval(offset))
+            _ = try await store.insert(
+                socialContactDraft(personID: personID, kind: kind, at: observedAt),
+                at: observedAt
+            )
+        }
+
+        let inferred = try await store.personContext(for: personID, at: start.addingTimeInterval(3))
+        XCTAssertNotNil(inferred.rapport)
+        XCTAssertGreaterThan(inferred.rapport?.familiarity ?? 0, 0.2)
+        XCTAssertGreaterThan(inferred.rapport?.interactionComfort ?? 0, 0.5)
+        XCTAssertGreaterThan(inferred.rapport?.communicationAlignment ?? 0, 0.5)
+        XCTAssertEqual(inferred.proactiveContactPreference, .unknown)
+
+        let explicit = try await store.setExplicitPersonRapport(
+            personEntityID: personID,
+            rapport: RapportProfile(
+                familiarity: 0.9,
+                interactionComfort: 0.8,
+                communicationAlignment: 0.7,
+                proactiveContact: .allowed
+            ),
+            at: start.addingTimeInterval(4)
+        )
+        XCTAssertEqual(explicit.rapport?.familiarity, 0.9)
+        XCTAssertEqual(explicit.rapport?.interactionComfort, 0.8)
+        XCTAssertEqual(explicit.rapport?.communicationAlignment, 0.7)
+        XCTAssertEqual(explicit.proactiveContactPreference, .allowed)
+
+        let preference = try await store.setExplicitPersonFact(
+            personEntityID: personID,
+            key: "proactive_contact",
+            value: ProactiveContactPreference.avoid.rawValue,
+            at: start.addingTimeInterval(5)
+        )
+        XCTAssertEqual(preference.rapport?.familiarity, 0.9)
+        XCTAssertEqual(preference.rapport?.interactionComfort, 0.8)
+        XCTAssertEqual(preference.rapport?.communicationAlignment, 0.7)
+        XCTAssertEqual(preference.proactiveContactPreference, .avoid)
+        try await store.close()
+    }
+
     func testWrongKeyAndSecondWriterAreRejected() async throws {
         let directory = temporaryDirectory("locking")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -568,6 +623,31 @@ final class CognitiveMemoryTests: XCTestCase {
             confidence: 1,
             provenance: [explicitProvenance(at: date)],
             expiresAt: expiresAt
+        )
+    }
+
+    private func socialContactDraft(
+        personID: UUID,
+        kind: L1SocialContactKind,
+        at date: Date
+    ) -> CognitiveMemoryDraft {
+        CognitiveMemoryDraft(
+            tier: .mediumTerm,
+            summary: "Social contact \(kind.rawValue).",
+            payload: .situation(SituationMemory(
+                state: "social_contact:\(kind.rawValue)",
+                participantEntityIDs: [personID]
+            )),
+            confidence: 1,
+            provenance: [MemoryProvenance(
+                source: .l1Inference,
+                sourceID: "l1_social_contact:test",
+                observedAt: date,
+                evidenceIDs: ["social:test"]
+            )],
+            sensitivity: .personal,
+            disclosure: .remoteSummaryAllowed,
+            expiresAt: date.addingTimeInterval(90 * 24 * 60 * 60)
         )
     }
 

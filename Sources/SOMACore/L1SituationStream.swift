@@ -258,6 +258,69 @@ public struct L1SocialContactEvent: Codable, Equatable, Sendable {
     }
 }
 
+/// Derives the mutable part of rapport from observed reciprocal contact.  It
+/// intentionally excludes inferred personality or sentiment: a reply and a
+/// completed conversation are evidence of conversational continuity, while a
+/// missed opening is only weak evidence of lower availability.
+public enum L1SocialRapportEstimator {
+    public static func infer(
+        from events: [L1SocialContactEvent],
+        at date: Date = Date()
+    ) -> RapportProfile? {
+        guard !events.isEmpty else { return nil }
+
+        var familiarityEvidence = 0.0
+        var positiveExchangeEvidence = 0.0
+        var unansweredOpeningEvidence = 0.0
+        var alignmentEvidence = 0.0
+        var misalignmentEvidence = 0.0
+
+        for event in events {
+            let age = max(0, date.timeIntervalSince(event.occurredAt))
+            let recency = exp(-age / (45 * 24 * 60 * 60))
+            switch event.kind {
+            case .nonverbalInvitation:
+                break
+            case .proactiveOpening:
+                break
+            case .conversationOpened:
+                break
+            case .participantResponded:
+                familiarityEvidence += 0.35 * recency
+                positiveExchangeEvidence += 1.0 * recency
+                alignmentEvidence += 1.0 * recency
+            case .conversationEnded:
+                familiarityEvidence += 0.10 * recency
+                positiveExchangeEvidence += 0.30 * recency
+                alignmentEvidence += 0.35 * recency
+            case .conversationEndedWithoutParticipantTurn:
+                unansweredOpeningEvidence += 0.55 * recency
+                misalignmentEvidence += 0.30 * recency
+            case .conversationInterrupted:
+                // A transport or environmental interruption is not a social
+                // rejection, so it adds no negative relationship evidence.
+                break
+            }
+        }
+
+        let familiarity = familiarityEvidence / (familiarityEvidence + 1.5)
+        let interactionComfort = (1 + positiveExchangeEvidence)
+            / (2 + positiveExchangeEvidence + unansweredOpeningEvidence)
+        let communicationAlignment = (1 + alignmentEvidence)
+            / (2 + alignmentEvidence + misalignmentEvidence)
+        return RapportProfile(
+            familiarity: Self.unit(familiarity),
+            interactionComfort: Self.unit(interactionComfort),
+            communicationAlignment: Self.unit(communicationAlignment),
+            proactiveContact: .unknown
+        )
+    }
+
+    private static func unit(_ value: Double) -> Double {
+        min(max(value, 0), 1)
+    }
+}
+
 public struct L1ConversationContext: Codable, Equatable, Sendable {
     public let turnRecordID: UUID
     public let role: ConversationParticipantRole

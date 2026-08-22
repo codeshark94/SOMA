@@ -242,6 +242,7 @@ private struct FaceServoDynamics: Sendable {
 /// Starts visual exploration before a session has a calibration. The bridge owns
 /// the physical pulse/rest pattern and cancels it on fresh visual evidence.
 public struct IdleExplorationGate: Sendable {
+    private static let absenceDwellNS: UInt64 = 450_000_000
     private var noTargetSinceNS: UInt64?
 
     public init() {}
@@ -250,9 +251,16 @@ public struct IdleExplorationGate: Sendable {
         if noTargetSinceNS == nil { noTargetSinceNS = monotonicNS }
     }
 
+    /// The first monotonic instant at which an absence may become physical
+    /// exploration. Scheduling is intentionally derived from the gate's own
+    /// clock instead of duplicating this dwell in a transport timer.
+    public var nextScanEligibleAtNS: UInt64? {
+        noTargetSinceNS.map { $0 + Self.absenceDwellNS }
+    }
+
     public mutating func beginIfEligible(at monotonicNS: UInt64) -> ExternalGimbalAttentionAction {
-        guard let noTargetSinceNS,
-              monotonicNS >= noTargetSinceNS + 450_000_000 else {
+        guard let nextScanEligibleAtNS,
+              monotonicNS >= nextScanEligibleAtNS else {
             return .none
         }
         return .velocity(pitchDegreesPerSecond: 0, panDegreesPerSecond: 180)
@@ -262,6 +270,7 @@ public struct IdleExplorationGate: Sendable {
 /// Local fixation and scan policy. It has no device API; transport must enforce
 /// its own watchdog and owner acknowledgements.
 public struct ExternalGimbalAttentionGate: Sendable {
+    private static let absenceDwellNS: UInt64 = 450_000_000
     private let calibration: ExternalGimbalCalibration
     private let autonomousScanEnabled: Bool
     private var active = false
@@ -410,10 +419,14 @@ public struct ExternalGimbalAttentionGate: Sendable {
 
     /// Grant a search sweep after continuous visual absence. The transport owns
     /// the physical pulse/rest pattern and cancels it on the next observation.
+    public var nextScanEligibleAtNS: UInt64? {
+        guard autonomousScanEnabled, let noTargetSinceNS else { return nil }
+        return noTargetSinceNS + Self.absenceDwellNS
+    }
+
     public mutating func beginScanIfEligible(at monotonicNS: UInt64) -> ExternalGimbalAttentionAction {
-        guard autonomousScanEnabled,
-              let noTargetSinceNS,
-              monotonicNS >= noTargetSinceNS + 450_000_000 else {
+        guard let nextScanEligibleAtNS,
+              monotonicNS >= nextScanEligibleAtNS else {
             return .none
         }
         active = true

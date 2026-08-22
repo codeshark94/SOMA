@@ -1163,6 +1163,7 @@ final class PredictiveWorldModelTests: XCTestCase {
 
         var scan = ExternalGimbalAttentionGate(calibration: calibration, autonomousScanEnabled: true)
         XCTAssertEqual(scan.recordVisualLoss(at: 8_000_000_000), .none)
+        XCTAssertEqual(scan.nextScanEligibleAtNS, 8_450_000_000)
         XCTAssertEqual(scan.beginScanIfEligible(at: 8_449_000_000), .none)
         guard case let .velocity(pitchDegreesPerSecond: scanPitch, panDegreesPerSecond: scanPan) = scan.beginScanIfEligible(at: 8_450_000_000) else {
             return XCTFail("expected bounded scan pulse")
@@ -2488,6 +2489,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         let start: UInt64 = 12_000_000_000
         var exploration = IdleExplorationGate()
         exploration.recordNoCalibratedTarget(at: start)
+        XCTAssertEqual(exploration.nextScanEligibleAtNS, start + 450_000_000)
         XCTAssertEqual(exploration.beginIfEligible(at: start + 449_000_000), .none)
         XCTAssertEqual(
             exploration.beginIfEligible(at: start + 450_000_000),

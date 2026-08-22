@@ -84,7 +84,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var generation: UInt64 = 0
     private var activePersonEntityID: UUID?
     private var activeThreadID: String?
-    private var lastVisualContextNS: UInt64 = 0
+    private var openingVisualContextAttached = false
+    private var activeContextDeltas: Set<String> = []
 
     init(
         projectDirectory: String? = nil,
@@ -199,6 +200,28 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
+    /// Adds a recalled fact only once to the current realtime thread. Recall
+    /// can run after each utterance without accumulating duplicate episodes.
+    func appendActiveContextDelta(_ text: String, role: String = "developer") {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        queue.async { [weak self] in
+            guard let self, self.active else { return }
+            let bounded = String(normalized.prefix(8_192))
+            let identity = "\(role)\u{0}\(bounded)"
+            guard activeContextDeltas.insert(identity).inserted else {
+                onInject?("deduplicated", role, bounded)
+                return
+            }
+            send([
+                "type": "append_text",
+                "text": bounded,
+                "role": role,
+            ])
+            onInject?("delta", role, bounded)
+        }
+    }
+
     func ingestAudio(samples: [Float], sampleRateHz: Double, durationNS _: UInt64) {
         guard !samples.isEmpty,
               sampleRateHz.isFinite,
@@ -228,9 +251,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     func observeVoiceActivity(_ active: Bool, at _: UInt64) {
         queue.async { [weak self] in
             guard let self, !stopped else { return }
-            if active, self.active {
-                self.enqueueCurrentCameraImageIfEnabled(force: true)
-            }
             guard gate.phase == .starting else { return }
             if active {
                 guard !capturingInitiatingTurn else { return }
@@ -336,6 +356,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         at monotonicNS: UInt64
     ) {
         inputTransportReported = false
+        openingVisualContextAttached = false
+        activeContextDeltas.removeAll(keepingCapacity: true)
         guard let helperURL = helperURL() else {
             gate.fail(at: monotonicNS)
             onEvent(.failed(
@@ -447,7 +469,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 // before its audio is interpreted, not after transcription has
                 // already begun.
                 if !buffered.isEmpty {
-                    enqueueCurrentCameraImageIfEnabled(force: true)
+                    enqueueOpeningCameraImageIfEnabled()
                 }
                 for chunk in buffered { send(chunk) }
                 if let pendingContext {
@@ -469,7 +491,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.proactiveOpeningTriggered)
             case "input_speech_started":
                 recordUserActivity(at: DispatchTime.now().uptimeNanoseconds)
-                enqueueCurrentCameraImageIfEnabled(force: true)
                 onEvent(.hearingUser)
             case "context_appended":
                 onEvent(.contextAppended)
@@ -616,25 +637,20 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ])
     }
 
-    /// A current camera frame is transient context for each user turn. The
-    /// explicit environment override exists for supervised privacy testing.
-    private func enqueueCurrentCameraImageIfEnabled(force: Bool) {
+    /// One opening frame grounds a user-initiated conversation without making
+    /// every speech onset a permanent item in the realtime thread.
+    private func enqueueOpeningCameraImageIfEnabled() {
         guard cameraContextAutoInjection else { return }
-        enqueueCurrentCameraImage(force: force)
+        enqueueOpeningCameraImage()
     }
 
-    /// A camera frame is transient input for the active turn, never a trace
-    /// artifact or person-memory record. The relay already bounds the JPEG
-    /// cadence; this guard prevents an audio transport retry from duplicating
-    /// the same visual item in one instant.
-    private func enqueueCurrentCameraImage(force: Bool) {
+    private func enqueueOpeningCameraImage() {
         guard active,
+              !openingVisualContextAttached,
               let currentCameraImageDataURI,
               let dataURI = currentCameraImageDataURI(),
               dataURI.utf8.count <= 4 * 1_048_576 else { return }
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard force || now >= lastVisualContextNS + 500_000_000 else { return }
-        lastVisualContextNS = now
+        openingVisualContextAttached = true
         send([
             "type": "append_image",
             "data": dataURI,
