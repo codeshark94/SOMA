@@ -100,8 +100,8 @@ require(indicatorInputs.resolvedState == .working, "working LED priority is wron
 let contactReadyRendering = SOMALEDSettings().signal(for: .contactReady).deviceRendering
 let humanDetectedRendering = SOMALEDSettings().signal(for: .humanDetected).deviceRendering
 require(
-    contactReadyRendering == .init(stateID: 54)
-        && humanDetectedRendering == .init(stateID: 57),
+    contactReadyRendering == .init(stateID: 54, pulseEnabled: false)
+        && humanDetectedRendering == .init(stateID: 57, pulseEnabled: false),
     "LED state does not resolve contact-ready and human presence independently"
 )
 require(

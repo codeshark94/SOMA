@@ -20,6 +20,7 @@ private struct Command: Decodable {
     let interactionAuthority: String?
     let personContextReference: String?
     let sessionCapability: String?
+    let appServerURL: String?
     let cameraContextAutoInjected: Bool?
     let codexSandbox: String?
     let codexAdminOnly: Bool?
@@ -58,6 +59,7 @@ private final class AppServerConnection: @unchecked Sendable {
     private let inputPipe = Pipe()
     private let outputPipe = Pipe()
     private let errorPipe = Pipe()
+    private var persistentWebSocket: URLSessionWebSocketTask?
     private var buffer = Data()
     private var nextRequestID = 1
     private var handlers: [Int: ResponseHandler] = [:]
@@ -70,10 +72,20 @@ private final class AppServerConnection: @unchecked Sendable {
     func start(
         codexURL: URL,
         sessionCapability: String?,
+        appServerURL: String?,
         completion: @escaping @Sendable (Result<Void, Error>) -> Void
     ) {
         queue.async {
             self.process.executableURL = codexURL
+            if let persistentEndpoint = Self.validPersistentAppServerURL(appServerURL) {
+                let socket = URLSession.shared.webSocketTask(with: persistentEndpoint)
+                socket.maximumMessageSize = 64 * 1024 * 1024
+                self.persistentWebSocket = socket
+                socket.resume()
+                self.receivePersistentWebSocket()
+                self.initialize(completion: completion)
+                return
+            }
             var arguments = ["app-server", "--stdio", "--enable", "realtime_conversation"]
             if let token = Self.validSessionCapability(sessionCapability) {
                 // The config override targets the named server while the
@@ -101,27 +113,7 @@ private final class AppServerConnection: @unchecked Sendable {
             }
             do {
                 try self.process.run()
-                self.request(
-                    method: "initialize",
-                    params: [
-                        "clientInfo": [
-                            "name": "soma-live-voice",
-                            "title": "SOMA Live Voice",
-                            "version": "0.1.0",
-                        ],
-                        "capabilities": [
-                            "experimentalApi": true,
-                            "requestAttestation": false,
-                        ],
-                    ]
-                ) { response in
-                    guard response.value["error"] == nil else {
-                        completion(.failure(LiveVoiceError.appServerResponse(Self.responseMessage(response.value))))
-                        return
-                    }
-                    self.notify(method: "initialized", params: [:])
-                    completion(.success(()))
-                }
+                self.initialize(completion: completion)
             } catch {
                 completion(.failure(error))
             }
@@ -148,6 +140,11 @@ private final class AppServerConnection: @unchecked Sendable {
 
     func stop() {
         queue.sync {
+            if let persistentWebSocket {
+                persistentWebSocket.cancel(with: .goingAway, reason: nil)
+                self.persistentWebSocket = nil
+                return
+            }
             outputPipe.fileHandleForReading.readabilityHandler = nil
             errorPipe.fileHandleForReading.readabilityHandler = nil
             try? inputPipe.fileHandleForWriting.close()
@@ -177,6 +174,67 @@ private final class AppServerConnection: @unchecked Sendable {
         return value.lowercased()
     }
 
+    private static func validPersistentAppServerURL(_ value: String?) -> URL? {
+        guard let value,
+              value.count <= 1_024,
+              !value.contains("\n"),
+              !value.contains("\0"),
+              let url = URL(string: value),
+              url.scheme == "ws",
+              url.host == "127.0.0.1",
+              url.port != nil else {
+            return nil
+        }
+        return url
+    }
+
+    private func initialize(completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        request(
+            method: "initialize",
+            params: [
+                "clientInfo": [
+                    "name": "soma-live-voice",
+                    "title": "SOMA Live Voice",
+                    "version": "0.1.0",
+                ],
+                "capabilities": [
+                    "experimentalApi": true,
+                    "requestAttestation": false,
+                ],
+            ]
+        ) { response in
+            guard response.value["error"] == nil else {
+                completion(.failure(LiveVoiceError.appServerResponse(Self.responseMessage(response.value))))
+                return
+            }
+            self.notify(method: "initialized", params: [:])
+            completion(.success(()))
+        }
+    }
+
+    private func receivePersistentWebSocket() {
+        guard let persistentWebSocket else { return }
+        persistentWebSocket.receive { [weak self, weak persistentWebSocket] result in
+            guard let self, let persistentWebSocket else { return }
+            self.queue.async {
+                guard self.persistentWebSocket === persistentWebSocket else { return }
+                switch result {
+                case let .success(message):
+                    let data: Data
+                    switch message {
+                    case let .string(value): data = Data(value.utf8)
+                    case let .data(value): data = value
+                    @unknown default: return
+                    }
+                    self.consume(data.last == 0x0A ? data : data + Data([0x0A]))
+                    self.receivePersistentWebSocket()
+                case .failure:
+                    self.persistentWebSocket = nil
+                }
+            }
+        }
+    }
+
     private func notify(method: String, params: [String: Any]) {
         write(["method": method, "params": params])
     }
@@ -184,6 +242,11 @@ private final class AppServerConnection: @unchecked Sendable {
     private func write(_ object: [String: Any]) {
         guard JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        if let persistentWebSocket,
+           let text = String(data: data, encoding: .utf8) {
+            persistentWebSocket.send(.string(text)) { _ in }
+            return
+        }
         inputPipe.fileHandleForWriting.write(data)
         inputPipe.fileHandleForWriting.write(Data([0x0A]))
     }
@@ -247,6 +310,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var interactionAuthority: String?
     private var personContextReference: UUID?
     private var sessionCapability: String?
+    private var appServerURL: String?
     private var cameraContextAutoInjected = false
     private var codexSandbox = "danger-full-access"
     private var codexAdminOnly = false
@@ -319,6 +383,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 uuidString: rawPersonContextReference.trimmingCharacters(in: .whitespacesAndNewlines)
             )
             sessionCapability = (command.sessionCapability ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            appServerURL = command.appServerURL?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             cameraContextAutoInjected = command.cameraContextAutoInjected ?? false
             if let sandbox = command.codexSandbox,
@@ -434,8 +500,14 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             fail(LiveVoiceError.codexNotFound)
             return
         }
-        emitter.emit("starting", fields: ["transport": "app_server_webrtc"])
-        connection.start(codexURL: codexURL, sessionCapability: sessionCapability) { [weak self] result in
+        emitter.emit("starting", fields: [
+            "transport": appServerURL == nil ? "app_server_webrtc" : "persistent_app_server_webrtc",
+        ])
+        connection.start(
+            codexURL: codexURL,
+            sessionCapability: sessionCapability,
+            appServerURL: appServerURL
+        ) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
@@ -667,8 +739,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         let identityManagementInstruction = embodimentMCPAvailable
             ? "For an administrator's explicit request to register a person who is currently present, first call list_present_people. Enroll only one anonymous entry that the administrator unambiguously identifies in the current scene; then call enroll_present_identity with confirmed_by_user=true. Do not enroll a historical, absent, ambiguous, or merely detected face. After a successful enrollment, persist only identity facts the administrator explicitly supplied, such as a name or their stated relationship, with set_person_fact. Do not claim registration is complete until each required tool result succeeds."
             : ""
+        let stopConversationInstruction = embodimentMCPAvailable
+            ? "If the participant explicitly asks to stop, be quiet, or end this conversation, call end_conversation immediately and silently. It terminates only this live session, so do not give a farewell first."
+            : ""
         let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
-        let instruction = [baseInstruction, languageInstruction(), proactiveOpeningInstruction()]
+        let instruction = [baseInstruction, stopConversationInstruction, languageInstruction(), proactiveOpeningInstruction()]
             .compactMap { $0 }
             .joined(separator: "\n\n")
         var params: [String: Any] = [
@@ -1142,6 +1217,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     interactionAuthority: nil,
                     personContextReference: nil,
                     sessionCapability: nil,
+                    appServerURL: nil,
                     cameraContextAutoInjected: nil,
                     codexSandbox: nil,
                     codexAdminOnly: nil,

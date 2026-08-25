@@ -309,6 +309,14 @@ private final class EmbodimentMCPServer {
         let sessionAuthorization = try sessionAuthorization(for: name, arguments: arguments)
         let toolArguments = arguments
         switch name {
+        case "end_conversation":
+            guard toolArguments.isEmpty else {
+                throw ServerFailure.invalidArguments("end_conversation takes no arguments")
+            }
+            return try EmbodimentShadowSocketClient.send(
+                .init(kind: .endConversation, sessionAuthorization: sessionAuthorization),
+                socketURL: socketURL
+            )
         case "get_embodiment_state", "list_scene_entities", "get_spatial_map":
             guard toolArguments.isEmpty else {
                 throw ServerFailure.invalidArguments("\(name) takes no arguments")
@@ -648,6 +656,7 @@ private final class EmbodimentMCPServer {
 
     private var knownToolNames: Set<String> {
         return [
+            "end_conversation",
             "get_embodiment_state",
             "list_scene_entities",
             "get_spatial_map",
@@ -684,6 +693,7 @@ private final class EmbodimentMCPServer {
 
     private func toolDefinitions() -> [[String: Any]] {
         embodimentStateTools()
+            + conversationTools()
             + identityTools()
             + personContextTools()
             + informationNeedTools()
@@ -698,6 +708,12 @@ private final class EmbodimentMCPServer {
             tool("get_view_capture", "Read one short-lived capture result by request ID.", objectSchema([
                 "request_id": stringSchema(maxLength: 96),
             ], required: ["request_id"]), readOnly: true),
+        ]
+    }
+
+    private func conversationTools() -> [[String: Any]] {
+        [
+            tool("end_conversation", "End this current Live Voice conversation immediately after the participant explicitly asks to stop, be quiet, or end it. This cannot affect any other session. Call it silently because the audio transport closes at once.", objectSchema([:], required: [])),
         ]
     }
 

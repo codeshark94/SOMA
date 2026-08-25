@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 
 public enum EmbodimentIPCCommandKind: String, Codable, Sendable {
+    case endConversation = "end_conversation"
     case submit
     case snapshot
     case captureResult = "capture_result"
@@ -308,6 +309,11 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     public typealias IndicatorCalibrationHandler = @Sendable (
         _ preset: SOMALEDFirmwarePreset?
     ) -> Result<Void, Error>
+    /// The live-session owner validates that this capability belongs to its
+    /// currently active conversation before accepting termination.
+    public typealias ConversationTerminationHandler = @Sendable (
+        _ sessionAuthorization: String?
+    ) -> Result<Void, Error>
     public typealias SessionAuthorizationProvider = @Sendable (
         _ token: String?,
         _ scope: SOMASessionCapabilityScope
@@ -324,6 +330,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let identityRosterProvider: IdentityRosterProvider
     private let identityEnrollmentProvider: IdentityEnrollmentProvider
     private let indicatorCalibrationHandler: IndicatorCalibrationHandler
+    private let conversationTerminationHandler: ConversationTerminationHandler
     private let sessionAuthorizationProvider: SessionAuthorizationProvider
     private let queue = DispatchQueue(label: "soma.embodiment.shadow.socket")
     private let group = DispatchGroup()
@@ -345,6 +352,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         identityRosterProvider: @escaping IdentityRosterProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         identityEnrollmentProvider: @escaping IdentityEnrollmentProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
+        conversationTerminationHandler: @escaping ConversationTerminationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
         sessionAuthorizationProvider: @escaping SessionAuthorizationProvider = { _, _ in .success(()) },
         onHealth: @escaping HealthHandler = { _, _ in }
     ) {
@@ -358,6 +366,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.identityRosterProvider = identityRosterProvider
         self.identityEnrollmentProvider = identityEnrollmentProvider
         self.indicatorCalibrationHandler = indicatorCalibrationHandler
+        self.conversationTerminationHandler = conversationTerminationHandler
         self.sessionAuthorizationProvider = sessionAuthorizationProvider
         self.onHealth = onHealth
     }
@@ -447,6 +456,23 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             let data = try Self.readLine(from: clientFD, maximumBytes: maximumMessageBytes)
             let command = try JSONDecoder().decode(EmbodimentIPCCommand.self, from: data)
             switch command.kind {
+            case .endConversation:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.informationNeeds == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .conversationControl)
+                switch conversationTerminationHandler(command.sessionAuthorization) {
+                case .success:
+                    writeReply(.init(ok: true), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
             case .snapshot:
                 guard command.request == nil,
                       command.requestID == nil,

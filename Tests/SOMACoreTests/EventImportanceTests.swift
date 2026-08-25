@@ -441,8 +441,10 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(inputs.resolvedState, .contactReady)
         inputs.interactionState = .conversation
         XCTAssertEqual(inputs.resolvedState, .conversation)
+        XCTAssertEqual(inputs.visualPresentationState, .contactReady)
         inputs.interactionState = .preparingReply
         XCTAssertEqual(inputs.resolvedState, .working)
+        XCTAssertEqual(inputs.visualPresentationState, .contactReady)
         inputs.visualState = .none
         inputs.interactionState = .idle
         XCTAssertEqual(inputs.resolvedState, .exploring)
@@ -463,10 +465,14 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(SubconsciousIndicatorState.contactReady.humanMeaning, "ready_speak_now")
         XCTAssertEqual(SubconsciousIndicatorState.conversation.humanMeaning, "conversation_active")
         XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "please_wait_preparing_reply")
-        let blue = SOMALEDDeviceRendering(stateID: 57)
-        let yellow = SOMALEDDeviceRendering(stateID: 16)
+        let blue = SOMALEDDeviceRendering(stateID: 57, pulseEnabled: false)
+        let yellow = SOMALEDDeviceRendering(stateID: 16, pulseEnabled: false)
         XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, blue.stateID)
         XCTAssertEqual(SOMALEDColor.yellow.firmwareStateID, yellow.stateID)
+        XCTAssertEqual(
+            SOMALEDSettings().signal(for: .contactReady).deviceRendering,
+            SOMALEDDeviceRendering(stateID: 54, pulseEnabled: false)
+        )
     }
 
     func testEyeContactIndicatorLeaseBridgesBriefGazeDropoutsOnly() {

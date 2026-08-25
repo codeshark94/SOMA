@@ -172,8 +172,6 @@ public enum SubconsciousIndicatorState: String, CaseIterable, Codable, Hashable,
         .exploring,
         .humanDetected,
         .contactReady,
-        .conversation,
-        .working,
     ]
 
     public var configurationState: Self {
@@ -236,9 +234,9 @@ public enum SubconsciousIndicatorInteractionState: String, Equatable, Sendable {
     case preparingReply = "preparing_reply"
 }
 
-/// The single semantic source for the LED. Visual contact is cleared only
-/// when L0 confirms its loss; an open voice session cannot keep a visual
-/// invitation asserted on its own.
+/// Visual contact is cleared only when L0 confirms its loss. Interaction
+/// state remains available to the runtime, while hardware presentation is
+/// derived from the visual state and may apply a separate session overlay.
 public struct SubconsciousIndicatorInputs: Equatable, Sendable {
     public var visualState: SubconsciousIndicatorVisualState
     public var interactionState: SubconsciousIndicatorInteractionState
@@ -330,6 +328,14 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
             case .humanDetected: return .humanDetected
             case .none: return .exploring
             }
+        }
+    }
+
+    public var visualPresentationState: SubconsciousIndicatorState {
+        switch visualState {
+        case .eyeContact: return .contactReady
+        case .humanDetected: return .humanDetected
+        case .none: return .exploring
         }
     }
 }

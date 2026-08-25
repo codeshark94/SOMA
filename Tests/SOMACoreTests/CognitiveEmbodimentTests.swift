@@ -27,6 +27,53 @@ final class CognitiveEmbodimentTests: XCTestCase {
         case .success: break
         case let .failure(error): XCTFail("ordinary embodied conversation unexpectedly denied: \(error)")
         }
+        switch store.authorize(token: token, scope: .conversationControl, at: 1_000_000_001) {
+        case .success: break
+        case let .failure(error): XCTFail("participant could not end their own conversation: \(error)")
+        }
+    }
+
+    func testConversationTerminationIPCRequiresCurrentCapability() throws {
+        let suffix = UUID().uuidString.prefix(8)
+        let directory = URL(fileURLWithPath: "/private/tmp/soma-conversation-end-ipc-\(suffix)", isDirectory: true)
+        let socketURL = directory.appendingPathComponent("shadow.sock")
+        let currentToken = UUID().uuidString.lowercased()
+        let terminated = LockedValue(false)
+        let server = EmbodimentShadowSocketServer(
+            socketURL: socketURL,
+            conversationTerminationHandler: { token in
+                guard token == currentToken else {
+                    return .failure(EmbodimentIPCError.permissionDenied)
+                }
+                terminated.set(true)
+                return .success(())
+            },
+            sessionAuthorizationProvider: { token, scope in
+                guard token == currentToken, scope == .conversationControl else {
+                    return .failure(EmbodimentIPCError.permissionDenied)
+                }
+                return .success(())
+            }
+        )
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let rejected = try EmbodimentShadowSocketClient.send(
+            .init(kind: .endConversation, sessionAuthorization: UUID().uuidString.lowercased()),
+            socketURL: socketURL
+        )
+        XCTAssertFalse(rejected.ok)
+        XCTAssertFalse(terminated.value)
+
+        let accepted = try EmbodimentShadowSocketClient.send(
+            .init(kind: .endConversation, sessionAuthorization: currentToken),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(accepted.ok)
+        XCTAssertTrue(terminated.value)
     }
 
     func testAdministratorCanManageIdentityRosterAndRegisteredContexts() {
@@ -1103,6 +1150,27 @@ final class CognitiveEmbodimentTests: XCTestCase {
             spatialConfidence: 0.9,
             lastSeenMilliseconds: lastSeenMilliseconds
         )
+    }
+}
+
+private final class LockedValue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: Bool
+
+    init(_ value: Bool) {
+        storedValue = value
+    }
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func set(_ value: Bool) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
     }
 }
 #endif

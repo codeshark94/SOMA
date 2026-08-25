@@ -1,6 +1,19 @@
 // swift-tools-version: 6.0
 
 import PackageDescription
+import Foundation
+
+let opencvPrefix: String = {
+    if let configured = ProcessInfo.processInfo.environment["SOMA_OPENCV_PREFIX"],
+       !configured.isEmpty {
+        return URL(fileURLWithPath: configured).standardizedFileURL.path
+    }
+    for candidate in ["/opt/homebrew/opt/opencv", "/usr/local/opt/opencv"]
+    where FileManager.default.fileExists(atPath: candidate) {
+        return candidate
+    }
+    return "/opt/homebrew/opt/opencv"
+}()
 
 let package = Package(
     name: "SOMA",
@@ -27,10 +40,10 @@ let package = Package(
             path: "Sources/SOMAOpenCV",
             publicHeadersPath: "include",
             cxxSettings: [
-                .unsafeFlags(["-I", "/opt/homebrew/opt/opencv/include/opencv5"]),
+                .unsafeFlags(["-I", "\(opencvPrefix)/include/opencv5"]),
             ],
             linkerSettings: [
-                .unsafeFlags(["-L", "/opt/homebrew/opt/opencv/lib"]),
+                .unsafeFlags(["-L", "\(opencvPrefix)/lib"]),
                 .linkedLibrary("opencv_core"),
                 .linkedLibrary("opencv_features"),
                 .linkedLibrary("opencv_imgcodecs"),

@@ -336,7 +336,7 @@ private final class SOMAControlModel: ObservableObject {
             guard await authenticateMacLogin(
                 reason: "Removing the SOMA administrator enrollment requires your Mac login password."
             ) else { return }
-            await self.finishRemoveAdministrator(administrator)
+            self.finishRemoveAdministrator(administrator)
         }
     }
 
@@ -674,7 +674,7 @@ private struct SOMASettingsView: View {
                 }
                 .disabled(model.settings.led.responseMode == .off)
             }
-            SettingsCard(title: "LED signals", subtitle: "Choose a supported firmware palette color. Status signals use steady palette states.") {
+            SettingsCard(title: "LED signals", subtitle: "Choose colors for visual attention. An open voice session pulses the current attention color.") {
                 LazyVStack(spacing: 8) {
                     ForEach(SubconsciousIndicatorState.configurationStates, id: \.self) { state in
                         LEDSignalRow(state: state, signal: ledSignalBinding(for: state))

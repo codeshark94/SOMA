@@ -22,6 +22,8 @@ endif()
 
 add_executable(soma-native-track main.cpp)
 target_include_directories(soma-native-track PRIVATE "${OBSBOT_SDK_ROOT}/include")
-target_link_directories(soma-native-track PRIVATE "${OBSBOT_LIBRARY_DIR}")
-target_link_libraries(soma-native-track PRIVATE dev)
-target_link_options(soma-native-track PRIVATE "-Wl,-rpath,${OBSBOT_LIBRARY_DIR}")
+target_link_libraries(soma-native-track PRIVATE "${OBSBOT_LIBRARY_DIR}/libdev.dylib")
+set_target_properties(
+    soma-native-track
+    PROPERTIES BUILD_RPATH "${OBSBOT_LIBRARY_DIR}"
+)

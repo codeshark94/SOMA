@@ -57,11 +57,29 @@ private struct BufferedLiveAudio: Sendable {
     let durationNS: UInt64
 }
 
+private enum LiveVoiceSessionTerminationError: LocalizedError {
+    case noActiveSession
+    case capabilityMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .noActiveSession: "No active Live Voice session is available to end"
+        case .capabilityMismatch: "The Live Voice capability does not own the active session"
+        }
+    }
+}
+
 final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "soma.live-voice.app-server", qos: .userInitiated)
     private let projectDirectory: String
     private let voice: SOMARealtimeVoice
     private let currentCameraImageDataURI: (@Sendable () -> String?)?
+    private let persistentAppServer: PersistentAppServerBroker?
+    private let persistentSessionAuthorizer: (@Sendable (
+        String,
+        SOMASessionCapabilityScope,
+        UInt64
+    ) -> Result<Void, SOMASessionCapabilityError>)?
     private let cameraContextAutoInjection: Bool
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
     var onInject: (@Sendable (String, String, String) -> Void)?
@@ -84,6 +102,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var generation: UInt64 = 0
     private var activePersonEntityID: UUID?
     private var activeThreadID: String?
+    /// This stays only with the corresponding helper process. It prevents an
+    /// older local MCP child from ending a newer participant's conversation.
+    private var activeSessionCapability: String?
     private var openingVisualContextAttached = false
     private var activeContextDeltas: Set<String> = []
 
@@ -91,6 +112,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         projectDirectory: String? = nil,
         voice: SOMARealtimeVoice = .maple,
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
+        persistentAppServer: PersistentAppServerBroker? = nil,
+        persistentSessionAuthorizer: (@Sendable (
+            String,
+            SOMASessionCapabilityScope,
+            UInt64
+        ) -> Result<Void, SOMASessionCapabilityError>)? = nil,
         onEvent: @escaping @Sendable (AppServerLiveVoiceEvent) -> Void
     ) {
         self.projectDirectory = projectDirectory
@@ -98,6 +125,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             ?? FileManager.default.currentDirectoryPath
         self.voice = voice
         self.currentCameraImageDataURI = currentCameraImageDataURI
+        self.persistentAppServer = persistentAppServer
+        self.persistentSessionAuthorizer = persistentSessionAuthorizer
         cameraContextAutoInjection = somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: true)
         self.onEvent = onEvent
     }
@@ -323,6 +352,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             active = false
             activeThreadID = nil
             activePersonEntityID = nil
+            activeSessionCapability = nil
             preRoll.removeAll(keepingCapacity: false)
             preRollDurationNS = 0
             initiatingTurn.removeAll(keepingCapacity: false)
@@ -343,6 +373,44 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
+    /// The local MCP endpoint has already validated the capability's general
+    /// scope. Match it to this particular helper before ending the session so
+    /// a capability from an earlier conversation cannot affect a later one.
+    func endCurrentSession(authorizedBy sessionCapability: String?) -> Result<Void, Error> {
+        queue.sync {
+            guard active else { return .failure(LiveVoiceSessionTerminationError.noActiveSession) }
+            guard let activeSessionCapability,
+                  let sessionCapability,
+                  activeSessionCapability == sessionCapability
+                    || persistentAppServer?.capability == sessionCapability else {
+                return .failure(LiveVoiceSessionTerminationError.capabilityMismatch)
+            }
+            _ = closeActiveSession(reason: "participant_requested_end")
+            return .success(())
+        }
+    }
+
+    /// A dedicated persistent App Server owns one opaque boot capability. It
+    /// never becomes an interaction grant by itself: each call is projected
+    /// through the active session's short-lived grant while the Live helper is
+    /// active, and returns nil for ordinary per-session tokens.
+    func authorizePersistentBroker(
+        token: String?,
+        scope: SOMASessionCapabilityScope,
+        at monotonicNS: UInt64
+    ) -> Result<Void, SOMASessionCapabilityError>? {
+        queue.sync {
+            guard let persistentAppServer,
+                  token == persistentAppServer.capability,
+                  active,
+                  let activeSessionCapability,
+                  let persistentSessionAuthorizer else {
+                return nil
+            }
+            return persistentSessionAuthorizer(activeSessionCapability, scope, monotonicNS)
+        }
+    }
+
     private func launch(
         authorization: String,
         initialContext: String,
@@ -358,6 +426,23 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         inputTransportReported = false
         openingVisualContextAttached = false
         activeContextDeltas.removeAll(keepingCapacity: true)
+        let persistentEndpoint: URL?
+        if let persistentAppServer {
+            switch persistentAppServer.ensureReady() {
+            case let .success(endpoint):
+                persistentEndpoint = endpoint
+            case let .failure(error):
+                gate.fail(at: monotonicNS)
+                onEvent(.failed(
+                    threadID: nil,
+                    personEntityID: personEntityID,
+                    reason: String(error.localizedDescription.prefix(192))
+                ))
+                return
+            }
+        } else {
+            persistentEndpoint = nil
+        }
         guard let helperURL = helperURL() else {
             gate.fail(at: monotonicNS)
             onEvent(.failed(
@@ -396,6 +481,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 let personEntityID = self.activePersonEntityID
                 self.activeThreadID = nil
                 self.activePersonEntityID = nil
+                self.activeSessionCapability = nil
                 self.onEvent(.failed(
                     threadID: threadID,
                     personEntityID: personEntityID,
@@ -417,12 +503,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.process = process
         input = inputPipe.fileHandleForWriting
         activePersonEntityID = personEntityID
+        activeSessionCapability = sessionCapability
         generation &+= 1
         let launchGeneration = generation
         guard send([
             "type": "start",
             "initialContext": String(initialContext.prefix(24_000)),
-            "sessionCapability": sessionCapability ?? "",
+            "sessionCapability": persistentAppServer == nil ? (sessionCapability ?? "") : "",
+            "appServerURL": persistentEndpoint?.absoluteString ?? "",
             "preferredLanguageTag": preferredLanguageTag ?? "",
             "languageStartInstruction": languageStartInstruction ?? "",
             "proactiveOpeningText": proactiveOpeningText ?? "",
@@ -553,6 +641,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 input = nil
                 activeThreadID = nil
                 activePersonEntityID = nil
+                activeSessionCapability = nil
                 onEvent(.ended(
                     threadID: threadID,
                     personEntityID: personEntityID,
@@ -580,6 +669,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         input = nil
         activeThreadID = nil
         activePersonEntityID = nil
+        activeSessionCapability = nil
         onEvent(.failed(
             threadID: threadID,
             personEntityID: personEntityID,
@@ -608,6 +698,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 
     private func closeForUserSilence(at monotonicNS: UInt64) {
         guard active, inactivityGate.shouldClose(at: monotonicNS) else { return }
+        _ = closeActiveSession(reason: "user_silence_timeout")
+    }
+
+    @discardableResult
+    private func closeActiveSession(reason: String) -> Bool {
+        guard active else { return false }
         let threadID = activeThreadID
         let personEntityID = activePersonEntityID
         active = false
@@ -621,11 +717,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         process = nil
         activeThreadID = nil
         activePersonEntityID = nil
+        activeSessionCapability = nil
         onEvent(.ended(
             threadID: threadID,
             personEntityID: personEntityID,
-            reason: "user_silence_timeout"
+            reason: String(reason.prefix(128))
         ))
+        return true
     }
 
     private func send(_ chunk: BufferedLiveAudio) {

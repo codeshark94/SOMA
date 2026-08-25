@@ -9,6 +9,10 @@ public enum SOMAInteractionAuthority: String, Codable, CaseIterable, Sendable {
 }
 
 public enum SOMASessionCapabilityScope: Equatable, Sendable {
+    /// End only the live conversation that owns this capability. This is
+    /// separate from embodiment authority: every participant may end their
+    /// own conversation, but no capability may end another person's session.
+    case conversationControl
     case personContext(UUID)
     /// A bounded projection of the people SOMA currently recognizes and the
     /// administrator's registered-person memory. This never includes face
@@ -112,6 +116,8 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
             return .failure(.expired)
         }
         switch scope {
+        case .conversationControl:
+            return .success(())
         case let .personContext(personEntityID):
             return grant.authority == .administrator || grant.personEntityID == personEntityID
                 ? .success(())

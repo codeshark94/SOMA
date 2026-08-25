@@ -623,20 +623,35 @@ struct GimbalAttitude {
     double pitch;
     double pan;
     uint64_t monotonicNS;
+    const char *source;
 };
 
 std::optional<GimbalAttitude> readGimbalAttitude(const std::shared_ptr<Device> &device) noexcept {
     std::lock_guard<std::mutex> lock(sdkMutex);
     float xyz[3] = {};
-    int result = RM_RET_ERR;
-    try { result = device->gimbalGetAttitudeInfoR(xyz); } catch (...) {}
-    if (result != RM_RET_OK || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) return std::nullopt;
+    int attitudeResult = RM_RET_ERR;
+    try { attitudeResult = device->gimbalGetAttitudeInfoR(xyz); } catch (...) {}
+    const bool hasAttitude = attitudeResult == RM_RET_OK
+        && std::isfinite(xyz[1])
+        && std::isfinite(xyz[2]);
+
+    Device::AiGimbalStateInfo aiState {};
+    int aiStateResult = RM_RET_ERR;
+    if (!hasAttitude) {
+        try { aiStateResult = device->aiGetGimbalStateR(&aiState); } catch (...) {}
+    }
+    const bool hasAIState = aiStateResult == RM_RET_OK
+        && std::isfinite(aiState.pitch_euler)
+        && std::isfinite(aiState.yaw_euler);
+    if (!hasAttitude && !hasAIState) return std::nullopt;
     mach_timebase_info_data_t timebase {};
     if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.denom == 0) return std::nullopt;
     const auto nanoseconds = static_cast<uint64_t>(
         (static_cast<__uint128_t>(mach_absolute_time()) * timebase.numer) / timebase.denom
     );
-    return GimbalAttitude {xyz[1], xyz[2], nanoseconds};
+    return hasAttitude
+        ? GimbalAttitude {xyz[1], xyz[2], nanoseconds, "attitude"}
+        : GimbalAttitude {aiState.pitch_euler, aiState.yaw_euler, nanoseconds, "ai_state"};
 }
 
 void emitGimbalAttitude(const GimbalAttitude &attitude) noexcept {
@@ -644,6 +659,7 @@ void emitGimbalAttitude(const GimbalAttitude &attitude) noexcept {
         std::lock_guard<std::mutex> lock(stderrMutex);
         std::cerr << "SOMA_GIMBAL_ATTITUDE pitch=" << attitude.pitch
                   << " pan=" << attitude.pan
+                  << " source=" << attitude.source
                   << " monotonic_ns=" << attitude.monotonicNS << "\n" << std::flush;
     } catch (...) {}
 }
@@ -674,10 +690,6 @@ bool requestExternalVelocity(
     if (!std::isfinite(pitch) || !std::isfinite(pan) || std::abs(pitch) > 90 || std::abs(pan) > 180) {
         trace.event("camera.ack", "fault", "external_velocity_rejected", RM_RET_ERR, "external_velocity_out_of_range", commandID);
         return false;
-    }
-    const auto attitude = readGimbalAttitude(device);
-    if (attitude) {
-        emitGimbalAttitude(*attitude);
     }
     trace.event(
         "camera.command",
@@ -714,10 +726,7 @@ bool requestExternalVelocity(
         speedResult == RM_RET_OK ? "external" : "fault",
         speedResult == RM_RET_OK ? "external_active" : "external_speed_rejected",
         speedResult,
-        "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device))
-            + (attitude
-                ? "; pitch_degrees=" + std::to_string(attitude->pitch) + "; pan_degrees=" + std::to_string(attitude->pan)
-                : "; attitude=unavailable"),
+        "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)) + "; attitude=reported_by_poller",
         commandID
     );
     if (speedResult != RM_RET_OK) requestManualStop(device, trace, "external_speed_rejected", "cleanup-" + commandID, "external");
@@ -736,8 +745,6 @@ bool requestExternalPosition(
         trace.event("camera.ack", "fault", "external_position_rejected", RM_RET_ERR, "external_position_out_of_range", commandID);
         return false;
     }
-    const auto attitude = readGimbalAttitude(device);
-    if (attitude) emitGimbalAttitude(*attitude);
     trace.event(
         "camera.command",
         "external",
@@ -774,10 +781,7 @@ bool requestExternalPosition(
         positionResult == RM_RET_OK ? "external" : "fault",
         positionResult == RM_RET_OK ? "external_position_active" : "external_position_rejected",
         positionResult,
-        "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device))
-            + (attitude
-                ? "; pitch_degrees=" + std::to_string(attitude->pitch) + "; pan_degrees=" + std::to_string(attitude->pan)
-                : "; attitude=unavailable"),
+        "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)) + "; attitude=reported_by_poller",
         commandID
     );
     if (positionResult != RM_RET_OK) requestManualStop(device, trace, "external_position_rejected", "cleanup-" + commandID, "external");
@@ -923,6 +927,7 @@ struct BridgeCommand {
     double pan = 0;
     int durationMilliseconds = 0;
     int value = 0;
+    bool pulseEnabled = false;
 };
 
 bool validCommandID(const std::string &value) {
@@ -1002,21 +1007,28 @@ BridgeCommand parseBridgeCommand(const std::string &line) {
     }
     if (verb == "indicator_enforce") {
         int stateID = -1;
-        if (!(input >> stateID) || (input >> extra)) return {};
+        int pulseEnabled = -1;
+        if (!(input >> stateID >> pulseEnabled) || (input >> extra)
+            || (pulseEnabled != 0 && pulseEnabled != 1)) return {};
         if (!validIndicatorStateID(stateID)) return {};
         BridgeCommand command;
         command.type = BridgeCommandType::indicatorEnforce;
         command.commandID = commandID;
         command.value = stateID;
+        command.pulseEnabled = pulseEnabled == 1;
         return command;
     }
     if (verb == "indicator_reconcile") {
         int stateID = -1;
-        if (!(input >> stateID) || (input >> extra) || !validIndicatorStateID(stateID)) return {};
+        int pulseEnabled = -1;
+        if (!(input >> stateID >> pulseEnabled) || (input >> extra)
+            || !validIndicatorStateID(stateID)
+            || (pulseEnabled != 0 && pulseEnabled != 1)) return {};
         BridgeCommand command;
         command.type = BridgeCommandType::indicatorReconcile;
         command.commandID = commandID;
         command.value = stateID;
+        command.pulseEnabled = pulseEnabled == 1;
         return command;
     }
     if (input >> extra) return {};
@@ -1034,7 +1046,6 @@ public:
     IndicatorSession(std::shared_ptr<Device> device, Trace &trace)
         : device_(std::move(device)), trace_(trace) {
         readBaseline();
-        clearResidualPalette();
     }
 
     ~IndicatorSession() {
@@ -1042,25 +1053,23 @@ public:
     }
 
     void set(int stateID, const std::string &commandID) noexcept {
-        trace_.event("indicator.command", "soma", "set_state", 0, "state_id=" + std::to_string(stateID), commandID);
-        int result = RM_RET_ERR;
-        try { result = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
-        if (result == RM_RET_OK) activeStates_.insert(stateID);
-        trace_.event(
-            "indicator.ack",
-            result == RM_RET_OK ? "soma" : "fault",
-            result == RM_RET_OK ? "state_active" : "state_rejected",
-            result,
-            "state_id=" + std::to_string(stateID),
-            commandID
-        );
+        activate(stateID, false, "set_state", commandID);
     }
 
     void clear(int stateID, const std::string &commandID) noexcept {
         trace_.event("indicator.command", "soma", "clear_state", 0, "state_id=" + std::to_string(stateID), commandID);
+        if (desiredState_ && *desiredState_ == stateID) {
+            desiredState_.reset();
+            pulseEnabled_ = false;
+            pulseVisible_ = false;
+            nextPulseTransition_.reset();
+        }
+        const bool visibilityRestored = restorePulseLEDVisibility();
         int result = RM_RET_ERR;
-        try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
-        if (result == RM_RET_OK) activeStates_.erase(stateID);
+        if (visibilityRestored) {
+            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+        }
+        if (result == RM_RET_OK && activeState_ && *activeState_ == stateID) activeState_.reset();
         trace_.event(
             "indicator.ack",
             result == RM_RET_OK ? "firmware" : "fault",
@@ -1095,7 +1104,10 @@ public:
             commandID
         );
         const int result = callSetEnabled(enabled);
-        if (result == RM_RET_OK) enabledChanged_ = true;
+        if (result == RM_RET_OK) {
+            enabledChanged_ = true;
+            pulseLEDDisabled_ = !enabled;
+        }
         trace_.event(
             "indicator.ack",
             result == RM_RET_OK ? "soma" : "fault",
@@ -1106,73 +1118,64 @@ public:
         );
     }
 
-    void enforce(int stateID, const std::string &commandID) noexcept {
-        trace_.event(
-            "indicator.command",
-            "soma",
-            "enforce_palette",
-            0,
-            "target_state_id=" + std::to_string(stateID),
-            commandID
-        );
-
-        bool clearSucceeded = true;
-        for (const int candidate : kPaletteStateIDs) {
-            if (candidate == stateID) continue;
-            int result = RM_RET_ERR;
-            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(candidate)); } catch (...) {}
-            clearSucceeded = clearSucceeded && result == RM_RET_OK;
-            if (result == RM_RET_OK) activeStates_.erase(candidate);
-        }
-
-        int setResult = RM_RET_ERR;
-        try { setResult = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
-        if (setResult == RM_RET_OK) activeStates_.insert(stateID);
-
-        const bool succeeded = clearSucceeded && setResult == RM_RET_OK;
-        trace_.event(
-            "indicator.ack",
-            succeeded ? "soma" : "fault",
-            succeeded ? "palette_enforced" : "palette_enforcement_incomplete",
-            succeeded ? RM_RET_OK : RM_RET_ERR,
-            "target_state_id=" + std::to_string(stateID)
-                + "; non_target_states_cleared=" + (clearSucceeded ? "true" : "false"),
-            commandID
-        );
+    void enforce(int stateID, bool pulseEnabled, const std::string &commandID) noexcept {
+        activate(stateID, pulseEnabled, "enforce_state", commandID);
     }
 
-    void reconcile(int stateID, const std::string &commandID) noexcept {
-        trace_.event(
-            "indicator.command",
-            "soma",
-            "reconcile_palette",
-            0,
-            "target_state_id=" + std::to_string(stateID),
-            commandID
-        );
+    void reconcile(int stateID, bool pulseEnabled, const std::string &commandID) noexcept {
+        activate(stateID, pulseEnabled, "reconcile_state", commandID);
+    }
 
-        bool clearSucceeded = true;
-        for (const int candidate : kPaletteStateIDs) {
-            if (candidate == stateID) continue;
-            int result = RM_RET_ERR;
-            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(candidate)); } catch (...) {}
-            clearSucceeded = clearSucceeded && result == RM_RET_OK;
-            if (result == RM_RET_OK) activeStates_.erase(candidate);
+    std::optional<Clock::time_point> nextWakeup() const noexcept {
+        return nextPulseTransition_;
+    }
+
+    void tick(Clock::time_point now) noexcept {
+        if (!pulseEnabled_ || !desiredState_ || !nextPulseTransition_ || now < *nextPulseTransition_) return;
+
+        const int stateID = *desiredState_;
+        if (pulseVisible_) {
+            trace_.event("indicator.command", "soma", "pulse_off", 0, "state_id=" + std::to_string(stateID));
+            const int result = callSetEnabled(false);
+            if (result == RM_RET_OK) {
+                pulseLEDDisabled_ = true;
+                pulseChangedEnabled_ = true;
+                pulseVisible_ = false;
+                nextPulseTransition_ = now + std::chrono::milliseconds(kPulseDarkMilliseconds);
+            } else {
+                nextPulseTransition_ = now + std::chrono::milliseconds(kPulseRetryMilliseconds);
+            }
+            trace_.event(
+                "indicator.ack",
+                result == RM_RET_OK ? "soma" : "fault",
+                result == RM_RET_OK ? "pulse_dark" : "pulse_dark_rejected",
+                result,
+                "state_id=" + std::to_string(stateID) + "; led_enabled=false"
+            );
+            return;
         }
 
-        int setResult = RM_RET_ERR;
-        try { setResult = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
-        if (setResult == RM_RET_OK) activeStates_.insert(stateID);
-        const bool succeeded = clearSucceeded && setResult == RM_RET_OK;
-
+        trace_.event("indicator.command", "soma", "pulse_on", 0, "state_id=" + std::to_string(stateID));
+        const int enableResult = callSetEnabled(true);
+        int result = enableResult;
+        if (enableResult == RM_RET_OK) {
+            try { result = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) { result = RM_RET_ERR; }
+        }
+        if (result == RM_RET_OK) {
+            pulseLEDDisabled_ = false;
+            pulseChangedEnabled_ = true;
+            activeState_ = stateID;
+            pulseVisible_ = true;
+            nextPulseTransition_ = now + std::chrono::milliseconds(kPulseLitMilliseconds);
+        } else {
+            nextPulseTransition_ = now + std::chrono::milliseconds(kPulseRetryMilliseconds);
+        }
         trace_.event(
             "indicator.ack",
-            succeeded ? "soma" : "fault",
-            succeeded ? "palette_reasserted" : "palette_reassertion_incomplete",
-            succeeded ? RM_RET_OK : RM_RET_ERR,
-            "target_state_id=" + std::to_string(stateID)
-                + "; non_target_states_cleared=" + (clearSucceeded ? "true" : "false"),
-            commandID
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "pulse_lit" : "pulse_lit_rejected",
+            result,
+            "state_id=" + std::to_string(stateID) + "; led_enabled=true"
         );
     }
 
@@ -1180,17 +1183,23 @@ public:
         if (restored_) return;
         restored_ = true;
         bool clearSucceeded = true;
-        for (const int stateID : activeStates_) {
+        const bool visibilityRestored = restorePulseLEDVisibility();
+        clearSucceeded = clearSucceeded && visibilityRestored;
+        if (visibilityRestored && activeState_) {
             int result = RM_RET_ERR;
-            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(*activeState_)); } catch (...) {}
             clearSucceeded = clearSucceeded && result == RM_RET_OK;
         }
-        activeStates_.clear();
+        activeState_.reset();
+        desiredState_.reset();
+        pulseEnabled_ = false;
+        pulseVisible_ = false;
+        nextPulseTransition_.reset();
         bool globalsSucceeded = true;
         if (brightnessChanged_ && baselineBrightness_) {
             globalsSucceeded = callSetBrightness(*baselineBrightness_) == RM_RET_OK && globalsSucceeded;
         }
-        if (enabledChanged_ && baselineEnabled_) {
+        if ((enabledChanged_ || pulseChangedEnabled_) && baselineEnabled_) {
             globalsSucceeded = callSetEnabled(*baselineEnabled_) == RM_RET_OK && globalsSucceeded;
         }
         trace_.event(
@@ -1204,7 +1213,71 @@ public:
     }
 
 private:
-    static constexpr int kPaletteStateIDs[] = {16, 17, 18, 54, 57};
+    static constexpr int kPulseLitMilliseconds = 420;
+    static constexpr int kPulseDarkMilliseconds = 240;
+    static constexpr int kPulseRetryMilliseconds = 160;
+
+    void activate(int stateID, bool pulseEnabled, const std::string &operation, const std::string &commandID) noexcept {
+        const bool desiredMatches = desiredState_ && *desiredState_ == stateID && pulseEnabled_ == pulseEnabled;
+        if (desiredMatches && (pulseEnabled || (activeState_ && *activeState_ == stateID))) {
+            trace_.event(
+                "indicator.ack",
+                "soma",
+                "state_already_active",
+                RM_RET_OK,
+                "state_id=" + std::to_string(stateID)
+                    + "; pulse_enabled=" + (pulseEnabled ? "true" : "false")
+                    + "; no_reassertion",
+                commandID
+            );
+            return;
+        }
+
+        trace_.event(
+            "indicator.command",
+            "soma",
+            operation,
+            0,
+            "state_id=" + std::to_string(stateID)
+                + "; pulse_enabled=" + (pulseEnabled ? "true" : "false"),
+            commandID
+        );
+        const bool visibilityRestored = restorePulseLEDVisibility();
+        bool priorCleared = true;
+        if (visibilityRestored && activeState_ && *activeState_ != stateID) {
+            int clearResult = RM_RET_ERR;
+            try { clearResult = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(*activeState_)); } catch (...) {}
+            priorCleared = clearResult == RM_RET_OK;
+            if (priorCleared) activeState_.reset();
+        }
+
+        desiredState_ = stateID;
+        pulseEnabled_ = pulseEnabled;
+        nextPulseTransition_.reset();
+        int setResult = visibilityRestored ? RM_RET_OK : RM_RET_ERR;
+        if (visibilityRestored && !activeState_) {
+            setResult = RM_RET_ERR;
+            try { setResult = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+            if (setResult == RM_RET_OK) activeState_ = stateID;
+        }
+        pulseVisible_ = activeState_ && *activeState_ == stateID;
+        if (pulseVisible_ && pulseEnabled_) {
+            nextPulseTransition_ = Clock::now() + std::chrono::milliseconds(kPulseLitMilliseconds);
+        }
+        const bool succeeded = visibilityRestored && priorCleared && setResult == RM_RET_OK;
+        trace_.event(
+            "indicator.ack",
+            succeeded ? "soma" : "fault",
+            succeeded ? "state_active" : "state_transition_incomplete",
+            succeeded ? RM_RET_OK : RM_RET_ERR,
+            "state_id=" + std::to_string(stateID)
+                + "; pulse_enabled=" + (pulseEnabled ? "true" : "false")
+                + "; led_enabled=" + (visibilityRestored ? "true" : "restore_failed")
+                + "; previous_state_cleared=" + (priorCleared ? "true" : "false")
+                + "; physical_state_set=" + (setResult == RM_RET_OK ? "true" : "false"),
+            commandID
+        );
+    }
 
     using GetEnabled = int (*)(Device *, bool &);
     using SetEnabled = int (*)(Device *, bool);
@@ -1237,28 +1310,6 @@ private:
         );
     }
 
-    // Indicator states live in device firmware, not in this helper process.
-    // A helper restart after a forced service restart therefore cannot infer
-    // which of the limited palette states the prior process left active.
-    // Clear the whole supported palette once before accepting commands so each
-    // subsequent rendering has exactly one firmware state as its owner.
-    void clearResidualPalette() noexcept {
-        bool cleared = true;
-        for (const int stateID : kPaletteStateIDs) {
-            int result = RM_RET_ERR;
-            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
-            cleared = cleared && result == RM_RET_OK;
-        }
-        trace_.event(
-            "indicator.ack",
-            cleared ? "firmware" : "fault",
-            cleared ? "palette_reset" : "palette_reset_incomplete",
-            cleared ? RM_RET_OK : RM_RET_ERR,
-            "states=16,17,18,54,57"
-        );
-    }
-
-
     int callSetEnabled(bool enabled) noexcept {
         const auto function = symbol<SetEnabled>("_ZN6Device19sysMgSetLedEnabledREb");
         if (!function) return RM_RET_ERR;
@@ -1271,9 +1322,26 @@ private:
         try { return function(device_.get(), brightness); } catch (...) { return RM_RET_ERR; }
     }
 
+    bool restorePulseLEDVisibility() noexcept {
+        if (!pulseLEDDisabled_) return true;
+        const int result = callSetEnabled(true);
+        if (result == RM_RET_OK) {
+            pulseLEDDisabled_ = false;
+            pulseChangedEnabled_ = true;
+            return true;
+        }
+        return false;
+    }
+
     std::shared_ptr<Device> device_;
     Trace &trace_;
-    std::set<int> activeStates_;
+    std::optional<int> activeState_;
+    std::optional<int> desiredState_;
+    bool pulseEnabled_ = false;
+    bool pulseVisible_ = false;
+    bool pulseLEDDisabled_ = false;
+    bool pulseChangedEnabled_ = false;
+    std::optional<Clock::time_point> nextPulseTransition_;
     std::optional<bool> baselineEnabled_;
     std::optional<uint8_t> baselineBrightness_;
     bool brightnessChanged_ = false;
@@ -1393,6 +1461,13 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
         if (externalControl && externalPulseDeadline) {
             const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(*externalPulseDeadline - Clock::now()).count();
             pollTimeoutMilliseconds = static_cast<int>(std::clamp<int64_t>(remaining, 0, 100));
+        }
+        if (const auto indicatorWakeup = indicator.nextWakeup()) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(*indicatorWakeup - Clock::now()).count();
+            pollTimeoutMilliseconds = std::min(
+                pollTimeoutMilliseconds,
+                static_cast<int>(std::clamp<int64_t>(remaining, 0, 100))
+            );
         }
         const int polled = ::poll(&descriptor, 1, pollTimeoutMilliseconds);
         if (polled > 0 && (descriptor.revents & POLLIN)) {
@@ -1577,10 +1652,10 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                 indicator.setEnabled(command.value == 1, command.commandID);
                 break;
             case BridgeCommandType::indicatorEnforce:
-                indicator.enforce(command.value, command.commandID);
+                indicator.enforce(command.value, command.pulseEnabled, command.commandID);
                 break;
             case BridgeCommandType::indicatorReconcile:
-                indicator.reconcile(command.value, command.commandID);
+                indicator.reconcile(command.value, command.pulseEnabled, command.commandID);
                 break;
             case BridgeCommandType::shutdown:
                 {
@@ -1591,45 +1666,6 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
                     } else {
                         trace.event("camera.ack", "manual", "manual_active", RM_RET_OK, "bridge_shutdown_manual", command.commandID);
                     }
-                    // Park the gimbal at center before sleeping so the camera
-                    // rests in a neutral pose instead of freezing wherever it
-                    // was last looking. The move is bounded: worst-case travel
-                    // (pan +-120deg at 90deg/s, pitch +-90deg at 60deg/s) is
-                    // ~1.5s, so a 4s deadline is generous.
-                    int centerResult = RM_RET_ERR;
-                    {
-                        std::lock_guard<std::mutex> lock(sdkMutex);
-                        try { centerResult = device->gimbalSetSpeedPositionR(0, 0, 0, 0, 60, 90); } catch (...) {}
-                    }
-                    if (centerResult == RM_RET_OK) {
-                        trace.event("camera.command", "manual", "center_sent", 0, "shutdown_park; pitch_degrees=0; yaw_degrees=0", command.commandID);
-                        const auto centerDeadline = Clock::now() + std::chrono::seconds(4);
-                        while (Clock::now() < centerDeadline && !interrupted) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                            const auto attitude = readGimbalAttitude(device);
-                            if (attitude && std::abs(attitude->pitch) <= 1.5 && std::abs(attitude->pan) <= 1.5) break;
-                        }
-                    } else {
-                        trace.event("camera.ack", "fault", "center_rejected", centerResult, "shutdown_park_rejected", command.commandID);
-                    }
-                    // Put the camera into sleep mode so it fully powers down its
-                    // AI tracking rather than continuing to follow people after
-                    // SOMA has been stopped.
-                    int sleepResult = RM_RET_ERR;
-                    {
-                        std::lock_guard<std::mutex> lock(sdkMutex);
-                        try {
-                            sleepResult = device->cameraSetDevRunStatusR(Device::DevStatusSleep);
-                        } catch (...) {}
-                    }
-                    trace.event(
-                        "camera.ack",
-                        sleepResult == RM_RET_OK ? "sleep" : "fault",
-                        sleepResult == RM_RET_OK ? "sleep_requested" : "sleep_rejected",
-                        sleepResult,
-                        "bridge_shutdown_sleep",
-                        command.commandID
-                    );
                     return 0;
                 }
             case BridgeCommandType::invalid:
@@ -1651,6 +1687,7 @@ int runBridgeServer(const std::shared_ptr<Device> &device, Trace &trace, int dur
             externalPulseStopCommandID.clear();
             if (!stopped) return 4;
         }
+        indicator.tick(Clock::now());
         // Attitude reporting is owned by AttitudeReporter on its own thread;
         // the bridge loop must never gate the pose stream on its own latency.
         if (nativeTracking && Clock::now() - lastHeartbeat > nativeWatchdog) {

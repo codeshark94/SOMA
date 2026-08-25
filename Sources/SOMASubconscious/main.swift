@@ -680,8 +680,7 @@ func performL1AnonymousReview(
     request.httpBody = payload
 
     let semaphore = DispatchSemaphore(value: 0)
-    var decision = true
-    var healthMessage = "unavailable"
+    let resultBox = SynchronousResultBox<(decision: Bool, healthMessage: String)>()
     URLSession.shared.dataTask(with: request) { data, response, error in
         defer { semaphore.signal() }
         guard error == nil,
@@ -691,15 +690,20 @@ func performL1AnonymousReview(
               let contentData = content.data(using: .utf8),
               let parsed = try? JSONSerialization.jsonObject(with: contentData) as? [String: Any],
               let register = parsed["register_anonymous_identity"] as? Bool else {
-            healthMessage = error?.localizedDescription ?? "malformed_response"
+            resultBox.set(.success((true, error?.localizedDescription ?? "malformed_response")))
             return
         }
-        decision = register
-        healthMessage = register ? "approved" : "declined"
+        resultBox.set(.success((register, register ? "approved" : "declined")))
     }.resume()
     semaphore.wait()
-    onHealth("reviewed", "decision=\(healthMessage)")
-    return decision
+    let result: (decision: Bool, healthMessage: String)
+    if case let .success(value)? = resultBox.get() {
+        result = value
+    } else {
+        result = (true, "unavailable")
+    }
+    onHealth("reviewed", "decision=\(result.healthMessage)")
+    return result.decision
 }
 
 private enum RuntimeError: LocalizedError {
@@ -1559,11 +1563,12 @@ private final class ConversationContactRuntime: @unchecked Sendable {
     func authorizeSpeechOnset(at monotonicNS: UInt64) -> ConversationOpeningAuthorization? {
         lock.lock()
         defer { lock.unlock() }
-        // The caller has already established a current, verified visual
-        // anchor through LiveConversationVisualAdmission. Gaze remains useful
-        // social evidence for L1, but must not become a second, independent
-        // admission gate for a person who has just spoken to SOMA.
-        return gate.authorizeSpeechOnset(at: monotonicNS, directContact: true)
+        // A current face anchor establishes who can be addressed. A fresh
+        // directed-contact observation establishes that this sound is a
+        // request to SOMA rather than ambient speech. The sole exception is a
+        // reply inside SOMA's own outstanding social invitation.
+        let directContact = directedContactHistory.snapshot(at: monotonicNS).eyeContactActive
+        return gate.authorizeSpeechOnset(at: monotonicNS, directContact: directContact)
     }
 
     func markConversationOpened(at monotonicNS: UInt64) {
@@ -3051,6 +3056,29 @@ private final class GimbalPoseStore: @unchecked Sendable {
         return recent.last(where: { $0.monotonicNS <= monotonicNS && $0.isFresh(for: monotonicNS, maximumAgeNS: maximumAgeNS) })
     }
 
+    func hasContinuousFeedback(
+        at monotonicNS: UInt64,
+        minimumSamples: Int = 3,
+        maximumSampleAgeNS: UInt64 = 500_000_000,
+        maximumInterSampleGapNS: UInt64 = 220_000_000
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let samples = recent.reversed().prefix { pose in
+            monotonicNS >= pose.monotonicNS
+                && monotonicNS - pose.monotonicNS <= maximumSampleAgeNS
+        }
+        guard samples.count >= minimumSamples else { return false }
+        let ordered = samples.reversed()
+        for (previous, next) in zip(ordered, ordered.dropFirst()) {
+            guard next.monotonicNS > previous.monotonicNS,
+                  next.monotonicNS - previous.monotonicNS <= maximumInterSampleGapNS else {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Motor commands must use the latest physical pose, not a pose ordered
     /// before the frame timestamp. The helper can report a few milliseconds
     /// after Vision finishes a frame; rejecting that newer sample creates a
@@ -3387,6 +3415,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var helperDiagnosticBuffer = ""
     private var poseAvailabilityReported = false
     private var fieldOfViewAvailabilityReported = false
+    private var poseWaitStopIssued = false
     // The calibration expresses an expected axis sign. During exploration the
     // SDK attitude is the authority: one non-moving pan pulse reverses the
     // next pulse; both directions failing requires a physical re-home.
@@ -6330,6 +6359,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         panoramaWaypointStableSinceNS = nil
         cameraGeometryNextPositionCommandNS = 0
         explorationBoundaryTurning = false
+        poseWaitStopIssued = false
         smoothExploration.reset()
         scheduleScanControlTick(generation: scanGeneration)
     }
@@ -6355,6 +6385,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         panoramaWaypointStableSinceNS = nil
         cameraGeometryNextPositionCommandNS = 0
         explorationBoundaryTurning = false
+        poseWaitStopIssued = false
         smoothExploration.reset()
     }
 
@@ -6396,23 +6427,45 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // slowly enough that a pose up to 600ms old is still safe for
             // waypoint tracking.
             guard let pose = poseStore.latest(at: now, maximumAgeNS: 600_000_000) else {
-                // A transient attitude gap must not silently switch a
-                // calibrated spherical route into the blind fallback scan or
-                // reset its waypoint clock. Decelerate on the existing curve
-                // and resume the same route when a fresh pose arrives.
-                let velocity = smoothExploration.advance(
-                    towardPitch: 0,
-                    pan: 0,
-                    at: now
-                )
-                sendSmoothExplorationVelocity(
-                    velocity,
-                    state: "coverage_pose_wait_curve",
-                    at: now
-                )
+                // A calibrated spherical route has no valid frame of
+                // reference without current attitude feedback. Releasing a
+                // prior velocity once preserves the last safe posture; a
+                // repeated zero-velocity command would instead seize the
+                // camera in external mode while providing no recovery path.
+                if !poseWaitStopIssued {
+                    poseWaitStopIssued = true
+                    if externalCommandID != nil {
+                        sendExternalStop(state: "coverage_pose_unavailable", at: now)
+                    }
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: now,
+                        source: "attention_gimbal_bridge",
+                        state: "coverage_pose_unavailable",
+                        message: "route_paused_until_sdk_attitude_feedback"
+                    ))
+                }
                 scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
                 return
             }
+            guard poseStore.hasContinuousFeedback(at: now) else {
+                if !poseWaitStopIssued {
+                    poseWaitStopIssued = true
+                    if externalCommandID != nil {
+                        sendExternalStop(state: "coverage_pose_stream_unstable", at: now)
+                    }
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: now,
+                        source: "attention_gimbal_bridge",
+                        state: "coverage_pose_stream_unstable",
+                        message: "route_paused_until_continuous_sdk_attitude_feedback"
+                    ))
+                }
+                scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
+                return
+            }
+            poseWaitStopIssued = false
             if cameraGeometryCalibrationMode {
                 runCameraGeometryCalibrationTick(
                     pose: pose,
@@ -6984,7 +7037,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         forceHardwareReassertion: Bool = false
     ) {
         guard indicatorCalibrationPreset == nil else { return }
-        let next = indicatorInputs.resolvedState
+        let next = indicatorInputs.visualPresentationState
         guard ledSettings.responseMode.permits(next) else {
             guard helperReady, process.isRunning, next != activeIndicatorState || indicatorIlluminated else { return }
             if indicatorIlluminated, let previous = activeIndicatorState {
@@ -7008,10 +7061,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               forceHardwareReassertion || next != activeIndicatorState || activeIndicatorRendering != indicatorRendering(next) else { return }
         activeIndicatorState = next
         let nextSignal = ledSettings.signal(for: next)
-        let nextRendering = nextSignal.deviceRendering
+        let nextRendering = indicatorRendering(next)
         let commandID = nextCommandID(prefix: "indicator-enforce")
         send(
-            "indicator_enforce \(commandID) \(nextRendering.stateID)"
+            "indicator_enforce \(commandID) \(nextRendering.stateID) \(nextRendering.pulseEnabled ? 1 : 0)"
         )
         activeIndicatorRendering = nextRendering
         indicatorIlluminated = true
@@ -7020,13 +7073,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNS,
             source: "social_indicator",
             state: next.rawValue,
-            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); command_submitted=true; physical_visibility=unverified; rgb_palette=true; arbitrary_rgb=false"
+            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); pulse_enabled=\(nextRendering.pulseEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); command_submitted=true; physical_visibility=unverified; rgb_palette=true; arbitrary_rgb=false"
         ))
     }
 
     private func reconcileIndicatorPalette(at monotonicNS: UInt64) {
         guard indicatorCalibrationPreset == nil else { return }
-        let next = indicatorInputs.resolvedState
+        let next = indicatorInputs.visualPresentationState
         guard ledSettings.responseMode.permits(next),
               helperReady,
               process.isRunning,
@@ -7037,14 +7090,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             refreshIndicator(at: monotonicNS)
             return
         }
+        guard !activeIndicatorRendering.pulseEnabled else { return }
         let commandID = nextCommandID(prefix: "indicator-reconcile")
         send(
-            "indicator_reconcile \(commandID) \(activeIndicatorRendering.stateID)"
+            "indicator_reconcile \(commandID) \(activeIndicatorRendering.stateID) \(activeIndicatorRendering.pulseEnabled ? 1 : 0)"
         )
     }
 
     private func indicatorRendering(_ state: SubconsciousIndicatorState) -> SOMALEDDeviceRendering {
-        ledSettings.signal(for: state).deviceRendering
+        ledSettings.deviceRendering(
+            for: state,
+            voiceSessionOpen: liveVoicePresentation != .inactive
+        )
     }
 
     private func indicatorFirmwareStateID(_ state: SubconsciousIndicatorState) -> Int {
@@ -9642,6 +9699,48 @@ private func run(_ options: Options) throws {
         .deletingLastPathComponent()
         .appendingPathComponent("identity-current.json")
     let liveSessionCapabilities = SOMASessionCapabilityStore()
+    let persistentLiveVoiceBroker: PersistentAppServerBroker?
+    if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
+        do {
+            let broker = try PersistentAppServerBroker(
+                capability: UUID().uuidString.lowercased(),
+                onHealth: { state, message in
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "l2_app_server_broker",
+                        state: state,
+                        message: message
+                    ))
+                }
+            )
+            persistentLiveVoiceBroker = broker
+            switch broker.ensureReady() {
+            case .success:
+                break
+            case let .failure(error):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "l2_app_server_broker",
+                    state: "unavailable",
+                    message: String(error.localizedDescription.prefix(192))
+                ))
+            }
+        } catch {
+            persistentLiveVoiceBroker = nil
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l2_app_server_broker",
+                state: "unavailable",
+                message: String(error.localizedDescription.prefix(192))
+            ))
+        }
+    } else {
+        persistentLiveVoiceBroker = nil
+    }
+    defer { persistentLiveVoiceBroker?.stop() }
     let spatialAtlas = SphericalSceneAtlasStore()
     let placeEmbeddingEncoder = PanoramaPlaceEmbedding.cpuSpatialSignatureEncoder
     let placeEmbeddingRevision = 1
@@ -10134,6 +10233,10 @@ private func run(_ options: Options) throws {
             voice: controlSettings.realtimeVoice,
             currentCameraImageDataURI: {
                 liveCameraFrameRelay?.currentImageDataURI(at: monotonicNanoseconds())
+            },
+            persistentAppServer: persistentLiveVoiceBroker,
+            persistentSessionAuthorizer: { token, scope, at in
+                liveSessionCapabilities.authorize(token: token, scope: scope, at: at)
             }
         ) { event in
             let eventNS = monotonicNanoseconds()
@@ -10141,7 +10244,6 @@ private func run(_ options: Options) throws {
             case let .launchRequested(authorization, _):
                 l1LiveConversationState.begin()
                 liveCameraFrameRelay?.setEnabled(true)
-                attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
                     monotonicNS: eventNS,
@@ -10425,7 +10527,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_or_social_pulse; new_session_requires=current_verified_human_target; gaze=availability_context_only; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_updates_and_recall_deltas"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=voice_activity_and_current_eye_contact_or_social_pulse_response; new_session_requires=current_verified_human_target; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_updates_and_recall_deltas"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -11160,7 +11262,42 @@ private func run(_ options: Options) throws {
                 }
                 return attentionGimbalBridge.calibrateIndicator(preset: preset)
             },
+            conversationTerminationHandler: { sessionAuthorization in
+                guard let liveVoiceLauncher else {
+                    return .failure(RuntimeError.unavailable("No Live Voice session is active"))
+                }
+                if let result = liveVoiceLauncher.authorizePersistentBroker(
+                    token: sessionAuthorization,
+                    scope: .conversationControl,
+                    at: monotonicNanoseconds()
+                ), case let .failure(error) = result {
+                    return .failure(error)
+                }
+                let result = liveVoiceLauncher.endCurrentSession(authorizedBy: sessionAuthorization)
+                if case .success = result {
+                    writer.write(RuntimeEvent(
+                        event: "human.interaction",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "l2_live_voice",
+                        state: "end_requested",
+                        message: "origin=active_session_mcp"
+                    ))
+                }
+                return result
+            },
             sessionAuthorizationProvider: { token, scope in
+                if let result = liveVoiceLauncher?.authorizePersistentBroker(
+                    token: token,
+                    scope: scope,
+                    at: monotonicNanoseconds()
+                ) {
+                    switch result {
+                    case .success:
+                        return .success(())
+                    case let .failure(error):
+                        return .failure(error)
+                    }
+                }
                 switch liveSessionCapabilities.authorize(
                     token: token,
                     scope: scope,

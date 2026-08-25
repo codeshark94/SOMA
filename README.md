@@ -218,6 +218,31 @@ by default.
 See [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) for the detailed
 authority, memory, and privacy contracts.
 
+## Requirements
+
+SOMA's Swift package has no remote SwiftPM dependencies. Its native vision and
+hardware paths use local system components:
+
+- Apple Silicon Mac running macOS 13 or newer
+- Xcode command-line tools with a Swift 6 toolchain
+- Homebrew OpenCV 5 for the Swift/C++ panorama bridge
+- CMake and the OBSBOT `libdev_v2.1.0_8` SDK for the native gimbal/LED bridge
+- A signed-in Codex installation only when L2 Live Voice is enabled
+
+Install the public build tools and verify the compile-time requirements:
+
+```sh
+brew install cmake opencv
+scripts/soma-doctor.zsh --build
+swift build
+swift test
+```
+
+`SOMA_OPENCV_PREFIX` overrides the OpenCV prefix when Homebrew is not installed
+under `/opt/homebrew` or `/usr/local`. The proprietary OBSBOT SDK is not stored
+in Git; put it at `Reference/SDK/libdev_v2.1.0_8` or set
+`SOMA_OBSBOT_SDK_ROOT` to its absolute directory before a full installation.
+
 ## Run a safe probe first
 
 SOMA is a research prototype with real hardware. Start with a non-actuating
@@ -255,18 +280,23 @@ scripts and hardware flags before enabling physical camera control.
 <br>
 
 ```sh
-swift build --build-path .build/soma-live
+scripts/soma-doctor.zsh --runtime
 mkdir -p "$HOME/Library/Application Support/SOMA"
 cp config/soma.env.example "$HOME/Library/Application Support/SOMA/.env"
-# Edit .env with the OBSBOT IDs from the safe probe above.
+# `auto` selects a single connected OBSBOT; use explicit IDs for multiple cameras.
 scripts/install-soma-subconscious-app.zsh
 scripts/soma.zsh start
+scripts/soma.zsh status
 ```
 
-The installed runtime is intended for a local macOS user with the connected
-camera, configured permissions, and—when Live Voice is enabled—a signed-in
-Codex installation. Motion stays disabled until the local configuration
-explicitly enables it with a calibration for the connected device.
+The installer rebuilds the Swift and native helpers, signs a local app bundle,
+writes `com.soma.menu-bar` and `com.soma.reactive-l0` LaunchAgents, and starts or
+restarts them. macOS may then request Camera, Microphone, Speech Recognition,
+and Accessibility permissions. The installed runtime is intended for a local
+macOS user with the connected camera and—when Live Voice is enabled—a signed-in
+Codex installation. Motion stays disabled until `.env` explicitly enables it
+and the connected device has a valid calibration. Use `scripts/soma.zsh stop`,
+`start`, `restart`, or `status` for subsequent service control.
 </details>
 
 ## Repository map

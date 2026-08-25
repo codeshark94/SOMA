@@ -55,7 +55,7 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: JSONEncoder().encode(settings)
         )
 
-        XCTAssertEqual(decoded.led.signal(for: .conversation).color, .green)
+        XCTAssertEqual(decoded.led.signal(for: .conversation).color, .blue)
         XCTAssertEqual(decoded.led.signal(for: .conversation).pattern, .steady)
         XCTAssertEqual(decoded.led.signal(for: .exploring).color, .yellow)
         XCTAssertEqual(decoded.led.signal(for: .exploring).pattern, .steady)
@@ -65,17 +65,40 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertEqual(decoded.led.signal(for: .contactReady).firmwareStateID, 54)
         XCTAssertEqual(
             decoded.led.signal(for: .contactReady).deviceRendering,
-            .init(stateID: 54)
+            .init(stateID: 54, pulseEnabled: false)
         )
     }
 
-    func testLegacyContactBlinkBecomesAVisiblePaletteState() {
+    func testLegacyBlinkNormalizesToAVisiblePaletteState() {
         let legacy = SOMALEDSettings(
             signals: [.contactReady: .init(color: .blue, pattern: .blink)]
         )
         XCTAssertEqual(
             legacy.signal(for: .contactReady),
-            .init(color: .green, pattern: .steady)
+            .init(color: .blue, pattern: .steady)
+        )
+    }
+
+    func testVoiceSessionPulsesTheCurrentVisualAttentionSignal() {
+        let settings = SOMALEDSettings(
+            signals: [
+                .exploring: .init(color: .yellow, pattern: .steady),
+                .humanDetected: .init(color: .blue, pattern: .steady),
+                .contactReady: .init(color: .green, pattern: .steady),
+            ]
+        )
+
+        XCTAssertEqual(
+            settings.deviceRendering(for: .humanDetected, voiceSessionOpen: false),
+            .init(stateID: 57, pulseEnabled: false)
+        )
+        XCTAssertEqual(
+            settings.deviceRendering(for: .humanDetected, voiceSessionOpen: true),
+            .init(stateID: 57, pulseEnabled: true)
+        )
+        XCTAssertEqual(
+            settings.deviceRendering(for: .contactReady, voiceSessionOpen: true),
+            .init(stateID: 54, pulseEnabled: true)
         )
     }
 
@@ -170,7 +193,7 @@ final class SOMAControlSettingsTests: XCTestCase {
         )
 
         XCTAssertEqual(migrated.led.signals.count, SubconsciousIndicatorState.configurationStates.count)
-        XCTAssertEqual(migrated.led.signal(for: .conversation).color, .green)
+        XCTAssertEqual(migrated.led.signal(for: .conversation).color, .blue)
         XCTAssertNil(migrated.led.signals[.listening])
         XCTAssertNil(migrated.led.signals[.speaking])
     }

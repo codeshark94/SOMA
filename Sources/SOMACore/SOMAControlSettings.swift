@@ -77,13 +77,15 @@ public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
     }
 }
 
-/// A Tiny 2 Lite status-indicator state is an opaque firmware palette entry.
-/// The host only uses the documented palette state API for social signalling.
+/// A Tiny 2 Lite status-indicator rendering combines an opaque firmware
+/// palette entry with an optional bridge-owned pulse.
 public struct SOMALEDDeviceRendering: Equatable, Sendable {
     public let stateID: Int
+    public let pulseEnabled: Bool
 
-    public init(stateID: Int) {
+    public init(stateID: Int, pulseEnabled: Bool) {
         self.stateID = stateID
+        self.pulseEnabled = pulseEnabled
     }
 }
 
@@ -139,8 +141,6 @@ public enum SOMALEDPattern: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    /// The exposed status palette supports steady states. UVC special effects
-    /// are camera-control functions, not a reliable status-light cadence.
     public func isPhysicallySupported(for color: SOMALEDColor) -> Bool {
         self == .steady
     }
@@ -192,7 +192,7 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
     }
 
     public var deviceRendering: SOMALEDDeviceRendering {
-        .init(stateID: color.firmwareStateID)
+        .init(stateID: color.firmwareStateID, pulseEnabled: false)
     }
 
     public var firmwareStateID: Int {
@@ -265,21 +265,26 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         return Self.defaultSignal(for: canonical)
     }
 
+    /// Voice presence is an overlay on the current visual-attention signal.
+    /// The local bridge pulses the selected firmware palette state, rather
+    /// than using the camera's unrelated special LED control.
+    public func deviceRendering(
+        for state: SubconsciousIndicatorState,
+        voiceSessionOpen: Bool
+    ) -> SOMALEDDeviceRendering {
+        let base = signal(for: state).deviceRendering
+        return .init(
+            stateID: base.stateID,
+            pulseEnabled: voiceSessionOpen
+        )
+    }
+
     private static func normalized(
         _ signals: [SubconsciousIndicatorState: SOMALEDSignalSettings]
     ) -> [SubconsciousIndicatorState: SOMALEDSignalSettings] {
         Dictionary(uniqueKeysWithValues: SubconsciousIndicatorState.configurationStates.map { state in
             let selected = signal(for: state, from: signals)
-            // A prior runtime treated the UVC camera special effect as a blue
-            // status blink. On this firmware it extinguishes the indicator.
-            // Preserve contact-ready's semantic distinction with a visible
-            // palette colour instead of replaying that unsafe configuration.
-            let normalized = state == .contactReady
-                && selected.color == .blue
-                && selected.pattern == .blink
-                ? SOMALEDSignalSettings(color: .green, pattern: .steady)
-                : selected.normalizedForDevice()
-            return (state, normalized)
+            return (state, selected.normalizedForDevice())
         })
     }
 

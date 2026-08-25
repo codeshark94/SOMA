@@ -14,6 +14,7 @@ soma_vad_resources="$soma_build_root/SOMA_SOMAVADModel.bundle"
 soma_native_source="$soma_root/Sources/SOMANativeTracking"
 soma_native_build_root="$soma_root/.build/soma-live/native"
 soma_native_binary="$soma_native_build_root/soma-native-track"
+soma_obsbot_sdk_root=${SOMA_OBSBOT_SDK_ROOT:-"$soma_root/Reference/SDK/libdev_v2.1.0_8"}
 soma_cmake=${SOMA_CMAKE:-}
 soma_tool_path='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
 soma_app_root=${SOMA_APP_ROOT:-"$HOME/Library/Application Support/SOMA/Applications/SOMA Subconscious.app"}
@@ -39,7 +40,10 @@ fi
 # before copying so an earlier local artifact cannot silently replace newer
 # source changes in the signed app.
 /usr/bin/env swift build --package-path "$soma_root" --scratch-path "$soma_root/.build/soma-live"
-"$soma_cmake" -S "$soma_native_source" -B "$soma_native_build_root"
+"$soma_cmake" \
+  -S "$soma_native_source" \
+  -B "$soma_native_build_root" \
+  -DOBSBOT_SDK_ROOT="$soma_obsbot_sdk_root"
 "$soma_cmake" --build "$soma_native_build_root" --parallel
 
 if [[ ! -x "$soma_source_binary" ]]; then
