@@ -3885,6 +3885,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             || nativeTrackingStartPending
     }
 
+    /// The device accepts only one gimbal-control mode at a time. A native
+    /// handoff is already an ownership claim even before its asynchronous
+    /// acknowledgement arrives: any external motion command during that window
+    /// returns the camera to manual mode.
+    private var nativeTrackingOwnsMotor: Bool {
+        nativeTrackingActive || nativeTrackingStartPending
+    }
+
+    private var lastNativeLeaseMotionSuppressionNS: UInt64 = 0
+
     private var cognitiveMotionMode: CognitiveMotionMode?
     private var cognitiveMotionGeneration = 0
     private var cognitiveMotionLoopRunning = false
@@ -5562,6 +5572,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // velocity command, so a leftover scan pulse would kill the very
             // lock this start is establishing.
             cancelScan()
+            cancelExternalStop()
+            externalCommandID = nil
             let targetRect = target.rect.clippedToUnitSquare()
             let bridgeLocale = Locale(identifier: "en_US_POSIX")
             let targetBox = targetRect.map { rect in
@@ -5967,45 +5979,39 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 lastObservedFaceNS = monotonicNS
                 lastObservedFaceRect = observedFace.observation.rect
                 if faceLock.isActive(at: monotonicNS) {
-                    // The ready-to-speak invitation must be earned by the
-                    // camera actually following the person (device-confirmed
-                    // native tracking). A locked face with eye contact but no
-                    // live tracking is "person visible", not "ready to talk":
-                    // the two states rise and fall together so the blinking
-                    // blue indicator never claims a tracking SOMA is not doing.
-                    if nativeTrackingFunctionallyVerified {
-                        switch observedFace.observation.gazeEvidence {
-                        case .direct:
-                            eyeContactIndicatorLease.observe(
-                                sceneID: observedFace.id,
-                                at: monotonicNS
-                            )
+                    // Eye contact is perceptual evidence from the current
+                    // face lock. Native liveness separately protects motor
+                    // ownership and must not delay the social response when a
+                    // person is already looking at the camera.
+                    switch observedFace.observation.gazeEvidence {
+                    case .direct:
+                        eyeContactIndicatorLease.observe(
+                            sceneID: observedFace.id,
+                            at: monotonicNS
+                        )
+                        indicatorInputs.visualState = .eyeContact
+                    case .averted:
+                        if eyeContactIndicatorLease.observeAverted(
+                            sceneID: observedFace.id,
+                            at: monotonicNS
+                        ) {
                             indicatorInputs.visualState = .eyeContact
-                        case .averted:
-                            if eyeContactIndicatorLease.observeAverted(
-                                sceneID: observedFace.id,
-                                at: monotonicNS
-                            ) {
-                                indicatorInputs.visualState = .eyeContact
-                            } else {
-                                indicatorInputs.visualState = .humanDetected
-                            }
-                        case .unavailable:
-                            // Pupil landmarks are intermittent on the live
-                            // stream. Preserve a current invitation through a
-                            // measurement gap, but never turn an unknown gaze
-                            // into a new invitation.
-                            if eyeContactIndicatorLease.maintain(
-                                sceneID: observedFace.id,
-                                at: monotonicNS
-                            ) || eyeContactIndicatorLease.isActive(at: monotonicNS) {
-                                indicatorInputs.visualState = .eyeContact
-                            } else {
-                                indicatorInputs.visualState = .humanDetected
-                            }
+                        } else {
+                            indicatorInputs.visualState = .humanDetected
                         }
-                    } else {
-                        indicatorInputs.visualState = .humanDetected
+                    case .unavailable:
+                        // Pupil landmarks are intermittent on the live
+                        // stream. Preserve a current invitation through a
+                        // measurement gap, but never turn an unknown gaze
+                        // into a new invitation.
+                        if eyeContactIndicatorLease.maintain(
+                            sceneID: observedFace.id,
+                            at: monotonicNS
+                        ) || eyeContactIndicatorLease.isActive(at: monotonicNS) {
+                            indicatorInputs.visualState = .eyeContact
+                        } else {
+                            indicatorInputs.visualState = .humanDetected
+                        }
                     }
                     refreshIndicator(at: monotonicNS)
                     socialTrackingContinuity.recordObservation(at: monotonicNS)
@@ -6945,6 +6951,21 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             cognitiveMotionHolding = false
             startCognitiveMotionLoop()
         case let .express(requestID, expression, expiresAtNS):
+            // An arrival acknowledgment is a low-amplitude social overlay,
+            // not permission to take the gimbal away from the face currently
+            // being followed. The active eye-contact presentation supplies the
+            // acknowledgment while L0 retains the social motor lease.
+            if expression == .acknowledge,
+               nativeTrackingOwnsMotor || faceLock.permitsMotor(at: now) {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "embodiment_motor",
+                    state: "acknowledgment_preserved_l0_tracking",
+                    message: "request_id=\(String(requestID.prefix(96))); native_lease=\(nativeTrackingOwnsMotor)"
+                ))
+                return
+            }
             claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
             cognitiveMotionMode = .expression(
                 kind: expression,
@@ -7614,6 +7635,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         helperPulseDurationMS: Int? = nil,
         afterStop: (@Sendable (UInt64) -> Void)? = nil
     ) {
+        guard !suppressExternalMotionForNativeLease(
+            state: state,
+            at: monotonicNS
+        ) else {
+            return
+        }
         // A face command is never allowed to keep pushing while its own
         // previous commands have carried the optical axis into a posture that
         // cannot be justified by the current image. Release the latch, stop,
@@ -7692,6 +7719,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         at monotonicNS: UInt64,
         hardStopAfterNS: UInt64?
     ) {
+        guard !suppressExternalMotionForNativeLease(
+            state: state,
+            at: monotonicNS
+        ) else {
+            return
+        }
         cancelExternalStop()
         poseStore.noteMotion(at: monotonicNS, durationNS: 750_000_000)
         let commandID = externalCommandID ?? nextCommandID(prefix: "external")
@@ -7713,6 +7746,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func sendExternalStop(state: String, at monotonicNS: UInt64) {
+        guard !nativeTrackingOwnsMotor else {
+            cancelExternalStop()
+            externalCommandID = nil
+            return
+        }
         poseStore.noteMotion(at: monotonicNS, durationNS: 250_000_000)
         let faceAgeMilliseconds: Double?
         if let lastObservedFaceNS, monotonicNS >= lastObservedFaceNS {
@@ -7751,6 +7789,26 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             targetLabel: nil,
             targetProbability: 0
         ))
+    }
+
+    private func suppressExternalMotionForNativeLease(
+        state: String,
+        at monotonicNS: UInt64
+    ) -> Bool {
+        guard nativeTrackingOwnsMotor else { return false }
+        cancelExternalStop()
+        externalCommandID = nil
+        if monotonicNS >= lastNativeLeaseMotionSuppressionNS + 250_000_000 {
+            lastNativeLeaseMotionSuppressionNS = monotonicNS
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNS,
+                source: "attention_gimbal_bridge",
+                state: "external_motion_suppressed",
+                message: "reason=native_tracking_lease; requested_state=\(String(state.prefix(96)))"
+            ))
+        }
+        return true
     }
 
     private func scheduleExternalStop(

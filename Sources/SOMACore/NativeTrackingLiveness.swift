@@ -20,6 +20,7 @@ public struct NativeTrackingLiveness: Sendable {
     }
 
     private let acquisitionTimeoutNS: UInt64
+    private let centeredConfirmationNS: UInt64
     private let centeredOffset: Double
     private let requiredOffsetImprovement: Double
     private let minimumPoseMotionDegrees: Double
@@ -28,11 +29,16 @@ public struct NativeTrackingLiveness: Sendable {
 
     public init(
         acquisitionTimeoutMilliseconds: UInt64 = 2_500,
+        centeredConfirmationMilliseconds: UInt64 = 400,
         centeredOffset: Double = 0.12,
         requiredOffsetImprovement: Double = 0.06,
         minimumPoseMotionDegrees: Double = 0.50
     ) {
         acquisitionTimeoutNS = acquisitionTimeoutMilliseconds * 1_000_000
+        centeredConfirmationNS = min(
+            centeredConfirmationMilliseconds,
+            acquisitionTimeoutMilliseconds
+        ) * 1_000_000
         self.centeredOffset = centeredOffset
         self.requiredOffsetImprovement = requiredOffsetImprovement
         self.minimumPoseMotionDegrees = minimumPoseMotionDegrees
@@ -79,16 +85,23 @@ public struct NativeTrackingLiveness: Sendable {
             return .confirmed
         }
 
-        // A face that begins centered is not evidence that native tracking
-        // acquired it: an external servo, a stationary subject, or plain
-        // chance produces the same image.  The native owner is allowed to
-        // keep its lease, but it only becomes verified after a measured gimbal
-        // response keeps that centered target in frame.  If the person moves
-        // away from center first, start a fresh observable challenge from that
-        // offset rather than treating the original centered frame as proof.
+        // A centered target produces no motor displacement to observe. Once
+        // the device has accepted the native mode, an independently observed
+        // face that remains centered through a short dwell is sufficient
+        // evidence that the native loop is holding its target. If the face
+        // moves away first, replace the dwell with the normal measurable
+        // re-centering challenge.
         if let startingOffset = attempt.startingOffset,
            startingOffset <= centeredOffset {
-            if let currentOffset, currentOffset > centeredOffset {
+            guard let currentOffset else {
+                guard monotonicNS >= attempt.deadlineNS else {
+                    self.attempt = attempt
+                    return .observing
+                }
+                self.attempt = nil
+                return .unresponsive
+            }
+            if currentOffset > centeredOffset {
                 attempt.startedNS = monotonicNS
                 attempt.deadlineNS = monotonicNS + acquisitionTimeoutNS
                 attempt.startingOffset = currentOffset
@@ -96,14 +109,18 @@ public struct NativeTrackingLiveness: Sendable {
                 self.attempt = attempt
                 return .observing
             }
-            if let currentOffset,
-               currentOffset <= centeredOffset,
+            if currentOffset <= centeredOffset,
+               monotonicNS >= attempt.startedNS + centeredConfirmationNS {
+                self.attempt = nil
+                return .confirmed
+            }
+            if currentOffset <= centeredOffset,
                moved(from: attempt.startingPose, to: pose) {
                 self.attempt = nil
                 return .confirmed
             }
-            // There has been no observable challenge yet. Keep waiting instead
-            // of converting a stationary, centered face into a false success.
+            // Keep waiting until the centered dwell completes or a measurable
+            // displacement presents a re-centering challenge.
             self.attempt = attempt
             return .observing
         }
