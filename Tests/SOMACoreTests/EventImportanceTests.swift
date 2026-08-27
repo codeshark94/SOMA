@@ -491,9 +491,10 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(lease.isActive(at: start + 4_001_000_000))
 
         lease.observe(sceneID: "face-a", at: start)
-        XCTAssertTrue(lease.maintain(sceneID: "face-a", at: start + 10_000_000_000))
-        XCTAssertTrue(lease.isActive(at: start + 12_999_000_000))
-        XCTAssertFalse(lease.maintain(sceneID: "face-b", at: start + 13_000_000_000))
+        XCTAssertTrue(lease.maintain(sceneID: "face-a", at: start + 100_000_000))
+        XCTAssertTrue(lease.isActive(at: start + 2_999_000_000))
+        XCTAssertFalse(lease.maintain(sceneID: "face-a", at: start + 3_001_000_000))
+        XCTAssertFalse(lease.maintain(sceneID: "face-b", at: start + 3_001_000_000))
     }
 
     func testEyeContactIndicatorLeaseRequiresSustainedAvertedEvidenceToClear() {

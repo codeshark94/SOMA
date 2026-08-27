@@ -9723,8 +9723,9 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             return (yaw, pitch, nil, nil, .unavailable)
         }
         // Vision exposes yaw in coarse steps on this camera (0, about +/-45,
-        // and about +/-90 degrees). It is useful for rejecting an unambiguous
-        // head turn, but not for rejecting frontal social contact at 45.
+        // and about +/-90 degrees). A clear head turn is evidence of aversion;
+        // a frontal pose is only a prerequisite, never eye-contact evidence by
+        // itself.
         guard abs(yaw) <= 0.95 else {
             return (yaw, pitch, nil, nil, .averted)
         }
@@ -9742,16 +9743,12 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         }
         let directed = pupilIsCentered(leftPupil, in: leftEye)
             && pupilIsCentered(rightPupil, in: rightEye)
-        // The camera's pupil estimate is noisy while a tracked face moves.
-        // A frontal pose is positive contact evidence; an off-centre pupil in
-        // that pose merely lowers confidence and must not cancel the contact.
-        let frontal = abs(yaw) <= 0.80
         return (
             yaw,
             pitch,
             max(left.x, right.x),
             max(left.y, right.y),
-            directed || frontal ? .direct : .unavailable
+            directed ? .direct : .unavailable
         )
     }
 
@@ -9803,12 +9800,9 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         guard width > 0.001, height > 0.001 else { return false }
         let normalizedX = abs(Double(pupilPoint.x) - (minimumX + maximumX) / 2) / (width / 2)
         let normalizedY = abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2)
-        // Vision reports the pupil near the eye centre regardless of gaze on
-        // this camera (yaw is quantized to 0 / +/-45 / +/-90 and pitch is nil),
-        // so the pupil offset cannot discriminate a subtle averted gaze. Keep a
-        // permissive threshold so a direct stare — and a slightly turned head
-        // that is still making eye contact — is accepted; a clear head turn is
-        // rejected by the yaw guard in gazeAssessment instead.
+        // This is presentation-only evidence. A frontal head alone is not
+        // enough: both measured pupils must be near their eye centres before
+        // SOMA offers a ready-to-speak blink.
         return normalizedX <= 0.68 * pupilCenteringThreshold
             && normalizedY <= 0.82 * pupilCenteringThreshold
     }

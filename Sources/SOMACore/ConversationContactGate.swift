@@ -145,13 +145,19 @@ public struct EyeContactIndicatorLease: Sendable {
         aversionStartedNS = nil
     }
 
-    /// Extends an already-established social contact only for the same locked
-    /// face. This intentionally does not affect the separate fresh-gaze gate
-    /// required to authorize a spoken opening.
+    /// Reports whether the established social contact may survive a brief
+    /// missing-gaze measurement for the same locked face. Only a new direct
+    /// observation renews the lease; otherwise a continuous stream of absent
+    /// pupil landmarks would turn one past eye-contact event into a permanent
+    /// invitation.
     @discardableResult
     public mutating func maintain(sceneID: String, at monotonicNS: UInt64) -> Bool {
-        guard self.sceneID == sceneID else { return false }
-        observedNS = monotonicNS
+        guard self.sceneID == sceneID, isActive(at: monotonicNS) else {
+            if self.sceneID == sceneID {
+                clear()
+            }
+            return false
+        }
         return true
     }
 
