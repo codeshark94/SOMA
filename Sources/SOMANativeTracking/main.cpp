@@ -4033,20 +4033,26 @@ private:
     ) noexcept {
         const bool sameActiveColor = desiredRGB_ && activeRGB_
             && *desiredRGB_ == color && *activeRGB_ == color;
-        const bool beginContactPulse = pattern == IndicatorPattern::firmwareAnimation
-            && pattern_ != IndicatorPattern::firmwareAnimation;
-        if (sameActiveColor && !beginContactPulse) {
+        if (sameActiveColor) {
             const bool visibilityRestored = restorePulseLEDVisibility();
             pattern_ = pattern;
             patternPhaseIndex_ = 0;
-            nextPulseTransition_.reset();
+            pulseVisible_ = visibilityRestored && activeRGB_ && *activeRGB_ == color;
+            if (pulseVisible_ && pattern_ != IndicatorPattern::steady) {
+                nextPulseTransition_ = Clock::now() + std::chrono::milliseconds(
+                    indicatorPatternPhases(pattern_).front().durationMilliseconds
+                );
+            } else {
+                nextPulseTransition_.reset();
+            }
             trace_.event(
                 "indicator.ack",
                 visibilityRestored ? "soma" : "fault",
-                visibilityRestored ? "rgb_already_active" : "rgb_restore_rejected",
+                visibilityRestored ? "rgb_pattern_armed" : "rgb_restore_rejected",
                 visibilityRestored ? RM_RET_OK : RM_RET_ERR,
                 "rgb=" + rgbDescription(color) + "; pattern=" + indicatorPatternName(pattern)
-                    + "; no_reassertion; brightness_restored=" + (visibilityRestored ? "true" : "false"),
+                    + "; rgb_reused=true; pulse_armed=" + (pulseVisible_ && pattern_ != IndicatorPattern::steady ? "true" : "false")
+                    + "; brightness_restored=" + (visibilityRestored ? "true" : "false"),
                 commandID
             );
             return;
