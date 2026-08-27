@@ -132,7 +132,7 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertEqual(migrated.led.signal(for: .conversation).pattern, .steady)
     }
 
-    func testVersionTwoPresetSettingsMigrateToCurrentSocialSignalContract() throws {
+    func testVersionTwoPresetSettingsMigrateToExplicitContactBlink() throws {
         let legacy = """
         {
           "schemaVersion": 2,
@@ -154,7 +154,7 @@ final class SOMAControlSettingsTests: XCTestCase {
 
         XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
         XCTAssertEqual(migrated.led.signal(for: .contactReady).color, .blue)
-        XCTAssertEqual(migrated.led.signal(for: .contactReady).pattern, .firmwareAnimation)
+        XCTAssertEqual(migrated.led.signal(for: .contactReady).pattern, .blink)
     }
 
     func testVisibleHostCadenceSurvivesMigrationToTheDevice() throws {
@@ -200,7 +200,31 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
         XCTAssertEqual(
             migrated.led.signal(for: .contactReady).deviceRendering(for: .tiny3Lite),
-            .init(directRGB: .blue, pattern: .firmwareAnimation)
+            .init(directRGB: .blue, pattern: .blink)
+        )
+    }
+
+    func testSchemaSevenExplicitContactBlinkIsNotOverwrittenByMigration() throws {
+        let legacy = """
+        {
+          "schemaVersion": 7,
+          "led": {
+            "signals": [
+              "contact_ready",
+              { "color": "blue", "pattern": "blink" }
+            ]
+          }
+        }
+        """
+
+        let migrated = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: Data(legacy.utf8)
+        )
+
+        XCTAssertEqual(
+            migrated.led.signal(for: .contactReady),
+            .init(color: .blue, pattern: .blink)
         )
     }
 

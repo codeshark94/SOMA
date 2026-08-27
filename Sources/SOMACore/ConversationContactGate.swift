@@ -115,17 +115,25 @@ public enum LiveConversationVisualAdmission {
 /// The owner clears this lease when visual contact is conclusively lost.
 public struct EyeContactIndicatorLease: Sendable {
     private let holdNS: UInt64
+    private let aversionConfirmationNS: UInt64
     private var observedNS: UInt64?
     private var sceneID: String?
+    private var aversionStartedNS: UInt64?
 
-    public init(holdMilliseconds: UInt64 = 3_000) {
+    public init(
+        holdMilliseconds: UInt64 = 3_000,
+        aversionConfirmationMilliseconds: UInt64 = 750
+    ) {
         precondition(holdMilliseconds > 0)
+        precondition(aversionConfirmationMilliseconds > 0)
         holdNS = holdMilliseconds * 1_000_000
+        aversionConfirmationNS = aversionConfirmationMilliseconds * 1_000_000
     }
 
     public mutating func observe(at monotonicNS: UInt64) {
         observedNS = monotonicNS
         sceneID = nil
+        aversionStartedNS = nil
     }
 
     /// Starts a contact-ready indication for a particular face reference.
@@ -134,6 +142,7 @@ public struct EyeContactIndicatorLease: Sendable {
     public mutating func observe(sceneID: String, at monotonicNS: UInt64) {
         self.sceneID = sceneID
         observedNS = monotonicNS
+        aversionStartedNS = nil
     }
 
     /// Extends an already-established social contact only for the same locked
@@ -146,13 +155,45 @@ public struct EyeContactIndicatorLease: Sendable {
         return true
     }
 
+    /// A landmark gaze estimate is noisy enough that one `averted` frame is
+    /// not a meaningful social withdrawal. Keep the current indication while
+    /// the contradiction is brief, but clear it after sustained averted
+    /// evidence for this same face reference.
+    @discardableResult
+    public mutating func observeAverted(sceneID: String, at monotonicNS: UInt64) -> Bool {
+        guard self.sceneID == sceneID, observedNS != nil else {
+            clear()
+            return false
+        }
+        if aversionStartedNS == nil {
+            aversionStartedNS = monotonicNS
+        }
+        guard isActive(at: monotonicNS) else {
+            clear()
+            return false
+        }
+        if let aversionStartedNS,
+           monotonicNS >= aversionStartedNS,
+           monotonicNS - aversionStartedNS >= aversionConfirmationNS {
+            clear()
+            return false
+        }
+        return true
+    }
+
     public mutating func clear() {
         observedNS = nil
         sceneID = nil
+        aversionStartedNS = nil
     }
 
     public func isActive(at monotonicNS: UInt64) -> Bool {
         guard let observedNS, monotonicNS >= observedNS else { return false }
+        if let aversionStartedNS,
+           monotonicNS >= aversionStartedNS,
+           monotonicNS - aversionStartedNS >= aversionConfirmationNS {
+            return false
+        }
         return monotonicNS - observedNS <= holdNS
     }
 }

@@ -496,6 +496,25 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(lease.maintain(sceneID: "face-b", at: start + 13_000_000_000))
     }
 
+    func testEyeContactIndicatorLeaseRequiresSustainedAvertedEvidenceToClear() {
+        let start: UInt64 = 15_000_000_000
+        var lease = EyeContactIndicatorLease(
+            holdMilliseconds: 3_000,
+            aversionConfirmationMilliseconds: 750
+        )
+
+        lease.observe(sceneID: "face-a", at: start)
+        XCTAssertTrue(lease.observeAverted(sceneID: "face-a", at: start + 100_000_000))
+        XCTAssertTrue(lease.isActive(at: start + 849_000_000))
+        XCTAssertFalse(lease.observeAverted(sceneID: "face-a", at: start + 850_000_000))
+        XCTAssertFalse(lease.isActive(at: start + 851_000_000))
+
+        lease.observe(sceneID: "face-a", at: start + 1_000_000_000)
+        XCTAssertTrue(lease.observeAverted(sceneID: "face-a", at: start + 1_100_000_000))
+        lease.observe(sceneID: "face-a", at: start + 1_500_000_000)
+        XCTAssertTrue(lease.isActive(at: start + 2_249_000_000))
+    }
+
     func testLiveVoiceLaunchGateDebouncesAndHasBoundedRetry() {
         var gate = LiveVoiceLaunchGate()
         let start: UInt64 = 10_000_000_000

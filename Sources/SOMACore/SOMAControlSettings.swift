@@ -455,9 +455,10 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             decodedLED.signals[.contactReady] = .init(color: .blue, pattern: .blink)
             decodedLED.signals[.conversation] = .init(color: .green, pattern: .steady)
         }
-        if sourceVersion < 8 {
-            decodedLED.signals[.contactReady] = .init(color: .blue, pattern: .firmwareAnimation)
-        }
+        // A persisted signal is an operator-owned interaction contract. Older
+        // schema versions may legitimately contain the explicit blue blink
+        // used for direct contact, so decoding must never replace it with a
+        // later default cadence.
         led = decodedLED
         nativeHumanTrackingEnabled = try values.decodeIfPresent(Bool.self, forKey: .nativeHumanTrackingEnabled) ?? true
         autonomousExplorationEnabled = try values.decodeIfPresent(Bool.self, forKey: .autonomousExplorationEnabled) ?? true

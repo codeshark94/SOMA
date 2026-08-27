@@ -5982,10 +5982,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                             )
                             indicatorInputs.visualState = .eyeContact
                         case .averted:
-                            // A fresh, explicit landmark reading of averted
-                            // gaze ends the invitation immediately.
-                            eyeContactIndicatorLease.clear()
-                            indicatorInputs.visualState = .humanDetected
+                            if eyeContactIndicatorLease.observeAverted(
+                                sceneID: observedFace.id,
+                                at: monotonicNS
+                            ) {
+                                indicatorInputs.visualState = .eyeContact
+                            } else {
+                                indicatorInputs.visualState = .humanDetected
+                            }
                         case .unavailable:
                             // Pupil landmarks are intermittent on the live
                             // stream. Preserve a current invitation through a
@@ -8814,10 +8818,11 @@ private final class AudioVADWorker: @unchecked Sendable {
     let warmupMS: Double
 
     init(
+        activationThreshold: Double,
         onEvidence: @escaping (NeuralVoiceActivityEvidence, AudioVADFrame, UInt64) -> Void,
         onError: @escaping (String) -> Void
     ) throws {
-        detector = try NeuralVoiceActivityDetector()
+        detector = try NeuralVoiceActivityDetector(activationThreshold: activationThreshold)
         computeUnits = detector.computeUnits
         warmupMS = detector.warmupMS
         self.onEvidence = onEvidence
@@ -8868,6 +8873,41 @@ private final class AudioVADWorker: @unchecked Sendable {
                 if shouldReport { onError(error.localizedDescription) }
             }
         }
+    }
+}
+
+/// Reports aggregate detector evidence without retaining any audio samples.
+/// This makes a missing voice onset distinguishable from an L2 launch failure.
+private final class VoiceEvidenceTelemetry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextReportNS: UInt64 = 0
+    private var peakProbability = 0.0
+    private var peakLevelDB = -Double.infinity
+
+    func record(
+        evidence: NeuralVoiceActivityEvidence,
+        frame: AudioVADFrame,
+        at monotonicNS: UInt64
+    ) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        peakProbability = max(peakProbability, evidence.probability)
+        peakLevelDB = max(peakLevelDB, frame.levelDB)
+        guard evidence.changed || monotonicNS >= nextReportNS else { return nil }
+
+        let report = String(
+            format: "active=%@; probability=%.3f; level_db=%.1f; peak_probability=%.3f; peak_level_db=%.1f",
+            evidence.active ? "true" : "false",
+            evidence.probability,
+            frame.levelDB,
+            peakProbability,
+            peakLevelDB
+        )
+        nextReportNS = monotonicNS + 1_000_000_000
+        peakProbability = 0
+        peakLevelDB = -Double.infinity
+        return report
     }
 }
 
@@ -9621,15 +9661,22 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         guard rect.centerX >= 0.26, rect.centerX <= 0.74,
               rect.centerY >= 0.13, rect.centerY <= 0.89,
               rect.width * rect.height >= 0.008,
-              let yaw,
-              let leftEye = landmarks.leftEye,
+              let yaw else {
+            return (yaw, pitch, nil, nil, .unavailable)
+        }
+        // Vision exposes yaw in coarse steps on this camera (0, about +/-45,
+        // and about +/-90 degrees). It is useful for rejecting an unambiguous
+        // head turn, but not for rejecting frontal social contact at 45.
+        guard abs(yaw) <= 0.95 else {
+            return (yaw, pitch, nil, nil, .averted)
+        }
+        guard let leftEye = landmarks.leftEye,
               let rightEye = landmarks.rightEye,
               let leftPupil = landmarks.leftPupil,
               let rightPupil = landmarks.rightPupil else {
+            // Missing pupil landmarks are a loss of evidence, never proof
+            // that the person deliberately withdrew attention.
             return (yaw, pitch, nil, nil, .unavailable)
-        }
-        guard abs(yaw) <= 0.50 else {
-            return (yaw, pitch, nil, nil, .averted)
         }
         guard let left = pupilOffset(leftPupil, in: leftEye),
               let right = pupilOffset(rightPupil, in: rightEye) else {
@@ -9637,12 +9684,16 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         }
         let directed = pupilIsCentered(leftPupil, in: leftEye)
             && pupilIsCentered(rightPupil, in: rightEye)
+        // The camera's pupil estimate is noisy while a tracked face moves.
+        // A frontal pose is positive contact evidence; an off-centre pupil in
+        // that pose merely lowers confidence and must not cancel the contact.
+        let frontal = abs(yaw) <= 0.80
         return (
             yaw,
             pitch,
             max(left.x, right.x),
             max(left.y, right.y),
-            directed ? .direct : .averted
+            directed || frontal ? .direct : .unavailable
         )
     }
 
@@ -10621,14 +10672,20 @@ private final class VisionWorker: @unchecked Sendable {
                 if lastSystemFaceVerificationHadFace != hasLandmarkFace
                     || faceVerificationNow >= nextSystemFaceVerificationHealthNS {
                     let captureAgeMS = Double(faceVerificationNow - verification.captureNS) / 1_000_000
+                    let directGazeCount = verification.faces.filter { $0.gazeState == .direct }.count
+                    let avertedGazeCount = verification.faces.filter { $0.gazeState == .averted }.count
+                    let unavailableGazeCount = verification.faces.filter { $0.gazeState == .unavailable }.count
                     writer.write(RuntimeEvent(
                         event: "source.health",
                         monotonicNS: faceVerificationNow,
                         source: "system_face_verifier",
                         state: hasLandmarkFace ? "face_detected" : "no_face",
                         message: String(
-                            format: "landmark_faces=%d; capture_age_ms=%.1f",
+                            format: "landmark_faces=%d; gaze_direct=%d; gaze_averted=%d; gaze_unavailable=%d; capture_age_ms=%.1f",
                             verification.faces.count,
+                            directGazeCount,
+                            avertedGazeCount,
+                            unavailableGazeCount,
                             captureAgeMS
                         )
                     ))
@@ -11953,6 +12010,7 @@ private func run(_ options: Options) throws {
             case let .launchRequested(authorization, _):
                 l1LiveConversationState.begin()
                 liveCameraFrameRelay?.setEnabled(true)
+                attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
                     monotonicNS: eventNS,
@@ -13232,13 +13290,32 @@ private func run(_ options: Options) throws {
         speechInteraction = nil
     }
     defer { speechInteraction?.stop() }
+    // A live voice opening is additionally gated by fresh directed visual
+    // contact. This lets the microphone onset be calibrated to the actual
+    // Tiny 3 front end without turning ambient room noise into a session.
+    let voiceVADThreshold = somaEnvDouble("SOMA_L0_VAD_THRESHOLD", default: 0.35)
+    let voiceEvidenceTelemetry = VoiceEvidenceTelemetry()
     let voiceWorker = try AudioVADWorker(
+        activationThreshold: voiceVADThreshold,
         onEvidence: { evidence, frame, completedNS in
             if evidence.inferenceMS > 0 {
                 counters.neuralVADInference(
                     inferenceMS: evidence.inferenceMS,
                     windowEndToEvidenceMS: milliseconds(from: frame.captureNS, to: completedNS)
                 )
+            }
+            if let telemetry = voiceEvidenceTelemetry.record(
+                evidence: evidence,
+                frame: frame,
+                at: completedNS
+            ) {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: completedNS,
+                    source: "neural_vad",
+                    state: "evidence",
+                    message: telemetry
+                ))
             }
             let belief = worldModel.ingestVoice(
                 active: evidence.active,
@@ -13464,9 +13541,10 @@ private func run(_ options: Options) throws {
         ))
     }
     let neuralVADConfiguration = String(
-        format: "model=silero_vad_unified_256ms_v6.2.1; compute_units=%@; warmup_ms=%.2f; window_ms=260; threshold=0.50",
+        format: "model=silero_vad_unified_256ms_v6.2.1; compute_units=%@; warmup_ms=%.2f; window_ms=260; threshold=%.2f",
         voiceWorker.computeUnits,
-        voiceWorker.warmupMS
+        voiceWorker.warmupMS,
+        voiceVADThreshold
     )
     writer.write(RuntimeEvent(
         event: "source.health",

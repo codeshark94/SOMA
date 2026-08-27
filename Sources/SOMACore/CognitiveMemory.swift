@@ -818,6 +818,27 @@ public struct CognitiveMemoryJournalRecoveryReport: Sendable, Equatable {
     }
 }
 
+/// Records an activated recovery while retaining the original encrypted
+/// journal beside the live store for later inspection or repair.
+public struct CognitiveMemoryJournalRecoveryActivationReport: Sendable, Equatable {
+    public let sourceEntryCount: Int
+    public let recoveredEntryCount: Int
+    public let firstRejectedLine: Int
+    public let backupJournalURL: URL
+
+    public init(
+        sourceEntryCount: Int,
+        recoveredEntryCount: Int,
+        firstRejectedLine: Int,
+        backupJournalURL: URL
+    ) {
+        self.sourceEntryCount = sourceEntryCount
+        self.recoveredEntryCount = recoveredEntryCount
+        self.firstRejectedLine = firstRejectedLine
+        self.backupJournalURL = backupJournalURL
+    }
+}
+
 public struct CognitiveMemoryValidator: Sendable {
     public let policy: CognitiveMemoryValidationPolicy
 
@@ -1268,6 +1289,74 @@ public actor CognitiveMemoryStore {
             recoveredEntryCount: Int(state.sequence),
             firstRejectedLine: firstRejectedLine,
             recoveryDirectoryURL: recoveryDirectoryURL
+        )
+    }
+
+    /// Replaces a corrupted journal only after writing and validating its
+    /// recoverable prefix. The full original journal is atomically retained in
+    /// the memory directory, so a damaged suffix is never silently discarded.
+    public static func activateRecoverablePrefix(
+        from directoryURL: URL,
+        encryptionKey: CognitiveMemoryEncryptionKey,
+        policy: CognitiveMemoryValidationPolicy = .init()
+    ) throws -> CognitiveMemoryJournalRecoveryActivationReport {
+        let manager = FileManager.default
+        try manager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
+
+        let lockURL = directoryURL.appendingPathComponent(lockFilename)
+        if !manager.fileExists(atPath: lockURL.path) {
+            manager.createFile(atPath: lockURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: lockURL.path)
+        let lockHandle = try FileHandle(forUpdating: lockURL)
+        guard flock(lockHandle.fileDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            try? lockHandle.close()
+            throw CognitiveMemoryError.storeLocked
+        }
+        defer {
+            _ = flock(lockHandle.fileDescriptor, LOCK_UN)
+            try? lockHandle.close()
+        }
+
+        let recoveryDirectoryURL = directoryURL.deletingLastPathComponent()
+            .appendingPathComponent(".soma-memory-recovery-\(UUID().uuidString)", isDirectory: true)
+        defer { try? manager.removeItem(at: recoveryDirectoryURL) }
+        let recovery = try stageRecoverablePrefix(
+            from: directoryURL,
+            encryptionKey: encryptionKey,
+            into: recoveryDirectoryURL,
+            policy: policy
+        )
+        guard let firstRejectedLine = recovery.firstRejectedLine else {
+            throw POSIXError(.EALREADY)
+        }
+
+        let recoveredJournalURL = recoveryDirectoryURL.appendingPathComponent(journalFilename)
+        let journalURL = directoryURL.appendingPathComponent(journalFilename)
+        let replacementURL = directoryURL.appendingPathComponent(
+            ".\(journalFilename).recovered-\(UUID().uuidString)"
+        )
+        defer { try? manager.removeItem(at: replacementURL) }
+        try manager.copyItem(at: recoveredJournalURL, to: replacementURL)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: replacementURL.path)
+
+        let backupJournalURL = directoryURL.appendingPathComponent(
+            "\(journalFilename).corrupt-\(UUID().uuidString)"
+        )
+        try manager.moveItem(at: journalURL, to: backupJournalURL)
+        do {
+            try manager.moveItem(at: replacementURL, to: journalURL)
+        } catch {
+            try? manager.moveItem(at: backupJournalURL, to: journalURL)
+            throw error
+        }
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: journalURL.path)
+        return .init(
+            sourceEntryCount: recovery.sourceEntryCount,
+            recoveredEntryCount: recovery.recoveredEntryCount,
+            firstRejectedLine: firstRejectedLine,
+            backupJournalURL: backupJournalURL
         )
     }
 

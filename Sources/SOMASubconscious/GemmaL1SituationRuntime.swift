@@ -309,16 +309,29 @@ private final class RecoveringCognitiveMemoryStore: @unchecked Sendable {
 
         let openedStore: CognitiveMemoryStore?
         let openError: Error?
+        let recovery: CognitiveMemoryJournalRecoveryActivationReport?
         do {
             let key = try OwnerOnlyInstallationSecret.loadOrCreate(
                 in: directory,
                 filename: "installation-key-v1.bin"
             )
-            openedStore = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+            do {
+                openedStore = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+                recovery = nil
+            } catch let error as CognitiveMemoryError {
+                guard case .corruptJournal = error else { throw error }
+                let activatedRecovery = try CognitiveMemoryStore.activateRecoverablePrefix(
+                    from: directory,
+                    encryptionKey: key
+                )
+                openedStore = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+                recovery = activatedRecovery
+            }
             openError = nil
         } catch {
             openedStore = nil
             openError = error
+            recovery = nil
         }
         let retryAfterStartupFailure: Bool
 
@@ -341,6 +354,12 @@ private final class RecoveringCognitiveMemoryStore: @unchecked Sendable {
         lock.unlock()
 
         if openedStore != nil {
+            if let recovery {
+                onHealth(
+                    "memory_recovered",
+                    "source_entries=\(recovery.sourceEntryCount); recovered_entries=\(recovery.recoveredEntryCount); first_rejected_line=\(recovery.firstRejectedLine); backup=\(recovery.backupJournalURL.lastPathComponent)"
+                )
+            }
             onHealth("memory_ready", "store=encrypted_local; remote_projection=policy_filtered")
         } else if let openError {
             let failure = String(describing: openError)

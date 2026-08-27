@@ -28,7 +28,7 @@ public struct NeuralVoiceActivityEvidence: Sendable {
 public final class NeuralVoiceActivityDetector: @unchecked Sendable {
     public static let targetSampleRateHz = 16_000.0
     public static let windowSampleCount = 4_160
-    public static let activationThreshold = 0.5
+    public static let defaultActivationThreshold = 0.5
 
     public let computeUnits = "cpu_and_neural_engine"
     public private(set) var warmupMS = 0.0
@@ -39,8 +39,11 @@ public final class NeuralVoiceActivityDetector: @unchecked Sendable {
     private var pendingSamples: [Float] = []
     private var active = false
     private var holdUntilNS: UInt64 = 0
+    private let activationThreshold: Double
 
-    public init() throws {
+    public init(activationThreshold: Double = NeuralVoiceActivityDetector.defaultActivationThreshold) throws {
+        precondition((0...1).contains(activationThreshold))
+        self.activationThreshold = activationThreshold
         guard let modelURL = Bundle.module.url(forResource: "SileroVAD256ms", withExtension: "mlmodelc") else {
             throw NeuralVoiceActivityError.missingModel
         }
@@ -79,7 +82,7 @@ public final class NeuralVoiceActivityDetector: @unchecked Sendable {
             let probability = try predict(window)
             let inferenceMS = Double(DispatchTime.now().uptimeNanoseconds - startedNS) / 1_000_000
             let previous = active
-            if probability >= Self.activationThreshold {
+            if probability >= activationThreshold {
                 active = true
                 holdUntilNS = monotonicNS + 520_000_000
             } else if active, monotonicNS >= holdUntilNS {
