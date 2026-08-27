@@ -9603,6 +9603,43 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         return ciContext.createCGImage(scaled, from: scaled.extent)
     }
 
+    /// Landmark discovery needs a small whole-frame image on this camera, but
+    /// that representation leaves too few pixels for a trustworthy pupil
+    /// measurement. Once a face is located, repeat only the gaze measurement
+    /// on its original-resolution crop.
+    private func faceCropCGImage(
+        from pixelBuffer: CVPixelBuffer,
+        rect: SOMACore.NormalizedRect,
+        maxWidth: Int = 640
+    ) -> CGImage? {
+        let source = CIImage(cvPixelBuffer: pixelBuffer)
+        let extent = source.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+
+        let faceWidth = CGFloat(rect.width) * extent.width
+        let faceHeight = CGFloat(rect.height) * extent.height
+        guard faceWidth > 0, faceHeight > 0 else { return nil }
+
+        // Core Image uses a bottom-left origin, while the perception pipeline
+        // uses a top-left normalized rectangle.
+        let faceX = CGFloat(rect.x) * extent.width
+        let faceY = (1 - CGFloat(rect.y) - CGFloat(rect.height)) * extent.height
+        let horizontalPadding = faceWidth * 0.55
+        let verticalPadding = faceHeight * 0.70
+        let crop = CGRect(
+            x: faceX - horizontalPadding,
+            y: faceY - verticalPadding,
+            width: faceWidth + horizontalPadding * 2,
+            height: faceHeight + verticalPadding * 2
+        ).intersection(extent)
+        guard !crop.isNull, crop.width >= 40, crop.height >= 40 else { return nil }
+
+        let cropped = source.cropped(to: crop)
+        let scale = min(1, CGFloat(maxWidth) / crop.width)
+        let rendered = cropped.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return ciContext.createCGImage(rendered, from: rendered.extent)
+    }
+
     func detect(in pixelBuffer: CVPixelBuffer) -> [SystemFaceEvidence] {
         let faceRequest = VNDetectFaceLandmarksRequest()
         let handler: VNImageRequestHandler
@@ -9631,11 +9668,12 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             guard let alignment = alignmentEvidence(landmarks: landmarks, rect: rect) else {
                 return nil
             }
-            let gaze = gazeAssessment(
+            let wholeFrameGaze = gazeAssessment(
                 observation: observation,
                 landmarks: landmarks,
                 rect: rect
             )
+            let gaze = refinedGaze(in: pixelBuffer, faceRect: rect) ?? wholeFrameGaze
             return SystemFaceEvidence(
                 rect: rect,
                 gazeState: gaze.state,
@@ -9646,6 +9684,28 @@ private final class SystemFaceVerifier: @unchecked Sendable {
                 alignment: alignment
             )
         }
+    }
+
+    private func refinedGaze(
+        in pixelBuffer: CVPixelBuffer,
+        faceRect: SOMACore.NormalizedRect
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, state: SOMACore.VisualGazeEvidence)? {
+        guard let crop = faceCropCGImage(from: pixelBuffer, rect: faceRect) else { return nil }
+        let request = VNDetectFaceLandmarksRequest()
+        let handler = VNImageRequestHandler(cgImage: crop, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let observation = (request.results ?? []).max(by: {
+                  $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
+              }),
+              let landmarks = observation.landmarks,
+              hasFacialFeatureSet(landmarks) else {
+            return nil
+        }
+        return gazeAssessment(
+            observation: observation,
+            landmarks: landmarks,
+            rect: faceRect
+        )
     }
 
     private func alignmentEvidence(
