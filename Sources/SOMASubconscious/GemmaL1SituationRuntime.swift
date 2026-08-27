@@ -277,6 +277,93 @@ public struct PersistedInformationNeed: Codable, Equatable, Sendable {
         self.createdAt = createdAt
     }
 }
+private final class RecoveringCognitiveMemoryStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private let directory: URL
+    private let onHealth: @Sendable (String, String) -> Void
+    private var store: CognitiveMemoryStore?
+    private var opening = false
+    private var nextOpenAttempt = Date.distantPast
+    private var startupRecoveryAttemptsRemaining = 3
+
+    init(onHealth: @escaping @Sendable (String, String) -> Void) {
+        self.directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/SOMA/memory", isDirectory: true)
+        self.onHealth = onHealth
+        _ = currentStore()
+    }
+
+    func currentStore() -> CognitiveMemoryStore? {
+        let now = Date()
+        lock.lock()
+        if let store {
+            lock.unlock()
+            return store
+        }
+        guard !opening, now >= nextOpenAttempt else {
+            lock.unlock()
+            return nil
+        }
+        opening = true
+        lock.unlock()
+
+        let openedStore: CognitiveMemoryStore?
+        let openError: Error?
+        do {
+            let key = try OwnerOnlyInstallationSecret.loadOrCreate(
+                in: directory,
+                filename: "installation-key-v1.bin"
+            )
+            openedStore = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+            openError = nil
+        } catch {
+            openedStore = nil
+            openError = error
+        }
+        let retryAfterStartupFailure: Bool
+
+        lock.lock()
+        opening = false
+        if let openedStore {
+            store = openedStore
+            nextOpenAttempt = .distantFuture
+            retryAfterStartupFailure = false
+        } else {
+            // A launch-agent restart can overlap the former instance's final
+            // file-lock release. Keep single-writer semantics, but retry after
+            // that short handoff instead of disabling durable memory forever.
+            nextOpenAttempt = now.addingTimeInterval(1)
+            retryAfterStartupFailure = startupRecoveryAttemptsRemaining > 0
+            if retryAfterStartupFailure {
+                startupRecoveryAttemptsRemaining -= 1
+            }
+        }
+        lock.unlock()
+
+        if openedStore != nil {
+            onHealth("memory_ready", "store=encrypted_local; remote_projection=policy_filtered")
+        } else if let openError {
+            let failure = String(describing: openError)
+            onHealth(
+                "memory_unavailable",
+                "error=\(failure); type=\(String(reflecting: type(of: openError)))"
+            )
+        }
+        if retryAfterStartupFailure {
+            onHealth("memory_retry_scheduled", "reason=startup_store_open_failure; delay_seconds=1.25")
+            scheduleStartupRecovery()
+        }
+        return openedStore
+    }
+
+    private func scheduleStartupRecovery() {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.25) { [weak self] in
+            self?.onHealth("memory_retrying", "reason=startup_store_open_failure")
+            _ = self?.currentStore()
+        }
+    }
+}
+
 final class L1MemoryContextProvider: @unchecked Sendable {
     private static let obsoletePlaceAffiliationQuestion =
         "Understand this person's relationship to the current place and its recurring objects before treating place observations as personal context."
@@ -314,7 +401,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         var socialEpisode: L1ConversationContactEpisode
     }
 
-    private let store: CognitiveMemoryStore?
+    private let recoveringStore: RecoveringCognitiveMemoryStore
+    private var store: CognitiveMemoryStore? { recoveringStore.currentStore() }
     private let onHealth: @Sendable (String, String) -> Void
     private let onPreferredLanguageChanged: @Sendable (UUID, String?) -> Void
     private let onSocialContactPersisted: @Sendable (UUID) -> Void
@@ -345,19 +433,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         self.onPreferredLanguageChanged = onPreferredLanguageChanged
         self.onSocialContactPersisted = onSocialContactPersisted
         self.transcriptRetentionSeconds = min(max(transcriptRetentionSeconds, 60 * 60), 24 * 60 * 60)
-        do {
-            let directory = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/SOMA/memory", isDirectory: true)
-            let key = try OwnerOnlyInstallationSecret.loadOrCreate(
-                in: directory,
-                filename: "installation-key-v1.bin"
-            )
-            store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
-            onHealth("memory_ready", "store=encrypted_local; remote_projection=policy_filtered")
-        } catch {
-            store = nil
-            onHealth("memory_unavailable", String(error.localizedDescription.prefix(192)))
-        }
+        recoveringStore = RecoveringCognitiveMemoryStore(onHealth: onHealth)
     }
 
     func context(

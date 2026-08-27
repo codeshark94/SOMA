@@ -4,6 +4,38 @@ import XCTest
 @testable import SOMACore
 
 final class CognitiveEmbodimentTests: XCTestCase {
+    func testRuntimeShutdownIPCIsLocalAndPayloadFree() throws {
+        let suffix = UUID().uuidString.prefix(8)
+        let directory = URL(fileURLWithPath: "/private/tmp/soma-runtime-stop-ipc-\(suffix)", isDirectory: true)
+        let socketURL = directory.appendingPathComponent("shadow.sock")
+        let shutdownRequested = LockedValue(false)
+        let server = EmbodimentShadowSocketServer(
+            socketURL: socketURL,
+            runtimeShutdownHandler: {
+                shutdownRequested.set(true)
+                return .success(())
+            }
+        )
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let accepted = try EmbodimentShadowSocketClient.send(
+            .init(kind: .runtimeShutdown),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(accepted.ok)
+        XCTAssertTrue(shutdownRequested.value)
+
+        let rejected = try EmbodimentShadowSocketClient.send(
+            .init(kind: .runtimeShutdown, requestID: "unexpected"),
+            socketURL: socketURL
+        )
+        XCTAssertFalse(rejected.ok)
+    }
+
     func testParticipantCapabilityIsBoundToOwnContextAndAllowsEmbodiedConversation() {
         let store = SOMASessionCapabilityStore(lifetimeSeconds: 60)
         let participant = UUID()
@@ -999,6 +1031,659 @@ final class CognitiveEmbodimentTests: XCTestCase {
                 expiresAtNS: current.lease.expiresAtNS
             )
         )
+    }
+
+    func testOpticalZoomReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 71_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-for-detail",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 18, elevationDegrees: 3),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        XCTAssertEqual(orientationDecision.status, .accepted)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let zoom = shadowRequest(
+            id: "zoom-for-detail",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 90,
+            now: now + 1,
+            operation: .setOpticalZoom(OpticalZoomGoal(factor: 1.25))
+        )
+        XCTAssertNoThrow(try zoom.validate())
+        let zoomDecision = arbiter.submit(zoom, at: now + 1)
+
+        XCTAssertEqual(zoomDecision.status, .accepted)
+        XCTAssertEqual(zoomDecision.reason, "optical_zoom_ready_l0_adapter")
+        XCTAssertEqual(zoomDecision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: zoom, decision: zoomDecision, at: now + 1),
+            .opticalZoom(requestID: zoom.requestID, factor: 1.25)
+        )
+    }
+
+    func testAudioCaptureModeReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 72_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-listening",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: -12, elevationDegrees: 1),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let audioMode = shadowRequest(
+            id: "front-conversation-audio",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 90,
+            now: now + 1,
+            operation: .setAudioCaptureMode(.init(mode: .conversationFront))
+        )
+        XCTAssertNoThrow(try audioMode.validate())
+        let decision = arbiter.submit(audioMode, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "audio_capture_mode_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: audioMode, decision: decision, at: now + 1),
+            .audioCaptureMode(requestID: audioMode.requestID, mode: .conversationFront)
+        )
+    }
+
+    func testAudioInputGainReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 72_500_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-adjusting-input-gain",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: -12, elevationDegrees: 1),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let inputGain = shadowRequest(
+            id: "conversation-input-gain",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 90,
+            now: now + 1,
+            operation: .setAudioInputGain(.init(percent: 60))
+        )
+        XCTAssertNoThrow(try inputGain.validate())
+        let decision = arbiter.submit(inputGain, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "audio_input_gain_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: inputGain, decision: decision, at: now + 1),
+            .audioInputGain(requestID: inputGain.requestID, percent: 60)
+        )
+    }
+
+    func testCameraWhiteBalanceReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 73_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-white-balance-changes",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 10, elevationDegrees: 2),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let whiteBalance = shadowRequest(
+            id: "manual-panorama-white-balance",
+            layer: .l2,
+            owner: "l2:panorama",
+            priority: 90,
+            now: now + 1,
+            operation: .setCameraWhiteBalance(.init(mode: .manual, temperatureKelvin: 5_000))
+        )
+        XCTAssertNoThrow(try whiteBalance.validate())
+        let decision = arbiter.submit(whiteBalance, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "camera_white_balance_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: whiteBalance, decision: decision, at: now + 1),
+            .cameraWhiteBalance(
+                requestID: whiteBalance.requestID,
+                mode: .manual,
+                temperatureKelvin: 5_000
+            )
+        )
+
+        let invalidAutomatic = shadowRequest(
+            id: "invalid-auto-temperature",
+            layer: .l2,
+            owner: "l2:panorama",
+            priority: 90,
+            now: now + 2,
+            operation: .setCameraWhiteBalance(.init(mode: .auto, temperatureKelvin: 5_000))
+        )
+        XCTAssertThrowsError(try invalidAutomatic.validate())
+    }
+
+    func testCameraExposureLockReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 73_500_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-exposure-lock-changes",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 10, elevationDegrees: 2),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let exposureLock = shadowRequest(
+            id: "lock-exposure-for-panorama",
+            layer: .l2,
+            owner: "l2:panorama",
+            priority: 90,
+            now: now + 1,
+            operation: .setCameraExposureLock(.init(locked: true))
+        )
+        XCTAssertNoThrow(try exposureLock.validate())
+        let decision = arbiter.submit(exposureLock, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "camera_exposure_lock_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: exposureLock, decision: decision, at: now + 1),
+            .cameraExposureLock(requestID: exposureLock.requestID, locked: true)
+        )
+    }
+
+    func testManualFocusAndExposureReachL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 73_600_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-lens-controls-change",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 10, elevationDegrees: 2),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let focus = shadowRequest(
+            id: "fixed-focus-for-close-inspection",
+            layer: .l2,
+            owner: "l2:inspection",
+            priority: 90,
+            now: now + 1,
+            operation: .setCameraFocus(.init(mode: .manual, position: 50))
+        )
+        XCTAssertNoThrow(try focus.validate())
+        let focusDecision = arbiter.submit(focus, at: now + 1)
+        XCTAssertEqual(focusDecision.status, .accepted)
+        XCTAssertEqual(focusDecision.reason, "camera_focus_ready_l0_adapter")
+        XCTAssertEqual(focusDecision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: focus, decision: focusDecision, at: now + 1),
+            .cameraFocus(requestID: focus.requestID, mode: .manual, position: 50)
+        )
+
+        let exposure = shadowRequest(
+            id: "fixed-exposure-for-close-inspection",
+            layer: .l2,
+            owner: "l2:inspection",
+            priority: 90,
+            now: now + 2,
+            operation: .setCameraAbsoluteExposure(.init(mode: .manual, shutterCode: 33))
+        )
+        XCTAssertNoThrow(try exposure.validate())
+        let exposureDecision = arbiter.submit(exposure, at: now + 2)
+        XCTAssertEqual(exposureDecision.status, .accepted)
+        XCTAssertEqual(exposureDecision.reason, "camera_absolute_exposure_ready_l0_adapter")
+        XCTAssertEqual(exposureDecision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: exposure, decision: exposureDecision, at: now + 2),
+            .cameraAbsoluteExposure(requestID: exposure.requestID, mode: .manual, shutterCode: 33)
+        )
+
+        let invalidAutomaticFocus = shadowRequest(
+            id: "invalid-auto-focus-position",
+            layer: .l2,
+            owner: "l2:inspection",
+            priority: 90,
+            now: now + 3,
+            operation: .setCameraFocus(.init(mode: .auto, position: 50))
+        )
+        XCTAssertThrowsError(try invalidAutomaticFocus.validate())
+
+        let invalidExposureRange = shadowRequest(
+            id: "invalid-exposure-code",
+            layer: .l2,
+            owner: "l2:inspection",
+            priority: 90,
+            now: now + 4,
+            operation: .setCameraAbsoluteExposure(.init(mode: .manual, shutterCode: 101))
+        )
+        XCTAssertThrowsError(try invalidExposureRange.validate())
+    }
+
+    func testNativeHumanTrackingPolicyReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 73_750_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-native-policy-changes",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 10, elevationDegrees: 2),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let policy = shadowRequest(
+            id: "native-policy-fast-retentive",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 90,
+            now: now + 1,
+            operation: .setNativeHumanTrackingPolicy(.init(
+                speed: .fast,
+                motionTracking: true,
+                foreTarget: true,
+                adaptiveComposition: false,
+                adaptivePanGain: false,
+                adaptivePitchGain: false,
+                panGain: 0.55,
+                pitchGain: 0.75
+            ))
+        )
+        XCTAssertNoThrow(try policy.validate())
+        let decision = arbiter.submit(policy, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "native_human_tracking_policy_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: policy, decision: decision, at: now + 1),
+            .nativeHumanTrackingPolicy(
+                requestID: policy.requestID,
+                speed: .fast,
+                motionTracking: true,
+                foreTarget: true,
+                adaptiveComposition: false,
+                adaptivePanGain: false,
+                adaptivePitchGain: false,
+                panGain: 0.55,
+                pitchGain: 0.75
+            )
+        )
+    }
+
+    func testNativeHumanTrackingPolicyRejectsPartialOrConflictingFixedGains() throws {
+        let now: UInt64 = 73_800_000_000
+        let partialGain = shadowRequest(
+            id: "native-policy-partial-fixed-gain",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 90,
+            now: now,
+            operation: .setNativeHumanTrackingPolicy(.init(
+                panGain: 0.55
+            ))
+        )
+        XCTAssertThrowsError(try partialGain.validate())
+
+        let conflictingGain = shadowRequest(
+            id: "native-policy-adaptive-fixed-gain",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 90,
+            now: now + 1,
+            operation: .setNativeHumanTrackingPolicy(.init(
+                adaptivePanGain: true,
+                panGain: 0.55,
+                pitchGain: 0.75
+            ))
+        )
+        XCTAssertThrowsError(try conflictingGain.validate())
+    }
+
+    func testCameraFacePriorityReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 73_900_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-face-priority-changes",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 10, elevationDegrees: 2),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let facePriority = shadowRequest(
+            id: "face-priority-social-tracking",
+            layer: .l2,
+            owner: "l2:conversation",
+            priority: 90,
+            now: now + 1,
+            operation: .setCameraFacePriority(.init(enabled: true))
+        )
+        XCTAssertNoThrow(try facePriority.validate())
+        let decision = arbiter.submit(facePriority, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "camera_face_priority_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: facePriority, decision: decision, at: now + 1),
+            .cameraFacePriority(requestID: facePriority.requestID, enabled: true)
+        )
+    }
+
+    func testCameraAntiFlickerReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 73_950_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-anti-flicker-changes",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 10, elevationDegrees: 2),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let antiFlicker = shadowRequest(
+            id: "anti-flicker-local-mains",
+            layer: .l2,
+            owner: "l2:visual-observation",
+            priority: 90,
+            now: now + 1,
+            operation: .setCameraAntiFlicker(.init(mode: .hz60))
+        )
+        XCTAssertNoThrow(try antiFlicker.validate())
+        let decision = arbiter.submit(antiFlicker, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "camera_anti_flicker_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: antiFlicker, decision: decision, at: now + 1),
+            .cameraAntiFlicker(requestID: antiFlicker.requestID, mode: .hz60)
+        )
+    }
+
+    func testCameraImageTuningReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 73_975_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-image-tuning-changes",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: 10, elevationDegrees: 2),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let tuningGoal = CameraImageTuningGoal(brightness: 55, saturation: 45)
+        let tuning = shadowRequest(
+            id: "image-tuning-observation",
+            layer: .l2,
+            owner: "l2:visual-observation",
+            priority: 90,
+            now: now + 1,
+            operation: .setCameraImageTuning(tuningGoal)
+        )
+        XCTAssertNoThrow(try tuning.validate())
+        let decision = arbiter.submit(tuning, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "camera_image_tuning_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: tuning, decision: decision, at: now + 1),
+            .cameraImageTuning(requestID: tuning.requestID, goal: tuningGoal)
+        )
+    }
+
+    func testCameraFieldOfViewReachesL0WithoutPreemptingAnActiveGimbalLease() throws {
+        let now: UInt64 = 74_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let orientation = shadowRequest(
+            id: "orient-while-fov-changes",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 50,
+            now: now,
+            durationMilliseconds: 5_000,
+            operation: .orient(OrientGoal(
+                bearing: .init(azimuthDegrees: -8, elevationDegrees: 1),
+                motionStyle: .smooth
+            ))
+        )
+        let orientationDecision = arbiter.submit(orientation, at: now)
+        guard case .orient = coordinator.apply(
+            request: orientation,
+            decision: orientationDecision,
+            at: now
+        ) else {
+            return XCTFail("orientation should hold the active gimbal lease")
+        }
+
+        let fieldOfView = shadowRequest(
+            id: "narrow-detail-field-of-view",
+            layer: .l2,
+            owner: "l2:observation",
+            priority: 90,
+            now: now + 1,
+            operation: .setCameraFieldOfView(.init(degrees: 65))
+        )
+        XCTAssertNoThrow(try fieldOfView.validate())
+        let decision = arbiter.submit(fieldOfView, at: now + 1)
+
+        XCTAssertEqual(decision.status, .accepted)
+        XCTAssertEqual(decision.reason, "camera_field_of_view_ready_l0_adapter")
+        XCTAssertEqual(decision.snapshot.activeRequestID, orientation.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: fieldOfView, decision: decision, at: now + 1),
+            .cameraFieldOfView(requestID: fieldOfView.requestID, degrees: 65)
+        )
+
+        let invalidFieldOfView = shadowRequest(
+            id: "invalid-field-of-view",
+            layer: .l2,
+            owner: "l2:observation",
+            priority: 90,
+            now: now + 2,
+            operation: .setCameraFieldOfView(.init(degrees: 70))
+        )
+        XCTAssertThrowsError(try invalidFieldOfView.validate())
+    }
+
+    func testDeviceSoundFollowingClaimsTheMotorAndItsOwnerCanReleaseIt() throws {
+        let now: UInt64 = 75_000_000_000
+        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
+        var coordinator = EmbodimentMotorCoordinator()
+        let start = shadowRequest(
+            id: "sound-following-start",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 60,
+            now: now,
+            durationMilliseconds: 10_000,
+            operation: .setDeviceSoundFollowing(.init(enabled: true))
+        )
+
+        XCTAssertNoThrow(try start.validate())
+        let startDecision = arbiter.submit(start, at: now)
+        XCTAssertEqual(startDecision.status, .accepted)
+        XCTAssertEqual(startDecision.snapshot.activeRequestID, start.requestID)
+        XCTAssertEqual(
+            coordinator.apply(request: start, decision: startDecision, at: now),
+            .deviceSoundFollowing(
+                requestID: start.requestID,
+                enabled: true,
+                expiresAtNS: start.lease.expiresAtNS
+            )
+        )
+        XCTAssertEqual(coordinator.activeRequestID, start.requestID)
+
+        let stop = shadowRequest(
+            id: "sound-following-stop",
+            layer: .l1,
+            owner: "l1:situation",
+            priority: 60,
+            now: now + 1,
+            durationMilliseconds: 1_000,
+            operation: .setDeviceSoundFollowing(.init(enabled: false))
+        )
+        let stopDecision = arbiter.submit(stop, at: now + 1)
+        XCTAssertEqual(stopDecision.status, .accepted)
+        XCTAssertNil(stopDecision.snapshot.activeRequestID)
+        XCTAssertEqual(
+            coordinator.apply(request: stop, decision: stopDecision, at: now + 1),
+            .deviceSoundFollowing(requestID: stop.requestID, enabled: false, expiresAtNS: nil)
+        )
+        XCTAssertNil(coordinator.activeRequestID)
     }
 
     func testCaptureResultIPCReturnsOnlyTheRequestedTTLResource() throws {

@@ -6,6 +6,7 @@ import CoreVideo
 import CoreImage
 import Foundation
 import SOMACore
+import SOMAOpenCV
 import SOMAVADModel
 @preconcurrency import Vision
 
@@ -2326,6 +2327,203 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             framingWidth = nil
             framingHeight = nil
             self.expiresAtNS = expiresAtNS
+        case let .opticalZoom(requestID, factor):
+            self.requestID = requestID
+            action = "optical_zoom"
+            reason = String(format: "factor=%.3f", factor)
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .audioCaptureMode(requestID, mode):
+            self.requestID = requestID
+            action = "audio_capture_mode"
+            reason = mode.rawValue
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .audioInputGain(requestID, percent):
+            self.requestID = requestID
+            action = "audio_input_gain"
+            reason = "percent=\(percent)"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraWhiteBalance(requestID, mode, temperatureKelvin):
+            self.requestID = requestID
+            action = "camera_white_balance"
+            reason = temperatureKelvin.map { "\(mode.rawValue)=\($0)K" } ?? mode.rawValue
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraExposureLock(requestID, locked):
+            self.requestID = requestID
+            action = "camera_exposure_lock"
+            reason = locked ? "locked" : "automatic"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraFocus(requestID, mode, position):
+            self.requestID = requestID
+            action = "camera_focus"
+            reason = position.map { "\(mode.rawValue)=\($0)" } ?? mode.rawValue
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraAbsoluteExposure(requestID, mode, shutterCode):
+            self.requestID = requestID
+            action = "camera_absolute_exposure"
+            reason = shutterCode.map { "\(mode.rawValue)=\($0)" } ?? mode.rawValue
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraFacePriority(requestID, enabled):
+            self.requestID = requestID
+            action = "camera_face_priority"
+            reason = enabled ? "enabled" : "disabled"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraAntiFlicker(requestID, mode):
+            self.requestID = requestID
+            action = "camera_anti_flicker"
+            reason = mode.rawValue
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraImageTuning(requestID, goal):
+            self.requestID = requestID
+            action = "camera_image_tuning"
+            reason = "brightness=\(goal.brightness.map(String.init) ?? "keep"); contrast=\(goal.contrast.map(String.init) ?? "keep"); hue=\(goal.hue.map(String.init) ?? "keep"); saturation=\(goal.saturation.map(String.init) ?? "keep"); sharpness=\(goal.sharpness.map(String.init) ?? "keep")"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .nativeHumanTrackingPolicy(requestID, speed, motionTracking, foreTarget, adaptiveComposition, adaptivePanGain, adaptivePitchGain, panGain, pitchGain):
+            self.requestID = requestID
+            action = "native_human_tracking_policy"
+            let panGainValue = panGain.map { String($0) } ?? "keep"
+            let pitchGainValue = pitchGain.map { String($0) } ?? "keep"
+            reason = "speed=\(speed.rawValue); motion=\(motionTracking); fore_target=\(foreTarget); adaptive_composition=\(adaptiveComposition); adaptive_pan_gain=\(adaptivePanGain); adaptive_pitch_gain=\(adaptivePitchGain); pan_gain=\(panGainValue); pitch_gain=\(pitchGainValue)"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .cameraFieldOfView(requestID, degrees):
+            self.requestID = requestID
+            action = "camera_field_of_view"
+            reason = "degrees=\(degrees)"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = Double(degrees)
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            expiresAtNS = nil
+        case let .deviceSoundFollowing(requestID, enabled, expiresAtNS):
+            self.requestID = requestID
+            action = "device_sound_following"
+            reason = enabled ? "enabled" : "disabled"
+            targetReference = nil
+            sceneID = nil
+            targetAzimuthDegrees = nil
+            targetElevationDegrees = nil
+            fieldOfViewDegrees = nil
+            observedThisFrame = nil
+            framingCenterX = nil
+            framingCenterY = nil
+            framingWidth = nil
+            framingHeight = nil
+            self.expiresAtNS = expiresAtNS
         case let .explore(requestID, policy, expiresAtNS):
             self.requestID = requestID
             action = "explore"
@@ -2945,51 +3143,136 @@ private final class GimbalPoseStore: @unchecked Sendable {
     private let lock = NSLock()
     private let geometryCalibration: CameraGeometryCalibration?
     private var recent: [GimbalPose] = []
+    private var recentRaw: [GimbalPose] = []
+    private var deviceProfile: OBSBOTDeviceProfile?
+    private var attitudeCalibration: ExternalGimbalCalibration?
+    private var runtimeAttitudeHome: GimbalPose?
     private var horizontalFieldOfViewDegrees = OBSBOTTiny2LiteOptics.wideHorizontalDegrees
     private var fieldOfViewMode = 86
+    private var baseCameraProjectionModel = CameraProjectionModel.pinhole(
+        horizontalFieldOfViewDegrees: OBSBOTTiny2LiteOptics.wideHorizontalDegrees
+    )
     private var cameraProjectionModel = CameraProjectionModel.pinhole(
         horizontalFieldOfViewDegrees: OBSBOTTiny2LiteOptics.wideHorizontalDegrees
     )
+    private var opticalZoomFactor = 1.0
     private var motionUntilNS: UInt64 = 0
 
     init(geometryCalibration: CameraGeometryCalibration? = nil) {
         self.geometryCalibration = geometryCalibration
         if let geometryCalibration, geometryCalibration.fovMode == 86 {
+            baseCameraProjectionModel = geometryCalibration.projection
             cameraProjectionModel = geometryCalibration.projection
             horizontalFieldOfViewDegrees = geometryCalibration.projection.horizontalFieldOfViewDegrees
         }
     }
 
+    func configureDeviceProfile(
+        _ profile: OBSBOTDeviceProfile,
+        calibration: ExternalGimbalCalibration? = nil
+    ) {
+        lock.lock()
+        deviceProfile = profile
+        attitudeCalibration = calibration?.isValid == true && calibration?.deviceProfile == profile
+            ? calibration
+            : nil
+        fieldOfViewMode = Int(OBSBOTTiny2LiteOptics.nominalWideModeDegrees)
+        baseCameraProjectionModel = .pinhole(
+            horizontalFieldOfViewDegrees: profile.capabilities.nominalWideHorizontalFieldOfViewDegrees
+        )
+        opticalZoomFactor = 1
+        if let geometryCalibration,
+           geometryCalibration.applies(to: profile),
+           geometryCalibration.fovMode == fieldOfViewMode {
+            baseCameraProjectionModel = geometryCalibration.projection
+        }
+        applyOpticalZoomProjection()
+        lock.unlock()
+    }
+
     func update(pitchDegrees: Double, panDegrees: Double, at monotonicNS: UInt64) {
         guard pitchDegrees.isFinite, panDegrees.isFinite else { return }
         lock.lock()
-        recent.append(GimbalPose(pitchDegrees: pitchDegrees, panDegrees: panDegrees, monotonicNS: monotonicNS))
+        let raw = GimbalPose(pitchDegrees: pitchDegrees, panDegrees: panDegrees, monotonicNS: monotonicNS)
+        recentRaw.append(raw)
+        if let runtimeAttitudeHome {
+            recent.append(GimbalPose(
+                pitchDegrees: raw.pitchDegrees - runtimeAttitudeHome.pitchDegrees,
+                panDegrees: raw.panDegrees - runtimeAttitudeHome.panDegrees,
+                monotonicNS: monotonicNS
+            ))
+        } else {
+            recent.append(attitudeCalibration?.logicalPose(from: raw) ?? raw)
+        }
         // Live control reads only the newest samples, while the camera's host-
         // aligned PTS may arrive hundreds of milliseconds after exposure. Keep
         // more than the one-second PTS admission window so panorama alignment
         // can still find both measured sides of that exposure without relaxing
         // the 50/80 ms interpolation bounds.
         if recent.count > 128 { recent.removeFirst(recent.count - 128) }
+        if recentRaw.count > 128 { recentRaw.removeFirst(recentRaw.count - 128) }
+        lock.unlock()
+    }
+
+    /// Tiny 3 Lite's raw attitude origin is device-session dependent. The
+    /// native bridge recentres first, then supplies this settled reference so
+    /// visual tracking and spatial mapping share the same pose frame.
+    func establishRuntimeAttitudeHome(
+        pitchDegrees: Double,
+        panDegrees: Double,
+        at monotonicNS: UInt64
+    ) {
+        guard pitchDegrees.isFinite, panDegrees.isFinite else { return }
+        lock.lock()
+        runtimeAttitudeHome = GimbalPose(
+            pitchDegrees: pitchDegrees,
+            panDegrees: panDegrees,
+            monotonicNS: monotonicNS
+        )
+        recent.removeAll(keepingCapacity: true)
+        recentRaw.removeAll(keepingCapacity: true)
         lock.unlock()
     }
 
     func updateFieldOfViewMode(_ degrees: Double) -> Double? {
-        guard let horizontal = OBSBOTTiny2LiteOptics.horizontalDegrees(
-            forFOVMode: degrees
-        ) else { return nil }
         lock.lock()
+        guard let profile = deviceProfile,
+              let horizontal = profile.horizontalFieldOfViewDegrees(forSDKMode: degrees) else {
+            lock.unlock()
+            return nil
+        }
         fieldOfViewMode = Int(degrees)
         if let geometryCalibration,
+           geometryCalibration.applies(to: profile),
            geometryCalibration.fovMode == Int(degrees) {
-            cameraProjectionModel = geometryCalibration.projection
-            horizontalFieldOfViewDegrees = geometryCalibration.projection.horizontalFieldOfViewDegrees
+            baseCameraProjectionModel = geometryCalibration.projection
         } else {
-            cameraProjectionModel = .pinhole(horizontalFieldOfViewDegrees: horizontal)
-            horizontalFieldOfViewDegrees = horizontal
+            baseCameraProjectionModel = .pinhole(horizontalFieldOfViewDegrees: horizontal)
         }
+        applyOpticalZoomProjection()
         let appliedHorizontal = horizontalFieldOfViewDegrees
         lock.unlock()
         return appliedHorizontal
+    }
+
+    /// The device reports a normalized zoom factor after each accepted camera
+    /// command.  Rebuild its ray model before accepting later image evidence,
+    /// otherwise spatial memory would assign cropped observations to a wider
+    /// world sector than they actually occupy.
+    func updateOpticalZoomFactor(_ factor: Double) -> Double? {
+        guard factor.isFinite, factor >= 1, factor <= 2 else { return nil }
+        lock.lock()
+        opticalZoomFactor = factor
+        applyOpticalZoomProjection()
+        let appliedHorizontal = horizontalFieldOfViewDegrees
+        lock.unlock()
+        return appliedHorizontal
+    }
+
+    private func applyOpticalZoomProjection() {
+        cameraProjectionModel = baseCameraProjectionModel.withOpticalZoom(opticalZoomFactor)
+            ?? baseCameraProjectionModel
+        horizontalFieldOfViewDegrees = cameraProjectionModel.horizontalFieldOfViewDegrees
     }
 
     /// Attitude packets describe where the gimbal was, but external velocity
@@ -3056,6 +3339,14 @@ private final class GimbalPoseStore: @unchecked Sendable {
         return recent.last(where: { $0.monotonicNS <= monotonicNS && $0.isFresh(for: monotonicNS, maximumAgeNS: maximumAgeNS) })
     }
 
+    func latestRaw(at monotonicNS: UInt64, maximumAgeNS: UInt64 = 75_000_000) -> GimbalPose? {
+        lock.lock()
+        defer { lock.unlock() }
+        return recentRaw.last(where: {
+            $0.monotonicNS <= monotonicNS && $0.isFresh(for: monotonicNS, maximumAgeNS: maximumAgeNS)
+        })
+    }
+
     func hasContinuousFeedback(
         at monotonicNS: UInt64,
         minimumSamples: Int = 3,
@@ -3093,6 +3384,41 @@ private final class GimbalPoseStore: @unchecked Sendable {
             return nil
         }
         return pose
+    }
+
+    /// Latest measured attitude rate in logical pose coordinates. Commands are
+    /// deliberately not used here: this feedback describes what the gimbal is
+    /// actually doing after device latency and gives the face servo a real
+    /// braking signal rather than an assumed one.
+    func currentVelocity(maximumAgeNS: UInt64 = 150_000_000) -> GimbalVelocityFeedback? {
+        let now = monotonicNanoseconds()
+        lock.lock()
+        defer { lock.unlock() }
+        guard let latest = recent.last,
+              now >= latest.monotonicNS,
+              now - latest.monotonicNS <= maximumAgeNS,
+              let prior = recent.reversed().first(where: { sample in
+                  latest.monotonicNS > sample.monotonicNS
+                      && latest.monotonicNS - sample.monotonicNS >= 8_000_000
+                      && latest.monotonicNS - sample.monotonicNS <= 120_000_000
+              }) else {
+            return nil
+        }
+        let elapsed = Double(latest.monotonicNS - prior.monotonicNS) / 1_000_000_000
+        guard elapsed > 0 else { return nil }
+        let feedback = GimbalVelocityFeedback(
+            pitchDegreesPerSecond: (latest.pitchDegrees - prior.pitchDegrees) / elapsed,
+            panDegreesPerSecond: (latest.panDegrees - prior.panDegrees) / elapsed
+        )
+        // Reject malformed SDK attitude jumps rather than presenting an
+        // implausible instantaneous rate as a braking measurement.
+        guard feedback.pitchDegreesPerSecond.isFinite,
+              feedback.panDegreesPerSecond.isFinite,
+              abs(feedback.pitchDegreesPerSecond) <= 360,
+              abs(feedback.panDegreesPerSecond) <= 360 else {
+            return nil
+        }
+        return feedback
     }
 
     /// The most recent pose regardless of age. Used by bounded expressions so a
@@ -3300,20 +3626,25 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         case stopped
     }
 
+    /// A short, CPU-local image reference used only while deriving the Tiny 3
+    /// pose convention. The reference deliberately contains no semantic or
+    /// identity data: LK follows the scene's visual texture, so a detector
+    /// changing an anonymous saliency ID cannot invalidate the measurement.
     private struct CalibrationSample: Sendable {
-        let sceneID: String
-        let kind: AttentionTargetKind
-        let label: String?
-        let centerX: Double
-        let centerY: Double
+        let bgra: Data
+        let bytesPerRow: Int
+        let width: Int
+        let height: Int
+        let captureNS: UInt64
+        let pose: GimbalPose
     }
 
     private enum CalibrationStage {
         case awaitingTarget
         case panPulse(baseline: CalibrationSample, startedNS: UInt64)
-        case panSettling(baseline: CalibrationSample, stoppedNS: UInt64)
-        case pitchPulse(panImageDelta: Double, baseline: CalibrationSample, startedNS: UInt64)
-        case pitchSettling(panImageDelta: Double, baseline: CalibrationSample, stoppedNS: UInt64)
+        case panSettling(baseline: CalibrationSample, pulseCount: Int, stoppedNS: UInt64)
+        case pitchPulse(panImageDelta: Double, panPoseDelta: Double, baseline: CalibrationSample, startedNS: UInt64)
+        case pitchSettling(panImageDelta: Double, panPoseDelta: Double, baseline: CalibrationSample, pulseCount: Int, stoppedNS: UInt64)
         case completed
         case failed
     }
@@ -3342,6 +3673,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         case suspended(reason: String)
     }
 
+    private enum NativeTrackingRuntimeAvailability: String {
+        case unverified
+        case verified
+        case unavailable
+
+        var permitsNewHandoff: Bool {
+            self != .unavailable
+        }
+    }
+
     private let queue = DispatchQueue(label: "soma.subconscious.gimbal-bridge")
     private let writer: JSONLWriter
     private let process: Process
@@ -3360,7 +3701,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var state: State = .running
     private var gate = NativeHumanTrackingGate()
     private var nativeCommandID: String?
+    /// SDK acknowledgement only means the device accepted a mode switch. It
+    /// becomes a motor owner after its response has been observed.
     private var nativeTrackingActive = false
+    private var nativeTrackingFunctionallyVerified = false
     private var nativeTrackingStartPending = false
     /// Deadline for a pending native start. The device handoff (external
     /// yield + AI-mode switch) takes ~1-4s; if the helper never confirms
@@ -3377,13 +3721,26 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var nativeConsecutiveFailures = 0
     private let nativeStartConfirmationWindowNS: UInt64 = 8_000_000_000
     private var nativeHeartbeatGeneration = 0
+    private var nativeTrackingLiveness = NativeTrackingLiveness()
+    private var nativeTrackingRuntimeAvailability: NativeTrackingRuntimeAvailability = .unverified
+    /// Tiny 3 exposes an SDK command for sound following, but this bridge has
+    /// not observed a trustworthy physical orientation response from it yet.
+    /// VAD remains useful perception evidence; it cannot suspend L0 movement.
+    private var autonomousSoundFollowingFunctionallyVerified = false
     private var externalGate: ExternalGimbalAttentionGate?
     private var idleExplorationGate: IdleExplorationGate?
     private var externalCommandID: String?
     private var helperReady = false
+    private var deviceProfile: OBSBOTDeviceProfile?
+    private var deviceCapabilities: OBSBOTDeviceCapabilities?
+    private var rejectedFirmwareAudioModes = Set<Int>()
     private var commandSequence = 0
     private var calibrationStage: CalibrationStage = .awaitingTarget
+    private var calibrationHomePose: GimbalPose?
+    private let calibrationMaximumPulsesPerAxis = 3
     private var calibrationMode: Bool
+    private var lastCalibrationFrameAdmissionNS: UInt64 = 0
+    private var lastCalibrationOpticalDiagnosticNS: UInt64 = 0
     private var externalStopGeneration = 0
     private var scanGeneration = 0
     private var scanRunning = false
@@ -3416,6 +3773,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var poseAvailabilityReported = false
     private var fieldOfViewAvailabilityReported = false
     private var poseWaitStopIssued = false
+    private var poseStreamDegradedReported = false
     // The calibration expresses an expected axis sign. During exploration the
     // SDK attitude is the authority: one non-moving pan pulse reverses the
     // next pulse; both directions failing requires a physical re-home.
@@ -3495,15 +3853,38 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var attemptedSpatialFaceReacquisitionIDs: Set<String> = []
     private var confirmedVisualLossNS: UInt64?
     private var lastSpatialFaceReacquisitionCommandNS: UInt64 = 0
+    /// Bounded command/feedback samples make the live face-servo loop
+    /// inspectable without turning the rolling runtime trace into a 50 Hz
+    /// attitude dump.
+    private var lastFaceServoDiagnosticNS: UInt64 = 0
     private var lastObservedFaceNS: UInt64?
+    private var lastObservedFaceRect: SOMACore.NormalizedRect?
     private var lastMotorTarget: AttentionTarget?
-    private var freshFaceBearings: [String: (bearing: GimbalRelativeBearing, monotonicNS: UInt64)] = [:]
+    private var freshFaceBearings: [String: (bearing: GimbalRelativeBearing, captureNS: UInt64, observedNS: UInt64)] = [:]
     // Camera delivery and face-model warm-up begin after the helper reports
     // ready. Do not let no-target exploration pull the optical axis away from
     // the user before that first live face pass has had time to arrive.
     private var explorationEligibleAfterNS: UInt64 = 0
     private var activeCognitiveMotorRequestID: String?
     private var activeCognitiveMotorExpiresAtNS: UInt64?
+    private var deviceSoundFollowingRequestID: String?
+    /// L0's auditory orienting lease is deliberately separate from a
+    /// cognitive sound-following request. A brief new voice onset can recruit
+    /// the device microphone array while no face is visible, but it may never
+    /// preempt L1/L2 motor ownership or outlive fresh visual evidence.
+    private var auditoryOrientingRequestID: String?
+    private var auditoryOrientingGeneration = 0
+
+    /// Coverage is the fallback motor owner. A queued visual-loss callback
+    /// must not acquire the gimbal while another attention loop owns it.
+    private var coverageScanBlockedByMotorLease: Bool {
+        activeCognitiveMotorRequestID != nil
+            || deviceSoundFollowingRequestID != nil
+            || auditoryOrientingRequestID != nil
+            || nativeTrackingActive
+            || nativeTrackingStartPending
+    }
+
     private var cognitiveMotionMode: CognitiveMotionMode?
     private var cognitiveMotionGeneration = 0
     private var cognitiveMotionLoopRunning = false
@@ -3536,10 +3917,47 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var indicatorCalibrationPreset: SOMALEDFirmwarePreset?
     private var indicatorCalibrationStateID: Int?
     private var indicatorReassertionGeneration = 0
-    /// The visual invitation stays legible through brief gaze-estimator
-    /// dropouts. Voice activity is admitted independently of gaze.
-    private var eyeContactIndicatorLease = EyeContactIndicatorLease(holdMilliseconds: 750)
+    /// A completed Vision gaze result remains current through a normal
+    /// asynchronous landmark gap. This affects only presentation; speech still
+    /// requires a separately fresh direct-contact observation.
+    private var eyeContactIndicatorLease = EyeContactIndicatorLease(holdMilliseconds: 3_000)
     private let indicatorReassertionIntervalMilliseconds = 1_000
+
+    private var allowsMotorControl: Bool {
+        guard let deviceCapabilities, let deviceProfile else { return false }
+        if deviceCapabilities.supportsCalibratedMotorControl { return true }
+        return externalCalibration?.deviceProfile == deviceProfile
+            && (!deviceCapabilities.requiresMeasuredAttitudeFrame
+                || externalCalibration?.hasMeasuredAttitudeFrame == true)
+    }
+
+    private var externalPoseProjection: GimbalPoseProjection {
+        externalCalibration?.poseProjection ?? .identity
+    }
+
+    private var activeKinematicEnvelope: GimbalKinematicEnvelope {
+        deviceProfile?.kinematicEnvelope ?? .obsbotTiny2Lite
+    }
+
+    private var allowsBoundedCalibrationPulses: Bool {
+        calibrationMode && deviceCapabilities?.supportsBoundedCalibrationPulses == true
+    }
+
+    private var supportsFirmwareIndicatorPalette: Bool {
+        deviceCapabilities?.supportsFirmwareIndicatorPalette == true
+    }
+
+    private var supportsDirectIndicatorRGB: Bool {
+        deviceCapabilities?.supportsDirectIndicatorRGB == true
+    }
+
+    private var supportsIndicatorRendering: Bool {
+        supportsFirmwareIndicatorPalette || supportsDirectIndicatorRGB
+    }
+
+    private var supportsBasicIndicatorControl: Bool {
+        deviceCapabilities?.supportsIndicatorEnableAndBrightness == true
+    }
 
     init(
         helperURL: URL,
@@ -3594,6 +4012,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             "--duration", String(Int(duration)),
             "--output", outputURL.path,
         ]
+        if calibrationMode {
+            processArguments.append("--allow-device-calibration")
+        } else if externalCalibration?.deviceProfile == .tiny3Lite {
+            processArguments.append("--allow-profile-calibrated-motion")
+        }
         if let traceRotationPolicy {
             processArguments += [
                 "--trace-max-megabytes", String(traceRotationPolicy.maximumBytes / 1_048_576),
@@ -3648,6 +4071,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             helperDiagnosticBuffer.removeSubrange(...newline)
             if line.hasPrefix("SOMA_GIMBAL_ATTITUDE ") {
                 consumeAttitudeLine(line)
+            } else if line.hasPrefix("SOMA_GIMBAL_HOME ") {
+                consumeHomeLine(line)
             } else {
                 queue.async { [weak self] in self?.consumeHelperDiagnostic(line) }
             }
@@ -3681,15 +4106,213 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         ))
     }
 
+    private func consumeHomeLine(_ line: String) {
+        let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
+            let pair = part.split(separator: "=", maxSplits: 1)
+            guard pair.count == 2 else { return }
+            result[String(pair[0])] = pair[1]
+        }
+        guard let pitchText = values["pitch"], let pitch = Double(pitchText),
+              let panText = values["pan"], let pan = Double(panText) else { return }
+        let receivedNS = monotonicNanoseconds()
+        poseStore.establishRuntimeAttitudeHome(
+            pitchDegrees: pitch,
+            panDegrees: pan,
+            at: receivedNS
+        )
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: receivedNS,
+            source: "gimbal_pose",
+            state: "home_reference_updated",
+            message: "profile_calibrated_center"
+        ))
+    }
+
     private func consumeHelperDiagnostic(_ line: String) {
+        if line.hasPrefix("SOMA_GIMBAL_HEALTH ") {
+            let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
+                let pair = part.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { return }
+                result[String(pair[0])] = pair[1]
+            }
+            let result = values["result"].flatMap { Int($0) }
+            let warningFlags = values["warning_flags"].flatMap { Int($0) }
+            let errorFlags = values["error_flags"].flatMap { Int($0) }
+            let state: String
+            if result != 0 {
+                state = "unavailable"
+            } else if errorFlags != 0 {
+                state = "error"
+            } else if warningFlags != 0 {
+                state = "warning"
+            } else {
+                state = "healthy"
+            }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_gimbal",
+                state: state,
+                message: String(line.dropFirst("SOMA_GIMBAL_HEALTH ".count))
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_OBSBOT_CAPABILITY ") {
+            let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
+                let pair = part.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { return }
+                result[String(pair[0])] = pair[1]
+            }
+            guard let profileText = values["profile"],
+                  let profile = OBSBOTDeviceProfile(rawValue: String(profileText)) else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "obsbot_device",
+                    state: "unsupported_profile",
+                    message: String(line.prefix(192))
+                ))
+                return
+            }
+            let expected = profile.capabilities
+            let reportedBool: (String) -> Bool? = { key in
+                guard let value = values[key] else { return nil }
+                if value == "true" { return true }
+                if value == "false" { return false }
+                return nil
+            }
+            let reportedDouble: (String) -> Double? = { key in
+                values[key].flatMap { Double($0) }
+            }
+            let capabilitiesMatch = reportedBool("motor_calibrated") == expected.supportsCalibratedMotorControl
+                && reportedBool("bounded_calibration_pulses") == expected.supportsBoundedCalibrationPulses
+                && reportedBool("indicator_palette") == expected.supportsFirmwareIndicatorPalette
+                && reportedBool("indicator_direct_rgb") == expected.supportsDirectIndicatorRGB
+                && reportedBool("indicator_basic") == expected.supportsIndicatorEnableAndBrightness
+                && reportedBool("selectable_audio_modes") == expected.supportsSelectableAudioModes
+                && reportedBool("sound_localization") == expected.supportsDeviceSoundLocalization
+                && reportedBool("requires_measured_attitude_frame") == expected.requiresMeasuredAttitudeFrame
+                && reportedDouble("maximum_pan_degrees_per_second") == expected.maximumPanDegreesPerSecond
+                && reportedDouble("maximum_pitch_degrees_per_second") == expected.maximumPitchDegreesPerSecond
+            guard capabilitiesMatch else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "obsbot_device",
+                    state: "capability_profile_mismatch",
+                    message: String(line.prefix(192))
+                ))
+                return
+            }
+            deviceProfile = profile
+            deviceCapabilities = profile.capabilities
+            poseStore.configureDeviceProfile(profile, calibration: externalCalibration)
+            if helperReady {
+                disableFirmwareSoundFollowing(
+                    at: monotonicNanoseconds(),
+                    reason: "capabilities_ready"
+                )
+            }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_device",
+                state: "capabilities_ready",
+                message: "profile=\(profile.rawValue); motor_calibrated=\(profile.capabilities.supportsCalibratedMotorControl); firmware_indicator_palette=\(profile.capabilities.supportsFirmwareIndicatorPalette); direct_indicator_rgb=\(profile.capabilities.supportsDirectIndicatorRGB); selectable_audio_modes=\(profile.capabilities.supportsSelectableAudioModes); sound_localization=\(profile.capabilities.supportsDeviceSoundLocalization)"
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_AUDIO_FRONTEND ") {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_audio_frontend",
+                state: "settings_observed",
+                message: String(line.dropFirst("SOMA_AUDIO_FRONTEND ".count))
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_AUDIO_MODE ") {
+            let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
+                let pair = part.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { return }
+                result[String(pair[0])] = pair[1]
+            }
+            let confirmed = values["confirmed"].map { $0 == "true" }
+            if let requested = values["requested"].flatMap({ Int($0) }) {
+                if confirmed == true {
+                    rejectedFirmwareAudioModes.remove(requested)
+                } else if confirmed == false {
+                    rejectedFirmwareAudioModes.insert(requested)
+                }
+            }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_audio_frontend",
+                state: confirmed == true
+                    ? "capture_mode_active"
+                    : (confirmed == false ? "capture_mode_unconfirmed" : "capture_mode_observed"),
+                message: String(line.dropFirst("SOMA_AUDIO_MODE ".count))
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_DOA_FOLLOW ") {
+            let enabled = line.contains("enabled=true")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_audio_doa",
+                state: enabled ? "device_sound_following_active" : "device_sound_following_disabled",
+                message: String(line.dropFirst("SOMA_DOA_FOLLOW ".count))
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_CAMERA_OPTICS ") {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_camera_optics",
+                state: "settings_observed",
+                message: String(line.dropFirst("SOMA_CAMERA_OPTICS ".count))
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_CAMERA_WHITE_BALANCE ") {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_camera_imaging",
+                state: "white_balance_active",
+                message: String(line.dropFirst("SOMA_CAMERA_WHITE_BALANCE ".count))
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_CAMERA_FOV ") {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_camera_optics",
+                state: "field_of_view_active",
+                message: String(line.dropFirst("SOMA_CAMERA_FOV ".count))
+            ))
+            return
+        }
         if line == "SOMA_NATIVE_BRIDGE_READY" {
             guard !helperReady else { return }
             helperReady = true
+            disableFirmwareSoundFollowing(
+                at: monotonicNanoseconds(),
+                reason: "bridge_startup"
+            )
             explorationEligibleAfterNS = monotonicNanoseconds() + 3_000_000_000
-            let indicatorEnableCommandID = nextCommandID(prefix: "indicator-enable")
-            send("indicator_enabled \(indicatorEnableCommandID) \(ledSettings.responseMode == .off ? 0 : 1)")
-            let indicatorBrightnessCommandID = nextCommandID(prefix: "indicator-brightness")
-            send("indicator_brightness \(indicatorBrightnessCommandID) \(ledSettings.brightness)")
+            if supportsBasicIndicatorControl {
+                let indicatorEnableCommandID = nextCommandID(prefix: "indicator-enable")
+                send("indicator_enabled \(indicatorEnableCommandID) \(ledSettings.responseMode == .off ? 0 : 1)")
+                let indicatorBrightnessCommandID = nextCommandID(prefix: "indicator-brightness")
+                send("indicator_brightness \(indicatorBrightnessCommandID) \(ledSettings.brightness)")
+            }
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
@@ -3697,14 +4320,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 state: "ready",
                 message: "native_endpoint_discovered"
             ))
-            if cameraGeometryCalibrationMode || panoramaStripScanMode {
+            if allowsMotorControl && (cameraGeometryCalibrationMode || panoramaStripScanMode) {
                 startSmoothExploration()
             }
             refreshIndicator(
                 at: monotonicNanoseconds(),
                 forceHardwareReassertion: true
             )
-            startIndicatorReassertionLoop()
+            if supportsIndicatorRendering {
+                startIndicatorReassertionLoop()
+            }
             return
         }
         if line.hasPrefix("SOMA_NATIVE_TRACKING ") {
@@ -3714,13 +4339,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 result[String(pair[0])] = pair[1]
             }
             guard let state = values["state"] else { return }
+            let commandID = values["command_id"].map(String.init)
+            let outcome = values["outcome"].map(String.init)
             if state == "active" {
                 nativeTrackingActive = true
+                nativeTrackingFunctionallyVerified = false
                 nativeTrackingStartPending = false
                 nativeStartDeadlineNS = nil
-                nativeConsecutiveFailures = 0
-                nativeRetryCooldownUntilNS = nil
                 startNativeHeartbeatLoop()
+                startNativeTrackingLivenessCheck(at: monotonicNanoseconds())
                 // Native human tracking can replace the visible hardware
                 // indication while it activates. Reassert the selected SOMA
                 // signal after the device has confirmed that transition.
@@ -3737,17 +4364,38 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 // the next native start indefinitely. Only a native session we
                 // actually own (active or pending) is a real failure signal.
                 guard nativeTrackingActive || nativeTrackingStartPending else { return }
-                // A PENDING start is mid-handoff: the helper's own reinit
-                // (requestManualStop before switching the device into AI mode)
-                // emits this inactive ack as part of the handshake. Treating
-                // it as a failure clears nativeCommandID, so the heartbeats
-                // after the device confirms carry no command and the helper's
-                // 750 ms watchdog kills the fresh native lock ~1 s after every
-                // successful start. Real start failures are caught by the 8 s
-                // confirmation deadline, not this ack.
-                guard !nativeTrackingStartPending else { return }
+                if nativeTrackingStartPending {
+                    // Reinitialization emits unrelated inactive updates while
+                    // a request is pending. Only the matching terminal
+                    // rejection may cancel this handoff.
+                    guard outcome == "start_rejected",
+                          commandID == nativeCommandID else {
+                        return
+                    }
+                    nativeTrackingStartPending = false
+                    nativeStartDeadlineNS = nil
+                    nativeCommandID = nil
+                    _ = gate.invalidate()
+                    nativeConsecutiveFailures += 1
+                    let cooldownMilliseconds = min(
+                        5_000 * (1 << min(nativeConsecutiveFailures - 1, 3)),
+                        40_000
+                    )
+                    nativeRetryCooldownUntilNS = monotonicNanoseconds()
+                        + UInt64(cooldownMilliseconds) * 1_000_000
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "native_tracking",
+                        state: "start_rejected",
+                        message: "device_rejected_portrait_tracking; retry_after_ms=\(cooldownMilliseconds)"
+                    ))
+                    return
+                }
                 stopNativeHeartbeatLoop()
+                nativeTrackingLiveness.cancel()
                 nativeTrackingActive = false
+                nativeTrackingFunctionallyVerified = false
                 nativeTrackingStartPending = false
                 nativeStartDeadlineNS = nil
                 nativeCommandID = nil
@@ -3773,8 +4421,25 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 source: "gimbal_pose",
                 state: "fov_available",
                 message: String(
-                    format: "reported_fov_mode=%.0f; horizontal_degrees=%.3f; optical_profile=tiny_2_lite; aspect_ratio=16:9",
+                    format: "reported_fov_mode=%.0f; horizontal_degrees=%.3f; optical_profile=%@; aspect_ratio=16:9",
                     degrees,
+                    horizontal,
+                    deviceProfile?.rawValue ?? "unknown"
+                )
+            ))
+            return
+        }
+        if line.hasPrefix("SOMA_CAMERA_ZOOM factor="),
+           let factor = Double(line.dropFirst("SOMA_CAMERA_ZOOM factor=".count)),
+           let horizontal = poseStore.updateOpticalZoomFactor(factor) {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_camera_optics",
+                state: "optical_zoom_active",
+                message: String(
+                    format: "reported_factor=%.3f; horizontal_degrees=%.3f",
+                    factor,
                     horizontal
                 )
             ))
@@ -3797,10 +4462,48 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
-    func ingestSceneCandidates(_ candidates: [SceneCandidate], at monotonicNS: UInt64) {
+    func ingestSceneCandidates(
+        _ candidates: [SceneCandidate],
+        captureNS: UInt64,
+        at monotonicNS: UInt64
+    ) {
         queue.async { [weak self] in
             self?.spatialAtlas.updateScene(candidates.map(EmbodimentSceneEntity.init))
-            self?.applySceneCandidates(candidates, at: monotonicNS)
+            self?.applySceneCandidates(candidates, captureNS: captureNS, at: monotonicNS)
+        }
+    }
+
+    /// Feeds the bounded device-calibration routine a frame whose pose is
+    /// aligned to its exposure. Normal attention never copies camera frames;
+    /// this path is admitted only for the initial visual reference and the
+    /// two short settle windows.
+    func ingestCalibrationFrame(
+        _ pixelBuffer: CVPixelBuffer,
+        captureNS: UInt64,
+        observedNS: UInt64
+    ) {
+        let shouldCapture = queue.sync { [self] in
+            guard calibrationMode, process.isRunning, helperReady else { return false }
+            switch calibrationStage {
+            case .awaitingTarget:
+                return true
+            case let .panSettling(_, _, stoppedNS),
+                 let .pitchSettling(_, _, _, _, stoppedNS):
+                return captureNS >= stoppedNS + 400_000_000
+                    && (lastCalibrationFrameAdmissionNS == 0
+                        || captureNS >= lastCalibrationFrameAdmissionNS + 150_000_000)
+            case .panPulse, .pitchPulse, .completed, .failed:
+                return false
+            }
+        }
+        guard shouldCapture,
+              let sample = calibrationSample(from: pixelBuffer, captureNS: captureNS) else {
+            return
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.lastCalibrationFrameAdmissionNS = captureNS
+            self.applyCalibrationFrame(sample, at: observedNS)
         }
     }
 
@@ -3867,15 +4570,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func refreshCommunicationIndicatorInputs() {
-        let conversationActive = liveVoicePresentation == .hearingUser
-            || liveVoicePresentation == .responding
-            || liveVoiceUserSpeaking
+        // A connected Live Voice session is already a social commitment. It
+        // keeps one unambiguous session presentation while the user pauses or
+        // the assistant prepares a reply; speech activity only changes the
+        // conversational turn, not the visible readiness state.
+        let liveVoiceSessionOpen = liveVoicePresentation != .inactive
+        let conversationActive = liveVoiceSessionOpen
             || localSpeechListening
             || localSpeechSpeaking
-        let preparingReply = liveVoicePresentation == .preparingResponse || localSpeechWorking
-        indicatorInputs.interactionState = preparingReply
-            ? .preparingReply
-            : (conversationActive ? .conversation : .idle)
+        let preparingReply = !liveVoiceSessionOpen && localSpeechWorking
+        indicatorInputs.interactionState = conversationActive
+            ? .conversation
+            : (preparingReply ? .preparingReply : .idle)
     }
 
     func ingestCoverage(
@@ -3970,6 +4676,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     func stop() {
         queue.sync {
             if case .stopped = state { return }
+            let stopNS = monotonicNanoseconds()
             if calibrationOutputURL != nil {
                 switch calibrationStage {
                 case .completed, .failed:
@@ -3984,6 +4691,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     ))
                 }
             }
+            stopAuditoryOrienting(
+                state: "runtime_stopping",
+                at: stopNS,
+                resumeExploration: false
+            )
+            disableDeviceSoundFollowing(state: "runtime_stopping", at: stopNS)
+            // Sound following is a firmware state, not a host-side velocity
+            // command. Clear it even when no local lease survived a previous
+            // process so the next launch begins from an unowned motor state.
+            disableFirmwareSoundFollowing(at: stopNS, reason: "runtime_stopping")
             let commandID = nextCommandID(prefix: "shutdown")
             send("shutdown \(commandID)")
             writer.write(CameraIntentEvent(
@@ -4004,10 +4721,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             state = .stopped
         }
         guard process.isRunning else { return }
-        // The helper parks the gimbal at center before sleeping on shutdown
-        // (up to ~4s of travel), so allow it to finish instead of killing it
-        // mid-park.
-        if exited.wait(timeout: .now() + 8) == .timedOut {
+        // The helper moves to a stabilised horizontal rest pose and then puts
+        // the camera to sleep. Leave enough time for the physical arrival
+        // check rather than interrupting that shutdown sequence mid-motion.
+        if exited.wait(timeout: .now() + 20) == .timedOut {
             process.terminate()
             _ = exited.wait(timeout: .now() + 3)
         }
@@ -4019,15 +4736,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         }
         guard helperReady else { return }
+        guard allowsMotorControl || allowsBoundedCalibrationPulses else { return }
         guard !cameraGeometryCalibrationMode, !panoramaStripScanMode else { return }
         guard !explorationRecentering else { return }
         if calibrationMode {
-            if reason != "vision_miss", VisualObservationSource(rawValue: reason) == nil {
-                // Calibration may move only in response to a completed visual
-                // observation; predictions and audio cannot prove displacement.
-                return
-            }
-            applyCalibration(belief, reason: reason)
+            // Calibration is driven by capture-aligned optical-flow frames.
+            // Beliefs are semantic and may assign a new anonymous scene ID as
+            // the camera moves, so they cannot provide the correspondence.
             return
         }
         guard activeCognitiveMotorRequestID == nil else {
@@ -4037,6 +4752,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         let now = belief.monotonicNS
         cancelStaleNativeStartIfNeeded(at: now)
+        if reason != "vision_miss", hasRecentObservedFace(at: now) {
+            stopAuditoryOrienting(
+                state: "visual_face_observed",
+                at: now,
+                resumeExploration: false
+            )
+        }
         if reason == "vision_miss" {
             // A completed detector miss can race another detector's fresh
             // face result. The worker already applies this continuity rule,
@@ -4059,7 +4781,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // loss window. Previously the controller received the lease bit
             // alone, so a stale person hypothesis could indefinitely suppress
             // exploration after the camera was no longer seeing a person.
-            let socialEvidenceFresh = nativeTrackingActive
+            let socialEvidenceFresh = nativeTrackingFunctionallyVerified
                 ? !nativeTrustContinuity.confirmsLoss(at: now)
                 : !socialTrackingContinuity.confirmsLoss(at: now)
             let socialFixationSupported = faceLock.permitsMotor(at: now)
@@ -4128,7 +4850,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             belief: belief,
             evidence: .visualObservation,
             socialFixationPermitted: faceLock.permitsInitialMotor(at: now)
-                && (nativeTrackingActive
+                && (nativeTrackingFunctionallyVerified
                     ? !nativeTrustContinuity.confirmsLoss(at: now)
                     : !socialTrackingContinuity.confirmsLoss(at: now)),
             nativeSocialTrackingPermitted: faceLock.permitsInitialMotor(at: now),
@@ -4256,7 +4978,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         let immediateNativeAcquisition = verifiedCurrentFaceLock
         let nativeAction: NativeHumanTrackingAction
-        if nativeHumanTrackingEnabled && faceLock.permitsMotor(at: now) {
+        // A temporally matched ANE face may already be handing its image-space
+        // box to the device while landmark verification is still pending.  Do
+        // not let the slower belief path revoke that pending transfer simply
+        // because it is not yet allowed to create social/identity authority.
+        // Once the device accepts the start, the normal active-native path
+        // retains ownership only through its visual-loss continuity rules.
+        let nativeLeasePermitted = faceLock.permitsMotor(at: now)
+            || ((nativeTrackingStartPending || nativeTrackingActive)
+                && faceLock.permitsInitialMotor(at: now))
+        if nativeTrackingMayStart && nativeLeasePermitted {
             // Retain a device-confirmed native lock through a short detector
             // blip: the current frame briefly lost its face target (nil, a
             // body/saliency candidate taking precedence, or a fast head move)
@@ -4295,6 +5026,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     + " verifiedLock=\(verifiedCurrentFaceLock)"
                     + " trustLoss=\(nativeTrustContinuity.confirmsLoss(at: now))"
                     + " enabled=\(nativeHumanTrackingEnabled)"
+                    + " runtimeAvailability=\(nativeTrackingRuntimeAvailability.rawValue)"
                     + " nativeActive=\(nativeTrackingActive)"
                     + " cooldownUntil=\(nativeRetryCooldownUntilNS.map { $0 >= now ? String(format: "%.0f", Double($0 - now) / 1e9) : "0" } ?? "-")s"
                     + " pending=\(nativeTrackingStartPending)"
@@ -4306,19 +5038,20 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // Keep the visual servo alive while a fresh face earns the native
             // lease. Once the device confirms native tracking, it becomes the
             // sole motor owner; a face must never create a 500 ms dead zone.
-            let nativeHandoffPending = nativeHumanTrackingEnabled
+            let nativeHandoffPending = nativeTrackingMayStart
                 && (nativeTrackingStartPending || nativeAction == .start)
             let nativeOwnsHuman = nativeTrackingActive || nativeHandoffPending
             let faceBearing: GimbalRelativeBearing?
             if let target = belief.target,
                let stored = freshFaceBearings[target.id],
-               now >= stored.monotonicNS,
-               now - stored.monotonicNS <= 500_000_000 {
+               now >= stored.observedNS,
+               now - stored.observedNS <= 500_000_000 {
                 faceBearing = stored.bearing
             } else {
                 faceBearing = nil
             }
             let currentPose = poseStore.current()
+            let currentVelocity = poseStore.currentVelocity()
             // External velocity is a physical closed loop. A face rectangle
             // without its capture-time bearing or a current SDK attitude is
             // awareness, not enough state to steer the gimbal: image-space
@@ -4330,8 +5063,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 ? externalGate.update(
                     belief,
                     faceBearing: faceBearing,
+                    faceObservationNS: belief.target.flatMap { target in
+                        freshFaceBearings[target.id]?.captureNS
+                    },
                     currentPose: currentPose,
-                    poseProjection: .obsbotTiny2Lite
+                    currentVelocity: currentVelocity,
+                    poseProjection: externalPoseProjection
                 )
                 : (externalCommandID == nil ? .none : .stop)
             externalAction = nativeOwnsHuman
@@ -4506,7 +5243,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             let action = externalGate.update(
                 belief,
                 currentPose: poseStore.current(),
-                poseProjection: .obsbotTiny2Lite,
+                poseProjection: externalPoseProjection,
                 allowSocialReframing: true
             )
             self.externalGate = externalGate
@@ -4544,7 +5281,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         if confirmedVisualLossNS == nil {
             confirmedVisualLossNS = now
         }
-        let nativeAction = nativeHumanTrackingEnabled
+        let nativeAction = nativeTrackingMayStart
             ? (gate.isActive
                 && !nativeTrustContinuity.confirmsLoss(at: now)
                 ? gate.heartbeatIfActive(at: now)
@@ -4575,8 +5312,97 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
+    /// A new speech onset without a visual person is an orienting event, not
+    /// an invitation to begin a conversation. Tiny 3 Lite can follow its own
+    /// microphone-array estimate even when the host does not have a calibrated
+    /// stereo bearing. The firmware lease is short and yields immediately to
+    /// a face, native tracking, or a higher cognitive motor lease.
+    func ingestAuditoryOnset(at monotonicNS: UInt64) {
+        queue.async { [weak self] in
+            guard let self,
+                  case .running = self.state,
+                  self.autonomousSoundFollowingFunctionallyVerified,
+                  self.helperReady,
+                  self.process.isRunning,
+                  self.deviceProfile?.capabilities.supportsDeviceSoundLocalization == true,
+                  self.activeCognitiveMotorRequestID == nil,
+                  self.deviceSoundFollowingRequestID == nil,
+                  !self.nativeTrackingActive,
+                  !self.nativeTrackingStartPending,
+                  !self.hasRecentObservedFace(at: monotonicNS) else {
+                return
+            }
+
+            self.auditoryOrientingGeneration += 1
+            let generation = self.auditoryOrientingGeneration
+            let requestID = self.nextCommandID(prefix: "auditory-orient")
+            self.auditoryOrientingRequestID = requestID
+            self.cancelScan()
+            if self.externalCommandID != nil {
+                self.cancelExternalStop()
+                self.sendExternalStop(state: "auditory_orienting_acquired", at: monotonicNS)
+            }
+            self.send("doa_follow \(requestID) 1")
+            self.writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNS,
+                source: "obsbot_audio_doa",
+                state: "auditory_orienting_requested",
+                message: "request_id=\(requestID); source=vad_onset; visual_face=false; lease_ms=4500"
+            ))
+            self.scheduleAuditoryOrientingExpiry(
+                requestID: requestID,
+                generation: generation,
+                at: monotonicNS
+            )
+        }
+    }
+
+    private func scheduleAuditoryOrientingExpiry(
+        requestID: String,
+        generation: Int,
+        at monotonicNS: UInt64
+    ) {
+        let durationNS: UInt64 = 4_500_000_000
+        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(durationNS))) { [weak self] in
+            guard let self,
+                  self.auditoryOrientingGeneration == generation,
+                  self.auditoryOrientingRequestID == requestID else {
+                return
+            }
+            self.stopAuditoryOrienting(
+                state: "auditory_orienting_expired",
+                at: monotonicNanoseconds(),
+                resumeExploration: !self.hasRecentObservedFace(at: monotonicNanoseconds())
+            )
+        }
+    }
+
+    private func stopAuditoryOrienting(
+        state: String,
+        at monotonicNS: UInt64,
+        resumeExploration: Bool
+    ) {
+        guard let requestID = auditoryOrientingRequestID else { return }
+        auditoryOrientingRequestID = nil
+        auditoryOrientingGeneration += 1
+        disableFirmwareSoundFollowing(at: monotonicNS, reason: state)
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "obsbot_audio_doa",
+            state: state,
+            message: "request_id=\(requestID); visual_face=\(hasRecentObservedFace(at: monotonicNS)); exploration_resume=\(resumeExploration)"
+        ))
+        if resumeExploration,
+           activeCognitiveMotorRequestID == nil,
+           deviceSoundFollowingRequestID == nil {
+            scheduleScanAfterContinuousVisualLoss(minimumDelayMilliseconds: 150)
+        }
+    }
+
     private func scheduleScanAfterContinuousVisualLoss(minimumDelayMilliseconds: Int? = nil) {
-        guard !explorationRecentering else { return }
+        guard !explorationRecentering, !coverageScanBlockedByMotorLease else { return }
         let evidenceGeneration = visualEvidenceGeneration
         guard scanScheduledForEvidenceGeneration != evidenceGeneration else { return }
         scanScheduledForEvidenceGeneration = evidenceGeneration
@@ -4643,6 +5469,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 self.scanScheduledForEvidenceGeneration = nil
                 return
             }
+            // The state may have changed since this callback was armed. Do
+            // not let coverage preempt a currently active motor lease.
+            guard !self.coverageScanBlockedByMotorLease else {
+                self.scanScheduledForEvidenceGeneration = nil
+                return
+            }
             let action: ExternalGimbalAttentionAction
             if var externalGate = self.externalGate {
                 action = externalGate.beginScanIfEligible(at: now)
@@ -4685,15 +5517,29 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         case .start:
             guard let target else { return }
-            guard !nativeTrackingActive else { return }
-            guard now >= (nativeRetryCooldownUntilNS ?? 0) else { return }
+            guard nativeTrackingMayStart, !nativeTrackingActive else {
+                _ = gate.invalidate()
+                return
+            }
+            guard now >= (nativeRetryCooldownUntilNS ?? 0) else {
+                // Gate ownership is provisional until the command is written
+                // to the bridge. Leaving it active during a cooldown makes a
+                // failed handoff look like a live device lock and prevents the
+                // next eligible frame from retrying.
+                _ = gate.invalidate()
+                return
+            }
             if nativeTrackingStartPending {
                 // A pending start whose confirmation window has passed is
                 // stale: clear it (and the helper's half-finished handoff)
                 // before starting fresh.
-                guard now >= (nativeStartDeadlineNS ?? .max) else { return }
+                guard now >= (nativeStartDeadlineNS ?? .max) else {
+                    _ = gate.invalidate()
+                    return
+                }
                 nativeStartDeadlineNS = nil
                 nativeTrackingStartPending = false
+                _ = gate.invalidate()
                 let cleanupID = nextCommandID(prefix: "manual-stop")
                 send("manual_stop \(cleanupID)")
                 writer.write(CameraIntentEvent(
@@ -4716,7 +5562,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // velocity command, so a leftover scan pulse would kill the very
             // lock this start is establishing.
             cancelScan()
-            send("native_start \(commandID)")
+            let targetRect = target.rect.clippedToUnitSquare()
+            let bridgeLocale = Locale(identifier: "en_US_POSIX")
+            let targetBox = targetRect.map { rect in
+                [rect.x, rect.y, rect.width, rect.height]
+                    .map { String(format: "%.6f", locale: bridgeLocale, arguments: [$0]) }
+                    .joined(separator: " ")
+            }
+            send("native_start \(commandID)\(targetBox.map { " \($0)" } ?? "")")
             nativeCommandID = commandID
             writer.write(CameraIntentEvent(
                 monotonicNS: now,
@@ -4746,10 +5599,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 nativeStartDeadlineNS = nil
             }
             stopNativeHeartbeatLoop()
+            nativeTrackingLiveness.cancel()
             let commandID = nextCommandID(prefix: "manual-stop")
             send("manual_stop \(commandID)")
             nativeCommandID = nil
             nativeTrackingActive = false
+            nativeTrackingFunctionallyVerified = false
             nativeTrackingStartPending = false
             writer.write(CameraIntentEvent(
                 monotonicNS: now,
@@ -4774,6 +5629,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               now >= deadline else { return }
         nativeStartDeadlineNS = nil
         nativeTrackingStartPending = false
+        _ = gate.invalidate()
         // A start the device never confirmed within the window is a failure
         // too: back off so a wedged device is not hammered on every frame.
         nativeConsecutiveFailures += 1
@@ -4830,6 +5686,91 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         nativeHeartbeatGeneration += 1
     }
 
+    private func recentObservedFaceRect(at monotonicNS: UInt64) -> SOMACore.NormalizedRect? {
+        guard let lastObservedFaceNS,
+              let lastObservedFaceRect,
+              monotonicNS >= lastObservedFaceNS,
+              monotonicNS - lastObservedFaceNS <= 750_000_000 else {
+            return nil
+        }
+        return lastObservedFaceRect
+    }
+
+    private func startNativeTrackingLivenessCheck(at monotonicNS: UInt64) {
+        let token = nativeTrackingLiveness.begin(
+            target: recentObservedFaceRect(at: monotonicNS),
+            pose: poseStore.lastKnown(),
+            at: monotonicNS
+        )
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "native_tracking",
+            state: "functional_verification_started",
+            message: "deadline_ms=\(nativeTrackingLiveness.acquisitionTimeoutMilliseconds); sdk_ack_is_not_a_lock"
+        ))
+        queue.asyncAfter(
+            deadline: .now() + .milliseconds(nativeTrackingLiveness.acquisitionTimeoutMilliseconds)
+        ) { [weak self] in
+            self?.evaluateNativeTrackingLiveness(token: token)
+        }
+    }
+
+    private func evaluateNativeTrackingLiveness(token: UInt64) {
+        guard case .running = state, nativeTrackingActive else { return }
+        let now = monotonicNanoseconds()
+        let result = nativeTrackingLiveness.evaluate(
+            token: token,
+            target: recentObservedFaceRect(at: now),
+            pose: poseStore.lastKnown(),
+            at: now
+        )
+        switch result {
+        case .superseded:
+            return
+        case .observing:
+            queue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+                self?.evaluateNativeTrackingLiveness(token: token)
+            }
+        case .confirmed:
+            nativeTrackingRuntimeAvailability = .verified
+            nativeTrackingFunctionallyVerified = true
+            nativeConsecutiveFailures = 0
+            nativeRetryCooldownUntilNS = nil
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "native_tracking",
+                state: "functional_verification_confirmed",
+                message: "target_centering_or_measured_progress"
+            ))
+        case .unresponsive:
+            nativeTrackingFunctionallyVerified = false
+            nativeConsecutiveFailures += 1
+            let cooldownMilliseconds = min(
+                5_000 * (1 << min(nativeConsecutiveFailures - 1, 3)),
+                40_000
+            )
+            nativeRetryCooldownUntilNS = now + UInt64(cooldownMilliseconds) * 1_000_000
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "native_tracking",
+                state: "functional_verification_failed",
+                message: "no_target_centering_or_measured_progress; runtime_capability=retryable; retry_after_ms=\(cooldownMilliseconds); retaining_visual_face_lock"
+            ))
+            // A native mode that does not react disproves only its own motor
+            // claim. The independently verified visual face stays eligible
+            // for the predictive external tracker on the next video frame.
+            let stop = gate.stop()
+            apply(stop, at: now, target: nil, reason: "native_tracking_unresponsive")
+        }
+    }
+
+    private var nativeTrackingMayStart: Bool {
+        nativeHumanTrackingEnabled && nativeTrackingRuntimeAvailability.permitsNewHandoff
+    }
+
     private func apply(
         _ action: ExternalGimbalAttentionAction,
         at now: UInt64,
@@ -4883,51 +5824,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
-    private func applyCalibration(_ belief: BeliefSnapshot, reason: String) {
-        let now = belief.monotonicNS
-        if reason == "vision_miss" {
-            switch calibrationStage {
-            case .awaitingTarget:
-                // Calibration needs a stationary image reference. It waits for
-                // a suitable scene candidate rather than moving the camera to
-                // manufacture one.
-                break
-            case .panPulse, .panSettling, .pitchPulse, .pitchSettling:
-                // Gimbal movement can blank one or two detector frames. The
-                // timer already ends the pulse; wait for a same-track sample
-                // during settling instead of mistaking this for target loss.
-                break
-            case .completed, .failed:
-                break
-            }
-            return
-        }
-        switch calibrationStage {
-        case .awaitingTarget:
-            // The calibration anchor is selected directly from SceneField.
-            // The attention posterior may legitimately switch to an edge
-            // candidate between frames, but that is a poor target for a
-            // displacement pulse.
-            return
-        case .panPulse:
-            return
-        case .panSettling:
-            guard let sample = calibrationSample(from: belief) else { return }
-            advanceCalibration(with: sample, target: belief.target, at: now)
-        case .pitchPulse:
-            return
-        case .pitchSettling:
-            guard let sample = calibrationSample(from: belief) else { return }
-            advanceCalibration(with: sample, target: belief.target, at: now)
-        case .completed, .failed:
-            return
-        }
-    }
-
-    private func applySceneCandidates(_ candidates: [SceneCandidate], at monotonicNS: UInt64) {
+    private func applySceneCandidates(
+        _ candidates: [SceneCandidate],
+        captureNS: UInt64,
+        at monotonicNS: UInt64
+    ) {
         guard !cameraGeometryCalibrationMode, !panoramaStripScanMode else { return }
         if calibrationMode {
-            applyCalibrationCandidates(candidates, at: monotonicNS)
             return
         }
         // Social signalling follows fresh human perception, not the later
@@ -4967,9 +5870,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         freshFaceBearings.removeAll(keepingCapacity: true)
         for candidate in candidates where candidate.observedThisFrame
             && candidate.observation.kind == .human
-            && candidate.observation.label == "face" {
-            if let bearing = candidate.bearing {
-                freshFaceBearings[candidate.id] = (bearing, monotonicNS)
+            && candidate.observation.label == "face"
+            && candidate.observation.source == .neuralFaceDetector {
+            if let bearing = candidate.observedBearing ?? candidate.bearing {
+                freshFaceBearings[candidate.id] = (
+                    bearing: bearing,
+                    captureNS: captureNS,
+                    observedNS: monotonicNS
+                )
             }
         }
         guard activeCognitiveMotorRequestID == nil else { return }
@@ -5019,8 +5927,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                             observationCount: $0.observationCount,
                             confidence: $0.observation.confidence
                         )
-                    return ($0.faceActivityEligible || provisionalExplorationInterception)
-                        && isFaceAcquisitionFramed($0.observation.rect)
+                    // The native tracker takes the image-space target box
+                    // directly, so an edge face is exactly where it has the
+                    // most value: it can acquire before the coverage motion
+                    // carries the person out of view.  The old foveal-only
+                    // rule was appropriate for an external velocity servo but
+                    // incorrectly prevented native acquisition altogether.
+                    return $0.faceActivityEligible || provisionalExplorationInterception
                 }
                 .max { $0.observation.confidence < $1.observation.confidence }
         } else if faceLock.permitsMotor(at: monotonicNS) {
@@ -5052,6 +5965,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             if accepted, faceLock.permitsInitialMotor(at: monotonicNS) {
                 let preemptedExploration = scanRunning || activeSpatialFaceReacquisition != nil
                 lastObservedFaceNS = monotonicNS
+                lastObservedFaceRect = observedFace.observation.rect
                 if faceLock.isActive(at: monotonicNS) {
                     // The ready-to-speak invitation must be earned by the
                     // camera actually following the person (device-confirmed
@@ -5059,24 +5973,33 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     // live tracking is "person visible", not "ready to talk":
                     // the two states rise and fall together so the blinking
                     // blue indicator never claims a tracking SOMA is not doing.
-                    if nativeTrackingActive, observedFace.eyeContactEligible {
-                        eyeContactIndicatorLease.observe(
-                            sceneID: observedFace.id,
-                            at: monotonicNS
-                        )
-                        indicatorInputs.visualState = .eyeContact
-                    } else if nativeTrackingActive,
-                              eyeContactIndicatorLease.isActive(at: monotonicNS) {
-                        // Bridge a brief gaze dropout (and a SceneField track-ID
-                        // reassignment of the same face) while the camera is
-                        // still following the person. We intentionally use the
-                        // non-refreshing isActive() hold here rather than
-                        // maintain(sceneID:), which refreshes the lease on every
-                        // same-face observation and would keep the blink asserted
-                        // indefinitely once eye contact drops. This expires ~3s
-                        // after the last real eye contact, so looking away
-                        // releases the blink instead of holding it.
-                        indicatorInputs.visualState = .eyeContact
+                    if nativeTrackingFunctionallyVerified {
+                        switch observedFace.observation.gazeEvidence {
+                        case .direct:
+                            eyeContactIndicatorLease.observe(
+                                sceneID: observedFace.id,
+                                at: monotonicNS
+                            )
+                            indicatorInputs.visualState = .eyeContact
+                        case .averted:
+                            // A fresh, explicit landmark reading of averted
+                            // gaze ends the invitation immediately.
+                            eyeContactIndicatorLease.clear()
+                            indicatorInputs.visualState = .humanDetected
+                        case .unavailable:
+                            // Pupil landmarks are intermittent on the live
+                            // stream. Preserve a current invitation through a
+                            // measurement gap, but never turn an unknown gaze
+                            // into a new invitation.
+                            if eyeContactIndicatorLease.maintain(
+                                sceneID: observedFace.id,
+                                at: monotonicNS
+                            ) || eyeContactIndicatorLease.isActive(at: monotonicNS) {
+                                indicatorInputs.visualState = .eyeContact
+                            } else {
+                                indicatorInputs.visualState = .humanDetected
+                            }
+                        }
                     } else {
                         indicatorInputs.visualState = .humanDetected
                     }
@@ -5096,10 +6019,29 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     cancelExternalStop()
                     sendExternalStop(state: "face_observation_preempted_exploration", at: monotonicNS)
                 }
+                let directTarget = AttentionTarget(
+                    id: observedFace.id,
+                    rect: observedFace.observation.rect,
+                    confidence: observedFace.observation.confidence,
+                    velocityX: 0,
+                    velocityY: 0,
+                    kind: observedFace.observation.kind,
+                    label: observedFace.observation.label,
+                    attentionWeight: observedFace.observation.attentionWeight,
+                    posteriorProbability: observedFace.spatialConfidence,
+                    stabilityMilliseconds: observedFace.stabilityMilliseconds,
+                    isActionEligible: observedFace.isActionEligible
+                )
+                let nativeAction: NativeHumanTrackingAction
+                // A raw ANE rectangle can initiate local, predictive
+                // re-centering but cannot force a hardware mode switch. The
+                // native tracker remains reserved for the independent
+                // face-verification path in apply(_:reason:).
+                nativeAction = gate.heartbeatIfActive(at: monotonicNS)
                 apply(
-                    gate.heartbeatIfActive(at: monotonicNS),
+                    nativeAction,
                     at: monotonicNS,
-                    target: nil,
+                    target: directTarget,
                     reason: observedFace.observation.source.rawValue
                 )
                 return
@@ -5225,17 +6167,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         faceFixationCooldownUntilNS = now + faceFixationReleaseCooldownNS
         releaseWrongFixation(reason: "face_fixation_timeout", at: now, priority: .l1)
     }
-
-
-    private func isFaceAcquisitionFramed(_ rect: SOMACore.NormalizedRect) -> Bool {
-        // A new lock needs a foveal face measurement. This is deliberately
-        // stricter than the ongoing servo envelope: after a real face has
-        // acquired the lease, it may walk toward an edge without being
-        // abandoned. The lower field is where the live cable/desk false
-        // positives occur, so it cannot originate a social motor lock.
-        TrackingBoundary.allowsFaceLockAcquisition(rect)
-    }
-
     private func applySpatialFaceReacquisition(_ candidate: SceneCandidate, at monotonicNS: UInt64) {
         guard !hasRecentObservedFace(at: monotonicNS) else { return }
         if let activeSpatialFaceReacquisition {
@@ -5255,6 +6186,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               let motionGuide = GimbalVisibilityRoutePlanner.guide(
                 to: bearing,
                 from: pose,
+                kinematicEnvelope: activeKinematicEnvelope,
                 horizontalViewMarginDegrees: 18,
                 verticalViewMarginDegrees: 12
               ) else {
@@ -5274,11 +6206,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         )
         let pan = calibration.panCommand(
             forPoseError: panError,
-            projection: .obsbotTiny2Lite
+            projection: externalPoseProjection
         )
         let pitch = calibration.pitchCommand(
             forPoseError: pitchError,
-            projection: .obsbotTiny2Lite
+            projection: externalPoseProjection
         )
         guard pan != 0 || pitch != 0 else {
             attemptedSpatialFaceReacquisitionIDs.insert(candidate.id)
@@ -5314,31 +6246,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         return errorDegrees < 0 ? -speed : speed
     }
 
-    private func applyCalibrationCandidates(_ candidates: [SceneCandidate], at monotonicNS: UInt64) {
-        guard calibrationMode, process.isRunning, helperReady else { return }
-        if case .awaitingTarget = calibrationStage {
-            guard let sample = calibrationAnchor(from: candidates) else { return }
-            beginCalibration(with: sample, at: monotonicNS)
-            return
-        }
-        let baseline: CalibrationSample
-        switch calibrationStage {
-        case let .panSettling(sample, stoppedNS) where monotonicNS >= stoppedNS + 400_000_000:
-            baseline = sample
-        case let .pitchSettling(_, sample, stoppedNS) where monotonicNS >= stoppedNS + 400_000_000:
-            baseline = sample
-        default:
-            return
-        }
-        guard let sample = candidates.lazy
-            .filter(\.observedThisFrame)
-            .compactMap(calibrationSample(from:))
-            .first(where: { matches($0, baseline) }) else {
-            return
-        }
-        advanceCalibration(with: sample, target: nil, at: monotonicNS)
-    }
-
     private func spatialSpeed(
         errorDegrees: Double,
         maximumDegreesPerSecond: Double,
@@ -5359,27 +6266,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         return difference
     }
 
-    private func calibrationAnchor(from candidates: [SceneCandidate]) -> CalibrationSample? {
-        let anchor = candidates
-            .filter { candidate in
-                let observation = candidate.observation
-                return candidate.observedThisFrame
-                    && candidate.stabilityMilliseconds >= 500
-                    && observation.label != nil
-                    && observation.rect.centerX >= 0.25
-                    && observation.rect.centerX <= 0.70
-                    && observation.rect.centerY >= 0.20
-                    && observation.rect.centerY <= 0.80
-            }
-            .max { lhs, rhs in
-                lhs.observation.confidence < rhs.observation.confidence
-            }
-        return anchor.flatMap(calibrationSample(from:))
-    }
-
     private func beginCalibration(with sample: CalibrationSample, at monotonicNS: UInt64) {
         cancelScan()
-        calibrationStage = .panPulse(baseline: sample, startedNS: monotonicNS)
+        calibrationHomePose = sample.pose
+        sendCalibrationPanPulse(baseline: sample, pulseCount: 1, at: monotonicNS)
+    }
+
+    private func sendCalibrationPanPulse(
+        baseline: CalibrationSample,
+        pulseCount: Int,
+        at monotonicNS: UInt64
+    ) {
+        calibrationStage = .panPulse(baseline: baseline, startedNS: monotonicNS)
         sendCalibrationVelocity(
             pitch: 0,
             pan: 18,
@@ -5387,41 +6285,109 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             target: nil,
             at: monotonicNS,
             afterStop: { [weak self] stoppedNS in
-                self?.calibrationStage = .panSettling(baseline: sample, stoppedNS: stoppedNS)
+                self?.calibrationStage = .panSettling(
+                    baseline: baseline,
+                    pulseCount: pulseCount,
+                    stoppedNS: stoppedNS
+                )
+            }
+        )
+    }
+
+    private func sendCalibrationPitchPulse(
+        panImageDelta: Double,
+        panPoseDelta: Double,
+        baseline: CalibrationSample,
+        pulseCount: Int,
+        at monotonicNS: UInt64
+    ) {
+        calibrationStage = .pitchPulse(
+            panImageDelta: panImageDelta,
+            panPoseDelta: panPoseDelta,
+            baseline: baseline,
+            startedNS: monotonicNS
+        )
+        sendCalibrationVelocity(
+            pitch: 25,
+            pan: 0,
+            state: "calibration_pitch_pulse",
+            target: nil,
+            at: monotonicNS,
+            afterStop: { [weak self] stoppedNS in
+                self?.calibrationStage = .pitchSettling(
+                    panImageDelta: panImageDelta,
+                    panPoseDelta: panPoseDelta,
+                    baseline: baseline,
+                    pulseCount: pulseCount,
+                    stoppedNS: stoppedNS
+                )
             }
         )
     }
 
     private func advanceCalibration(
         with sample: CalibrationSample,
-        target: AttentionTarget?,
         at monotonicNS: UInt64
     ) {
         switch calibrationStage {
-        case let .panSettling(baseline, stoppedNS):
-            guard monotonicNS >= stoppedNS + 400_000_000, matches(sample, baseline) else { return }
-            let panImageDelta = sample.centerX - baseline.centerX
-            guard abs(panImageDelta) >= 0.015 else {
-                failCalibration("pan_response_below_detector_jitter", at: monotonicNS)
+        case let .panSettling(baseline, pulseCount, stoppedNS):
+            guard monotonicNS >= stoppedNS + 400_000_000 else { return }
+            guard let displacement = opticalDisplacement(from: baseline, to: sample, at: monotonicNS) else {
+                if monotonicNS >= stoppedNS + 2_000_000_000 {
+                    failCalibration("optical_flow_pan_unavailable", at: monotonicNS)
+                }
                 return
             }
-            calibrationStage = .pitchPulse(panImageDelta: panImageDelta, baseline: sample, startedNS: monotonicNS)
-            sendCalibrationVelocity(
-                pitch: 25,
-                pan: 0,
-                state: "calibration_pitch_pulse",
-                target: target,
-                at: monotonicNS,
-                afterStop: { [weak self] stoppedNS in
-                    self?.calibrationStage = .pitchSettling(panImageDelta: panImageDelta, baseline: sample, stoppedNS: stoppedNS)
+            let panImageDelta = displacement.x
+            let panPoseDelta = sample.pose.panDegrees - baseline.pose.panDegrees
+            guard abs(panImageDelta) >= 0.015 else {
+                guard pulseCount < calibrationMaximumPulsesPerAxis else {
+                    failCalibration("pan_response_below_optical_jitter", at: monotonicNS)
+                    return
                 }
+                sendCalibrationPanPulse(
+                    baseline: baseline,
+                    pulseCount: pulseCount + 1,
+                    at: monotonicNS
+                )
+                return
+            }
+            sendCalibrationPitchPulse(
+                panImageDelta: panImageDelta,
+                panPoseDelta: panPoseDelta,
+                baseline: sample,
+                pulseCount: 1,
+                at: monotonicNS
             )
-        case let .pitchSettling(panImageDelta, baseline, stoppedNS):
-            guard monotonicNS >= stoppedNS + 400_000_000, matches(sample, baseline) else { return }
-            let pitchImageDelta = sample.centerY - baseline.centerY
+        case let .pitchSettling(panImageDelta, panPoseDelta, baseline, pulseCount, stoppedNS):
+            guard monotonicNS >= stoppedNS + 400_000_000 else { return }
+            guard let displacement = opticalDisplacement(from: baseline, to: sample, at: monotonicNS) else {
+                if monotonicNS >= stoppedNS + 2_000_000_000 {
+                    failCalibration("optical_flow_pitch_unavailable", at: monotonicNS)
+                }
+                return
+            }
+            let pitchImageDelta = displacement.y
+            let pitchPoseDelta = sample.pose.pitchDegrees - baseline.pose.pitchDegrees
+            guard abs(pitchImageDelta) >= 0.015 || pulseCount == calibrationMaximumPulsesPerAxis else {
+                sendCalibrationPitchPulse(
+                    panImageDelta: panImageDelta,
+                    panPoseDelta: panPoseDelta,
+                    baseline: baseline,
+                    pulseCount: pulseCount + 1,
+                    at: monotonicNS
+                )
+                return
+            }
             guard let calibration = ExternalGimbalCalibration.fromPositivePulseDisplacements(
                 panImageDelta: panImageDelta,
-                pitchImageDelta: pitchImageDelta
+                pitchImageDelta: pitchImageDelta,
+                maximumPanDegreesPerSecond: deviceCapabilities?.maximumPanDegreesPerSecond ?? 180,
+                maximumPitchDegreesPerSecond: deviceCapabilities?.maximumPitchDegreesPerSecond ?? 90,
+                deviceProfile: deviceProfile,
+                panPoseDelta: panPoseDelta,
+                pitchPoseDelta: pitchPoseDelta,
+                homePose: calibrationHomePose
             ) else {
                 failCalibration("pitch_response_below_detector_jitter", at: monotonicNS)
                 return
@@ -5432,6 +6398,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 try encoder.encode(calibration).write(to: calibrationOutputURL!, options: .atomic)
                 calibrationStage = .completed
                 calibrationMode = false
+                if let deviceProfile {
+                    poseStore.configureDeviceProfile(deviceProfile, calibration: calibration)
+                }
                 externalGate = ExternalGimbalAttentionGate(calibration: calibration, autonomousScanEnabled: true)
                 idleExplorationGate = nil
                 writer.write(RuntimeEvent(
@@ -5439,7 +6408,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     monotonicNS: monotonicNS,
                     source: "external_gimbal_calibration",
                     state: "completed",
-                    message: String(format: "pan_image_delta=%.4f; pitch_image_delta=%.4f", panImageDelta, pitchImageDelta)
+                    message: String(
+                        format: "tracker=lucas_kanade; pan_image_delta=%.4f; pitch_image_delta=%.4f; pan_pose_delta=%.3f; pitch_pose_delta=%.3f",
+                        panImageDelta,
+                        pitchImageDelta,
+                        panPoseDelta,
+                        pitchPoseDelta
+                    )
                 ))
             } catch {
                 failCalibration("write_failed", at: monotonicNS)
@@ -5449,50 +6424,114 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
-    private func calibrationSample(from belief: BeliefSnapshot) -> CalibrationSample? {
-        guard let target = belief.target, target.isActionEligible else { return nil }
+    private func calibrationSample(
+        from pixelBuffer: CVPixelBuffer,
+        captureNS: UInt64
+    ) -> CalibrationSample? {
+        guard let pose = poseStore.latestRaw(at: captureNS, maximumAgeNS: 150_000_000) else {
+            return nil
+        }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard width >= 32, height >= 32, bytesPerRow >= width * 4 else { return nil }
         return CalibrationSample(
-            sceneID: target.id,
-            kind: target.kind,
-            label: target.label,
-            centerX: target.rect.centerX,
-            centerY: target.rect.centerY
+            bgra: Data(bytes: baseAddress, count: bytesPerRow * height),
+            bytesPerRow: bytesPerRow,
+            width: width,
+            height: height,
+            captureNS: captureNS,
+            pose: pose
         )
     }
 
-    private func calibrationSample(from candidate: SceneCandidate) -> CalibrationSample? {
-        guard candidate.isActionEligible else { return nil }
-        let observation = candidate.observation
-        return CalibrationSample(
-            sceneID: candidate.id,
-            kind: observation.kind,
-            label: observation.label,
-            centerX: observation.rect.centerX,
-            centerY: observation.rect.centerY
-        )
+    private func applyCalibrationFrame(
+        _ sample: CalibrationSample,
+        at monotonicNS: UInt64
+    ) {
+        guard calibrationMode, process.isRunning, helperReady else { return }
+        switch calibrationStage {
+        case .awaitingTarget:
+            beginCalibration(with: sample, at: monotonicNS)
+        case .panPulse, .pitchPulse, .completed, .failed:
+            return
+        case .panSettling, .pitchSettling:
+            advanceCalibration(with: sample, at: monotonicNS)
+        }
     }
 
-    private func matches(_ candidate: CalibrationSample, _ baseline: CalibrationSample) -> Bool {
-        if candidate.sceneID == baseline.sceneID {
-            return true
+    private func opticalDisplacement(
+        from baseline: CalibrationSample,
+        to current: CalibrationSample,
+        at monotonicNS: UInt64
+    ) -> (x: Double, y: Double)? {
+        guard baseline.width == current.width,
+              baseline.height == current.height,
+              baseline.bytesPerRow == current.bytesPerRow else {
+            return nil
         }
-
-        // A short calibration pulse can move an otherwise stable detector box
-        // far enough that SceneField assigns a new local ID. Keep the
-        // correspondence only for an identified, same-kind target that remains
-        // near the prior image position; anonymous saliency never crosses an
-        // ID boundary during calibration.
-        guard let label = baseline.label,
-              candidate.kind == baseline.kind,
-              candidate.label == label else {
-            return false
+        let result = baseline.bgra.withUnsafeBytes { baselineBytes in
+            current.bgra.withUnsafeBytes { currentBytes in
+                soma_lucas_kanade_translation_bgra(
+                    baselineBytes.bindMemory(to: UInt8.self).baseAddress,
+                    Int32(baseline.bytesPerRow),
+                    currentBytes.bindMemory(to: UInt8.self).baseAddress,
+                    Int32(current.bytesPerRow),
+                    Int32(baseline.width),
+                    Int32(baseline.height)
+                )
+            }
         }
-        return abs(candidate.centerX - baseline.centerX) <= 0.25
-            && abs(candidate.centerY - baseline.centerY) <= 0.25
+        guard result.success != 0,
+              result.tracked_points >= 12,
+              result.confidence >= 0.55 else {
+            if lastCalibrationOpticalDiagnosticNS == 0
+                || monotonicNS >= lastCalibrationOpticalDiagnosticNS + 500_000_000 {
+                lastCalibrationOpticalDiagnosticNS = monotonicNS
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNS,
+                    source: "external_gimbal_calibration",
+                    state: "optical_flow_rejected",
+                    message: String(
+                        format: "success=%d; tracked_points=%d; confidence=%.3f; translation_x=%.2f; translation_y=%.2f; elapsed_ms=%.2f",
+                        result.success,
+                        result.tracked_points,
+                        result.confidence,
+                        result.translation_x,
+                        result.translation_y,
+                        result.elapsed_milliseconds
+                    )
+                ))
+            }
+            return nil
+        }
+        return (
+            Double(result.translation_x) / Double(baseline.width),
+            Double(result.translation_y) / Double(baseline.height)
+        )
     }
 
     private func applyEmbodimentIntent(_ intent: EmbodimentMotorIntent) {
         let now = monotonicNanoseconds()
+        if !allowsMotorControl {
+            switch intent {
+            case .captureCurrent, .suspend, .release:
+                break
+            default:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "embodiment_motor",
+                    state: "calibration_required",
+                    message: "profile=\(deviceProfile?.rawValue ?? "unknown"); motion_request_rejected"
+                ))
+                return
+            }
+        }
         switch intent {
         case let .orient(requestID, bearing, tolerance, style, expiresAtNS, reason):
             claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
@@ -5510,7 +6549,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 poseStore.projection(at: now).cameraProjectionModel.cameraBearing(
                     placing: bearing,
                     at: $0,
-                    poseProjection: externalCalibration == nil ? .identity : .obsbotTiny2Lite
+                    poseProjection: externalPoseProjection
                 )
             } ?? bearing
             cognitiveMotionMode = .waypoint(
@@ -5549,6 +6588,351 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 cameraPose: poseStore.current(maximumAgeNS: 600_000_000) ?? poseStore.lastKnown(),
                 at: now
             )
+        case let .opticalZoom(requestID, factor):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_optics",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96)))"
+                ))
+                return
+            }
+            send(String(format: "camera_zoom %@ %.4f", requestID, factor))
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_optics",
+                state: "optical_zoom_requested",
+                message: String(format: "request_id=%@; requested_factor=%.3f", String(requestID.prefix(96)), factor)
+            ))
+        case let .audioCaptureMode(requestID, mode):
+            guard let firmwareMode = deviceProfile?.firmwareAudioMode(for: mode) else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_audio_frontend",
+                    state: "capture_mode_unsupported",
+                    message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue)"
+                ))
+                return
+            }
+            guard !rejectedFirmwareAudioModes.contains(Int(firmwareMode)) else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_audio_frontend",
+                    state: "capture_mode_unavailable_on_device",
+                    message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue); firmware_mode=\(firmwareMode)"
+                ))
+                return
+            }
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_audio_frontend",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue)"
+                ))
+                return
+            }
+            send("audio_mode \(requestID) \(firmwareMode)")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_audio_frontend",
+                state: "capture_mode_requested",
+                message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue); firmware_mode=\(firmwareMode)"
+            ))
+        case let .audioInputGain(requestID, percent):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_audio_frontend",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); input_gain_percent=\(percent)"
+                ))
+                return
+            }
+            send("audio_input_gain \(requestID) \(percent)")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_audio_frontend",
+                state: "input_gain_requested",
+                message: "request_id=\(String(requestID.prefix(96))); input_gain_percent=\(percent)"
+            ))
+        case let .cameraWhiteBalance(requestID, mode, temperatureKelvin):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_imaging",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue)"
+                ))
+                return
+            }
+            switch mode {
+            case .auto:
+                send("camera_white_balance \(requestID) auto")
+            case .manual:
+                guard let temperatureKelvin else {
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: now,
+                        source: "obsbot_camera_imaging",
+                        state: "white_balance_invalid",
+                        message: "request_id=\(String(requestID.prefix(96))); manual_temperature_missing"
+                    ))
+                    return
+                }
+                send("camera_white_balance \(requestID) manual \(temperatureKelvin)")
+            }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_imaging",
+                state: "white_balance_requested",
+                message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue); temperature_kelvin=\(temperatureKelvin.map(String.init) ?? "automatic")"
+            ))
+        case let .cameraExposureLock(requestID, locked):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_imaging",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); exposure_lock=\(locked)"
+                ))
+                return
+            }
+            send("camera_ae_lock \(requestID) \(locked ? 1 : 0)")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_imaging",
+                state: "exposure_lock_requested",
+                message: "request_id=\(String(requestID.prefix(96))); locked=\(locked)"
+            ))
+        case let .cameraFocus(requestID, mode, position):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_imaging",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); focus_mode=\(mode.rawValue)"
+                ))
+                return
+            }
+            switch mode {
+            case .auto:
+                send("camera_focus \(requestID) auto")
+            case .manual:
+                guard let position else {
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: now,
+                        source: "obsbot_camera_imaging",
+                        state: "focus_invalid",
+                        message: "request_id=\(String(requestID.prefix(96))); manual_position_missing"
+                    ))
+                    return
+                }
+                send("camera_focus \(requestID) manual \(position)")
+            }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_imaging",
+                state: "focus_requested",
+                message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue); position=\(position.map(String.init) ?? "automatic")"
+            ))
+        case let .cameraAbsoluteExposure(requestID, mode, shutterCode):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_imaging",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); exposure_mode=\(mode.rawValue)"
+                ))
+                return
+            }
+            switch mode {
+            case .auto:
+                send("camera_absolute_exposure \(requestID) auto")
+            case .manual:
+                guard let shutterCode else {
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: now,
+                        source: "obsbot_camera_imaging",
+                        state: "absolute_exposure_invalid",
+                        message: "request_id=\(String(requestID.prefix(96))); manual_shutter_code_missing"
+                    ))
+                    return
+                }
+                send("camera_absolute_exposure \(requestID) manual \(shutterCode)")
+            }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_imaging",
+                state: "absolute_exposure_requested",
+                message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue); shutter_code=\(shutterCode.map(String.init) ?? "automatic")"
+            ))
+        case let .cameraFacePriority(requestID, enabled):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_imaging",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); face_priority=\(enabled)"
+                ))
+                return
+            }
+            send("camera_face_priority \(requestID) \(enabled ? 1 : 0)")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_imaging",
+                state: "face_priority_requested",
+                message: "request_id=\(String(requestID.prefix(96))); enabled=\(enabled)"
+            ))
+        case let .cameraAntiFlicker(requestID, mode):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_imaging",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); anti_flicker=\(mode.rawValue)"
+                ))
+                return
+            }
+            let firmwareMode: Int
+            switch mode {
+            case .off: firmwareMode = 0
+            case .hz50: firmwareMode = 1
+            case .hz60: firmwareMode = 2
+            case .auto: firmwareMode = 3
+            }
+            send("camera_anti_flicker \(requestID) \(firmwareMode)")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_imaging",
+                state: "anti_flicker_requested",
+                message: "request_id=\(String(requestID.prefix(96))); mode=\(mode.rawValue)"
+            ))
+        case let .cameraImageTuning(requestID, goal):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_imaging",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); image_tuning_requested"
+                ))
+                return
+            }
+            let value: (Int?) -> String = { $0.map(String.init) ?? "keep" }
+            send("camera_image_tuning \(requestID) \(value(goal.brightness)) \(value(goal.contrast)) \(value(goal.hue)) \(value(goal.saturation)) \(value(goal.sharpness))")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_imaging",
+                state: "image_tuning_requested",
+                message: "request_id=\(String(requestID.prefix(96))); brightness=\(value(goal.brightness)); contrast=\(value(goal.contrast)); hue=\(value(goal.hue)); saturation=\(value(goal.saturation)); sharpness=\(value(goal.sharpness))"
+            ))
+        case let .nativeHumanTrackingPolicy(requestID, speed, motionTracking, foreTarget, adaptiveComposition, adaptivePanGain, adaptivePitchGain, panGain, pitchGain):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_native_human_tracking",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); speed=\(speed.rawValue)"
+                ))
+                return
+            }
+            let firmwareSpeed: Int
+            switch speed {
+            case .superLazy: firmwareSpeed = 0
+            case .lazy: firmwareSpeed = 1
+            case .slow: firmwareSpeed = 2
+            case .fast: firmwareSpeed = 3
+            case .crazy: firmwareSpeed = 4
+            }
+            let gainToken: (Double?) -> String = { value in
+                value.map { String(format: "%.3f", $0) } ?? "keep"
+            }
+            send("native_tracking_policy \(requestID) \(firmwareSpeed) \(motionTracking ? 1 : 0) \(foreTarget ? 1 : 0) \(adaptiveComposition ? 1 : 0) \(adaptivePanGain ? 1 : 0) \(adaptivePitchGain ? 1 : 0) \(gainToken(panGain)) \(gainToken(pitchGain))")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_native_human_tracking",
+                state: "policy_requested",
+                message: "request_id=\(String(requestID.prefix(96))); speed=\(speed.rawValue); motion=\(motionTracking); fore_target=\(foreTarget); adaptive_composition=\(adaptiveComposition); adaptive_pan_gain=\(adaptivePanGain); adaptive_pitch_gain=\(adaptivePitchGain); pan_gain=\(gainToken(panGain)); pitch_gain=\(gainToken(pitchGain))"
+            ))
+        case let .cameraFieldOfView(requestID, degrees):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_camera_optics",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); field_of_view_degrees=\(degrees)"
+                ))
+                return
+            }
+            send("camera_fov \(requestID) \(degrees)")
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_camera_optics",
+                state: "field_of_view_requested",
+                message: "request_id=\(String(requestID.prefix(96))); field_of_view_degrees=\(degrees)"
+            ))
+        case let .deviceSoundFollowing(requestID, enabled, expiresAtNS):
+            guard helperReady else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "obsbot_audio_doa",
+                    state: "helper_unavailable",
+                    message: "request_id=\(String(requestID.prefix(96))); enabled=\(enabled)"
+                ))
+                return
+            }
+            if enabled {
+                guard let expiresAtNS else { return }
+                claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
+                cognitiveMotionMode = .suspended(reason: "firmware_sound_following")
+                stopCognitiveMotion(state: "firmware_sound_following_acquired", at: now, retainLease: true)
+                deviceSoundFollowingRequestID = requestID
+                send("doa_follow \(requestID) 1")
+                scheduleDeviceSoundFollowingExpiry(requestID: requestID, expiresAtNS: expiresAtNS)
+            } else {
+                let activeRequestID = deviceSoundFollowingRequestID
+                disableDeviceSoundFollowing(state: "explicit_disable", at: now)
+                if activeCognitiveMotorRequestID == activeRequestID {
+                    releaseCognitiveMotor(state: "firmware_sound_following_disabled", at: now)
+                }
+            }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: now,
+                source: "obsbot_audio_doa",
+                state: enabled ? "device_sound_following_requested" : "device_sound_following_disable_requested",
+                message: "request_id=\(String(requestID.prefix(96))); enabled=\(enabled)"
+            ))
         case let .explore(requestID, policy, expiresAtNS):
             claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
             cognitiveMotionMode = .exploration(policy: policy)
@@ -5587,6 +6971,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private func claimCognitiveMotor(requestID: String, expiresAtNS: UInt64, at monotonicNS: UInt64) {
         let changesOwner = activeCognitiveMotorRequestID != requestID
         let previousRequestID = activeCognitiveMotorRequestID
+        if changesOwner {
+            stopAuditoryOrienting(
+                state: "cognitive_motor_preempted",
+                at: monotonicNS,
+                resumeExploration: false
+            )
+        }
+        if changesOwner, deviceSoundFollowingRequestID != nil {
+            disableDeviceSoundFollowing(state: "cognitive_motor_preempted", at: monotonicNS)
+        }
         activeCognitiveMotorRequestID = requestID
         activeCognitiveMotorExpiresAtNS = expiresAtNS
         visualEvidenceGeneration += 1
@@ -5745,6 +7139,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         guard let guide = GimbalVisibilityRoutePlanner.guide(
             to: target,
             from: pose,
+            kinematicEnvelope: activeKinematicEnvelope,
             observationPreference: .centered
         ) else {
             stopCognitiveMotion(state: "cognitive_route_unreachable", at: monotonicNS, retainLease: true)
@@ -5775,11 +7170,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let velocity = cognitiveDynamics.advance(
             towardPitch: calibration.pitchCommand(
                 forPoseError: desiredPitch,
-                projection: .obsbotTiny2Lite
+                projection: externalPoseProjection
             ),
             pan: calibration.panCommand(
                 forPoseError: desiredPan,
-                projection: .obsbotTiny2Lite
+                projection: externalPoseProjection
             ),
             at: monotonicNS,
             maximumPitchAcceleration: profile.pitchAcceleration * accelerationMultiplier,
@@ -5807,6 +7202,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         guard let guide = GimbalVisibilityRoutePlanner.guide(
             to: bearing,
             from: pose,
+            kinematicEnvelope: activeKinematicEnvelope,
             observationPreference: .centered
         ) else {
             embodimentViewCaptureStore?.cancel(
@@ -6115,6 +7511,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private func releaseCognitiveMotor(state: String, at monotonicNS: UInt64) {
         guard activeCognitiveMotorRequestID != nil else { return }
         let releasedRequestID = activeCognitiveMotorRequestID
+        if deviceSoundFollowingRequestID == releasedRequestID {
+            disableDeviceSoundFollowing(state: state, at: monotonicNS)
+        }
         if let releasedRequestID {
             embodimentViewCaptureStore?.cancel(
                 requestID: releasedRequestID,
@@ -6132,6 +7531,51 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         ))
         scanScheduledForEvidenceGeneration = nil
         scheduleScanAfterContinuousVisualLoss()
+    }
+
+    private func scheduleDeviceSoundFollowingExpiry(requestID: String, expiresAtNS: UInt64) {
+        let now = monotonicNanoseconds()
+        let delayNS = expiresAtNS > now ? expiresAtNS - now : 0
+        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(min(delayNS, UInt64(Int.max))))) { [weak self] in
+            guard let self,
+                  self.deviceSoundFollowingRequestID == requestID,
+                  self.activeCognitiveMotorRequestID == requestID,
+                  self.activeCognitiveMotorExpiresAtNS.map({ $0 <= monotonicNanoseconds() }) == true else {
+                return
+            }
+            let expiredAt = monotonicNanoseconds()
+            self.releaseCognitiveMotor(state: "firmware_sound_following_expired", at: expiredAt)
+        }
+    }
+
+    private func disableDeviceSoundFollowing(state: String, at monotonicNS: UInt64) {
+        guard let activeRequestID = deviceSoundFollowingRequestID else { return }
+        deviceSoundFollowingRequestID = nil
+        disableFirmwareSoundFollowing(at: monotonicNS, reason: state)
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "obsbot_audio_doa",
+            state: "device_sound_following_released",
+            message: "request_id=\(String(activeRequestID.prefix(96))); reason=\(String(state.prefix(96)))"
+        ))
+    }
+
+    private func disableFirmwareSoundFollowing(at monotonicNS: UInt64, reason: String) {
+        guard helperReady,
+              process.isRunning,
+              deviceProfile?.capabilities.supportsDeviceSoundLocalization == true else {
+            return
+        }
+        let commandID = nextCommandID(prefix: "doa-disable")
+        send("doa_follow \(commandID) 0")
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "obsbot_audio_doa",
+            state: "firmware_sound_following_disabled",
+            message: "reason=\(String(reason.prefix(96))); command_id=\(commandID)"
+        ))
     }
 
     private func sendCalibrationVelocity(
@@ -6199,6 +7643,27 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             targetLabel: target?.label,
             targetProbability: target?.posteriorProbability ?? 0
         ))
+        if target?.isFaceMotorTarget == true,
+           monotonicNS >= lastFaceServoDiagnosticNS + 150_000_000 {
+            lastFaceServoDiagnosticNS = monotonicNS
+            let measuredPose = poseStore.current(maximumAgeNS: 500_000_000)
+            writer.write(RuntimeEvent(
+                event: "face_servo.command",
+                monotonicNS: monotonicNS,
+                source: "face_servo",
+                state: state,
+                message: String(
+                    format: "scene_id=%@; center_x=%.3f; center_y=%.3f; command_pitch_dps=%.2f; command_pan_dps=%.2f; feedback_pitch_degrees=%@; feedback_pan_degrees=%@",
+                    target?.id ?? "none",
+                    target?.rect.centerX ?? -1,
+                    target?.rect.centerY ?? -1,
+                    pitch,
+                    pan,
+                    measuredPose.map { String(format: "%.2f", $0.pitchDegrees) } ?? "unavailable",
+                    measuredPose.map { String(format: "%.2f", $0.panDegrees) } ?? "unavailable"
+                )
+            ))
+        }
         scheduleExternalStop(afterNS: hardStopAfterNS, state: hardStopState, afterStop: afterStop)
     }
 
@@ -6360,6 +7825,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         cameraGeometryNextPositionCommandNS = 0
         explorationBoundaryTurning = false
         poseWaitStopIssued = false
+        poseStreamDegradedReported = false
         smoothExploration.reset()
         scheduleScanControlTick(generation: scanGeneration)
     }
@@ -6374,6 +7840,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     private func cancelScan() {
         scanGeneration += 1
+        // A scheduled absence callback is valid only until the scan it may
+        // start is preempted. Keeping its generation after cancellation makes
+        // a later legitimate resume (for example after an auditory orienting
+        // lease expires) look like a duplicate and leaves the camera idle.
+        scanScheduledForEvidenceGeneration = nil
         scanRunning = false
         explorationWaypoint = nil
         explorationWaypointStartedNS = nil
@@ -6386,6 +7857,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         cameraGeometryNextPositionCommandNS = 0
         explorationBoundaryTurning = false
         poseWaitStopIssued = false
+        poseStreamDegradedReported = false
         smoothExploration.reset()
     }
 
@@ -6448,22 +7920,19 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
                 return
             }
-            guard poseStore.hasContinuousFeedback(at: now) else {
-                if !poseWaitStopIssued {
-                    poseWaitStopIssued = true
-                    if externalCommandID != nil {
-                        sendExternalStop(state: "coverage_pose_stream_unstable", at: now)
-                    }
+            if !poseStore.hasContinuousFeedback(at: now) {
+                if !poseStreamDegradedReported {
+                    poseStreamDegradedReported = true
                     writer.write(RuntimeEvent(
                         event: "source.health",
                         monotonicNS: now,
                         source: "attention_gimbal_bridge",
-                        state: "coverage_pose_stream_unstable",
-                        message: "route_paused_until_continuous_sdk_attitude_feedback"
+                        state: "coverage_pose_stream_degraded",
+                        message: "sdk_attitude_gap_observed; route_continues_with_fresh_measured_pose"
                     ))
                 }
-                scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
-                return
+            } else {
+                poseStreamDegradedReported = false
             }
             poseWaitStopIssued = false
             if cameraGeometryCalibrationMode {
@@ -6510,6 +7979,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                         if let motionGuide = GimbalVisibilityRoutePlanner.guide(
                             to: sampledDirection.bearing,
                             from: pose,
+                            kinematicEnvelope: activeKinematicEnvelope,
                             observationPreference: .centered
                         ) {
                             plannedDirection = (sampledDirection, motionGuide, coverageUniform)
@@ -6618,11 +8088,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         desired = (
                 calibration.pitchCommand(
                     forPoseError: pitchError,
-                    projection: .obsbotTiny2Lite
+                    projection: externalPoseProjection
                 ),
                 calibration.panCommand(
                     forPoseError: panError,
-                    projection: .obsbotTiny2Lite
+                    projection: externalPoseProjection
                 ) * explorationPanPolarity,
                 explorationBoundaryTurning
                     ? "coverage_boundary_turn_curve"
@@ -6733,7 +8203,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func beginBoundaryTurnIfNeeded(at monotonicNS: UInt64, pose: GimbalPose) {
-        let envelope = GimbalKinematicEnvelope.obsbotTiny2Lite
+        let envelope = activeKinematicEnvelope
         let measuredCenter = GimbalRelativeBearing(
             azimuthDegrees: pose.panDegrees,
             elevationDegrees: pose.pitchDegrees
@@ -7015,6 +8485,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func startIndicatorReassertionLoop() {
+        guard supportsIndicatorRendering else { return }
         indicatorReassertionGeneration += 1
         scheduleIndicatorReassertion(generation: indicatorReassertionGeneration)
     }
@@ -7037,12 +8508,28 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         forceHardwareReassertion: Bool = false
     ) {
         guard indicatorCalibrationPreset == nil else { return }
-        let next = indicatorInputs.visualPresentationState
+        let next = resolvedIndicatorPresentation(at: monotonicNS)
+        guard supportsIndicatorRendering else {
+            guard next != activeIndicatorState || indicatorIlluminated else { return }
+            activeIndicatorState = next
+            activeIndicatorRendering = nil
+            indicatorIlluminated = false
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNS,
+                source: "social_indicator",
+                state: "palette_unverified_for_profile",
+                message: "profile=\(deviceProfile?.rawValue ?? "unknown"); requested_state=\(next.rawValue); basic_led_control=\(supportsBasicIndicatorControl)"
+            ))
+            return
+        }
         guard ledSettings.responseMode.permits(next) else {
             guard helperReady, process.isRunning, next != activeIndicatorState || indicatorIlluminated else { return }
-            if indicatorIlluminated, let previous = activeIndicatorState {
-                let commandID = nextCommandID(prefix: "indicator-policy-clear")
-                send("indicator_clear \(commandID) \(indicatorFirmwareStateID(previous))")
+            if indicatorIlluminated, let previousRendering = activeIndicatorRendering {
+                send(indicatorClearCommand(
+                    commandID: nextCommandID(prefix: "indicator-policy-clear"),
+                    rendering: previousRendering
+                ))
             }
             activeIndicatorState = next
             activeIndicatorRendering = nil
@@ -7056,16 +8543,35 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             ))
             return
         }
+        guard let nextRendering = indicatorRendering(next) else {
+            if indicatorIlluminated, let previousRendering = activeIndicatorRendering {
+                send(indicatorClearCommand(
+                    commandID: nextCommandID(prefix: "indicator-unsupported-clear"),
+                    rendering: previousRendering
+                ))
+            }
+            activeIndicatorState = next
+            activeIndicatorRendering = nil
+            indicatorIlluminated = false
+            let nextSignal = ledSettings.signal(for: next)
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNS,
+                source: "social_indicator",
+                state: "color_unsupported_for_profile",
+                message: "profile=\(deviceProfile?.rawValue ?? "unknown"); requested_state=\(next.rawValue); color=\(nextSignal.color.rawValue)"
+            ))
+            return
+        }
         guard helperReady,
               process.isRunning,
-              forceHardwareReassertion || next != activeIndicatorState || activeIndicatorRendering != indicatorRendering(next) else { return }
+              forceHardwareReassertion || next != activeIndicatorState || activeIndicatorRendering != nextRendering else { return }
         activeIndicatorState = next
         let nextSignal = ledSettings.signal(for: next)
-        let nextRendering = indicatorRendering(next)
         let commandID = nextCommandID(prefix: "indicator-enforce")
-        send(
-            "indicator_enforce \(commandID) \(nextRendering.stateID) \(nextRendering.pulseEnabled ? 1 : 0)"
-        )
+        if let command = indicatorEnforceCommand(commandID: commandID, rendering: nextRendering) {
+            send(command)
+        }
         activeIndicatorRendering = nextRendering
         indicatorIlluminated = true
         writer.write(RuntimeEvent(
@@ -7073,13 +8579,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNS,
             source: "social_indicator",
             state: next.rawValue,
-            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); firmware_state_id=\(nextRendering.stateID); pulse_enabled=\(nextRendering.pulseEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); command_submitted=true; physical_visibility=unverified; rgb_palette=true; arbitrary_rgb=false"
+            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); transport=\(nextRendering.usesDirectRGB ? "direct_rgb" : "firmware_state"); pulse_enabled=\(nextRendering.pulseEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); command_submitted=true"
         ))
     }
 
     private func reconcileIndicatorPalette(at monotonicNS: UInt64) {
-        guard indicatorCalibrationPreset == nil else { return }
-        let next = indicatorInputs.visualPresentationState
+        guard supportsIndicatorRendering, indicatorCalibrationPreset == nil else { return }
+        let next = resolvedIndicatorPresentation(at: monotonicNS)
         guard ledSettings.responseMode.permits(next),
               helperReady,
               process.isRunning,
@@ -7090,22 +8596,67 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             refreshIndicator(at: monotonicNS)
             return
         }
-        guard !activeIndicatorRendering.pulseEnabled else { return }
+        guard activeIndicatorRendering.pattern == .steady else { return }
         let commandID = nextCommandID(prefix: "indicator-reconcile")
-        send(
-            "indicator_reconcile \(commandID) \(activeIndicatorRendering.stateID) \(activeIndicatorRendering.pulseEnabled ? 1 : 0)"
-        )
+        if let command = indicatorReconcileCommand(commandID: commandID, rendering: activeIndicatorRendering) {
+            send(command)
+        }
     }
 
-    private func indicatorRendering(_ state: SubconsciousIndicatorState) -> SOMALEDDeviceRendering {
-        ledSettings.deviceRendering(
-            for: state,
-            voiceSessionOpen: liveVoicePresentation != .inactive
-        )
+    private func indicatorRendering(_ state: SubconsciousIndicatorState) -> SOMALEDDeviceRendering? {
+        guard let deviceProfile else { return nil }
+        return ledSettings.deviceRendering(for: state, on: deviceProfile)
     }
 
-    private func indicatorFirmwareStateID(_ state: SubconsciousIndicatorState) -> Int {
-        ledSettings.signal(for: state).firmwareStateID
+    /// Face and gaze evidence arrive on different cadence paths from native
+    /// tracking acknowledgements. The contact lease is the sole authority for
+    /// retaining the invitation signal through those transient state updates,
+    /// so an older human/exploring refresh cannot replace a live eye-contact
+    /// presentation.
+    private func resolvedIndicatorPresentation(at monotonicNS: UInt64) -> SubconsciousIndicatorState {
+        if indicatorInputs.interactionState == .conversation {
+            return .conversation
+        }
+        if indicatorInputs.visualState != .none,
+           eyeContactIndicatorLease.isActive(at: monotonicNS) {
+            return .contactReady
+        }
+        return indicatorInputs.visualPresentationState
+    }
+
+    private func indicatorEnforceCommand(
+        commandID: String,
+        rendering: SOMALEDDeviceRendering
+    ) -> String? {
+        if let rgb = rendering.directRGB {
+            return "indicator_rgb_enforce \(commandID) \(rgb.red) \(rgb.green) \(rgb.blue) \(rendering.pattern.rawValue)"
+        }
+        guard let stateID = rendering.stateID else { return nil }
+        return "indicator_enforce \(commandID) \(stateID) \(rendering.pattern.rawValue)"
+    }
+
+    private func indicatorReconcileCommand(
+        commandID: String,
+        rendering: SOMALEDDeviceRendering
+    ) -> String? {
+        if let rgb = rendering.directRGB {
+            return "indicator_rgb_reconcile \(commandID) \(rgb.red) \(rgb.green) \(rgb.blue) \(rendering.pattern.rawValue)"
+        }
+        guard let stateID = rendering.stateID else { return nil }
+        return "indicator_reconcile \(commandID) \(stateID) \(rendering.pattern.rawValue)"
+    }
+
+    private func indicatorClearCommand(
+        commandID: String,
+        rendering: SOMALEDDeviceRendering
+    ) -> String {
+        if rendering.directRGB != nil {
+            return "indicator_rgb_clear \(commandID)"
+        }
+        if let stateID = rendering.stateID {
+            return "indicator_clear \(commandID) \(stateID)"
+        }
+        return ""
     }
 
     func calibrateIndicator(
@@ -7115,13 +8666,23 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             guard case .running = state, helperReady, process.isRunning else {
                 return .failure(RuntimeError.unavailable("The local LED bridge is not ready"))
             }
+            guard supportsFirmwareIndicatorPalette else {
+                return .failure(RuntimeError.unavailable("This OBSBOT profile has no validated firmware indicator palette"))
+            }
             let commandID = nextCommandID(prefix: "indicator-calibration")
             let nextStateID = preset?.firmwareStateID
+            if let nextStateID, let deviceProfile,
+               !deviceProfile.supportsFirmwareIndicatorStateID(nextStateID) {
+                return .failure(RuntimeError.unavailable("This indicator state is not supported by the connected OBSBOT profile"))
+            }
 
             if indicatorIlluminated,
-               let activeIndicatorState,
-               indicatorFirmwareStateID(activeIndicatorState) != nextStateID {
-                send("indicator_clear \(commandID)-normal \(indicatorFirmwareStateID(activeIndicatorState))")
+               let activeIndicatorRendering,
+               activeIndicatorRendering.stateID != nextStateID {
+                send(indicatorClearCommand(
+                    commandID: "\(commandID)-normal",
+                    rendering: activeIndicatorRendering
+                ))
             }
             if let indicatorCalibrationStateID,
                indicatorCalibrationStateID != nextStateID {
@@ -7158,6 +8719,32 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func send(_ command: String) {
+        let verb = command.split(separator: " ", maxSplits: 1).first.map(String.init)
+        let isMotionCommand = verb.map {
+            ["native_start", "external_velocity", "external_position", "external_pulse", "recenter"].contains($0)
+        } ?? false
+        let isBoundedCalibrationPulse = verb == "external_pulse" && allowsBoundedCalibrationPulses
+        if isMotionCommand && !allowsMotorControl && !isBoundedCalibrationPulse {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "embodiment_motor",
+                state: "calibration_required",
+                message: "profile=\(deviceProfile?.rawValue ?? "unknown"); command=\(verb ?? "unknown")"
+            ))
+            return
+        }
+        let isPaletteCommand = verb.map {
+            [
+                "indicator_set", "indicator_clear", "indicator_enforce", "indicator_reconcile",
+            ].contains($0)
+        } ?? false
+        let isDirectRGBCommand = verb.map {
+            ["indicator_rgb_enforce", "indicator_rgb_reconcile", "indicator_rgb_clear"].contains($0)
+        } ?? false
+        guard !isPaletteCommand || supportsFirmwareIndicatorPalette else { return }
+        guard !isDirectRGBCommand || supportsDirectIndicatorRGB else { return }
+        guard !command.isEmpty else { return }
         guard let data = (command + "\n").data(using: .utf8) else { return }
         try? input.write(contentsOf: data)
     }
@@ -7297,6 +8884,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
     private let voiceWorker: AudioVADWorker
     private let speechInteraction: LocalSpeechInteractionCoordinator?
     private let liveVoiceLauncher: AppServerLiveVoiceLauncher?
+    private var rejectedAudioFormatReported = false
 
     init(
         worldModel: PredictiveWorldModel,
@@ -7327,7 +8915,20 @@ private final class AudioAnalyzer: @unchecked Sendable {
                 processingMS: milliseconds(from: now, to: monotonicNanoseconds())
             )
         }
-        guard let audio = monoAudio(from: sampleBuffer) else { return }
+        guard let audio = monoAudio(from: sampleBuffer) else {
+            calibrationRecorder?.record(.rejected(.invalidInput))
+            if !rejectedAudioFormatReported {
+                rejectedAudioFormatReported = true
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "audio",
+                    state: "input_format_rejected",
+                    message: describeAudioFormat(sampleBuffer)
+                ))
+            }
+            return
+        }
         let continuous = audioPacketIsContinuous(sampleBuffer, durationNS: audio.durationNS)
         let frame = AudioVADFrame(
             samples: audio.samples,
@@ -7350,18 +8951,29 @@ private final class AudioAnalyzer: @unchecked Sendable {
         )
         if voiceWorker.submit(frame) { counters.supersedeAudioVADFrame() }
         if !continuous { lastDirection = .unknown }
-        guard voiceWorker.currentActive(), now >= nextDirectionAnalysisNS else { return }
-        nextDirectionAnalysisNS = now + 125_000_000
         let stereoOutcome = stereoSamples(from: sampleBuffer)
         if let calibrationRecorder {
-            switch stereoOutcome {
-            case let .samples(stereo):
-                calibrationRecorder.record(
-                    StereoTDOAEstimator.assess(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz)
-                )
-            case let .rejected(reason): calibrationRecorder.record(.rejected(reason))
+            // Calibration runs alongside live VAD but must not depend on its
+            // asynchronous speech lease. A direct level gate retains spoken
+            // packets at turn onset; correlation remains the acceptance test.
+            if audio.levelDB < -55 {
+                calibrationRecorder.record(.rejected(.lowEnergy))
+            } else {
+                switch stereoOutcome {
+                case let .samples(stereo):
+                    calibrationRecorder.record(
+                        StereoTDOAEstimator.assess(
+                            left: stereo.left,
+                            right: stereo.right,
+                            sampleRateHz: stereo.sampleRateHz
+                        )
+                    )
+                case let .rejected(reason): calibrationRecorder.record(.rejected(reason))
+                }
             }
         }
+        guard voiceWorker.currentActive(), now >= nextDirectionAnalysisNS else { return }
+        nextDirectionAnalysisNS = now + 125_000_000
         guard case let .samples(stereo) = stereoOutcome else { return }
         guard let directionEstimator else { return }
         let direction = directionEstimator.estimate(left: stereo.left, right: stereo.right, sampleRateHz: stereo.sampleRateHz)
@@ -7659,7 +9271,10 @@ private final class ANEFaceDetector: @unchecked Sendable {
 
     private static func detect(in pixelBuffer: CVPixelBuffer, model: VNCoreMLModel, anchors: [Anchor], confidenceThreshold: Double) throws -> [VisualObservation] {
         let request = VNCoreMLRequest(model: model)
-        request.imageCropAndScaleOption = .centerCrop
+        // Faces can enter from either edge while the gimbal searches or
+        // follows. Center-cropping a 16:9 feed to the square model input
+        // discards those side bands before the detector can see them.
+        request.imageCropAndScaleOption = .scaleFit
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         try handler.perform([request])
         let features = request.results?.compactMap { $0 as? VNCoreMLFeatureValueObservation } ?? []
@@ -7678,7 +9293,10 @@ private final class ANEFaceDetector: @unchecked Sendable {
             throw RuntimeError.configuration("Unexpected Core ML face detector output layout")
         }
 
-        let crop = cropTransform(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+        let input = SOMACore.NormalizedSquareScaleFit(
+            sourceWidth: CVPixelBufferGetWidth(pixelBuffer),
+            sourceHeight: CVPixelBufferGetHeight(pixelBuffer)
+        )
         var candidates: [VisualObservation] = []
         for index in anchors.indices {
             let scoreOffset = index * scoreStrides[1]
@@ -7691,35 +9309,26 @@ private final class ANEFaceDetector: @unchecked Sendable {
             let height = Double(value(in: rawBoxes, at: boxOffset + boxStrides[2] * 3)) / 128
             guard width > 0, height > 0 else { continue }
 
-            let top = yCenter - height / 2
-            let left = xCenter - width / 2
-            let mappedLeft = crop.offsetX + left * crop.scaleX
-            let mappedTop = crop.offsetY + top * crop.scaleY
-            let mappedWidth = width * crop.scaleX
-            let mappedHeight = height * crop.scaleY
-            let rect = SOMACore.NormalizedRect(
-                x: max(0, mappedLeft),
-                y: max(0, mappedTop),
-                width: min(mappedWidth, 1 - max(0, mappedLeft)),
-                height: min(mappedHeight, 1 - max(0, mappedTop))
-            )
-            guard rect.width > 0.02, rect.height > 0.02 else { continue }
+            guard let rect = input.sourceRect(for: SOMACore.NormalizedRect(
+                x: xCenter - width / 2,
+                y: yCenter - height / 2,
+                width: width,
+                height: height
+            )), rect.width > 0.02, rect.height > 0.02 else { continue }
             // BlazeFace predicts right eye, left eye, nose, mouth, and ear
             // keypoints after its four box values. A high box score can occur
             // on cable texture; that texture does not normally preserve the
             // bilateral eye -> nose -> mouth geometry of a face.
-            func mappedPoint(_ x: Double, _ y: Double) -> (x: Double, y: Double) {
-                (
-                    crop.offsetX + x * crop.scaleX,
-                    1 - (crop.offsetY + y * crop.scaleY)
-                )
+            func mappedPoint(_ x: Double, _ y: Double) -> (x: Double, y: Double)? {
+                input.sourcePoint(x: x, y: y)
             }
-            let facePoints = (0..<4).map { pointIndex in
+            let facePoints = (0..<4).compactMap { pointIndex in
                 mappedPoint(
                     Double(value(in: rawBoxes, at: boxOffset + boxStrides[2] * (4 + pointIndex * 2))) / 128 + anchors[index].x,
                     Double(value(in: rawBoxes, at: boxOffset + boxStrides[2] * (5 + pointIndex * 2))) / 128 + anchors[index].y
                 )
             }
+            guard facePoints.count == 4 else { continue }
             guard hasPlausibleFaceGeometry(
                 rightEye: facePoints[0],
                 leftEye: facePoints[1],
@@ -7760,8 +9369,8 @@ private final class ANEFaceDetector: @unchecked Sendable {
         let eyeY = (rightEye.y + leftEye.y) / 2
         return eyeSeparation >= rect.width * 0.12
             && eyeSeparation <= rect.width * 1.20
-            && nose.y < eyeY - rect.height * 0.04
-            && mouth.y < nose.y - rect.height * 0.04
+            && nose.y > eyeY + rect.height * 0.04
+            && mouth.y > nose.y + rect.height * 0.04
             && abs(nose.x - eyeMidX) <= rect.width * 0.45
             && abs(mouth.x - nose.x) <= rect.width * 0.55
     }
@@ -7798,16 +9407,6 @@ private final class ANEFaceDetector: @unchecked Sendable {
             return Float(array.dataPointer.bindMemory(to: Float16.self, capacity: offset + 1)[offset])
         }
         return array.dataPointer.bindMemory(to: Float.self, capacity: offset + 1)[offset]
-    }
-
-    private static func cropTransform(width: Int, height: Int) -> (offsetX: Double, offsetY: Double, scaleX: Double, scaleY: Double) {
-        guard width > 0, height > 0 else { return (0, 0, 1, 1) }
-        if width > height {
-            let scaleX = Double(height) / Double(width)
-            return ((1 - scaleX) / 2, 0, scaleX, 1)
-        }
-        let scaleY = Double(width) / Double(height)
-        return (0, (1 - scaleY) / 2, 1, scaleY)
     }
 
     private static func suppressOverlaps(_ candidates: [VisualObservation]) -> [VisualObservation] {
@@ -7868,7 +9467,7 @@ private final class SystemSaliencyDetector: @unchecked Sendable {
 /// or landmark data are written.
 private struct SystemFaceEvidence: Sendable {
     let rect: SOMACore.NormalizedRect
-    let directedEyeContact: Bool
+    let gazeState: SOMACore.VisualGazeEvidence
     /// Raw Vision gaze features for diagnostics. Kept separate from the boolean
     /// so the live trace can reveal why a face is (or is not) contact-ready
     /// without re-deriving them.
@@ -7877,6 +9476,8 @@ private struct SystemFaceEvidence: Sendable {
     let pupilOffsetX: Double?
     let pupilOffsetY: Double?
     let alignment: FaceAlignmentEvidence
+
+    var directedEyeContact: Bool { gazeState == .direct }
 }
 
 private final class SystemFaceVerifier: @unchecked Sendable {
@@ -7939,7 +9540,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             )
             return SystemFaceEvidence(
                 rect: rect,
-                directedEyeContact: gaze.directed,
+                gazeState: gaze.state,
                 yaw: gaze.yaw,
                 pitch: gaze.pitch,
                 pupilOffsetX: gaze.pupilOffsetX,
@@ -8014,24 +9615,35 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         observation: VNFaceObservation,
         landmarks: VNFaceLandmarks2D,
         rect: SOMACore.NormalizedRect
-    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, directed: Bool) {
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, state: SOMACore.VisualGazeEvidence) {
         let yaw = observation.yaw?.doubleValue
         let pitch = observation.pitch?.doubleValue
         guard rect.centerX >= 0.26, rect.centerX <= 0.74,
               rect.centerY >= 0.13, rect.centerY <= 0.89,
               rect.width * rect.height >= 0.008,
-              let yaw, abs(yaw) <= 0.50,
+              let yaw,
               let leftEye = landmarks.leftEye,
               let rightEye = landmarks.rightEye,
               let leftPupil = landmarks.leftPupil,
               let rightPupil = landmarks.rightPupil else {
-            return (yaw, pitch, nil, nil, false)
+            return (yaw, pitch, nil, nil, .unavailable)
         }
-        let left = pupilOffset(leftPupil, in: leftEye)
-        let right = pupilOffset(rightPupil, in: rightEye)
+        guard abs(yaw) <= 0.50 else {
+            return (yaw, pitch, nil, nil, .averted)
+        }
+        guard let left = pupilOffset(leftPupil, in: leftEye),
+              let right = pupilOffset(rightPupil, in: rightEye) else {
+            return (yaw, pitch, nil, nil, .unavailable)
+        }
         let directed = pupilIsCentered(leftPupil, in: leftEye)
             && pupilIsCentered(rightPupil, in: rightEye)
-        return (yaw, pitch, max(left?.x ?? 0, right?.x ?? 0), max(left?.y ?? 0, right?.y ?? 0), directed)
+        return (
+            yaw,
+            pitch,
+            max(left.x, right.x),
+            max(left.y, right.y),
+            directed ? .direct : .averted
+        )
     }
 
     private func pupilOffset(
@@ -8485,7 +10097,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let counters: LatencyCounters
     private let faceLockDiagnosticRecorder: FaceLockDiagnosticRecorder?
     private let panoramaCompositor: RollingPanoramaCompositor?
-    private let onSceneCandidates: (([SceneCandidate], UInt64) -> Void)?
+    private let onSceneCandidates: (([SceneCandidate], UInt64, UInt64) -> Void)?
     private let onCoverage: ((GimbalPose, Double, GimbalPoseProjection, CameraProjectionModel, UInt64) -> Void)?
     private let onFatalVisionFailure: (() -> Void)?
     private let poseStore: GimbalPoseStore
@@ -8502,7 +10114,9 @@ private final class VisionWorker: @unchecked Sendable {
     private var nextFaceNS: UInt64 = 0
     private var lastAppliedFaceVerificationCaptureNS: UInt64 = 0
     private var lastAppliedSceneEnrichmentCaptureNS: UInt64 = 0
-    private var directedContactEvidence: [(rect: SOMACore.NormalizedRect, observedNS: UInt64)] = []
+    private var landmarkGazeEvidence: [
+        (rect: SOMACore.NormalizedRect, state: SOMACore.VisualGazeEvidence, observedNS: UInt64)
+    ] = []
     private var identityAlignmentEvidence: [(evidence: SystemFaceEvidence, observedNS: UInt64)] = []
     private var nextSceneSnapshotNS: UInt64 = 0
     private var visualEvidenceContinuity = VisualEvidenceContinuity()
@@ -8514,6 +10128,8 @@ private final class VisionWorker: @unchecked Sendable {
     private var faceMotorContinuityLease = FaceMotorContinuityLease()
     private var unverifiedFaceRejection = UnverifiedFaceRejectionGate()
     private var panoramaBackgroundAdmission = PanoramaBackgroundAdmission()
+    private var nextSystemFaceVerificationHealthNS: UInt64 = 0
+    private var lastSystemFaceVerificationHadFace: Bool?
     private var lastAttentionEntropy = 0.0
     private var lastFaceInferenceSuccessNS: UInt64 = 0
     private var faceInferenceFailureReported = false
@@ -8543,7 +10159,7 @@ private final class VisionWorker: @unchecked Sendable {
         externalGimbalCalibration: ExternalGimbalCalibration? = nil,
         faceLockDiagnosticRecorder: FaceLockDiagnosticRecorder? = nil,
         panoramaCompositor: RollingPanoramaCompositor? = nil,
-        onSceneCandidates: (([SceneCandidate], UInt64) -> Void)? = nil,
+        onSceneCandidates: (([SceneCandidate], UInt64, UInt64) -> Void)? = nil,
         onCoverage: ((GimbalPose, Double, GimbalPoseProjection, CameraProjectionModel, UInt64) -> Void)? = nil,
         onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)? = nil,
         onDiagnosticFrame: ((CVPixelBuffer, [VisualObservation], UInt64) -> Void)? = nil,
@@ -8569,7 +10185,11 @@ private final class VisionWorker: @unchecked Sendable {
         self.onIdentityPresenceEvidence = onIdentityPresenceEvidence
         self.systemFaceVerificationWorker = SystemFaceVerificationWorker(
             pupilCenteringThreshold: pupilCenteringThreshold,
-            maximumRateHz: 5
+            // Landmark verification runs independently from the 30 Hz capture
+            // loop. At 640px it completes in well under one frame interval on
+            // the deployment host, so 12 Hz reduces face-acquisition latency
+            // without competing with the high-rate ANE detector.
+            maximumRateHz: 12
         )
         let objectDetector: ANEObjectDetector?
         let objectDetectorState: String
@@ -8583,7 +10203,7 @@ private final class VisionWorker: @unchecked Sendable {
             )
             objectDetector = detector
             objectDetectorState = "configured"
-            objectDetectorMessage = "model=YOLO11n; compute_units=\(detector.computeUnits); labels=person_only; person_confidence_threshold=\(yoloPersonConfidence); prewarm_ms=\(detector.warmupMS); worker=scene_enrichment"
+            objectDetectorMessage = "model=YOLO11n; compute_units=\(detector.computeUnits); labels=coco_80; object_confidence_threshold=\(yoloConfidence); person_confidence_threshold=\(yoloPersonConfidence); prewarm_ms=\(detector.warmupMS); worker=scene_enrichment"
         } catch {
             objectDetector = nil
             objectDetectorState = "unavailable"
@@ -8668,7 +10288,7 @@ private final class VisionWorker: @unchecked Sendable {
             monotonicNS: monotonicNanoseconds(),
             source: "system_face_verifier",
             state: "configured",
-            message: "source=VNDetectFaceLandmarksRequest; max_hz=5; latest_result_mailbox=on; corroborates_high_rate_ane_face"
+            message: "source=VNDetectFaceLandmarksRequest; max_hz=12; latest_result_mailbox=on; corroborates_high_rate_ane_face"
         ))
         writer.write(RuntimeEvent(
             event: "source.health",
@@ -8745,7 +10365,7 @@ private final class VisionWorker: @unchecked Sendable {
             onCoverage?(
                 pose,
                 projection.horizontalFieldOfViewDegrees,
-                externalGimbalCalibration == nil ? .identity : .obsbotTiny2Lite,
+                externalGimbalCalibration?.poseProjection ?? .identity,
                 projection.cameraProjectionModel,
                 completedNS
             )
@@ -8758,7 +10378,7 @@ private final class VisionWorker: @unchecked Sendable {
                 cameraPose: projection.pose,
                 horizontalFieldOfViewDegrees: projection.horizontalFieldOfViewDegrees,
                 cameraSettled: projection.cameraSettled,
-                poseProjection: externalGimbalCalibration == nil ? .identity : .obsbotTiny2Lite,
+                poseProjection: externalGimbalCalibration?.poseProjection ?? .identity,
                 cameraProjectionModel: projection.cameraProjectionModel
             )
             let sceneFaceCount = sceneCandidates.filter { $0.observation.label == "face" && $0.observedThisFrame }.count
@@ -8771,7 +10391,7 @@ private final class VisionWorker: @unchecked Sendable {
                 message: "scene_face=\(sceneFaceCount); scene_total=\(sceneObservedCount)"
             ))
             writeSceneCandidates(sceneCandidates, at: completedNS)
-            onSceneCandidates?(sceneCandidates, completedNS)
+            onSceneCandidates?(sceneCandidates, frame.captureNS, completedNS)
             onDiagnosticFrame?(frame.pixelBuffer, diagnosticCandidates, frame.captureNS)
             submitPanorama(
                 frame,
@@ -8780,19 +10400,44 @@ private final class VisionWorker: @unchecked Sendable {
                 at: completedNS
             )
             let observedCandidates = sceneCandidates.filter(\.observedThisFrame)
-            // A BlazeFace frame can contain a broad, low-confidence face
-            // hypothesis around the same physical face as a landmark-verified
-            // box. Both remain in SceneField for awareness, but only the
-            // verified geometry may become this frame's L0 attention input.
-            // Otherwise the selector can alternate between two boxes for one
-            // person and make the gimbal chase their disagreement.
+            // System Vision validates faces and gaze asynchronously. Its
+            // geometry can belong to an earlier capture, so it must never
+            // replace the capture-synchronous ANE rectangle in the motor
+            // trajectory. Both remain scene evidence, but only ANE geometry
+            // may renew a real-time face command.
+            let landmarkFaceCandidates = observedCandidates.filter {
+                $0.observation.kind == .human
+                    && $0.observation.label == "face"
+                    && $0.faceVerificationEligible
+                    && $0.observation.source == .systemFaceDetector
+            }
             let hasVerifiedFace = observedCandidates.contains {
                 $0.observation.kind == .human
                     && $0.observation.label == "face"
                     && $0.faceVerificationEligible
             }
-            let attentionCandidates = (hasVerifiedFace
-                ? observedCandidates.filter {
+            let realtimeFaceCandidates = observedCandidates.filter {
+                $0.observation.kind == .human
+                    && $0.observation.label == "face"
+                    && $0.faceVerificationEligible
+                    && $0.observation.source == .neuralFaceDetector
+            }
+            let attentionCandidates: [SceneCandidate]
+            if !realtimeFaceCandidates.isEmpty {
+                attentionCandidates = observedCandidates.filter { candidate in
+                    candidate.observation.kind != .human
+                        || realtimeFaceCandidates.contains { face in face.id == candidate.id }
+                }
+            } else if !landmarkFaceCandidates.isEmpty {
+                // A landmark result still proves the social target remains in
+                // view, but it is not a fresh motor measurement. Keep the
+                // last capture-synchronous command alive until ANE provides
+                // the next frame instead of steering from delayed geometry.
+                visualEvidenceContinuity.recordObservation(at: completedNS)
+                counters.visionFrameSkipped()
+                return
+            } else if hasVerifiedFace {
+                attentionCandidates = observedCandidates.filter {
                     // A verified face is the strongest L0 motor evidence and
                     // must be the sole human attention input this frame. The
                     // YOLO person box around the same face (and any raw
@@ -8804,19 +10449,21 @@ private final class VisionWorker: @unchecked Sendable {
                     $0.observation.kind != .human
                         || ($0.observation.label == "face" && $0.faceVerificationEligible)
                 }
-                : observedCandidates
-            ).map { $0.attentionObservation() }
-            if attentionCandidates.contains(where: { $0.kind == .human && $0.isActionEligible }) {
+            } else {
+                attentionCandidates = observedCandidates
+            }
+            let attentionObservations = attentionCandidates.map { $0.attentionObservation() }
+            if attentionObservations.contains(where: { $0.kind == .human && $0.isActionEligible }) {
                 socialAttentionLease.recordEligibleHuman(at: completedNS)
             }
             if socialAttentionLease.suppressesDefaultNonHumanAttention(
-                candidates: attentionCandidates,
+                candidates: attentionObservations,
                 at: completedNS
             ) {
                 counters.visionFrameSkipped()
                 return
             }
-            guard let observation = chooseAttentionCandidate(attentionCandidates) else {
+            guard let observation = chooseAttentionCandidate(attentionObservations) else {
                 // A weak or habituated candidate can correctly yield
                 // no-target. It still is not proof that the prior visual
                 // target vanished; use the same continuous-loss window as an
@@ -8860,7 +10507,7 @@ private final class VisionWorker: @unchecked Sendable {
             if completedNS >= nextSceneSnapshotNS {
                 nextSceneSnapshotNS = completedNS + 250_000_000
                 writeSceneCandidates(sceneCandidates, at: completedNS)
-                onSceneCandidates?(sceneCandidates, completedNS)
+                onSceneCandidates?(sceneCandidates, frame.captureNS, completedNS)
             }
             guard visualEvidenceContinuity.confirmsLoss(at: completedNS) else {
                 counters.visionFrameSkipped()
@@ -8970,9 +10617,27 @@ private final class VisionWorker: @unchecked Sendable {
                 verificationCaptureNS = verification.captureNS
                 newlyVerifiedFaces = verification.faces
                 faceConfirmationLease.record(verification.faces.map(\.rect), at: verification.captureNS)
-                directedContactEvidence = verification.faces
-                    .filter(\.directedEyeContact)
-                    .map { ($0.rect, verification.captureNS) }
+                let hasLandmarkFace = !verification.faces.isEmpty
+                if lastSystemFaceVerificationHadFace != hasLandmarkFace
+                    || faceVerificationNow >= nextSystemFaceVerificationHealthNS {
+                    let captureAgeMS = Double(faceVerificationNow - verification.captureNS) / 1_000_000
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: faceVerificationNow,
+                        source: "system_face_verifier",
+                        state: hasLandmarkFace ? "face_detected" : "no_face",
+                        message: String(
+                            format: "landmark_faces=%d; capture_age_ms=%.1f",
+                            verification.faces.count,
+                            captureAgeMS
+                        )
+                    ))
+                    lastSystemFaceVerificationHadFace = hasLandmarkFace
+                    nextSystemFaceVerificationHealthNS = faceVerificationNow + 1_000_000_000
+                }
+                landmarkGazeEvidence = verification.faces.map {
+                    ($0.rect, $0.gazeState, verification.captureNS)
+                }
                 identityAlignmentEvidence = verification.faces.map { ($0, verification.captureNS) }
             }
         }
@@ -8991,7 +10656,8 @@ private final class VisionWorker: @unchecked Sendable {
                 label: "face",
                 isActionEligible: true,
                 isFaceVerified: true,
-                isEyeContactEligible: evidence.directedEyeContact
+                isEyeContactEligible: evidence.directedEyeContact,
+                gazeEvidence: evidence.gazeState
             )
         }
         candidates += systemFaceCandidates
@@ -9001,7 +10667,7 @@ private final class VisionWorker: @unchecked Sendable {
         candidates = facePersonFusion.fuse(candidates, at: faceVerificationNow)
         let directedContactFreshnessNS = UInt64(somaEnvDouble(
             "SOMA_L0_EYE_CONTACT_FRESHNESS_MS",
-            default: 450
+            default: 350
         )) * 1_000_000
         candidates = candidates.map { candidate in
             guard isFaceCandidate(candidate) else { return candidate }
@@ -9010,12 +10676,18 @@ private final class VisionWorker: @unchecked Sendable {
             // confirmation; never promote a System-Vision rectangle by itself.
             let independentlyVerified = candidate.isFaceVerified
                 || faceConfirmationLease.permits(candidate.rect, at: faceVerificationNow)
-            let directedEyeContact = independentlyVerified
-                && directedContactEvidence.contains { evidence in
-                    faceVerificationNow >= evidence.observedNS
-                        && faceVerificationNow - evidence.observedNS <= directedContactFreshnessNS
-                        && Self.faceEvidenceMatches(evidence.rect, candidate.rect)
-                }
+            let gazeEvidence: SOMACore.VisualGazeEvidence
+            if independentlyVerified,
+               let landmarkEvidence = landmarkGazeEvidence.first(where: { evidence in
+                   faceVerificationNow >= evidence.observedNS
+                       && faceVerificationNow - evidence.observedNS <= directedContactFreshnessNS
+                       && Self.faceEvidenceMatches(evidence.rect, candidate.rect)
+               }) {
+                gazeEvidence = landmarkEvidence.state
+            } else {
+                gazeEvidence = .unavailable
+            }
+            let directedEyeContact = gazeEvidence == .direct
             if independentlyVerified {
                 faceMotorContinuityLease.record(candidate.rect, at: faceVerificationNow)
             }
@@ -9032,7 +10704,8 @@ private final class VisionWorker: @unchecked Sendable {
                 isActionEligible: candidate.isActionEligible
                     || (candidate.source == .neuralFaceDetector && independentlyVerified),
                 isFaceVerified: independentlyVerified,
-                isEyeContactEligible: directedEyeContact
+                isEyeContactEligible: directedEyeContact,
+                gazeEvidence: gazeEvidence
             )
         }
         diagnosticCandidates = diagnosticCandidates.map { candidate in
@@ -9051,7 +10724,8 @@ private final class VisionWorker: @unchecked Sendable {
                 stabilityMilliseconds: candidate.stabilityMilliseconds,
                 isActionEligible: candidate.isActionEligible,
                 isFaceVerified: independentlyVerified,
-                isEyeContactEligible: candidate.isEyeContactEligible
+                isEyeContactEligible: candidate.isEyeContactEligible,
+                gazeEvidence: candidate.gazeEvidence
             )
         }
         for candidate in candidates where isFaceCandidate(candidate) && candidate.isFaceVerified {
@@ -9741,7 +11415,11 @@ private func run(_ options: Options) throws {
         persistentLiveVoiceBroker = nil
     }
     defer { persistentLiveVoiceBroker?.stop() }
-    let spatialAtlas = SphericalSceneAtlasStore()
+    let configuredDeviceProfile = ProcessInfo.processInfo.environment["SOMA_OBSBOT_PROFILE"]
+        .flatMap(OBSBOTDeviceProfile.init(rawValue:))
+    let spatialAtlas = SphericalSceneAtlasStore(
+        kinematicEnvelope: configuredDeviceProfile?.kinematicEnvelope ?? .obsbotTiny2Lite
+    )
     let placeEmbeddingEncoder = PanoramaPlaceEmbedding.cpuSpatialSignatureEncoder
     let placeEmbeddingRevision = 1
     let placeMemoryPersistence = options.panoramaPlaceMemoryURL.map { memoryURL in
@@ -9963,6 +11641,19 @@ private func run(_ options: Options) throws {
             guard calibration.isValid else {
                 throw RuntimeError.invalidArgument("External gimbal calibration must have schema 1, signs of -1 or 1, pan 0...180, and pitch 0...90")
             }
+            if let profileText = ProcessInfo.processInfo.environment["SOMA_OBSBOT_PROFILE"],
+               let activeProfile = OBSBOTDeviceProfile(rawValue: profileText) {
+                if let calibratedProfile = calibration.deviceProfile,
+                   calibratedProfile != activeProfile {
+                    throw RuntimeError.invalidArgument("External gimbal calibration belongs to \(calibratedProfile.rawValue), not \(activeProfile.rawValue)")
+                }
+                if activeProfile == .tiny3Lite, calibration.deviceProfile != .tiny3Lite {
+                    throw RuntimeError.invalidArgument("Tiny 3 Lite requires a calibration created for Tiny 3 Lite")
+                }
+                if activeProfile == .tiny3Lite, !calibration.hasMeasuredPoseProjection {
+                    throw RuntimeError.invalidArgument("Tiny 3 Lite requires a calibration with measured SDK-attitude axis signs")
+                }
+            }
             externalGimbalCalibration = calibration
         } catch let error as RuntimeError {
             throw error
@@ -9995,16 +11686,34 @@ private func run(_ options: Options) throws {
     let worldModel = PredictiveWorldModel()
     let counters = LatencyCounters()
     let poseStore = GimbalPoseStore(geometryCalibration: cameraGeometryCalibration)
+    if let profile = configuredDeviceProfile {
+        poseStore.configureDeviceProfile(profile, calibration: externalGimbalCalibration)
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "obsbot_device",
+            state: "profile_preflight",
+            message: "profile=\(profile.rawValue); source=sdk_launcher"
+        ))
+    } else if let profileText = ProcessInfo.processInfo.environment["SOMA_OBSBOT_PROFILE"],
+              !profileText.isEmpty {
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "obsbot_device",
+            state: "profile_unrecognized",
+            message: "profile=\(profileText); source=sdk_launcher"
+        ))
+    }
     poseStoreBox.store = poseStore
-    let panoramaPoseProjection: GimbalPoseProjection = externalGimbalCalibration == nil
-        ? .identity
-        : .obsbotTiny2Lite
+    let panoramaPoseProjection: GimbalPoseProjection = externalGimbalCalibration?.poseProjection ?? .identity
     let panoramaCompositor = try options.panoramaOutputURL.map { outputURL in
         try RollingPanoramaCompositor(
             outputURL: outputURL,
             geometryCaptureDirectoryURL: options.cameraGeometryCaptureDirectoryURL,
             statusStore: panoramaStatus,
             poseProjection: panoramaPoseProjection,
+            kinematicEnvelope: configuredDeviceProfile?.kinematicEnvelope ?? .obsbotTiny2Lite,
             poseAtCapture: { poseStore.captureAlignedPose(at: $0) },
             onSpatialObservation: { pose, horizontalFieldOfViewDegrees, cameraProjectionModel, dynamicVisionRects, frameQuality, embedding, monotonicNS in
                 spatialAtlas.observePanorama(
@@ -11262,6 +12971,18 @@ private func run(_ options: Options) throws {
                 }
                 return attentionGimbalBridge.calibrateIndicator(preset: preset)
             },
+            runtimeShutdownHandler: {
+                let shutdownNS = monotonicNanoseconds()
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: shutdownNS,
+                    source: "runtime_control",
+                    state: "graceful_shutdown_requested",
+                    message: "origin=local_service_control; motion=park_then_sleep"
+                ))
+                attentionGimbalBridge?.stop()
+                return .success(())
+            },
             conversationTerminationHandler: { sessionAuthorization in
                 guard let liveVoiceLauncher else {
                     return .failure(RuntimeError.unavailable("No Live Voice session is active"))
@@ -11343,10 +13064,14 @@ private func run(_ options: Options) throws {
         externalGimbalCalibration: externalGimbalCalibration,
         faceLockDiagnosticRecorder: faceLockDiagnosticRecorder,
         panoramaCompositor: panoramaCompositor,
-        onSceneCandidates: { candidates, monotonicNS in
+        onSceneCandidates: { candidates, captureNS, monotonicNS in
             conversationContact.observe(candidates, at: monotonicNS)
             embodimentSceneBridge.submit(candidates, at: monotonicNS)
-            attentionGimbalBridge?.ingestSceneCandidates(candidates, at: monotonicNS)
+            attentionGimbalBridge?.ingestSceneCandidates(
+                candidates,
+                captureNS: captureNS,
+                at: monotonicNS
+            )
         },
         onCoverage: { pose, horizontalFieldOfViewDegrees, poseProjection, cameraProjectionModel, monotonicNS in
             attentionGimbalBridge?.ingestCoverage(
@@ -11366,6 +13091,11 @@ private func run(_ options: Options) throws {
                 pixelBuffer,
                 candidates: candidates,
                 at: captureNS
+            )
+            attentionGimbalBridge?.ingestCalibrationFrame(
+                pixelBuffer,
+                captureNS: captureNS,
+                observedNS: monotonicNanoseconds()
             )
         },
         onIdentityDecision: { decision, faceRect, isPrimaryFace, monotonicNS in
@@ -11517,6 +13247,7 @@ private func run(_ options: Options) throws {
             )
             if evidence.active, evidence.changed {
                 conversationContact.recordConversationActivity(at: completedNS)
+                attentionGimbalBridge?.ingestAuditoryOnset(at: completedNS)
             }
             let visualAdmission = LiveConversationVisualAdmission.permitsNewSession(for: belief)
             let openingAuthorization = evidence.active && evidence.changed && visualAdmission
@@ -12365,6 +14096,42 @@ private struct MonoAudio {
     let levelDB: Double
 }
 
+private func normalizedSigned24BitSample(
+    _ raw: UnsafeRawPointer,
+    sampleIndex: Int,
+    bigEndian: Bool
+) -> Float {
+    let bytes = raw.assumingMemoryBound(to: UInt8.self).advanced(by: sampleIndex * 3)
+    let packed: UInt32
+    if bigEndian {
+        packed = UInt32(bytes[2]) | UInt32(bytes[1]) << 8 | UInt32(bytes[0]) << 16
+    } else {
+        packed = UInt32(bytes[0]) | UInt32(bytes[1]) << 8 | UInt32(bytes[2]) << 16
+    }
+    let signed = Int32(bitPattern: (packed & 0x0080_0000) == 0 ? packed : packed | 0xff00_0000)
+    return Float(signed) / 8_388_607
+}
+
+private func describeAudioFormat(_ sampleBuffer: CMSampleBuffer) -> String {
+    guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+          let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else {
+        return "audio_stream_description_unavailable"
+    }
+    let hasBlockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) != nil
+    return String(
+        format: "format_id=0x%08x; sample_rate_hz=%.0f; channels=%u; bits=%u; bytes_per_frame=%u; bytes_per_packet=%u; frames_per_packet=%u; flags=0x%08x; block_buffer=%@",
+        asbd.mFormatID,
+        asbd.mSampleRate,
+        asbd.mChannelsPerFrame,
+        asbd.mBitsPerChannel,
+        asbd.mBytesPerFrame,
+        asbd.mBytesPerPacket,
+        asbd.mFramesPerPacket,
+        asbd.mFormatFlags,
+        hasBlockBuffer ? "present" : "absent"
+    )
+}
+
 private func monoAudio(from sampleBuffer: CMSampleBuffer) -> MonoAudio? {
     guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
@@ -12400,6 +14167,7 @@ private func monoAudio(from sampleBuffer: CMSampleBuffer) -> MonoAudio? {
     let flags = asbd.mFormatFlags
     let isFloat = (flags & kAudioFormatFlagIsFloat) != 0
     let isSignedInteger = (flags & kAudioFormatFlagIsSignedInteger) != 0
+    let isBigEndian = (flags & kAudioFormatFlagIsBigEndian) != 0
     let raw = UnsafeRawPointer(dataPointer)
     var samples: [Float] = []
     samples.reserveCapacity(frameCount)
@@ -12420,6 +14188,15 @@ private func monoAudio(from sampleBuffer: CMSampleBuffer) -> MonoAudio? {
             var sum: Float = 0
             for channel in 0..<valuesPerFrame {
                 sum += Float(input[base + channel]) / Float(Int16.max)
+            }
+            samples.append(sum / Float(valuesPerFrame))
+        }
+    } else if isSignedInteger, asbd.mBitsPerChannel == 24, bytesPerSample == 3 {
+        for frame in 0..<frameCount {
+            let base = frame * scalarStride
+            var sum: Float = 0
+            for channel in 0..<valuesPerFrame {
+                sum += normalizedSigned24BitSample(raw, sampleIndex: base + channel, bigEndian: isBigEndian)
             }
             samples.append(sum / Float(valuesPerFrame))
         }
@@ -12495,6 +14272,15 @@ private func stereoSamples(from sampleBuffer: CMSampleBuffer) -> StereoSampleOut
             let offset = frame * scalarStride
             left.append(Float(samples[offset]) / Float(Int16.max))
             right.append(Float(samples[offset + 1]) / Float(Int16.max))
+        }
+    } else if (flags & kAudioFormatFlagIsSignedInteger) != 0,
+              asbd.mBitsPerChannel == 24,
+              bytesPerSample == 3 {
+        let isBigEndian = (flags & kAudioFormatFlagIsBigEndian) != 0
+        for frame in 0..<frameCount {
+            let offset = frame * scalarStride
+            left.append(normalizedSigned24BitSample(raw, sampleIndex: offset, bigEndian: isBigEndian))
+            right.append(normalizedSigned24BitSample(raw, sampleIndex: offset + 1, bigEndian: isBigEndian))
         }
     } else {
         return .rejected(.invalidInput)

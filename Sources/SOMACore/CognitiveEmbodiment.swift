@@ -327,6 +327,269 @@ public struct CaptureViewGoal: Codable, Equatable, Sendable {
     public var requestsCurrentFrame: Bool { currentFrame == true }
 }
 
+/// Explicitly changes the camera's sensor crop without claiming gimbal
+/// motion.  L0 verifies firmware support and updates its spatial projection
+/// from the camera's reported factor before accepting later image evidence.
+public struct OpticalZoomGoal: Codable, Equatable, Sendable {
+    public let factor: Double
+
+    public init(factor: Double) {
+        self.factor = factor
+    }
+}
+
+/// The listening representation requested by a cognitive layer.  L0 maps this
+/// semantic choice to the active device's verified firmware mode, keeping
+/// spatial stereo available whenever sound-direction evidence is needed.
+public enum MicrophoneCaptureMode: String, Codable, CaseIterable, Sendable {
+    case spatialStereo = "spatial_stereo"
+    case conversationFront = "conversation_front"
+    case ambientOmni = "ambient_omni"
+    case rear = "rear"
+    case bidirectional
+    case music
+}
+
+public struct AudioCaptureModeGoal: Codable, Equatable, Sendable {
+    public let mode: MicrophoneCaptureMode
+
+    public init(mode: MicrophoneCaptureMode) {
+        self.mode = mode
+    }
+}
+
+/// Sets the device's microphone input gain as a percentage of its measured
+/// firmware range. This changes the captured signal only and never takes a
+/// gimbal lease or changes spatial audio mode.
+public struct AudioInputGainGoal: Codable, Equatable, Sendable {
+    public let percent: Int
+
+    public init(percent: Int) {
+        self.percent = percent
+    }
+}
+
+/// A stable sensor setting for a visual task.  This is separate from optical
+/// zoom and motion: it changes pixel consistency without taking a gimbal lease.
+public enum CameraWhiteBalanceMode: String, Codable, CaseIterable, Sendable {
+    case auto
+    case manual
+}
+
+public struct CameraWhiteBalanceGoal: Codable, Equatable, Sendable {
+    public let mode: CameraWhiteBalanceMode
+    public let temperatureKelvin: Int?
+
+    public init(mode: CameraWhiteBalanceMode, temperatureKelvin: Int? = nil) {
+        self.mode = mode
+        self.temperatureKelvin = temperatureKelvin
+    }
+}
+
+/// Holds the firmware's current auto-exposure result for a stable visual
+/// observation. This leaves aperture and shutter selection to the camera;
+/// setting `locked` to false returns to normal automatic exposure.
+public struct CameraExposureLockGoal: Codable, Equatable, Sendable {
+    public let locked: Bool
+
+    public init(locked: Bool) {
+        self.locked = locked
+    }
+}
+
+/// Focus control for a deliberate close inspection. Automatic focus remains
+/// the normal perception mode; a manual position is only meaningful while a
+/// concrete visual task needs a fixed focal plane.
+public enum CameraFocusMode: String, Codable, CaseIterable, Sendable {
+    case auto
+    case manual
+}
+
+public struct CameraFocusGoal: Codable, Equatable, Sendable {
+    public let mode: CameraFocusMode
+    public let position: Int?
+
+    public init(mode: CameraFocusMode, position: Int? = nil) {
+        self.mode = mode
+        self.position = position
+    }
+}
+
+/// Controls the firmware's absolute shutter setting. The shutter code is the
+/// device-reported value rather than a guessed exposure time; L0 rejects a
+/// code outside the active camera's measured range before applying it.
+public enum CameraAbsoluteExposureMode: String, Codable, CaseIterable, Sendable {
+    case auto
+    case manual
+}
+
+public struct CameraAbsoluteExposureGoal: Codable, Equatable, Sendable {
+    public let mode: CameraAbsoluteExposureMode
+    public let shutterCode: Int?
+
+    public init(mode: CameraAbsoluteExposureMode, shutterCode: Int? = nil) {
+        self.mode = mode
+        self.shutterCode = shutterCode
+    }
+}
+
+/// Keeps autofocus and auto-exposure biased toward detected faces. This is an
+/// imaging preference, not target selection or a gimbal command.
+public struct CameraFacePriorityGoal: Codable, Equatable, Sendable {
+    public let enabled: Bool
+
+    public init(enabled: Bool) {
+        self.enabled = enabled
+    }
+}
+
+/// The mains-frequency assumption used by the camera exposure pipeline.
+/// Choosing the local mains frequency avoids temporal banding in visual input.
+public enum CameraAntiFlickerMode: String, Codable, CaseIterable, Sendable {
+    case off
+    case hz50 = "hz_50"
+    case hz60 = "hz_60"
+    case auto
+}
+
+public struct CameraAntiFlickerGoal: Codable, Equatable, Sendable {
+    public let mode: CameraAntiFlickerMode
+
+    public init(mode: CameraAntiFlickerMode) {
+        self.mode = mode
+    }
+}
+
+/// Optional image-pipeline adjustments. Every supplied value is applied as
+/// one verified transaction so a partial firmware failure cannot leave the
+/// visual sensor in a mixed state.
+public struct CameraImageTuningGoal: Codable, Equatable, Sendable {
+    public let brightness: Int?
+    public let contrast: Int?
+    public let hue: Int?
+    public let saturation: Int?
+    public let sharpness: Int?
+
+    public init(
+        brightness: Int? = nil,
+        contrast: Int? = nil,
+        hue: Int? = nil,
+        saturation: Int? = nil,
+        sharpness: Int? = nil
+    ) {
+        self.brightness = brightness
+        self.contrast = contrast
+        self.hue = hue
+        self.saturation = saturation
+        self.sharpness = sharpness
+    }
+
+    public var containsAdjustment: Bool {
+        brightness != nil || contrast != nil || hue != nil || saturation != nil || sharpness != nil
+    }
+}
+
+/// Firmware-defined response presets for Tiny 3 human tracking.  The policy
+/// is kept semantic here; L0 maps it to the active device profile.
+public enum NativeHumanTrackingSpeed: String, Codable, CaseIterable, Sendable {
+    case superLazy = "super_lazy"
+    case lazy
+    case slow
+    case fast
+    case crazy
+}
+
+/// Configures the device-native human tracker without bypassing L0 target
+/// selection, pose feedback, or ownership transitions.
+public struct NativeHumanTrackingPolicyGoal: Codable, Equatable, Sendable {
+    public let speed: NativeHumanTrackingSpeed
+    public let motionTracking: Bool
+    public let foreTarget: Bool
+    public let adaptiveComposition: Bool
+    public let adaptivePanGain: Bool
+    public let adaptivePitchGain: Bool
+    /// Optional fixed firmware gains. Both axes must be provided together and
+    /// adaptive gain must be disabled so their effect is unambiguous.
+    public let panGain: Double?
+    public let pitchGain: Double?
+
+    public init(
+        speed: NativeHumanTrackingSpeed = .fast,
+        motionTracking: Bool = true,
+        foreTarget: Bool = true,
+        adaptiveComposition: Bool = false,
+        adaptivePanGain: Bool = false,
+        adaptivePitchGain: Bool = false,
+        panGain: Double? = nil,
+        pitchGain: Double? = nil
+    ) {
+        self.speed = speed
+        self.motionTracking = motionTracking
+        self.foreTarget = foreTarget
+        self.adaptiveComposition = adaptiveComposition
+        self.adaptivePanGain = adaptivePanGain
+        self.adaptivePitchGain = adaptivePitchGain
+        self.panGain = panGain
+        self.pitchGain = pitchGain
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case speed
+        case motionTracking
+        case foreTarget
+        case adaptiveComposition
+        case adaptivePanGain
+        case adaptivePitchGain
+        case panGain
+        case pitchGain
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        speed = try values.decode(NativeHumanTrackingSpeed.self, forKey: .speed)
+        motionTracking = try values.decode(Bool.self, forKey: .motionTracking)
+        foreTarget = try values.decode(Bool.self, forKey: .foreTarget)
+        adaptiveComposition = try values.decode(Bool.self, forKey: .adaptiveComposition)
+        adaptivePanGain = try values.decodeIfPresent(Bool.self, forKey: .adaptivePanGain) ?? false
+        adaptivePitchGain = try values.decodeIfPresent(Bool.self, forKey: .adaptivePitchGain) ?? false
+        panGain = try values.decodeIfPresent(Double.self, forKey: .panGain)
+        pitchGain = try values.decodeIfPresent(Double.self, forKey: .pitchGain)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(speed, forKey: .speed)
+        try values.encode(motionTracking, forKey: .motionTracking)
+        try values.encode(foreTarget, forKey: .foreTarget)
+        try values.encode(adaptiveComposition, forKey: .adaptiveComposition)
+        try values.encode(adaptivePanGain, forKey: .adaptivePanGain)
+        try values.encode(adaptivePitchGain, forKey: .adaptivePitchGain)
+        try values.encodeIfPresent(panGain, forKey: .panGain)
+        try values.encodeIfPresent(pitchGain, forKey: .pitchGain)
+    }
+}
+
+/// Chooses one firmware-calibrated optical field of view.  L0 applies the
+/// reported value to its spherical projection before later pixels are used.
+public struct CameraFieldOfViewGoal: Codable, Equatable, Sendable {
+    public let degrees: Int
+
+    public init(degrees: Int) {
+        self.degrees = degrees
+    }
+}
+
+/// Lets a cognitive layer temporarily delegate gimbal orientation to the
+/// device's verified sound-source follower.  It is a motor lease because the
+/// firmware moves the physical head without emitting a bearing to the host.
+public struct DeviceSoundFollowingGoal: Codable, Equatable, Sendable {
+    public let enabled: Bool
+
+    public init(enabled: Bool) {
+        self.enabled = enabled
+    }
+}
+
 public enum EmbodimentViewCaptureState: String, Codable, Sendable {
     case pendingAlignment = "pending_alignment"
     case awaitingFrame = "awaiting_frame"
@@ -398,6 +661,19 @@ public enum CognitiveEmbodimentOperation: Equatable, Sendable {
     case orient(OrientGoal)
     case explore(ExplorationPolicyGoal)
     case captureView(CaptureViewGoal)
+    case setOpticalZoom(OpticalZoomGoal)
+    case setAudioCaptureMode(AudioCaptureModeGoal)
+    case setAudioInputGain(AudioInputGainGoal)
+    case setCameraWhiteBalance(CameraWhiteBalanceGoal)
+    case setCameraExposureLock(CameraExposureLockGoal)
+    case setCameraFocus(CameraFocusGoal)
+    case setCameraAbsoluteExposure(CameraAbsoluteExposureGoal)
+    case setCameraFacePriority(CameraFacePriorityGoal)
+    case setCameraAntiFlicker(CameraAntiFlickerGoal)
+    case setCameraImageTuning(CameraImageTuningGoal)
+    case setNativeHumanTrackingPolicy(NativeHumanTrackingPolicyGoal)
+    case setCameraFieldOfView(CameraFieldOfViewGoal)
+    case setDeviceSoundFollowing(DeviceSoundFollowingGoal)
     case express(SocialGimbalExpression)
     case release
 }
@@ -412,6 +688,19 @@ extension CognitiveEmbodimentOperation: Codable {
         case orient
         case explore
         case captureView = "capture_view"
+        case setOpticalZoom = "set_optical_zoom"
+        case setAudioCaptureMode = "set_audio_capture_mode"
+        case setAudioInputGain = "set_audio_input_gain"
+        case setCameraWhiteBalance = "set_camera_white_balance"
+        case setCameraExposureLock = "set_camera_exposure_lock"
+        case setCameraFocus = "set_camera_focus"
+        case setCameraAbsoluteExposure = "set_camera_absolute_exposure"
+        case setCameraFacePriority = "set_camera_face_priority"
+        case setCameraAntiFlicker = "set_camera_anti_flicker"
+        case setCameraImageTuning = "set_camera_image_tuning"
+        case setNativeHumanTrackingPolicy = "set_native_human_tracking_policy"
+        case setCameraFieldOfView = "set_camera_field_of_view"
+        case setDeviceSoundFollowing = "set_device_sound_following"
         case express
         case release
     }
@@ -433,6 +722,32 @@ extension CognitiveEmbodimentOperation: Codable {
             self = .explore(try values.decode(ExplorationPolicyGoal.self, forKey: .payload))
         case .captureView:
             self = .captureView(try values.decode(CaptureViewGoal.self, forKey: .payload))
+        case .setOpticalZoom:
+            self = .setOpticalZoom(try values.decode(OpticalZoomGoal.self, forKey: .payload))
+        case .setAudioCaptureMode:
+            self = .setAudioCaptureMode(try values.decode(AudioCaptureModeGoal.self, forKey: .payload))
+        case .setAudioInputGain:
+            self = .setAudioInputGain(try values.decode(AudioInputGainGoal.self, forKey: .payload))
+        case .setCameraWhiteBalance:
+            self = .setCameraWhiteBalance(try values.decode(CameraWhiteBalanceGoal.self, forKey: .payload))
+        case .setCameraExposureLock:
+            self = .setCameraExposureLock(try values.decode(CameraExposureLockGoal.self, forKey: .payload))
+        case .setCameraFocus:
+            self = .setCameraFocus(try values.decode(CameraFocusGoal.self, forKey: .payload))
+        case .setCameraAbsoluteExposure:
+            self = .setCameraAbsoluteExposure(try values.decode(CameraAbsoluteExposureGoal.self, forKey: .payload))
+        case .setCameraFacePriority:
+            self = .setCameraFacePriority(try values.decode(CameraFacePriorityGoal.self, forKey: .payload))
+        case .setCameraAntiFlicker:
+            self = .setCameraAntiFlicker(try values.decode(CameraAntiFlickerGoal.self, forKey: .payload))
+        case .setCameraImageTuning:
+            self = .setCameraImageTuning(try values.decode(CameraImageTuningGoal.self, forKey: .payload))
+        case .setNativeHumanTrackingPolicy:
+            self = .setNativeHumanTrackingPolicy(try values.decode(NativeHumanTrackingPolicyGoal.self, forKey: .payload))
+        case .setCameraFieldOfView:
+            self = .setCameraFieldOfView(try values.decode(CameraFieldOfViewGoal.self, forKey: .payload))
+        case .setDeviceSoundFollowing:
+            self = .setDeviceSoundFollowing(try values.decode(DeviceSoundFollowingGoal.self, forKey: .payload))
         case .express:
             self = .express(try values.decode(SocialGimbalExpression.self, forKey: .payload))
         case .release:
@@ -463,6 +778,45 @@ extension CognitiveEmbodimentOperation: Codable {
             try values.encode(payload, forKey: .payload)
         case let .captureView(payload):
             try values.encode(Kind.captureView, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setOpticalZoom(payload):
+            try values.encode(Kind.setOpticalZoom, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setAudioCaptureMode(payload):
+            try values.encode(Kind.setAudioCaptureMode, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setAudioInputGain(payload):
+            try values.encode(Kind.setAudioInputGain, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraWhiteBalance(payload):
+            try values.encode(Kind.setCameraWhiteBalance, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraExposureLock(payload):
+            try values.encode(Kind.setCameraExposureLock, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraFocus(payload):
+            try values.encode(Kind.setCameraFocus, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraAbsoluteExposure(payload):
+            try values.encode(Kind.setCameraAbsoluteExposure, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraFacePriority(payload):
+            try values.encode(Kind.setCameraFacePriority, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraAntiFlicker(payload):
+            try values.encode(Kind.setCameraAntiFlicker, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraImageTuning(payload):
+            try values.encode(Kind.setCameraImageTuning, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setNativeHumanTrackingPolicy(payload):
+            try values.encode(Kind.setNativeHumanTrackingPolicy, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setCameraFieldOfView(payload):
+            try values.encode(Kind.setCameraFieldOfView, forKey: .type)
+            try values.encode(payload, forKey: .payload)
+        case let .setDeviceSoundFollowing(payload):
+            try values.encode(Kind.setDeviceSoundFollowing, forKey: .type)
             try values.encode(payload, forKey: .payload)
         case let .express(payload):
             try values.encode(Kind.express, forKey: .type)
@@ -628,6 +982,74 @@ public struct CognitiveEmbodimentRequest: Codable, Equatable, Sendable {
                   goal.fieldOfViewDegrees.map({ $0.isFinite && $0 >= 5 && $0 <= 120 }) ?? true else {
                 throw CognitiveEmbodimentError.invalidCaptureGoal
             }
+        case let .setOpticalZoom(goal):
+            guard goal.factor.isFinite, goal.factor >= 1, goal.factor <= 2 else {
+                throw CognitiveEmbodimentError.invalidRequest
+            }
+        case .setAudioCaptureMode:
+            break
+        case let .setAudioInputGain(goal):
+            guard (0...100).contains(goal.percent) else {
+                throw CognitiveEmbodimentError.invalidRequest
+            }
+        case let .setCameraWhiteBalance(goal):
+            switch goal.mode {
+            case .auto:
+                guard goal.temperatureKelvin == nil else { throw CognitiveEmbodimentError.invalidRequest }
+            case .manual:
+                guard let temperature = goal.temperatureKelvin,
+                      (2_000...9_000).contains(temperature) else {
+                    throw CognitiveEmbodimentError.invalidRequest
+                }
+            }
+        case .setCameraExposureLock:
+            break
+        case let .setCameraFocus(goal):
+            switch goal.mode {
+            case .auto:
+                guard goal.position == nil else { throw CognitiveEmbodimentError.invalidRequest }
+            case .manual:
+                guard let position = goal.position, (0...100).contains(position) else {
+                    throw CognitiveEmbodimentError.invalidRequest
+                }
+            }
+        case let .setCameraAbsoluteExposure(goal):
+            switch goal.mode {
+            case .auto:
+                guard goal.shutterCode == nil else { throw CognitiveEmbodimentError.invalidRequest }
+            case .manual:
+                guard let shutterCode = goal.shutterCode, (0...100).contains(shutterCode) else {
+                    throw CognitiveEmbodimentError.invalidRequest
+                }
+            }
+        case .setCameraFacePriority:
+            break
+        case .setCameraAntiFlicker:
+            break
+        case let .setCameraImageTuning(goal):
+            let values = [goal.brightness, goal.contrast, goal.hue, goal.saturation, goal.sharpness]
+            guard goal.containsAdjustment, values.allSatisfy({ value in
+                value.map { (0...100).contains($0) } ?? true
+            }) else {
+                throw CognitiveEmbodimentError.invalidRequest
+            }
+        case let .setNativeHumanTrackingPolicy(goal):
+            let hasManualGain = goal.panGain != nil || goal.pitchGain != nil
+            guard !hasManualGain || (
+                goal.panGain != nil && goal.pitchGain != nil
+                    && !goal.adaptivePanGain && !goal.adaptivePitchGain
+                    && goal.panGain!.isFinite && goal.pitchGain!.isFinite
+                    && (0.1...1.0).contains(goal.panGain!)
+                    && (0.1...1.0).contains(goal.pitchGain!)
+            ) else {
+                throw CognitiveEmbodimentError.invalidRequest
+            }
+        case let .setCameraFieldOfView(goal):
+            guard [65, 78, 86].contains(goal.degrees) else {
+                throw CognitiveEmbodimentError.invalidRequest
+            }
+        case .setDeviceSoundFollowing:
+            break
         case .express, .release:
             break
         }
@@ -650,6 +1072,19 @@ public enum CognitiveEmbodimentOperationKind: String, Codable, CaseIterable, Sen
     case orient
     case explore
     case captureView = "capture_view"
+    case setOpticalZoom = "set_optical_zoom"
+    case setAudioCaptureMode = "set_audio_capture_mode"
+    case setAudioInputGain = "set_audio_input_gain"
+    case setCameraWhiteBalance = "set_camera_white_balance"
+    case setCameraExposureLock = "set_camera_exposure_lock"
+    case setCameraFocus = "set_camera_focus"
+    case setCameraAbsoluteExposure = "set_camera_absolute_exposure"
+    case setCameraFacePriority = "set_camera_face_priority"
+    case setCameraAntiFlicker = "set_camera_anti_flicker"
+    case setCameraImageTuning = "set_camera_image_tuning"
+    case setNativeHumanTrackingPolicy = "set_native_human_tracking_policy"
+    case setCameraFieldOfView = "set_camera_field_of_view"
+    case setDeviceSoundFollowing = "set_device_sound_following"
     case express
     case release
 }
@@ -664,6 +1099,19 @@ public extension CognitiveEmbodimentOperation {
         case .orient: .orient
         case .explore: .explore
         case .captureView: .captureView
+        case .setOpticalZoom: .setOpticalZoom
+        case .setAudioCaptureMode: .setAudioCaptureMode
+        case .setAudioInputGain: .setAudioInputGain
+        case .setCameraWhiteBalance: .setCameraWhiteBalance
+        case .setCameraExposureLock: .setCameraExposureLock
+        case .setCameraFocus: .setCameraFocus
+        case .setCameraAbsoluteExposure: .setCameraAbsoluteExposure
+        case .setCameraFacePriority: .setCameraFacePriority
+        case .setCameraAntiFlicker: .setCameraAntiFlicker
+        case .setCameraImageTuning: .setCameraImageTuning
+        case .setNativeHumanTrackingPolicy: .setNativeHumanTrackingPolicy
+        case .setCameraFieldOfView: .setCameraFieldOfView
+        case .setDeviceSoundFollowing: .setDeviceSoundFollowing
         case .express: .express
         case .release: .release
         }
@@ -675,7 +1123,9 @@ public extension CognitiveEmbodimentOperation {
             return true
         case let .captureView(goal):
             return !goal.requestsCurrentFrame
-        case .registerTarget, .removeTarget, .setAttentionPolicy, .release:
+        case let .setDeviceSoundFollowing(goal):
+            return goal.enabled
+        case .registerTarget, .removeTarget, .setAttentionPolicy, .setOpticalZoom, .setAudioCaptureMode, .setAudioInputGain, .setCameraWhiteBalance, .setCameraExposureLock, .setCameraFocus, .setCameraAbsoluteExposure, .setCameraFacePriority, .setCameraAntiFlicker, .setCameraImageTuning, .setNativeHumanTrackingPolicy, .setCameraFieldOfView, .release:
             return false
         }
     }
@@ -912,6 +1362,149 @@ public final class ShadowEmbodimentArbiter: @unchecked Sendable {
                 request: request,
                 status: .accepted,
                 reason: "current_frame_capture_ready",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setOpticalZoom:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "optical_zoom_ready_l0_adapter"
+                    : "optical_zoom_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setAudioCaptureMode:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "audio_capture_mode_ready_l0_adapter"
+                    : "audio_capture_mode_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setAudioInputGain:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "audio_input_gain_ready_l0_adapter"
+                    : "audio_input_gain_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraWhiteBalance:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_white_balance_ready_l0_adapter"
+                    : "camera_white_balance_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraExposureLock:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_exposure_lock_ready_l0_adapter"
+                    : "camera_exposure_lock_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraFocus:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_focus_ready_l0_adapter"
+                    : "camera_focus_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraAbsoluteExposure:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_absolute_exposure_ready_l0_adapter"
+                    : "camera_absolute_exposure_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraFacePriority:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_face_priority_ready_l0_adapter"
+                    : "camera_face_priority_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraAntiFlicker:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_anti_flicker_ready_l0_adapter"
+                    : "camera_anti_flicker_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraImageTuning:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_image_tuning_ready_l0_adapter"
+                    : "camera_image_tuning_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setNativeHumanTrackingPolicy:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "native_human_tracking_policy_ready_l0_adapter"
+                    : "native_human_tracking_policy_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case .setCameraFieldOfView:
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "camera_field_of_view_ready_l0_adapter"
+                    : "camera_field_of_view_ready_shadow_no_actuation",
+                preemptedRequestID: nil,
+                at: monotonicNS
+            )
+        case let .setDeviceSoundFollowing(goal) where goal.enabled:
+            return claimMotor(request, at: monotonicNS)
+        case .setDeviceSoundFollowing:
+            let activeOwner = activeMotorGoal?.lease.ownerID
+            guard activeOwner == nil || activeOwner == request.lease.ownerID else {
+                return decision(
+                    request: request,
+                    status: .rejected,
+                    reason: "sound_following_disable_not_owner",
+                    preemptedRequestID: nil,
+                    at: monotonicNS
+                )
+            }
+            activeMotorGoal = nil
+            return decision(
+                request: request,
+                status: .accepted,
+                reason: physicalActuationEnabled
+                    ? "device_sound_following_disabled_l0_adapter"
+                    : "device_sound_following_disabled_shadow_no_actuation",
                 preemptedRequestID: nil,
                 at: monotonicNS
             )

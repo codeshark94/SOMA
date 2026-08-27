@@ -2,6 +2,9 @@ import Darwin
 import Foundation
 
 public enum EmbodimentIPCCommandKind: String, Codable, Sendable {
+    /// Owner-local service lifecycle control. This is intentionally not an
+    /// embodied request: it drains the live runtime before launchd unloads it.
+    case runtimeShutdown = "runtime_shutdown"
     case endConversation = "end_conversation"
     case submit
     case snapshot
@@ -314,6 +317,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     public typealias ConversationTerminationHandler = @Sendable (
         _ sessionAuthorization: String?
     ) -> Result<Void, Error>
+    public typealias RuntimeShutdownHandler = @Sendable () -> Result<Void, Error>
     public typealias SessionAuthorizationProvider = @Sendable (
         _ token: String?,
         _ scope: SOMASessionCapabilityScope
@@ -331,6 +335,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let identityEnrollmentProvider: IdentityEnrollmentProvider
     private let indicatorCalibrationHandler: IndicatorCalibrationHandler
     private let conversationTerminationHandler: ConversationTerminationHandler
+    private let runtimeShutdownHandler: RuntimeShutdownHandler
     private let sessionAuthorizationProvider: SessionAuthorizationProvider
     private let queue = DispatchQueue(label: "soma.embodiment.shadow.socket")
     private let group = DispatchGroup()
@@ -352,6 +357,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         identityRosterProvider: @escaping IdentityRosterProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         identityEnrollmentProvider: @escaping IdentityEnrollmentProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
+        runtimeShutdownHandler: @escaping RuntimeShutdownHandler = { .failure(EmbodimentIPCError.unavailable) },
         conversationTerminationHandler: @escaping ConversationTerminationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
         sessionAuthorizationProvider: @escaping SessionAuthorizationProvider = { _, _ in .success(()) },
         onHealth: @escaping HealthHandler = { _, _ in }
@@ -367,6 +373,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.identityEnrollmentProvider = identityEnrollmentProvider
         self.indicatorCalibrationHandler = indicatorCalibrationHandler
         self.conversationTerminationHandler = conversationTerminationHandler
+        self.runtimeShutdownHandler = runtimeShutdownHandler
         self.sessionAuthorizationProvider = sessionAuthorizationProvider
         self.onHealth = onHealth
     }
@@ -456,6 +463,23 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             let data = try Self.readLine(from: clientFD, maximumBytes: maximumMessageBytes)
             let command = try JSONDecoder().decode(EmbodimentIPCCommand.self, from: data)
             switch command.kind {
+            case .runtimeShutdown:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.informationNeeds == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil,
+                      command.sessionAuthorization == nil else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                switch runtimeShutdownHandler() {
+                case .success:
+                    writeReply(.init(ok: true), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
             case .endConversation:
                 guard command.request == nil,
                       command.requestID == nil,
@@ -740,12 +764,12 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         guard result == 0 else { throw posixError("Cannot bind embodiment IPC socket") }
     }
 
-    fileprivate static func setTimeouts(_ fd: Int32) {
+    fileprivate static func setTimeouts(_ fd: Int32, timeoutSeconds: Int = 2) {
         var noSignal: Int32 = 1
         withUnsafePointer(to: &noSignal) { pointer in
             _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, pointer, socklen_t(MemoryLayout<Int32>.size))
         }
-        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        var timeout = timeval(tv_sec: max(1, min(timeoutSeconds, 30)), tv_usec: 0)
         withUnsafePointer(to: &timeout) { pointer in
             _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, pointer, socklen_t(MemoryLayout<timeval>.size))
             _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, pointer, socklen_t(MemoryLayout<timeval>.size))
@@ -796,7 +820,8 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
 public enum EmbodimentShadowSocketClient {
     public static func send(
         _ command: EmbodimentIPCCommand,
-        socketURL: URL
+        socketURL: URL,
+        timeoutSeconds: Int = 2
     ) throws -> EmbodimentIPCReply {
         try EmbodimentShadowSocketServer.validateSocketPath(socketURL.path)
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -805,7 +830,7 @@ public enum EmbodimentShadowSocketClient {
             Darwin.shutdown(fd, SHUT_RDWR)
             Darwin.close(fd)
         }
-        EmbodimentShadowSocketServer.setTimeouts(fd)
+        EmbodimentShadowSocketServer.setTimeouts(fd, timeoutSeconds: timeoutSeconds)
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(socketURL.path.utf8) + [0]

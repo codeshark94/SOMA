@@ -796,6 +796,28 @@ public enum CognitiveMemoryError: Error, Equatable, Sendable {
     case invalidReason
 }
 
+/// A non-destructive recovery candidate for an encrypted memory journal. The
+/// original journal is never modified; callers can inspect the candidate and
+/// decide whether to activate it separately.
+public struct CognitiveMemoryJournalRecoveryReport: Sendable, Equatable {
+    public let sourceEntryCount: Int
+    public let recoveredEntryCount: Int
+    public let firstRejectedLine: Int?
+    public let recoveryDirectoryURL: URL
+
+    public init(
+        sourceEntryCount: Int,
+        recoveredEntryCount: Int,
+        firstRejectedLine: Int?,
+        recoveryDirectoryURL: URL
+    ) {
+        self.sourceEntryCount = sourceEntryCount
+        self.recoveredEntryCount = recoveredEntryCount
+        self.firstRejectedLine = firstRejectedLine
+        self.recoveryDirectoryURL = recoveryDirectoryURL
+    }
+}
+
 public struct CognitiveMemoryValidator: Sendable {
     public let policy: CognitiveMemoryValidationPolicy
 
@@ -1083,6 +1105,12 @@ private struct MemoryJournalEnvelope: Codable {
     let ciphertext: String
 }
 
+private struct MemoryReplayState {
+    var sequence: UInt64 = 0
+    var current: [UUID: CognitiveMemoryRecord] = [:]
+    var historyByID: [UUID: [CognitiveMemoryRecord]] = [:]
+}
+
 private struct MemoryJournalCipher {
     private let key: SymmetricKey
 
@@ -1192,6 +1220,55 @@ public actor CognitiveMemoryStore {
         sequence = opened.sequence
         current = opened.current
         historyByID = opened.historyByID
+    }
+
+    /// Stages the longest cryptographically and semantically valid journal
+    /// prefix into a new directory. It never replaces the source journal or
+    /// copies the installation key, so activation remains an explicit action.
+    public static func stageRecoverablePrefix(
+        from directoryURL: URL,
+        encryptionKey: CognitiveMemoryEncryptionKey,
+        into recoveryDirectoryURL: URL,
+        policy: CognitiveMemoryValidationPolicy = .init()
+    ) throws -> CognitiveMemoryJournalRecoveryReport {
+        let manager = FileManager.default
+        let sourceURL = directoryURL.appendingPathComponent(journalFilename)
+        let source = try Data(contentsOf: sourceURL)
+        let lines = source.split(separator: 0x0A, omittingEmptySubsequences: true)
+        guard !manager.fileExists(atPath: recoveryDirectoryURL.path) else {
+            throw POSIXError(.EEXIST)
+        }
+
+        let cipher = MemoryJournalCipher(key: encryptionKey)
+        let validator = CognitiveMemoryValidator(policy: policy)
+        var state = MemoryReplayState()
+        var recovered = Data()
+        var firstRejectedLine: Int?
+
+        for (offset, line) in lines.enumerated() {
+            do {
+                let entry = try cipher.open(Data(line), line: offset + 1)
+                try apply(entry, at: offset + 1, to: &state, validator: validator)
+                recovered.append(contentsOf: line)
+                recovered.append(0x0A)
+            } catch {
+                firstRejectedLine = offset + 1
+                break
+            }
+        }
+
+        try manager.createDirectory(at: recoveryDirectoryURL, withIntermediateDirectories: false)
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: recoveryDirectoryURL.path)
+        let recoveredJournalURL = recoveryDirectoryURL.appendingPathComponent(journalFilename)
+        manager.createFile(atPath: recoveredJournalURL.path, contents: recovered, attributes: [.posixPermissions: 0o600])
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recoveredJournalURL.path)
+
+        return .init(
+            sourceEntryCount: lines.count,
+            recoveredEntryCount: Int(state.sequence),
+            firstRejectedLine: firstRejectedLine,
+            recoveryDirectoryURL: recoveryDirectoryURL
+        )
     }
 
     /// The longest expiry the validation policy permits for medium-term records.
@@ -1822,54 +1899,63 @@ public actor CognitiveMemoryStore {
         current: [UUID: CognitiveMemoryRecord],
         historyByID: [UUID: [CognitiveMemoryRecord]]
     ) {
-        var sequence: UInt64 = 0
-        var current: [UUID: CognitiveMemoryRecord] = [:]
-        var historyByID: [UUID: [CognitiveMemoryRecord]] = [:]
+        var state = MemoryReplayState()
         let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
         for (offset, line) in lines.enumerated() {
             let lineNumber = offset + 1
             let entry = try cipher.open(Data(line), line: lineNumber)
-            guard entry.schemaVersion == MemoryJournalEntry.currentSchemaVersion else {
-                throw CognitiveMemoryError.unsupportedSchema(entry.schemaVersion)
+            try apply(entry, at: lineNumber, to: &state, validator: validator)
+        }
+        return (state.sequence, state.current, state.historyByID)
+    }
+
+    private static func apply(
+        _ entry: MemoryJournalEntry,
+        at lineNumber: Int,
+        to state: inout MemoryReplayState,
+        validator: CognitiveMemoryValidator
+    ) throws {
+        guard entry.schemaVersion == MemoryJournalEntry.currentSchemaVersion else {
+            throw CognitiveMemoryError.unsupportedSchema(entry.schemaVersion)
+        }
+        guard entry.sequence == state.sequence + 1 else {
+            throw CognitiveMemoryError.corruptJournal(line: lineNumber)
+        }
+        switch entry.operation {
+        case .upsert:
+            guard let record = entry.record, record.id == entry.recordID else {
+                throw CognitiveMemoryError.corruptJournal(line: lineNumber)
             }
-            guard entry.sequence == sequence + 1 else { throw CognitiveMemoryError.corruptJournal(line: lineNumber) }
-            switch entry.operation {
-            case .upsert:
-                guard let record = entry.record, record.id == entry.recordID else {
-                    throw CognitiveMemoryError.corruptJournal(line: lineNumber)
-                }
-                try validator.validate(record)
-                if let previous = historyByID[record.id]?.last,
-                   record.revision != previous.revision + 1 {
+            try validator.validate(record)
+            if let previous = state.historyByID[record.id]?.last,
+               record.revision != previous.revision + 1 {
+                throw CognitiveMemoryError.revisionConflict(record.id)
+            }
+            if let previous = state.historyByID[record.id]?.last,
+               record.createdAt != previous.createdAt || record.updatedAt < previous.updatedAt {
+                throw CognitiveMemoryError.nonMonotonicUpdate(record.id)
+            }
+            if state.historyByID[record.id] == nil, record.revision != 1 {
+                // A compacted journal intentionally retains only the tail
+                // of a long revision chain. Its first retained record is
+                // therefore a verified baseline, not necessarily revision
+                // one; subsequent entries still have to be contiguous.
+                guard entry.reason == "compacted" else {
                     throw CognitiveMemoryError.revisionConflict(record.id)
                 }
-                if let previous = historyByID[record.id]?.last,
-                   record.createdAt != previous.createdAt || record.updatedAt < previous.updatedAt {
-                    throw CognitiveMemoryError.nonMonotonicUpdate(record.id)
-                }
-                if historyByID[record.id] == nil, record.revision != 1 {
-                    // A compacted journal intentionally retains only the tail
-                    // of a long revision chain. Its first retained record is
-                    // therefore a verified baseline, not necessarily revision
-                    // one; subsequent entries still have to be contiguous.
-                    guard entry.reason == "compacted" else {
-                        throw CognitiveMemoryError.revisionConflict(record.id)
-                    }
-                }
-                historyByID[record.id, default: []].append(record)
-                current[record.id] = record
-            case .delete:
-                guard entry.record == nil,
-                      let previous = current[entry.recordID],
-                      entry.timestamp >= previous.updatedAt else {
-                    throw CognitiveMemoryError.corruptJournal(line: lineNumber)
-                }
-                current.removeValue(forKey: entry.recordID)
-                historyByID.removeValue(forKey: entry.recordID)
             }
-            sequence = entry.sequence
+            state.historyByID[record.id, default: []].append(record)
+            state.current[record.id] = record
+        case .delete:
+            guard entry.record == nil,
+                      let previous = state.current[entry.recordID],
+                      entry.timestamp >= previous.updatedAt else {
+                throw CognitiveMemoryError.corruptJournal(line: lineNumber)
+            }
+            state.current.removeValue(forKey: entry.recordID)
+            state.historyByID.removeValue(forKey: entry.recordID)
         }
-        return (sequence, current, historyByID)
+        state.sequence = entry.sequence
     }
 }
 

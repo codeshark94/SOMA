@@ -58,38 +58,69 @@ public enum SOMALEDResponseMode: String, CaseIterable, Codable, Sendable {
     }
 }
 
-/// A user-facing colour available from the Tiny 2 Lite indicator. There is no
-/// public RGB API, so these map to the installed device-palette state IDs.
+/// A user-facing colour available from the connected OBSBOT indicator. There
+/// is no public RGB API, so each entry maps to a firmware palette state.
 public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
     case yellow
-    case blue
     case green
+    case blue
 
-    public var displayName: String { rawValue.capitalized }
-
-    /// State 57 is the Tiny firmware's tracking palette entry.
-    public var firmwareStateID: Int {
+    public var displayName: String {
         switch self {
-        case .yellow: 16
-        case .blue: 57
-        case .green: 54
+        case .yellow, .green, .blue:
+            rawValue.capitalized
         }
     }
+
+    /// The setting surface stays semantic. The connected product profile
+    /// resolves each colour to its own firmware palette entry at runtime.
+    public static let selectableCases: [Self] = allCases
+
 }
 
-/// A Tiny 2 Lite status-indicator rendering combines an opaque firmware
-/// palette entry with an optional bridge-owned pulse.
-public struct SOMALEDDeviceRendering: Equatable, Sendable {
-    public let stateID: Int
-    public let pulseEnabled: Bool
+public struct SOMALEDDirectRGB: Equatable, Sendable {
+    public let red: UInt8
+    public let green: UInt8
+    public let blue: UInt8
 
-    public init(stateID: Int, pulseEnabled: Bool) {
-        self.stateID = stateID
-        self.pulseEnabled = pulseEnabled
+    public init(red: UInt8, green: UInt8, blue: UInt8) {
+        self.red = red
+        self.green = green
+        self.blue = blue
     }
+
+    /// The Tiny 3 indicator transport accepts semantic RGB values directly.
+    /// Keep the supported palette deliberately small: cognition selects a
+    /// social state, never an arbitrary decorative colour.
+    public static let green = Self(red: 0, green: 255, blue: 0)
+    public static let yellow = Self(red: 255, green: 210, blue: 0)
+    public static let blue = Self(red: 0, green: 0, blue: 255)
 }
 
-/// Internal calibration entries for the Tiny 2 Lite. These describe the
+/// A device-specific status-indicator rendering. Palette state IDs and
+/// direct RGB requests are separate transports and must never be mixed.
+public struct SOMALEDDeviceRendering: Equatable, Sendable {
+    public let stateID: Int?
+    public let directRGB: SOMALEDDirectRGB?
+    public let pattern: SOMALEDPattern
+
+    public init(stateID: Int, pattern: SOMALEDPattern) {
+        self.stateID = stateID
+        directRGB = nil
+        self.pattern = pattern
+    }
+
+    public init(directRGB: SOMALEDDirectRGB, pattern: SOMALEDPattern) {
+        stateID = nil
+        self.directRGB = directRGB
+        self.pattern = pattern
+    }
+
+    public var usesDirectRGB: Bool { directRGB != nil }
+    public var pulseEnabled: Bool { pattern != .steady }
+}
+
+/// Internal calibration entries for Tiny devices. These describe the
 /// firmware's state IDs and are deliberately kept out of the user settings
 /// surface: names such as `tracking` are device implementation details, not
 /// meaningful LED choices.
@@ -104,8 +135,8 @@ public enum SOMALEDFirmwarePreset: String, CaseIterable, Codable, Sendable {
         switch self {
         case .targetLost: "Yellow"
         case .targetLock, .gesture: "Green"
-        case .normalWork: "Green"
-        case .tracking: "Blue"
+        case .normalWork: "Blue"
+        case .tracking: "Green"
         }
     }
 
@@ -124,6 +155,7 @@ public enum SOMALEDFirmwarePreset: String, CaseIterable, Codable, Sendable {
 
 public enum SOMALEDPattern: String, CaseIterable, Codable, Sendable {
     case steady
+    case firmwareAnimation = "firmware_animation"
     case beacon
     case doubleBlink
     case longPulse
@@ -133,6 +165,7 @@ public enum SOMALEDPattern: String, CaseIterable, Codable, Sendable {
     public var displayName: String {
         switch self {
         case .steady: "Steady"
+        case .firmwareAnimation: "Contact pulse"
         case .beacon: "Beacon"
         case .doubleBlink: "Double blink"
         case .longPulse: "Long pulse"
@@ -142,13 +175,19 @@ public enum SOMALEDPattern: String, CaseIterable, Codable, Sendable {
     }
 
     public func isPhysicallySupported(for color: SOMALEDColor) -> Bool {
-        self == .steady
+        // Timing is host-controlled; any firmware palette position can carry
+        // the same temporal pattern even before its colour is visually named.
+        true
     }
 
     public var indicatorPattern: SubconsciousIndicatorPattern {
         switch self {
         case .steady:
             .init(name: "steady", phases: [
+                .init(illuminated: true, durationMilliseconds: nil),
+            ])
+        case .firmwareAnimation:
+            .init(name: "firmware_animation", phases: [
                 .init(illuminated: true, durationMilliseconds: nil),
             ])
         case .beacon:
@@ -191,17 +230,19 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
         self.pattern = pattern
     }
 
-    public var deviceRendering: SOMALEDDeviceRendering {
-        .init(stateID: color.firmwareStateID, pulseEnabled: false)
-    }
-
-    public var firmwareStateID: Int {
-        deviceRendering.stateID
+    public func deviceRendering(for profile: OBSBOTDeviceProfile) -> SOMALEDDeviceRendering? {
+        if let directRGB = profile.directIndicatorRGB(for: color) {
+            return .init(directRGB: directRGB, pattern: pattern)
+        }
+        guard let stateID = profile.firmwareIndicatorStateID(for: color) else { return nil }
+        return .init(stateID: stateID, pattern: pattern)
     }
 
     public func normalizedForDevice() -> Self {
-        guard !pattern.isPhysicallySupported(for: color) else { return self }
-        return .init(color: color, pattern: .steady)
+        guard pattern.isPhysicallySupported(for: color) else {
+            return .init(color: color, pattern: .steady)
+        }
+        return self
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -222,10 +263,8 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
         switch legacyPreset {
         case .targetLost:
             color = .yellow
-        case .normalWork:
+        case .targetLock, .gesture, .normalWork, .tracking:
             color = .green
-        case .targetLock, .gesture, .tracking:
-            color = .blue
         }
     }
 
@@ -265,18 +304,14 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         return Self.defaultSignal(for: canonical)
     }
 
-    /// Voice presence is an overlay on the current visual-attention signal.
-    /// The local bridge pulses the selected firmware palette state, rather
-    /// than using the camera's unrelated special LED control.
+    /// The indicator cadence denotes the visual interaction state. A voice
+    /// session changes the state to conversation, but must not manufacture an
+    /// eye-contact blink after visual contact has ended.
     public func deviceRendering(
         for state: SubconsciousIndicatorState,
-        voiceSessionOpen: Bool
-    ) -> SOMALEDDeviceRendering {
-        let base = signal(for: state).deviceRendering
-        return .init(
-            stateID: base.stateID,
-            pulseEnabled: voiceSessionOpen
-        )
+        on profile: OBSBOTDeviceProfile
+    ) -> SOMALEDDeviceRendering? {
+        signal(for: state).deviceRendering(for: profile)
     }
 
     private static func normalized(
@@ -303,10 +338,10 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         for state: SubconsciousIndicatorState
     ) -> SOMALEDSignalSettings {
         switch state {
-        case .exploring: .init(color: .yellow, pattern: .steady)
+        case .exploring: .init(color: .green, pattern: .steady)
         case .humanDetected: .init(color: .blue, pattern: .steady)
-        case .contactReady: .init(color: .green, pattern: .steady)
-        case .conversation, .listening, .speaking: .init(color: .blue, pattern: .steady)
+        case .contactReady: .init(color: .blue, pattern: .firmwareAnimation)
+        case .conversation, .listening, .speaking: .init(color: .yellow, pattern: .steady)
         case .working: .init(color: .green, pattern: .steady)
         }
     }
@@ -351,7 +386,7 @@ public struct SOMAAdministratorIdentity: Codable, Equatable, Sendable {
 /// User-controlled settings consumed by the local runtime at process launch.
 /// None of the fields contain face embeddings or other raw biometric material.
 public struct SOMAControlSettings: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 5
+    public static let currentSchemaVersion = 8
 
     public var schemaVersion: Int
     public var realtimeVoiceEnabled: Bool
@@ -403,9 +438,25 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoiceEnabled = try values.decodeIfPresent(Bool.self, forKey: .realtimeVoiceEnabled) ?? true
         realtimeVoice = try values.decodeIfPresent(SOMARealtimeVoice.self, forKey: .realtimeVoice) ?? .maple
         var decodedLED = try values.decodeIfPresent(SOMALEDSettings.self, forKey: .led) ?? .init()
-        if sourceVersion < 3,
-           decodedLED.signal(for: .contactReady).color == .blue {
-            decodedLED.signals[.contactReady] = .init(color: .green, pattern: .steady)
+        if sourceVersion < 6,
+           decodedLED.signal(for: .contactReady).pattern == .steady {
+            let contactSignal = decodedLED.signal(for: .contactReady)
+            decodedLED.signals[.contactReady] = .init(
+                color: contactSignal.color,
+                pattern: .blink
+            )
+        }
+        if sourceVersion < 7 {
+            // These are social meanings, not a device fallback palette:
+            // visible person = blue, direct mutual attention = blue blink,
+            // and an active spoken session = green.
+            decodedLED.signals[.exploring] = .init(color: .yellow, pattern: .steady)
+            decodedLED.signals[.humanDetected] = .init(color: .blue, pattern: .steady)
+            decodedLED.signals[.contactReady] = .init(color: .blue, pattern: .blink)
+            decodedLED.signals[.conversation] = .init(color: .green, pattern: .steady)
+        }
+        if sourceVersion < 8 {
+            decodedLED.signals[.contactReady] = .init(color: .blue, pattern: .firmwareAnimation)
         }
         led = decodedLED
         nativeHumanTrackingEnabled = try values.decodeIfPresent(Bool.self, forKey: .nativeHumanTrackingEnabled) ?? true

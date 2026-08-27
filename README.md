@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://www.obsbot.com/obsbot-tiny-2-lite-4k-webcam">OBSBOT Tiny 2 Lite</a> ·
+  <a href="https://www.obsbot.com/obsbot-tiny-3-lite">OBSBOT Tiny 3 Lite</a> ·
   macOS 13+ · Swift · Core ML · Model Context Protocol · Codex Live Voice
 </p>
 
@@ -58,22 +59,36 @@ The resulting system is an **embodied interaction interface**: a platform for
 studying how an AI can share attention with a person, develop contextual memory,
 and choose when to speak, stay quiet, look again, or express readiness.
 
-## The body: OBSBOT Tiny 2 Lite
+## The body: OBSBOT Tiny
 
-SOMA is developed around the [OBSBOT Tiny 2 Lite](https://www.obsbot.com/obsbot-tiny-2-lite-4k-webcam),
-a 2-axis PTZ webcam with an integrated camera, microphone, and vendor tracking
-capabilities. SOMA uses it as a sensorimotor body rather than treating it as a
-passive webcam:
+SOMA recognizes connected OBSBOT hardware from the vendor SDK product type,
+not from a UVC display name. It was developed around the
+[OBSBOT Tiny 2 Lite](https://www.obsbot.com/obsbot-tiny-2-lite-4k-webcam), and
+also has a guarded profile for the
+[OBSBOT Tiny 3 Lite](https://www.obsbot.com/obsbot-tiny-3-lite). Both are
+treated as sensorimotor bodies rather than passive webcams:
 
 | Hardware affordance | Role in SOMA |
 | --- | --- |
 | UVC video | Low-latency visual evidence, face/person/object observations, scene change, and spherical mapping |
 | USB audio | On-device voice-activity evidence and live conversation audio |
 | 2-axis gimbal | Fixation, re-acquisition, active exploration, and compact nonverbal expressions |
-| Firmware LED palette | A nearby person can see whether SOMA has noticed them, is ready to listen, is thinking, or is in conversation |
+| Firmware LED feedback | A nearby person can see the state the connected model can physically express |
 
 The camera's vendor SDK is used only by a separately enabled local bridge. It
 does not become a direct model tool or a free-form velocity interface.
+
+| SDK profile | Available without new calibration | Intentionally withheld |
+| --- | --- | --- |
+| `tiny_2_lite` | Video, USB audio, calibrated gimbal control, firmware indicator palette | — |
+| `tiny_3_lite` | Video, USB audio, selectable microphone modes, profile-calibrated L0 gimbal control, native human-track policy, Live Voice, basic LED enable/brightness | Tiny 2 motor calibration, confirmed color/pattern state IDs, and a host-readable sound bearing |
+
+This is a physical boundary, not a feature downgrade: calibration signs,
+motion envelopes, sound-localization semantics, and LED state IDs are
+device-specific observations. A Tiny 3 Lite therefore uses its own measured
+attitude frame and native tracker configuration; it never inherits Tiny 2 Lite
+motion or indicator assumptions. Each profile requires independent calibration
+and physical LED validation before a capability is exposed as available.
 
 ## The cognitive architecture
 
@@ -177,7 +192,7 @@ whole attention policy while keeping the physical executor local.
 | Stable scene entities, bearings, freshness, and action eligibility | Set probabilistic attention priors and tracking commitment |
 | Spherical map, coverage, place familiarity, and available bearings | Track a grounded target or orient to a bearing |
 | A fresh `capture_view` image or selected panorama data | Shape exploration regions, direction distributions, dwell, and tempo |
-| Hardware capability report | Request a small social expression or semantic LED state |
+| Hardware capability report | Set a verified camera observation control or native human-track response policy |
 
 Every mutating request includes an owner, evidence references, a priority, and
 a bounded lease. L0 rejects stale or ambiguous targets, expires finished goals,
@@ -196,8 +211,10 @@ SOMA treats motion and light as part of interaction design:
   active conversation, and cognitive work legible from across the room.
 
 The Tiny 2 Lite exposes a firmware-defined RGB palette and pattern states—not
-arbitrary 24-bit color. SOMA requests semantic states and restores its own LED
-state on shutdown without overriding unrelated camera firmware states.
+arbitrary 24-bit color. The Tiny 3 Lite currently exposes only LED enable and
+brightness through the verified bridge. SOMA never claims a color or pulse is
+available until it has been physically validated for that model, and restores
+its own LED state on shutdown without overriding unrelated firmware states.
 
 ## Privacy and physical boundaries
 
@@ -220,28 +237,34 @@ authority, memory, and privacy contracts.
 
 ## Requirements
 
-SOMA's Swift package has no remote SwiftPM dependencies. Its native vision and
-hardware paths use local system components:
+SOMA's Swift package has no remote SwiftPM dependencies. A full runtime uses:
 
-- Apple Silicon Mac running macOS 13 or newer
+- Apple Silicon Mac running macOS 13 or newer for the Swift package; macOS 26
+  or newer for the full runtime installed by the current Brewfile
 - Xcode command-line tools with a Swift 6 toolchain
-- Homebrew OpenCV 5 for the Swift/C++ panorama bridge
+- Homebrew OpenCV 5 for the Swift/C++ vision bridge
 - CMake and the OBSBOT `libdev_v2.1.0_8` SDK for the native gimbal/LED bridge
-- A signed-in Codex installation only when L2 Live Voice is enabled
+- Ollama with the configured L1 model
+- A compatible signed-in Codex installation when L2 Live Voice is enabled
 
-Install the public build tools and verify the compile-time requirements:
+For a clean Mac, use the dependency-aware bootstrap and then verify both the
+build and runtime boundaries:
 
 ```sh
-brew install cmake opencv
+scripts/bootstrap-soma.zsh \
+  --sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip
 scripts/soma-doctor.zsh --build
 swift build
 swift test
+scripts/soma-doctor.zsh --runtime
 ```
 
-`SOMA_OPENCV_PREFIX` overrides the OpenCV prefix when Homebrew is not installed
-under `/opt/homebrew` or `/usr/local`. The proprietary OBSBOT SDK is not stored
-in Git; put it at `Reference/SDK/libdev_v2.1.0_8` or set
-`SOMA_OBSBOT_SDK_ROOT` to its absolute directory before a full installation.
+The proprietary OBSBOT SDK is intentionally not stored in Git. Bootstrap
+verifies its exact archive and stages it locally; `soma-doctor` verifies tool
+versions, bundled-model hashes, the SDK signature and hashes, Ollama/model
+availability, conditional Codex support, and optional MLX/ArcFace assets. See
+[`DEPENDENCIES.md`](DEPENDENCIES.md) for the full clean-Mac procedure and
+supported overrides.
 
 ## Run a safe probe first
 
@@ -280,9 +303,10 @@ scripts and hardware flags before enabling physical camera control.
 <br>
 
 ```sh
+scripts/bootstrap-soma.zsh \
+  --sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip
+# Review the owner-only configuration created by bootstrap before installation.
 scripts/soma-doctor.zsh --runtime
-mkdir -p "$HOME/Library/Application Support/SOMA"
-cp config/soma.env.example "$HOME/Library/Application Support/SOMA/.env"
 # `auto` selects a single connected OBSBOT; use explicit IDs for multiple cameras.
 scripts/install-soma-subconscious-app.zsh
 scripts/soma.zsh start

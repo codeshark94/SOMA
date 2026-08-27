@@ -134,6 +134,72 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
                 "field_of_view_degrees": numberProperty("Desired digital field of view, 5 to 86 degrees"),
                 "reason": property("Why a settled narrow view is needed")
             ], required: ["field_of_view_degrees", "reason"]),
+            tool("set_camera_optical_zoom", "Set the camera's physical sensor crop for a concrete detail-observation purpose. L0 verifies the active device's reported zoom before spatial evidence uses it. Use 1.0 to restore the wide view; do not use this merely to scan.", [
+                "factor": numberProperty("Requested physical zoom factor from 1.0 to 2.0"),
+                "reason": property("Specific detail-observation purpose")
+            ], required: ["factor", "reason"]),
+            tool("set_audio_capture_mode", "Select how the active hardware listens for a concrete task. spatial_stereo preserves binaural direction evidence; conversation_front is forward beamforming for a person already in front of the camera. L0 verifies the selected device mode before relying on it.", [
+                "mode": property("spatial_stereo, conversation_front, ambient_omni, rear, bidirectional, or music"),
+                "reason": property("Specific listening purpose")
+            ], required: ["mode", "reason"]),
+            tool("set_audio_input_gain", "Set microphone input gain for a specific listening task. This changes only input level: it neither changes spatial capture mode nor takes a gimbal lease. L0 verifies the firmware readback before accepting the result.", [
+                "percent": numberProperty("Integer microphone input gain from 0 through 100"),
+                "reason": property("Specific listening purpose")
+            ], required: ["percent", "reason"]),
+            tool("set_camera_white_balance", "Set camera white balance for a concrete visual task. auto keeps adaptive color; manual locks a Kelvin temperature so panorama strips or repeated observations share stable color. L0 verifies the firmware-reported setting.", [
+                "mode": property("auto or manual"),
+                "temperature_kelvin": numberProperty("Required from 2000 to 9000 only when mode is manual"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["mode", "reason"]),
+            tool("set_camera_exposure_lock", "Hold or release the camera's current automatic exposure for a concrete visual-observation task. Lock exposure only when stable brightness matters, such as a panorama strip; release it after the task so normal perception can adapt to the room.", [
+                "locked": booleanProperty("true holds current exposure; false restores automatic exposure"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["locked", "reason"]),
+            tool("set_camera_focus", "Set autofocus back to automatic mode, or hold one measured manual focus position for a specific close inspection. Manual focus is not a target-selection command and does not move the gimbal.", [
+                "mode": property("auto or manual"),
+                "position": numberProperty("Required integer from 0 through 100 only when mode is manual"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["mode", "reason"]),
+            tool("set_camera_absolute_exposure", "Return shutter control to automatic mode, or set one firmware shutter code for a specifically justified visual task. L0 checks the active camera's measured supported code range before applying it.", [
+                "mode": property("auto or manual"),
+                "shutter_code": numberProperty("Required integer only when mode is manual; the active Tiny 3 Lite reports 10 through 42"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["mode", "reason"]),
+            tool("set_camera_face_priority", "Enable or disable the camera firmware's face-priority autofocus and auto-exposure. Keep it enabled for human interaction unless a non-face observation needs neutral imaging.", [
+                "enabled": booleanProperty("Whether face-priority autofocus and auto-exposure are enabled"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["enabled", "reason"]),
+            tool("set_camera_anti_flicker", "Select the camera mains-frequency mode for a concrete visual-observation task. Use the local line frequency when lighting bands are visible; use auto when it is unknown.", [
+                "mode": property("off, hz_50, hz_60, or auto"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["mode", "reason"]),
+            tool("set_camera_image_tuning", "Set one or more image-pipeline controls for a concrete observation. Every requested field is range-checked, applied atomically, read back, and restored if any firmware step fails. Omit fields that should stay unchanged.", [
+                "brightness": numberProperty("Optional value from 0 through 100"),
+                "contrast": numberProperty("Optional value from 0 through 100"),
+                "hue": numberProperty("Optional value from 0 through 100"),
+                "saturation": numberProperty("Optional value from 0 through 100"),
+                "sharpness": numberProperty("Optional value from 0 through 100"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["reason"]),
+            tool("set_native_human_tracking_policy", "Configure the Tiny 3 native human tracker for an active or future human target. Use fast motion and fore-target retention for responsive social tracking. Fixed pan and pitch gains must be supplied together and require both adaptive gain controls to be disabled.", [
+                "speed": property("super_lazy, lazy, slow, fast, or crazy"),
+                "motion_tracking": booleanProperty("Whether native motion tracking remains enabled"),
+                "fore_target": booleanProperty("Whether native tracking retains the target through a brief occlusion"),
+                "adaptive_composition": booleanProperty("Whether nearby people may alter the selected target's composition"),
+                "adaptive_pan_gain": booleanProperty("Whether firmware automatically adapts pan tracking gain"),
+                "adaptive_pitch_gain": booleanProperty("Whether firmware automatically adapts pitch tracking gain"),
+                "pan_gain": numberProperty("Optional fixed pan tracking gain from 0.1 through 1.0; requires pitch_gain and disabled adaptive gains"),
+                "pitch_gain": numberProperty("Optional fixed pitch tracking gain from 0.1 through 1.0; requires pan_gain and disabled adaptive gains"),
+                "reason": property("Specific social or observation purpose")
+            ], required: ["speed", "motion_tracking", "fore_target", "adaptive_composition", "reason"]),
+            tool("set_camera_field_of_view", "Set a firmware-calibrated optical field of view for a concrete visual task: 86 wide, 78 medium, or 65 narrow degrees. L0 updates spherical projection from the confirmed camera value; use a narrower view only when it improves a specific observation.", [
+                "degrees": numberProperty("One of 86, 78, or 65"),
+                "reason": property("Specific visual-observation purpose")
+            ], required: ["degrees", "reason"]),
+            tool("set_device_sound_following", "Temporarily delegate head orientation to the Tiny 3 device's sound-source follower when no grounded visual target should own the gimbal. This takes a motor lease and is automatically disabled when the lease ends or a visual goal preempts it; it does not report a raw sound bearing.", [
+                "enabled": booleanProperty("true to start the temporary sound-following lease, false to stop it"),
+                "reason": property("Specific attention reason")
+            ], required: ["enabled", "reason"]),
             tool("orient_attention", "Lease a calibrated L0 orientation toward one spherical direction. L0 owns route planning, feedback, joint limits, and stopping.", [
                 "azimuth_degrees": numberProperty("Gimbal-home-relative azimuth from -180 to 180"),
                 "elevation_degrees": numberProperty("Gimbal-home-relative elevation from -90 to 90"),
@@ -223,6 +289,208 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
             )
         case "capture_target_view":
             return captureTargetView(arguments: args, reason: reason)
+        case "set_camera_optical_zoom":
+            guard let factor = number(args, "factor"), factor.isFinite, factor >= 1, factor <= 2 else {
+                return Self.json(["ok": false, "error": "optical_zoom_factor_must_be_1_to_2"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setOpticalZoom(.init(factor: factor))
+            )
+        case "set_audio_capture_mode":
+            guard let mode = string(args, "mode").flatMap(MicrophoneCaptureMode.init(rawValue:)) else {
+                return Self.json(["ok": false, "error": "invalid_audio_capture_mode"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setAudioCaptureMode(.init(mode: mode))
+            )
+        case "set_audio_input_gain":
+            guard let value = number(args, "percent"), value.isFinite,
+                  value.rounded() == value, (0...100).contains(Int(value)) else {
+                return Self.json(["ok": false, "error": "audio_input_gain_must_be_0_to_100"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setAudioInputGain(.init(percent: Int(value)))
+            )
+        case "set_camera_white_balance":
+            guard let mode = string(args, "mode").flatMap(CameraWhiteBalanceMode.init(rawValue:)) else {
+                return Self.json(["ok": false, "error": "invalid_camera_white_balance_mode"])
+            }
+            let temperatureKelvin: Int?
+            switch mode {
+            case .auto:
+                guard number(args, "temperature_kelvin") == nil else {
+                    return Self.json(["ok": false, "error": "automatic_white_balance_does_not_take_temperature"])
+                }
+                temperatureKelvin = nil
+            case .manual:
+                guard let temperature = number(args, "temperature_kelvin"),
+                      temperature.isFinite,
+                      temperature.rounded() == temperature,
+                      (2_000...9_000).contains(Int(temperature)) else {
+                    return Self.json(["ok": false, "error": "manual_white_balance_temperature_must_be_2000_to_9000"])
+                }
+                temperatureKelvin = Int(temperature)
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraWhiteBalance(.init(mode: mode, temperatureKelvin: temperatureKelvin))
+            )
+        case "set_camera_exposure_lock":
+            guard let locked = boolean(args, "locked") else {
+                return Self.json(["ok": false, "error": "missing_camera_exposure_lock_state"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraExposureLock(.init(locked: locked))
+            )
+        case "set_camera_focus":
+            guard let mode = string(args, "mode").flatMap(CameraFocusMode.init(rawValue:)) else {
+                return Self.json(["ok": false, "error": "invalid_camera_focus_mode"])
+            }
+            let position: Int?
+            switch mode {
+            case .auto:
+                guard number(args, "position") == nil else {
+                    return Self.json(["ok": false, "error": "automatic_focus_does_not_take_position"])
+                }
+                position = nil
+            case .manual:
+                guard let value = number(args, "position"), value.isFinite,
+                      value.rounded() == value, (0...100).contains(Int(value)) else {
+                    return Self.json(["ok": false, "error": "manual_focus_position_must_be_0_to_100"])
+                }
+                position = Int(value)
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraFocus(.init(mode: mode, position: position))
+            )
+        case "set_camera_absolute_exposure":
+            guard let mode = string(args, "mode").flatMap(CameraAbsoluteExposureMode.init(rawValue:)) else {
+                return Self.json(["ok": false, "error": "invalid_camera_absolute_exposure_mode"])
+            }
+            let shutterCode: Int?
+            switch mode {
+            case .auto:
+                guard number(args, "shutter_code") == nil else {
+                    return Self.json(["ok": false, "error": "automatic_exposure_does_not_take_shutter_code"])
+                }
+                shutterCode = nil
+            case .manual:
+                guard let value = number(args, "shutter_code"), value.isFinite,
+                      value.rounded() == value, (0...100).contains(Int(value)) else {
+                    return Self.json(["ok": false, "error": "manual_exposure_shutter_code_must_be_0_to_100"])
+                }
+                shutterCode = Int(value)
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraAbsoluteExposure(.init(mode: mode, shutterCode: shutterCode))
+            )
+        case "set_camera_face_priority":
+            guard let enabled = boolean(args, "enabled") else {
+                return Self.json(["ok": false, "error": "missing_camera_face_priority_state"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraFacePriority(.init(enabled: enabled))
+            )
+        case "set_camera_anti_flicker":
+            guard let mode = string(args, "mode").flatMap(CameraAntiFlickerMode.init(rawValue:)) else {
+                return Self.json(["ok": false, "error": "invalid_camera_anti_flicker_mode"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraAntiFlicker(.init(mode: mode))
+            )
+        case "set_camera_image_tuning":
+            let brightness = imageTuningValue(args, "brightness")
+            let contrast = imageTuningValue(args, "contrast")
+            let hue = imageTuningValue(args, "hue")
+            let saturation = imageTuningValue(args, "saturation")
+            let sharpness = imageTuningValue(args, "sharpness")
+            let values = [brightness, contrast, hue, saturation, sharpness]
+            guard values.allSatisfy(\.valid), values.contains(where: { $0.value != nil }) else {
+                return Self.json(["ok": false, "error": "camera_image_tuning_requires_one_integer_0_to_100"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraImageTuning(.init(
+                    brightness: brightness.value,
+                    contrast: contrast.value,
+                    hue: hue.value,
+                    saturation: saturation.value,
+                    sharpness: sharpness.value
+                ))
+            )
+        case "set_native_human_tracking_policy":
+            guard let speed = string(args, "speed").flatMap(NativeHumanTrackingSpeed.init(rawValue:)),
+                  let motionTracking = boolean(args, "motion_tracking"),
+                  let foreTarget = boolean(args, "fore_target"),
+                  let adaptiveComposition = boolean(args, "adaptive_composition") else {
+                return Self.json(["ok": false, "error": "invalid_native_human_tracking_policy"])
+            }
+            let adaptivePanGain = boolean(args, "adaptive_pan_gain") ?? false
+            let adaptivePitchGain = boolean(args, "adaptive_pitch_gain") ?? false
+            let panGain = number(args, "pan_gain")
+            let pitchGain = number(args, "pitch_gain")
+            let hasManualGain = panGain != nil || pitchGain != nil
+            guard !hasManualGain || (
+                panGain != nil && pitchGain != nil
+                    && panGain!.isFinite && pitchGain!.isFinite
+                    && (0.1...1.0).contains(panGain!) && (0.1...1.0).contains(pitchGain!)
+                    && !adaptivePanGain && !adaptivePitchGain
+            ) else {
+                return Self.json(["ok": false, "error": "manual_native_tracking_gains_require_both_axes_0_1_to_1_0_and_adaptive_gains_disabled"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setNativeHumanTrackingPolicy(.init(
+                    speed: speed,
+                    motionTracking: motionTracking,
+                    foreTarget: foreTarget,
+                    adaptiveComposition: adaptiveComposition,
+                    adaptivePanGain: adaptivePanGain,
+                    adaptivePitchGain: adaptivePitchGain,
+                    panGain: panGain,
+                    pitchGain: pitchGain
+                ))
+            )
+        case "set_camera_field_of_view":
+            guard let degrees = number(args, "degrees"),
+                  degrees.isFinite,
+                  degrees.rounded() == degrees,
+                  [65, 78, 86].contains(Int(degrees)) else {
+                return Self.json(["ok": false, "error": "camera_field_of_view_must_be_65_78_or_86"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: 5_000),
+                operation: .setCameraFieldOfView(.init(degrees: Int(degrees)))
+            )
+        case "set_device_sound_following":
+            guard let enabled = boolean(args, "enabled") else {
+                return Self.json(["ok": false, "error": "device_sound_following_enabled_must_be_boolean"])
+            }
+            return submit(
+                reason: reason,
+                durationMilliseconds: duration(args, fallback: enabled ? 10_000 : 1_000),
+                operation: .setDeviceSoundFollowing(.init(enabled: enabled))
+            )
         case "orient_attention":
             guard let bearing = bearing(args),
                   let motionStyle = string(args, "motion_style").flatMap(EmbodimentMotionStyle.init(rawValue:)) else {
@@ -511,10 +779,19 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
         return nil
     }
 
+    private func imageTuningValue(_ args: [String: Any], _ key: String) -> (valid: Bool, value: Int?) {
+        guard args[key] != nil else { return (true, nil) }
+        guard let value = number(args, key), value.isFinite,
+              value.rounded() == value, (0...100).contains(Int(value)) else {
+            return (false, nil)
+        }
+        return (true, Int(value))
+    }
+
     private static let toolNames: Set<String> = [
         "inspect_scene", "register_attention_target", "set_target_attention",
         "track_attention_target", "capture_target_view", "orient_attention",
-        "explore_attention", "release_attention",
+        "explore_attention", "set_camera_optical_zoom", "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance", "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure", "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning", "set_native_human_tracking_policy", "set_camera_field_of_view", "set_device_sound_following", "release_attention",
     ]
 
     private func tool(

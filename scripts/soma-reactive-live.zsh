@@ -5,6 +5,9 @@ soma_script_dir=${0:A:h}
 soma_root=${SOMA_ROOT:-${soma_script_dir:h}}
 soma_app_root=${SOMA_APP_ROOT:-"$HOME/Library/Application Support/SOMA/Applications/SOMA Subconscious.app"}
 soma_binary="$soma_app_root/Contents/MacOS/soma-subconscious"
+soma_native_helper="$soma_app_root/Contents/Helpers/soma-native-track"
+soma_device_probe="$soma_app_root/Contents/Helpers/soma-obsbot-probe"
+soma_calibration_selector="$soma_root/scripts/soma-select-gimbal-calibration.zsh"
 soma_runtime_root="$soma_root/artifacts/subconscious/runtime"
 soma_launcher_log="$soma_runtime_root/launcher/soma-reactive.log"
 
@@ -62,6 +65,25 @@ if [[ ! -x "$soma_binary" ]]; then
   print -u2 -r -- "SOMA application is not installed. Run $soma_root/scripts/install-soma-subconscious-app.zsh first."
   exit 64
 fi
+if [[ ! -x "$soma_native_helper" || ! -x "$soma_device_probe" || ! -x "$soma_calibration_selector" ]]; then
+  print -u2 -r -- 'SOMA native device helpers are unavailable.'
+  exit 64
+fi
+
+# Product identity must come from the OBSBOT SDK rather than the UVC display
+# name.  The result is used before any legacy camera calibration is selected.
+soma_device_profile=$(
+  "$soma_device_probe" 2>>"$soma_launcher_log" \
+    | /usr/bin/sed -n 's/^SOMA_OBSBOT_PROFILE=//p' \
+    | /usr/bin/tail -n 1
+)
+if [[ -z "$soma_device_profile" ]]; then
+  print -u2 -r -- 'Unable to resolve a supported OBSBOT product profile; starting perception without physical actuation.'
+  soma_device_profile=unknown
+fi
+export SOMA_OBSBOT_PROFILE="$soma_device_profile"
+print -r -- "SOMA device profile: $soma_device_profile"
+
 # Derive the L1 /api/chat endpoint from the configured host unless it was set
 # explicitly (SOMA_L1_OLLAMA_ENDPOINT already resolves in the binary too).
 if [[ -n "${OLLAMA_HOST:-}" && -z "${SOMA_L1_OLLAMA_ENDPOINT:-}" ]]; then
@@ -106,26 +128,31 @@ if [[ "${SOMA_ENABLE_PANORAMA:-0}" == "1" ]]; then
 fi
 
 soma_motion_args=()
-if [[ "${SOMA_ENABLE_MOTION:-1}" == "1" ]]; then
-  soma_external_calibration=${SOMA_EXTERNAL_GIMBAL_CALIBRATION:-"$soma_root/artifacts/subconscious/p7-reactive-robust-r8-calibration-20260814.json"}
-  if [[ ! -f "$soma_external_calibration" ]]; then
-    print -u2 -r -- 'SOMA external-gimbal calibration is unavailable.'
-    exit 64
+if [[ "${SOMA_ENABLE_MOTION:-0}" == "1" ]]; then
+  if [[ "$soma_device_profile" == "tiny_2_lite" || "$soma_device_profile" == "tiny_3_lite" ]]; then
+    if ! soma_external_calibration=$("$soma_calibration_selector" "$soma_root" "$soma_device_profile"); then
+      print -u2 -r -- "SOMA_ENABLE_MOTION=1 requires a calibration created for $soma_device_profile."
+      exit 64
+    fi
+    soma_motion_args=(
+      --allow-embodiment-motor-control
+      --embodiment-shadow-socket "$soma_runtime_root/ipc/embodiment-shadow.sock"
+      --embodiment-view-directory "$soma_runtime_root/views"
+      --allow-camera-motion
+      --native-gimbal-helper "$soma_native_helper"
+      --gimbal-output "$soma_runtime_root/actuator/gimbal.jsonl"
+      --gimbal-trace-max-megabytes 32
+      --gimbal-trace-retained-files 4
+      --allow-external-gimbal-control
+      --external-gimbal-calibration "$soma_external_calibration"
+      --allow-autonomous-scan
+    )
+    if [[ "$soma_device_profile" == "tiny_2_lite" || "$soma_device_profile" == "tiny_3_lite" ]]; then
+      soma_motion_args+=(--allow-native-human-tracking)
+    fi
+  else
+    print -r -- "SOMA physical actuation withheld for profile=$soma_device_profile until that profile has its own gimbal calibration."
   fi
-  soma_motion_args=(
-    --allow-embodiment-motor-control
-    --embodiment-shadow-socket "$soma_runtime_root/ipc/embodiment-shadow.sock"
-    --embodiment-view-directory "$soma_runtime_root/views"
-    --allow-camera-motion
-    --native-gimbal-helper "$soma_root/.build/soma-live/native/soma-native-track"
-    --gimbal-output "$soma_runtime_root/actuator/gimbal.jsonl"
-    --gimbal-trace-max-megabytes 32
-    --gimbal-trace-retained-files 4
-    --allow-native-human-tracking
-    --allow-external-gimbal-control
-    --external-gimbal-calibration "$soma_external_calibration"
-    --allow-autonomous-scan
-  )
 fi
 
 exec "$soma_binary" \

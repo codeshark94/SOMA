@@ -3,6 +3,51 @@ import XCTest
 @testable import SOMACore
 
 final class PredictiveWorldModelTests: XCTestCase {
+    func testNormalizedRectClipsAnEdgeFaceForDeviceTargetSelection() throws {
+        let clipped = try XCTUnwrap(
+            NormalizedRect(x: 0.817559, y: 0.086867, width: 0.189736, height: 0.416614)
+                .clippedToUnitSquare()
+        )
+
+        XCTAssertEqual(clipped.x, 0.817559, accuracy: 0.000_001)
+        XCTAssertEqual(clipped.y, 0.086867, accuracy: 0.000_001)
+        XCTAssertEqual(clipped.width, 0.182441, accuracy: 0.000_001)
+        XCTAssertEqual(clipped.height, 0.416614, accuracy: 0.000_001)
+        XCTAssertNil(NormalizedRect(x: 1.2, y: 0.2, width: 0.1, height: 0.1).clippedToUnitSquare())
+    }
+
+    func testOpticalZoomNarrowsProjectionWithoutDiscardingCalibration() throws {
+        let calibrated = CameraProjectionModel(
+            focalXNormalized: 0.70,
+            focalYNormalized: 1.24,
+            principalXNormalized: 0.492,
+            principalYNormalized: 0.517,
+            cameraToIdealRotation: [
+                0, -1, 0,
+                1, 0, 0,
+                0, 0, 1,
+            ],
+            radialK1: 0.04,
+            radialK2: -0.01
+        )
+
+        let zoomed = try XCTUnwrap(calibrated.withOpticalZoom(1.25))
+
+        XCTAssertEqual(zoomed.focalXNormalized, 0.875, accuracy: 0.000_001)
+        XCTAssertEqual(zoomed.focalYNormalized, 1.55, accuracy: 0.000_001)
+        XCTAssertEqual(zoomed.principalXNormalized, calibrated.principalXNormalized, accuracy: 0.000_001)
+        XCTAssertEqual(zoomed.principalYNormalized, calibrated.principalYNormalized, accuracy: 0.000_001)
+        XCTAssertEqual(zoomed.cameraToIdealRotation, calibrated.cameraToIdealRotation)
+        XCTAssertEqual(zoomed.radialK1, calibrated.radialK1)
+        XCTAssertEqual(zoomed.radialK2, calibrated.radialK2)
+        XCTAssertLessThan(
+            zoomed.horizontalFieldOfViewDegrees,
+            calibrated.horizontalFieldOfViewDegrees
+        )
+        XCTAssertNil(calibrated.withOpticalZoom(0.99))
+        XCTAssertNil(calibrated.withOpticalZoom(2.01))
+    }
+
     func testDiagonalCameraFOVConvertsToActiveHorizontalAndVerticalAngles() {
         let aspect = 16.0 / 9.0
         XCTAssertEqual(
@@ -75,7 +120,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         var sceneField = SceneField()
         let upperImageCandidate = sceneField.ingest(
             [VisualObservation(
-                rect: NormalizedRect(x: 0.45, y: 0.70, width: 0.10, height: 0.10),
+                rect: NormalizedRect(x: 0.45, y: 0.15, width: 0.10, height: 0.10),
                 confidence: 0.9,
                 source: .neuralDetector,
                 kind: .object,
@@ -124,6 +169,19 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertEqual(recovered.1 / recovered.2, ideal.1, accuracy: 0.000_001)
     }
 
+    func testSquareScaleFitRestoresSourceAspectRatioAfterLetterboxing() {
+        let transform = NormalizedSquareScaleFit(sourceWidth: 1920, sourceHeight: 1080)
+        let source = NormalizedRect(x: 0.22, y: 0.18, width: 0.20, height: 0.36)
+        let model = transform.squareRect(for: source)
+        XCTAssertEqual(model?.width ?? 0, 0.20, accuracy: 0.000_001)
+        XCTAssertEqual(model?.height ?? 0, 0.2025, accuracy: 0.000_001)
+        let restored = model.flatMap(transform.sourceRect(for:))
+        XCTAssertEqual(restored?.x ?? 0, source.x, accuracy: 0.000_001)
+        XCTAssertEqual(restored?.y ?? 0, source.y, accuracy: 0.000_001)
+        XCTAssertEqual(restored?.width ?? 0, source.width, accuracy: 0.000_001)
+        XCTAssertEqual(restored?.height ?? 0, source.height, accuracy: 0.000_001)
+    }
+
     func testFaceConfirmationLeaseRequiresFreshOverlappingGeometry() {
         let face = NormalizedRect(x: 0.42, y: 0.28, width: 0.12, height: 0.14)
         var lease = FaceConfirmationLease()
@@ -150,6 +208,72 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertFalse(continuity.permits(NormalizedRect(x: 0.78, y: 0.28, width: 0.12, height: 0.14), at: 4_080_000_000))
     }
 
+    func testPoseSpaceBearingAndCompositionUseTheMeasuredImageAxisDirection() {
+        let projection = CameraProjectionModel.pinhole(horizontalFieldOfViewDegrees: 72)
+        let target = GimbalRelativeBearing(azimuthDegrees: 0, elevationDegrees: 0)
+        let leftFraming = NormalizedRect(x: 0.15, y: 0.44, width: 0.10, height: 0.12)
+        let composition = projection.cameraBearing(
+            placing: target,
+            at: leftFraming,
+            poseProjection: .identity
+        )
+        XCTAssertLessThan(
+            composition?.azimuthDegrees ?? .infinity,
+            0,
+            "A left composition point must command the SDK attitude that moves a fixed subject left in image space"
+        )
+
+        var field = SceneField()
+        let leftFace = VisualObservation(
+            rect: leftFraming,
+            confidence: 0.95,
+            source: .systemFaceDetector,
+            kind: .human,
+            label: "face",
+            isActionEligible: true,
+            isFaceVerified: true
+        )
+        let candidate = field.ingest(
+            [leftFace],
+            at: 1_000_000_000,
+            cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1_000_000_000),
+            horizontalFieldOfViewDegrees: 72,
+            cameraSettled: true,
+            poseProjection: .identity,
+            cameraProjectionModel: projection
+        ).first
+        XCTAssertGreaterThan(
+            candidate?.bearing?.azimuthDegrees ?? -.infinity,
+            0,
+            "A subject left of centre requires an increasing SDK pan attitude when positive attitude moves image points right"
+        )
+
+        var verticalField = SceneField()
+        let upperFace = VisualObservation(
+            rect: NormalizedRect(x: 0.45, y: 0.10, width: 0.10, height: 0.12),
+            confidence: 0.95,
+            source: .systemFaceDetector,
+            kind: .human,
+            label: "face",
+            isActionEligible: true,
+            isFaceVerified: true
+        )
+        let verticalCandidate = verticalField.ingest(
+            [upperFace],
+            at: 1_000_000_000,
+            cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1_000_000_000),
+            horizontalFieldOfViewDegrees: 72,
+            cameraSettled: true,
+            poseProjection: .identity,
+            cameraProjectionModel: projection
+        ).first
+        XCTAssertGreaterThan(
+            verticalCandidate?.bearing?.elevationDegrees ?? -.infinity,
+            0,
+            "An upper-image target must retain its upward ray when projected into attitude space"
+        )
+    }
+
     func testFacePersonFusionKeepsFaceGeometryAndBridgesOnlyBriefly() {
         var fusion = FacePersonFusion()
         let person = VisualObservation(
@@ -170,6 +294,27 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertEqual(fused.filter { $0.label == "face" }.count, 1)
         XCTAssertFalse(fused.contains { $0.label == "person" }, "a matched body box must not displace the face target")
         XCTAssertTrue(fused.first(where: { $0.label == "face" })?.isActionEligible ?? false)
+
+        let landmarkVerifiedFace = VisualObservation(
+            rect: face.rect,
+            confidence: face.confidence,
+            source: .systemFaceDetector,
+            kind: .human,
+            label: "face",
+            isActionEligible: true,
+            isFaceVerified: true,
+            isEyeContactEligible: true
+        )
+        var landmarkFusion = FacePersonFusion()
+        let landmarkFused = landmarkFusion.fuse([person, landmarkVerifiedFace], at: 1_020_000_000)
+        let preservedVerification = landmarkFused.first(where: { $0.label == "face" })
+        XCTAssertTrue(preservedVerification?.isFaceVerified ?? false, "person fusion must preserve landmark verification")
+        XCTAssertTrue(preservedVerification?.isEyeContactEligible ?? false, "person fusion must preserve fresh gaze evidence")
+        XCTAssertEqual(
+            preservedVerification?.source,
+            .systemFaceDetector,
+            "person corroboration must not relabel landmark geometry as an ANE measurement"
+        )
 
         let faceCadenceFrame = fusion.fuse([face], at: 1_040_000_000)
         XCTAssertTrue(
@@ -779,6 +924,18 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertEqual(gate.update(face, hasVisualEvidence: false, immediateAcquisitionPermitted: true), .stop)
     }
 
+    func testRepeatedTemporalFaceEvidenceCanStartBoundedNativeAcquisition() {
+        var gate = NativeHumanTrackingGate()
+        let start: UInt64 = 6_700_000_000
+
+        XCTAssertEqual(gate.acquireFromTemporalFaceEvidence(at: start), .start)
+        XCTAssertTrue(gate.isActive)
+        XCTAssertEqual(gate.heartbeatIfActive(at: start + 199_000_000), .none)
+        XCTAssertEqual(gate.heartbeatIfActive(at: start + 200_000_000), .heartbeat)
+        XCTAssertEqual(gate.invalidate(), .stop)
+        XCTAssertFalse(gate.isActive)
+    }
+
     func testPersonObservationCannotInterruptActiveNativeFaceTracking() {
         let timestamp: UInt64 = 6_800_000_000
         let person = PredictiveWorldModel().ingestVisual(
@@ -877,18 +1034,18 @@ final class PredictiveWorldModelTests: XCTestCase {
         ))
     }
 
-    func testExplorationFaceInterceptionIsBoundedToRepeatedHighConfidenceEvidence() {
+    func testExplorationFaceInterceptionUsesRepeatedDetectorEvidence() {
         XCTAssertFalse(FaceLockLease.permitsProvisionalExplorationInterception(
             observationCount: 1,
             confidence: 0.99
         ))
         XCTAssertFalse(FaceLockLease.permitsProvisionalExplorationInterception(
             observationCount: 3,
-            confidence: 0.70
+            confidence: 0
         ))
         XCTAssertTrue(FaceLockLease.permitsProvisionalExplorationInterception(
             observationCount: 2,
-            confidence: 0.90
+            confidence: 0.55
         ))
     }
 
@@ -900,6 +1057,15 @@ final class PredictiveWorldModelTests: XCTestCase {
             maximumPitchDegreesPerSecond: 6
         )
         XCTAssertTrue(calibration.isValid)
+        let tiny3Calibration = ExternalGimbalCalibration.fromPositivePulseDisplacements(
+            panImageDelta: -0.04,
+            pitchImageDelta: 0.03,
+            deviceProfile: .tiny3Lite,
+            panPoseDelta: -1,
+            pitchPoseDelta: 1,
+            homePose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 1)
+        )
+        XCTAssertEqual(tiny3Calibration?.deviceProfile, .tiny3Lite)
         XCTAssertEqual(
             ExternalGimbalCalibration.fromPositivePulseDisplacements(panImageDelta: -0.04, pitchImageDelta: 0.03)?.panSign,
             1
@@ -1074,6 +1240,33 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertGreaterThan(initialPosePan, 0)
         XCTAssertLessThan(abs(closingPosePitch), abs(initialPosePitch))
         XCTAssertLessThan(abs(closingPosePan), abs(initialPosePan))
+
+        let measuredTiny3Calibration = ExternalGimbalCalibration(
+            panSign: 1,
+            pitchSign: -1,
+            maximumPanDegreesPerSecond: 90,
+            maximumPitchDegreesPerSecond: 45,
+            deviceProfile: .tiny3Lite,
+            posePanImageSign: 1,
+            posePitchImageSign: -1,
+            velocityPanPoseSign: -1,
+            velocityPitchPoseSign: 1,
+            homePanDegrees: 0,
+            homePitchDegrees: 0
+        )
+        var measuredTiny3Gate = ExternalGimbalAttentionGate(
+            calibration: measuredTiny3Calibration,
+            autonomousScanEnabled: false
+        )
+        guard case let .velocity(tiny3Pitch, tiny3Pan) = measuredTiny3Gate.update(
+            faceBelief(centerX: 0.58, at: 7_570_000_000),
+            faceBearing: GimbalRelativeBearing(azimuthDegrees: 12, elevationDegrees: -8),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 7_570_000_000)
+        ) else {
+            return XCTFail("measured-attitude face servo did not emit a correction")
+        }
+        XCTAssertLessThan(tiny3Pan, 0, "measured Tiny 3 pan direction must follow its velocity pulse")
+        XCTAssertLessThan(tiny3Pitch, 0, "measured Tiny 3 pitch direction must follow its velocity pulse")
         var risingFaceGate = ExternalGimbalAttentionGate(calibration: dynamicCalibration, autonomousScanEnabled: false)
         guard case let .velocity(initialPitch, _) = risingFaceGate.update(
             faceVerticalBelief(centerY: 0.22, stabilityMilliseconds: 0, at: 7_420_000_000)
@@ -1638,7 +1831,8 @@ final class PredictiveWorldModelTests: XCTestCase {
             )],
             at: start,
             cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 20, monotonicNS: start),
-            horizontalFieldOfViewDegrees: 70
+            horizontalFieldOfViewDegrees: 70,
+            poseProjection: .obsbotTiny2Lite
         )
         guard let initial = first.first, let initialBearing = initial.bearing else {
             return XCTFail("missing initial spatial bearing")
@@ -1657,7 +1851,8 @@ final class PredictiveWorldModelTests: XCTestCase {
             )],
             at: start + 1_000_000_000,
             cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 50, monotonicNS: start + 1_000_000_000),
-            horizontalFieldOfViewDegrees: 70
+            horizontalFieldOfViewDegrees: 70,
+            poseProjection: .obsbotTiny2Lite
         )
         XCTAssertEqual(reacquired.count, 1)
         XCTAssertEqual(reacquired.first?.id, initial.id)
@@ -1687,7 +1882,8 @@ final class PredictiveWorldModelTests: XCTestCase {
             )],
             at: start + 61_100_000_000,
             cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 50, monotonicNS: start + 61_100_000_000),
-            horizontalFieldOfViewDegrees: 70
+            horizontalFieldOfViewDegrees: 70,
+            poseProjection: .obsbotTiny2Lite
         )
         XCTAssertEqual(refreshed.count, 1)
         XCTAssertEqual(refreshed.first?.id, initial.id)
@@ -1772,6 +1968,113 @@ final class PredictiveWorldModelTests: XCTestCase {
             )
         ], at: start + 80_000_000).first
         XCTAssertEqual(moved?.id, initial?.id)
+    }
+
+    func testSceneFieldExposesFreshBearingWithoutDestabilizingPersistentMapBearing() {
+        let start: UInt64 = 32_000_000_000
+        var field = SceneField()
+        let initial = field.ingest(
+            [VisualObservation(
+                rect: NormalizedRect(x: 0.44, y: 0.40, width: 0.12, height: 0.20),
+                confidence: 0.95,
+                source: .neuralFaceDetector,
+                kind: .human,
+                label: "face",
+                isActionEligible: true
+            )],
+            at: start,
+            cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start),
+            horizontalFieldOfViewDegrees: 70
+        )
+        guard let initialID = initial.first?.id else {
+            return XCTFail("initial face did not enter the scene field")
+        }
+        let moved = field.ingest(
+            [VisualObservation(
+                rect: NormalizedRect(x: 0.56, y: 0.40, width: 0.12, height: 0.20),
+                confidence: 0.95,
+                source: .neuralFaceDetector,
+                kind: .human,
+                label: "face",
+                isActionEligible: true
+            )],
+            at: start + 80_000_000,
+            cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start + 80_000_000),
+            horizontalFieldOfViewDegrees: 70
+        )
+        guard let candidate = moved.first(where: { $0.id == initialID }),
+              let observedBearing = candidate.observedBearing,
+              let persistentBearing = candidate.bearing else {
+            return XCTFail("fresh and persistent bearings were not both available")
+        }
+        XCTAssertTrue(candidate.observedThisFrame)
+        XCTAssertGreaterThan(
+            abs(observedBearing.azimuthDegrees - persistentBearing.azimuthDegrees),
+            1,
+            "motor control must see the current bearing while the scene map remains filtered"
+        )
+    }
+
+    func testFaceServoBrakesOnlyAgainstMeasuredGimbalOvershoot() {
+        let calibration = ExternalGimbalCalibration(
+            panSign: 1,
+            pitchSign: 1,
+            maximumPanDegreesPerSecond: 90,
+            maximumPitchDegreesPerSecond: 45
+        )
+        func faceBelief(at monotonicNS: UInt64) -> BeliefSnapshot {
+            PredictiveWorldModel().ingestVisual(
+                VisualObservation(
+                    rect: NormalizedRect(x: 0.52, y: 0.40, width: 0.12, height: 0.20),
+                    confidence: 0.95,
+                    source: .neuralFaceDetector,
+                    kind: .human,
+                    label: "face",
+                    sceneID: "servo-face",
+                    stabilityMilliseconds: 250,
+                    isActionEligible: true
+                ),
+                at: monotonicNS
+            )
+        }
+        var gate = ExternalGimbalAttentionGate(calibration: calibration, autonomousScanEnabled: false)
+        guard case let .velocity(_, initialPan) = gate.update(
+            faceBelief(at: 40_000_000_000),
+            faceBearing: GimbalRelativeBearing(azimuthDegrees: 12, elevationDegrees: 0),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 40_000_000_000),
+            currentVelocity: GimbalVelocityFeedback(pitchDegreesPerSecond: 0, panDegreesPerSecond: 0)
+        ), case let .velocity(_, brakingPan) = gate.update(
+            faceBelief(at: 40_080_000_000),
+            faceBearing: GimbalRelativeBearing(azimuthDegrees: 12, elevationDegrees: 0),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 8, monotonicNS: 40_080_000_000),
+            currentVelocity: GimbalVelocityFeedback(pitchDegreesPerSecond: 0, panDegreesPerSecond: 100)
+        ), case let .velocity(_, reversingPan) = gate.update(
+            faceBelief(at: 40_160_000_000),
+            faceBearing: GimbalRelativeBearing(azimuthDegrees: 12, elevationDegrees: 0),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 10, monotonicNS: 40_160_000_000),
+            currentVelocity: GimbalVelocityFeedback(pitchDegreesPerSecond: 0, panDegreesPerSecond: 80)
+        ) else {
+            return XCTFail("pose-feedback face servo did not issue continuous commands")
+        }
+        XCTAssertGreaterThan(initialPan, 0)
+        XCTAssertLessThan(brakingPan, initialPan, "measured closure must reduce drive before centre crossing")
+        XCTAssertLessThan(reversingPan, 0, "only measured physical overshoot may request a braking reversal")
+
+        var movingFaceGate = ExternalGimbalAttentionGate(calibration: calibration, autonomousScanEnabled: false)
+        _ = movingFaceGate.update(
+            faceBelief(at: 41_000_000_000),
+            faceBearing: GimbalRelativeBearing(azimuthDegrees: 12, elevationDegrees: 0),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 41_000_000_000)
+        )
+        guard case let .velocity(_, movingFacePan) = movingFaceGate.update(
+            faceBelief(at: 41_080_000_000),
+            faceBearing: GimbalRelativeBearing(azimuthDegrees: 20, elevationDegrees: 0),
+            currentPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: 41_080_000_000),
+            currentVelocity: GimbalVelocityFeedback(pitchDegreesPerSecond: 0, panDegreesPerSecond: 0)
+        ) else {
+            return XCTFail("rapid subject motion did not produce a follow command")
+        }
+        XCTAssertGreaterThan(movingFacePan, 0, "subject motion alone must not reverse the camera away from the face")
     }
 
     func testGimbalPoseFreshnessRequiresACaptureAlignedSample() {

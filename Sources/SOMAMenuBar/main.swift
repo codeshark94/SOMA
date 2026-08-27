@@ -674,7 +674,7 @@ private struct SOMASettingsView: View {
                 }
                 .disabled(model.settings.led.responseMode == .off)
             }
-            SettingsCard(title: "LED signals", subtitle: "Choose colors for visual attention. An open voice session pulses the current attention color.") {
+            SettingsCard(title: "LED signals", subtitle: "Choose a color and timing pattern for each attention state. Voice adds a blink only when the selected state is steady.") {
                 LazyVStack(spacing: 8) {
                     ForEach(SubconsciousIndicatorState.configurationStates, id: \.self) { state in
                         LEDSignalRow(state: state, signal: ledSignalBinding(for: state))
@@ -1262,7 +1262,7 @@ private struct LEDSignalRow: View {
                 .shadow(color: accent.opacity(0.45), radius: 3)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.subheadline.weight(.medium))
-                Text("Steady firmware palette")
+                Text(signal.pattern.displayName)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1270,13 +1270,21 @@ private struct LEDSignalRow: View {
             HStack(spacing: 8) {
                 Text("Color").foregroundStyle(.secondary)
                 Picker("Color", selection: colorBinding) {
-                    ForEach(SOMALEDColor.allCases, id: \.self) { color in
+                    ForEach(SOMALEDColor.selectableCases, id: \.self) { color in
                         Text(color.displayName).tag(color)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 94)
+                Picker("Pattern", selection: patternBinding) {
+                    ForEach(SOMALEDPattern.allCases, id: \.self) { pattern in
+                        Text(pattern.displayName).tag(pattern)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 108)
             }
         }
         .padding(.horizontal, 12)
@@ -1309,8 +1317,14 @@ private struct LEDSignalRow: View {
             get: { signal.color },
             set: { color in
                 signal.color = color
-                signal.pattern = .steady
             }
+        )
+    }
+
+    private var patternBinding: Binding<SOMALEDPattern> {
+        Binding(
+            get: { signal.pattern },
+            set: { signal.pattern = $0 }
         )
     }
 }

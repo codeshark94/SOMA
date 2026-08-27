@@ -172,6 +172,8 @@ public enum SubconsciousIndicatorState: String, CaseIterable, Codable, Hashable,
         .exploring,
         .humanDetected,
         .contactReady,
+        .conversation,
+        .working,
     ]
 
     public var configurationState: Self {
@@ -332,6 +334,12 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
     }
 
     public var visualPresentationState: SubconsciousIndicatorState {
+        // A live conversation is the sole interaction state that overrides
+        // the visual layer. Preparing a response must not make the person
+        // lose the visible-contact signal.
+        if interactionState == .conversation {
+            return .conversation
+        }
         switch visualState {
         case .eyeContact: return .contactReady
         case .humanDetected: return .humanDetected

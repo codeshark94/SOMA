@@ -441,7 +441,7 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(inputs.resolvedState, .contactReady)
         inputs.interactionState = .conversation
         XCTAssertEqual(inputs.resolvedState, .conversation)
-        XCTAssertEqual(inputs.visualPresentationState, .contactReady)
+        XCTAssertEqual(inputs.visualPresentationState, .conversation)
         inputs.interactionState = .preparingReply
         XCTAssertEqual(inputs.resolvedState, .working)
         XCTAssertEqual(inputs.visualPresentationState, .contactReady)
@@ -465,13 +465,15 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(SubconsciousIndicatorState.contactReady.humanMeaning, "ready_speak_now")
         XCTAssertEqual(SubconsciousIndicatorState.conversation.humanMeaning, "conversation_active")
         XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "please_wait_preparing_reply")
-        let blue = SOMALEDDeviceRendering(stateID: 57, pulseEnabled: false)
-        let yellow = SOMALEDDeviceRendering(stateID: 16, pulseEnabled: false)
-        XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, blue.stateID)
-        XCTAssertEqual(SOMALEDColor.yellow.firmwareStateID, yellow.stateID)
+        let blue = SOMALEDDeviceRendering(directRGB: .blue, pattern: .steady)
+        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.firmwareIndicatorStateID(for: .green))
+        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.firmwareIndicatorStateID(for: .yellow))
+        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .green), .green)
+        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .yellow), .yellow)
+        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .blue), blue.directRGB)
         XCTAssertEqual(
-            SOMALEDSettings().signal(for: .contactReady).deviceRendering,
-            SOMALEDDeviceRendering(stateID: 54, pulseEnabled: false)
+            SOMALEDSettings().deviceRendering(for: .contactReady, on: .tiny3Lite),
+            SOMALEDDeviceRendering(directRGB: .blue, pattern: .firmwareAnimation)
         )
     }
 

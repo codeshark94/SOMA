@@ -30,6 +30,7 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         let rect: Rect
         let faceVerified: Bool
         let identity: String?
+        let trackingHold: Bool
     }
 
     struct VisionSnapshot: Encodable, Sendable {
@@ -56,9 +57,13 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
 
     private struct PendingFrame: @unchecked Sendable {
         let buffer: LiveDiagnosticsRetainedBuffer
-        let candidates: [VisualObservation]
+        let snapshot: VisionSnapshot
         let captureNS: UInt64
-        let identity: IdentityInfo?
+    }
+
+    private struct HeldFace: Sendable {
+        let candidate: Candidate
+        let observedNS: UInt64
     }
 
     struct Thought: Encodable, Sendable {
@@ -79,12 +84,14 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     private let maxFrameDimension = 640.0
     private let retainedDiagnosticFramePairs = 10
     private let maxThoughts = 400
+    private let faceOverlayHoldNS: UInt64 = 200_000_000
     private let encoder = JSONEncoder()
 
     private var nextFrameNS: UInt64 = 0
     private var pendingFrame: PendingFrame?
     private var encoding = false
     private var latestIdentity: IdentityInfo?
+    private var heldFace: HeldFace?
     private var thoughts: [Thought] = []
     /// Set whenever the ring buffer gains events that have not been written to
     /// the thoughts file yet. The frame path refreshes the file from this flag
@@ -119,11 +126,15 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
             return
         }
         nextFrameNS = captureNS &+ frameIntervalNS
+        let snapshot = stabilizedVisionSnapshot(
+            from: candidates,
+            identity: identity,
+            captureNS: captureNS
+        )
         pendingFrame = PendingFrame(
             buffer: LiveDiagnosticsRetainedBuffer(pixelBuffer),
-            candidates: candidates,
-            captureNS: captureNS,
-            identity: identity
+            snapshot: snapshot,
+            captureNS: captureNS
         )
         let shouldStart = !encoding
         if shouldStart { encoding = true }
@@ -291,11 +302,7 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         ) else {
             return
         }
-        let snapshot = visionSnapshot(
-            from: frame.candidates,
-            identity: frame.identity,
-            captureNS: frame.captureNS
-        )
+        let snapshot = frame.snapshot
         guard let snapshotData = try? encoder.encode(snapshot) else { return }
         let generation = frame.captureNS
         let frameFilename = "frame-\(generation).jpg"
@@ -391,10 +398,52 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
                 confidence: candidate.confidence,
                 rect: Rect(x: rect.x, y: rect.y, width: rect.width, height: rect.height),
                 faceVerified: display.faceVerified,
-                identity: display.identity
+                identity: display.identity,
+                trackingHold: false
             )
         }
         return VisionSnapshot(capturedAtNS: captureNS, candidates: panelCandidates)
+    }
+
+    /// The diagnostic overlay is allowed to bridge a brief detector dropout,
+    /// but it never feeds the control loop. A dashed held face means the
+    /// display is carrying the last confirmed box, rather than claiming a new
+    /// detector measurement for this camera buffer.
+    private func stabilizedVisionSnapshot(
+        from candidates: [VisualObservation],
+        identity: IdentityInfo?,
+        captureNS: UInt64
+    ) -> VisionSnapshot {
+        var snapshot = visionSnapshot(
+            from: candidates,
+            identity: identity,
+            captureNS: captureNS
+        )
+        let currentFaces = snapshot.candidates.filter { $0.label == "face" }
+        if let face = currentFaces.max(by: { $0.confidence < $1.confidence }) {
+            heldFace = HeldFace(candidate: face, observedNS: captureNS)
+            return snapshot
+        }
+        guard let heldFace,
+              captureNS >= heldFace.observedNS,
+              captureNS - heldFace.observedNS <= faceOverlayHoldNS else {
+            if let heldFace, captureNS >= heldFace.observedNS + faceOverlayHoldNS {
+                self.heldFace = nil
+            }
+            return snapshot
+        }
+        snapshot = VisionSnapshot(
+            capturedAtNS: captureNS,
+            candidates: snapshot.candidates + [Candidate(
+                label: heldFace.candidate.label,
+                confidence: heldFace.candidate.confidence,
+                rect: heldFace.candidate.rect,
+                faceVerified: heldFace.candidate.faceVerified,
+                identity: heldFace.candidate.identity,
+                trackingHold: true
+            )]
+        )
+        return snapshot
     }
 
     private func pruneDiagnosticFrames() {

@@ -8,45 +8,130 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
     public let pitchSign: Double
     public let maximumPanDegreesPerSecond: Double
     public let maximumPitchDegreesPerSecond: Double
+    public let deviceProfile: OBSBOTDeviceProfile?
+    /// Image displacement per positive SDK-attitude axis. These are observed
+    /// alongside the velocity-pulse signs and make pose-space planning
+    /// profile-specific instead of inheriting another camera's convention.
+    public let posePanImageSign: Double?
+    public let posePitchImageSign: Double?
+    /// SDK-attitude response to a positive direct-speed pulse. This is
+    /// independent from how the image moves and is the only sign valid for
+    /// routing toward an attitude-space waypoint.
+    public let velocityPanPoseSign: Double?
+    public let velocityPitchPoseSign: Double?
+    /// Raw SDK attitude reported immediately before the calibration pulses.
+    /// Some OBSBOT products report an unwrapped attitude, so all spatial
+    /// planning is performed relative to this measured home pose.
+    public let homePanDegrees: Double?
+    public let homePitchDegrees: Double?
 
     public init(
-        schemaVersion: Int = 1,
+        schemaVersion: Int = 2,
         panSign: Double,
         pitchSign: Double,
         maximumPanDegreesPerSecond: Double,
-        maximumPitchDegreesPerSecond: Double
+        maximumPitchDegreesPerSecond: Double,
+        deviceProfile: OBSBOTDeviceProfile? = nil,
+        posePanImageSign: Double? = nil,
+        posePitchImageSign: Double? = nil,
+        velocityPanPoseSign: Double? = nil,
+        velocityPitchPoseSign: Double? = nil,
+        homePanDegrees: Double? = nil,
+        homePitchDegrees: Double? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.panSign = panSign
         self.pitchSign = pitchSign
         self.maximumPanDegreesPerSecond = maximumPanDegreesPerSecond
         self.maximumPitchDegreesPerSecond = maximumPitchDegreesPerSecond
+        self.deviceProfile = deviceProfile
+        self.posePanImageSign = posePanImageSign
+        self.posePitchImageSign = posePitchImageSign
+        self.velocityPanPoseSign = velocityPanPoseSign
+        self.velocityPitchPoseSign = velocityPitchPoseSign
+        self.homePanDegrees = homePanDegrees
+        self.homePitchDegrees = homePitchDegrees
     }
 
     public var isValid: Bool {
-        schemaVersion == 1
+        (schemaVersion == 1 || schemaVersion == 2)
             && abs(abs(panSign) - 1) < 0.000_001
             && abs(abs(pitchSign) - 1) < 0.000_001
             && maximumPanDegreesPerSecond > 0 && maximumPanDegreesPerSecond <= 180
             && maximumPitchDegreesPerSecond > 0 && maximumPitchDegreesPerSecond <= 90
+            && Self.validOptionalSign(posePanImageSign)
+            && Self.validOptionalSign(posePitchImageSign)
+            && ((posePanImageSign == nil) == (posePitchImageSign == nil))
+            && Self.validOptionalSign(velocityPanPoseSign)
+            && Self.validOptionalSign(velocityPitchPoseSign)
+            && ((velocityPanPoseSign == nil) == (velocityPitchPoseSign == nil))
+            && Self.validOptionalFinite(homePanDegrees)
+            && Self.validOptionalFinite(homePitchDegrees)
+            && ((homePanDegrees == nil) == (homePitchDegrees == nil))
+            && (deviceProfile != .tiny3Lite || hasMeasuredAttitudeFrame)
     }
 
-    /// Converts an error in SDK attitude coordinates into the direct speed
-    /// command that produces the matching image correction. The two measured
-    /// mappings are both required: image-to-speed calibration and
-    /// image-to-attitude projection.
+    public var hasMeasuredPoseProjection: Bool {
+        posePanImageSign != nil && posePitchImageSign != nil
+    }
+
+    public var hasMeasuredAttitudeFrame: Bool {
+        hasMeasuredPoseProjection
+            && velocityPanPoseSign != nil
+            && velocityPitchPoseSign != nil
+            && homePanDegrees != nil
+            && homePitchDegrees != nil
+    }
+
+    public var poseProjection: GimbalPoseProjection {
+        guard let posePanImageSign, let posePitchImageSign else {
+            return .obsbotTiny2Lite
+        }
+        return GimbalPoseProjection(
+            panImageSign: posePanImageSign,
+            pitchImageSign: posePitchImageSign
+        )
+    }
+
+    private static func validOptionalSign(_ value: Double?) -> Bool {
+        guard let value else { return true }
+        return abs(abs(value) - 1) < 0.000_001
+    }
+
+    private static func validOptionalFinite(_ value: Double?) -> Bool {
+        value?.isFinite ?? true
+    }
+
+    /// Converts a logical attitude error into the direct-speed command that
+    /// moves toward that attitude. Image-space and attitude-space directions
+    /// are separate observations and must never be mixed.
     public func pitchCommand(
         forPoseError error: Double,
         projection: GimbalPoseProjection
     ) -> Double {
-        error * pitchSign * projection.pitchImageSign
+        if let velocityPitchPoseSign {
+            return error * velocityPitchPoseSign
+        }
+        return error * pitchSign * projection.pitchImageSign
     }
 
     public func panCommand(
         forPoseError error: Double,
         projection: GimbalPoseProjection
     ) -> Double {
-        error * panSign * projection.panImageSign
+        if let velocityPanPoseSign {
+            return error * velocityPanPoseSign
+        }
+        return error * panSign * projection.panImageSign
+    }
+
+    public func logicalPose(from rawPose: GimbalPose) -> GimbalPose {
+        guard let homePanDegrees, let homePitchDegrees else { return rawPose }
+        return GimbalPose(
+            pitchDegrees: rawPose.pitchDegrees - homePitchDegrees,
+            panDegrees: rawPose.panDegrees - homePanDegrees,
+            monotonicNS: rawPose.monotonicNS
+        )
     }
 
     /// Derives controller signs from the observed image displacement caused by
@@ -56,14 +141,45 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
         panImageDelta: Double,
         pitchImageDelta: Double,
         maximumPanDegreesPerSecond: Double = 180,
-        maximumPitchDegreesPerSecond: Double = 90
+        maximumPitchDegreesPerSecond: Double = 90,
+        deviceProfile: OBSBOTDeviceProfile? = nil,
+        panPoseDelta: Double? = nil,
+        pitchPoseDelta: Double? = nil,
+        homePose: GimbalPose? = nil
     ) -> ExternalGimbalCalibration? {
         guard abs(panImageDelta) >= 0.015, abs(pitchImageDelta) >= 0.015 else { return nil }
+        let poseSigns: (pan: Double?, pitch: Double?)
+        let velocityPoseSigns: (pan: Double?, pitch: Double?)
+        switch (panPoseDelta, pitchPoseDelta) {
+        case (nil, nil):
+            poseSigns = (nil, nil)
+            velocityPoseSigns = (nil, nil)
+        case let (panDelta?, pitchDelta?):
+            guard abs(panDelta) >= 0.25, abs(pitchDelta) >= 0.25 else { return nil }
+            guard homePose != nil else { return nil }
+            poseSigns = (
+                panImageDelta * panDelta >= 0 ? 1 : -1,
+                pitchImageDelta * pitchDelta >= 0 ? 1 : -1
+            )
+            velocityPoseSigns = (
+                panDelta >= 0 ? 1 : -1,
+                pitchDelta >= 0 ? 1 : -1
+            )
+        default:
+            return nil
+        }
         return ExternalGimbalCalibration(
             panSign: panImageDelta > 0 ? -1 : 1,
             pitchSign: pitchImageDelta > 0 ? -1 : 1,
             maximumPanDegreesPerSecond: maximumPanDegreesPerSecond,
-            maximumPitchDegreesPerSecond: maximumPitchDegreesPerSecond
+            maximumPitchDegreesPerSecond: maximumPitchDegreesPerSecond,
+            deviceProfile: deviceProfile,
+            posePanImageSign: poseSigns.pan,
+            posePitchImageSign: poseSigns.pitch,
+            velocityPanPoseSign: velocityPoseSigns.pan,
+            velocityPitchPoseSign: velocityPoseSigns.pitch,
+            homePanDegrees: homePose?.panDegrees,
+            homePitchDegrees: homePose?.pitchDegrees
         )
     }
 }
@@ -75,15 +191,33 @@ public enum ExternalGimbalAttentionAction: Equatable, Sendable {
     case stop
 }
 
-/// Image-space PD controller for a single face. Position drives the camera
-/// toward the optical centre; measured image velocity only removes drive while
-/// the error is already closing. This keeps the servo responsive to a person
-/// moving away without letting the camera's own delayed motion create a second
-/// steering target.
+/// Directional gimbal attitude feedback in the same logical pose frame used
+/// by `GimbalRelativeBearing`.  The face servo uses it to distinguish subject
+/// motion from camera motion and to begin braking before it passes the target.
+public struct GimbalVelocityFeedback: Equatable, Sendable {
+    public let pitchDegreesPerSecond: Double
+    public let panDegreesPerSecond: Double
+
+    public init(pitchDegreesPerSecond: Double, panDegreesPerSecond: Double) {
+        self.pitchDegreesPerSecond = pitchDegreesPerSecond
+        self.panDegreesPerSecond = panDegreesPerSecond
+    }
+}
+
+/// World-bearing servo for a single face.  Both the face bearing and gimbal
+/// pose are first projected to one control instant; the controller never
+/// compares a captured face with an older physical pose.  Subject velocity is
+/// then used to predict separation over the remaining actuator delay, rather
+/// than being injected as an open-loop motor command.
 private struct FaceServoDynamics: Sendable {
     private var sceneID: String?
     private var rect: NormalizedRect?
     private var referenceBearing: GimbalRelativeBearing?
+    private var referenceBearingNS: UInt64?
+    private var filteredTargetVelocity = GimbalVelocityFeedback(
+        pitchDegreesPerSecond: 0,
+        panDegreesPerSecond: 0
+    )
     private var panAxis = FaceServoAxis()
     private var pitchAxis = FaceServoAxis()
 
@@ -93,23 +227,36 @@ private struct FaceServoDynamics: Sendable {
         maximumPitch: Double,
         maximumPan: Double,
         bearing: GimbalRelativeBearing?,
+        faceObservationNS: UInt64?,
         currentPose: GimbalPose?,
+        currentVelocity: GimbalVelocityFeedback?,
         poseProjection: GimbalPoseProjection,
         at monotonicNS: UInt64
     ) -> (pitch: Double, pan: Double) {
         let continuesTrajectory = sceneID == target.id
             || rect.map { isGeometricallyContinuous($0, target.rect) } == true
             || spatiallyContinuous(with: bearing)
-        if !continuesTrajectory {
-            panAxis.reset()
-            pitchAxis.reset()
-        }
+        if !continuesTrajectory { reset() }
         sceneID = target.id
         rect = target.rect
-        if let bearing { referenceBearing = bearing }
+        let observationNS = min(faceObservationNS ?? monotonicNS, monotonicNS)
+        let targetVelocity = updateTargetVelocity(with: bearing, at: observationNS)
         let errors: (pan: Double, pitch: Double)
         let physicalReference = bearing.flatMap { bearing in
-            currentPose.map { pose in (bearing, pose) }
+            currentPose.map { pose in
+                let targetAgeSeconds = seconds(from: observationNS, to: monotonicNS)
+                let poseAgeSeconds = seconds(from: pose.monotonicNS, to: monotonicNS)
+                let targetAtControl = GimbalRelativeBearing(
+                    azimuthDegrees: bearing.azimuthDegrees + targetVelocity.panDegreesPerSecond * targetAgeSeconds,
+                    elevationDegrees: bearing.elevationDegrees + targetVelocity.pitchDegreesPerSecond * targetAgeSeconds
+                )
+                let cameraAtControl = GimbalPose(
+                    pitchDegrees: pose.pitchDegrees + (currentVelocity?.pitchDegreesPerSecond ?? 0) * poseAgeSeconds,
+                    panDegrees: pose.panDegrees + (currentVelocity?.panDegreesPerSecond ?? 0) * poseAgeSeconds,
+                    monotonicNS: monotonicNS
+                )
+                return (targetAtControl, cameraAtControl, poseAgeSeconds)
+            }
         }
         if let physicalReference {
             errors = (
@@ -125,24 +272,46 @@ private struct FaceServoDynamics: Sendable {
         let pitchTuning = physicalReference == nil
             ? (proportionalGain: 60.0, derivativeGain: 6.0, settlingError: 0.15)
             : (proportionalGain: 2.6, derivativeGain: 0.20, settlingError: 2.8)
-        let pan = panAxis.command(
+        let actuationHorizonSeconds = physicalReference.map {
+            // One control interval plus the measured feedback age approximates
+            // the portion of motion that is already in flight.  Clamping
+            // prevents a sparse attitude sample from becoming an aggressive
+            // extrapolation.
+            min(0.18, max(0.11, 0.08 + 0.5 * $0.2))
+        } ?? 0
+        let rawPan = panAxis.command(
             error: errors.pan,
             proportionalGain: panTuning.proportionalGain,
             derivativeGain: panTuning.derivativeGain,
             settlingError: panTuning.settlingError,
             maximum: maximumPan,
             maximumAcceleration: 260,
+            targetDegreesPerSecond: targetVelocity.panDegreesPerSecond,
+            measuredDegreesPerSecond: currentVelocity?.panDegreesPerSecond ?? 0,
+            actuationHorizonSeconds: actuationHorizonSeconds,
             at: monotonicNS
-        ) * (physicalReference == nil ? calibration.panSign : calibration.panSign * poseProjection.panImageSign)
-        let pitch = pitchAxis.command(
+        )
+        let rawPitch = pitchAxis.command(
             error: errors.pitch,
             proportionalGain: pitchTuning.proportionalGain,
             derivativeGain: pitchTuning.derivativeGain,
             settlingError: pitchTuning.settlingError,
             maximum: maximumPitch,
             maximumAcceleration: 120,
+            targetDegreesPerSecond: targetVelocity.pitchDegreesPerSecond,
+            measuredDegreesPerSecond: currentVelocity?.pitchDegreesPerSecond ?? 0,
+            actuationHorizonSeconds: actuationHorizonSeconds,
             at: monotonicNS
-        ) * (physicalReference == nil ? calibration.pitchSign : calibration.pitchSign * poseProjection.pitchImageSign)
+        )
+        // A physical bearing is expressed in the gimbal's measured attitude
+        // frame.  Its direct motor sign comes from the velocity pulse, not
+        // from the screen displacement sign used by image-only tracking.
+        let pan = physicalReference == nil
+            ? rawPan * calibration.panSign
+            : calibration.panCommand(forPoseError: rawPan, projection: poseProjection)
+        let pitch = physicalReference == nil
+            ? rawPitch * calibration.pitchSign
+            : calibration.pitchCommand(forPoseError: rawPitch, projection: poseProjection)
         return (pitch, pan)
     }
 
@@ -150,8 +319,61 @@ private struct FaceServoDynamics: Sendable {
         sceneID = nil
         rect = nil
         referenceBearing = nil
+        referenceBearingNS = nil
+        filteredTargetVelocity = GimbalVelocityFeedback(
+            pitchDegreesPerSecond: 0,
+            panDegreesPerSecond: 0
+        )
         panAxis.reset()
         pitchAxis.reset()
+    }
+
+    private mutating func updateTargetVelocity(
+        with next: GimbalRelativeBearing?,
+        at monotonicNS: UInt64
+    ) -> GimbalVelocityFeedback {
+        defer {
+            if let next {
+                referenceBearing = next
+                referenceBearingNS = monotonicNS
+            }
+        }
+        guard let prior = referenceBearing,
+              let referenceBearingNS,
+              let next,
+              monotonicNS > referenceBearingNS,
+              monotonicNS - referenceBearingNS <= 250_000_000 else {
+            return filteredTargetVelocity
+        }
+        let elapsed = Double(monotonicNS - referenceBearingNS) / 1_000_000_000
+        guard elapsed >= 0.012 else { return filteredTargetVelocity }
+        let instantaneous = GimbalVelocityFeedback(
+            pitchDegreesPerSecond: (next.elevationDegrees - prior.elevationDegrees) / elapsed,
+            panDegreesPerSecond: angularDifference(next.azimuthDegrees, prior.azimuthDegrees) / elapsed
+        )
+        // Angular bearing measurements can jump when a detector switches
+        // boxes. Keep the velocity useful for rapid human movement without
+        // letting one geometric outlier become a full-speed motor pulse.
+        filteredTargetVelocity = GimbalVelocityFeedback(
+            pitchDegreesPerSecond: boundedRate(
+                0.45 * instantaneous.pitchDegreesPerSecond
+                    + 0.55 * filteredTargetVelocity.pitchDegreesPerSecond
+            ),
+            panDegreesPerSecond: boundedRate(
+                0.45 * instantaneous.panDegreesPerSecond
+                    + 0.55 * filteredTargetVelocity.panDegreesPerSecond
+            )
+        )
+        return filteredTargetVelocity
+    }
+
+    private func boundedRate(_ value: Double) -> Double {
+        max(-120, min(120, value))
+    }
+
+    private func seconds(from earlier: UInt64, to later: UInt64) -> Double {
+        guard later > earlier else { return 0 }
+        return min(0.25, Double(later - earlier) / 1_000_000_000)
     }
 
     private func isGeometricallyContinuous(_ previous: NormalizedRect, _ next: NormalizedRect) -> Bool {
@@ -190,6 +412,9 @@ private struct FaceServoDynamics: Sendable {
             settlingError: Double,
             maximum: Double,
             maximumAcceleration: Double,
+            targetDegreesPerSecond: Double,
+            measuredDegreesPerSecond: Double,
+            actuationHorizonSeconds: Double,
             at monotonicNS: UInt64
         ) -> Double {
             guard let previousError,
@@ -198,9 +423,10 @@ private struct FaceServoDynamics: Sendable {
                   monotonicNS - lastNS <= 250_000_000 else {
                 self.previousError = error
                 filteredRate = 0
+                let drive = proportionalGain * error
                 command = abs(error) <= settlingError
                     ? 0
-                    : max(-maximum, min(maximum, proportionalGain * error))
+                    : bounded(drive, maximum: maximum)
                 self.lastNS = monotonicNS
                 return command
             }
@@ -208,14 +434,26 @@ private struct FaceServoDynamics: Sendable {
             let elapsed = min(Double(monotonicNS - lastNS) / 1_000_000_000, 0.08)
             let instantaneousRate = (error - previousError) / elapsed
             filteredRate = 0.45 * instantaneousRate + 0.55 * filteredRate
-            var desired = abs(error) <= settlingError
-                ? 0
-                : proportionalGain * error + derivativeGain * filteredRate
-            // The derivative term is braking only. While a face is still on
-            // one side of centre, a camera command may slow to zero but never
-            // reverse and push that face farther out of frame.
-            if desired * error < 0 { desired = 0 }
-            desired = max(-maximum, min(maximum, desired))
+            let relativeRate = targetDegreesPerSecond - measuredDegreesPerSecond
+            // Project separation over the measured remaining actuation delay.
+            // Target velocity is deliberately not added as an independent
+            // command: that was an open-loop impulse which kept driving after
+            // a rapidly moving person stopped, making the camera pass them.
+            let projectedError = error + relativeRate * actuationHorizonSeconds
+            var desired = (abs(error) <= settlingError ? 0 : proportionalGain * projectedError)
+                + derivativeGain * relativeRate
+            let isClosingTooFast = error * measuredDegreesPerSecond > 0
+                && error * projectedError < 0
+            // A reverse setpoint is physical braking only when measured
+            // attitude says the gimbal would cross the target. A face box
+            // moving on its own can reduce drive, but cannot reverse the
+            // camera away from that still-visible person.
+            if desired * error < 0 && !isClosingTooFast { desired = 0 }
+            if isClosingTooFast, desired * error < 0 {
+                let brakingMaximum = min(maximum * 0.45, abs(measuredDegreesPerSecond) * 0.75)
+                desired = max(-brakingMaximum, min(brakingMaximum, desired))
+            }
+            desired = bounded(desired, maximum: maximum)
             command = slew(
                 from: command,
                 to: desired,
@@ -235,6 +473,10 @@ private struct FaceServoDynamics: Sendable {
 
         private func slew(from current: Double, to desired: Double, maximumChange: Double) -> Double {
             max(current - maximumChange, min(current + maximumChange, desired))
+        }
+
+        private func bounded(_ value: Double, maximum: Double) -> Double {
+            max(-maximum, min(maximum, value))
         }
     }
 }
@@ -292,7 +534,9 @@ public struct ExternalGimbalAttentionGate: Sendable {
     public mutating func update(
         _ belief: BeliefSnapshot,
         faceBearing: GimbalRelativeBearing? = nil,
+        faceObservationNS: UInt64? = nil,
         currentPose: GimbalPose? = nil,
+        currentVelocity: GimbalVelocityFeedback? = nil,
         poseProjection: GimbalPoseProjection = .identity,
         allowSocialReframing: Bool = false
     ) -> ExternalGimbalAttentionAction {
@@ -357,7 +601,9 @@ public struct ExternalGimbalAttentionGate: Sendable {
                 maximumPitch: pitchMaximum,
                 maximumPan: panMaximum,
                 bearing: faceBearing,
+                faceObservationNS: faceObservationNS,
                 currentPose: currentPose,
+                currentVelocity: currentVelocity,
                 poseProjection: poseProjection,
                 at: belief.monotonicNS
             )

@@ -64,6 +64,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
     private let statusStore: PanoramaMapStatusStore
     private let poseAtCapture: @Sendable (UInt64) -> CaptureAlignedPoseResolution
     private let poseProjection: GimbalPoseProjection
+    private let kinematicEnvelope: GimbalKinematicEnvelope
     private let onSpatialObservation: @Sendable (
         GimbalPose,
         Double,
@@ -146,6 +147,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         geometryCaptureDirectoryURL: URL? = nil,
         statusStore: PanoramaMapStatusStore,
         poseProjection: GimbalPoseProjection,
+        kinematicEnvelope: GimbalKinematicEnvelope,
         poseAtCapture: @escaping @Sendable (UInt64) -> CaptureAlignedPoseResolution,
         onSpatialObservation: @escaping @Sendable (
             GimbalPose,
@@ -178,6 +180,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
         self.statusStore = statusStore
         self.poseAtCapture = poseAtCapture
         self.poseProjection = poseProjection
+        self.kinematicEnvelope = kinematicEnvelope
         self.onSpatialObservation = onSpatialObservation
         self.onHealth = onHealth
         pixels = [UInt8](repeating: 18, count: width * height * 4)
@@ -874,7 +877,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
                     bearing,
                     cameraProjectionModel: cameraProjectionModel,
                     poseProjection: poseProjection,
-                    kinematicEnvelope: .obsbotTiny2Lite
+                    kinematicEnvelope: kinematicEnvelope
                 ) else { continue }
                 mask[panoramaY * width + panoramaX] = true
                 count += 1

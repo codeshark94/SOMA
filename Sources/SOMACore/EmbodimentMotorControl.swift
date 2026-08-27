@@ -35,6 +35,69 @@ public enum EmbodimentMotorIntent: Equatable, Sendable {
         fieldOfViewDegrees: Double,
         expiresAtNS: UInt64
     )
+    case opticalZoom(
+        requestID: String,
+        factor: Double
+    )
+    case audioCaptureMode(
+        requestID: String,
+        mode: MicrophoneCaptureMode
+    )
+    case audioInputGain(
+        requestID: String,
+        percent: Int
+    )
+    case cameraWhiteBalance(
+        requestID: String,
+        mode: CameraWhiteBalanceMode,
+        temperatureKelvin: Int?
+    )
+    case cameraExposureLock(
+        requestID: String,
+        locked: Bool
+    )
+    case cameraFocus(
+        requestID: String,
+        mode: CameraFocusMode,
+        position: Int?
+    )
+    case cameraAbsoluteExposure(
+        requestID: String,
+        mode: CameraAbsoluteExposureMode,
+        shutterCode: Int?
+    )
+    case cameraFacePriority(
+        requestID: String,
+        enabled: Bool
+    )
+    case cameraAntiFlicker(
+        requestID: String,
+        mode: CameraAntiFlickerMode
+    )
+    case cameraImageTuning(
+        requestID: String,
+        goal: CameraImageTuningGoal
+    )
+    case nativeHumanTrackingPolicy(
+        requestID: String,
+        speed: NativeHumanTrackingSpeed,
+        motionTracking: Bool,
+        foreTarget: Bool,
+        adaptiveComposition: Bool,
+        adaptivePanGain: Bool,
+        adaptivePitchGain: Bool,
+        panGain: Double?,
+        pitchGain: Double?
+    )
+    case cameraFieldOfView(
+        requestID: String,
+        degrees: Int
+    )
+    case deviceSoundFollowing(
+        requestID: String,
+        enabled: Bool,
+        expiresAtNS: UInt64?
+    )
     case explore(
         requestID: String,
         policy: ExplorationPolicyGoal,
@@ -78,6 +141,100 @@ public struct EmbodimentMotorCoordinator: Sendable {
                 requestID: request.requestID,
                 fieldOfViewDegrees: goal.fieldOfViewDegrees ?? 70,
                 expiresAtNS: request.lease.expiresAtNS
+            )
+        }
+
+        if case let .setOpticalZoom(goal) = request.operation,
+           decision.status == .accepted {
+            return .opticalZoom(requestID: request.requestID, factor: goal.factor)
+        }
+
+        if case let .setAudioCaptureMode(goal) = request.operation,
+           decision.status == .accepted {
+            return .audioCaptureMode(requestID: request.requestID, mode: goal.mode)
+        }
+
+        if case let .setAudioInputGain(goal) = request.operation,
+           decision.status == .accepted {
+            return .audioInputGain(requestID: request.requestID, percent: goal.percent)
+        }
+
+        if case let .setCameraWhiteBalance(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraWhiteBalance(
+                requestID: request.requestID,
+                mode: goal.mode,
+                temperatureKelvin: goal.temperatureKelvin
+            )
+        }
+
+        if case let .setCameraExposureLock(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraExposureLock(requestID: request.requestID, locked: goal.locked)
+        }
+
+        if case let .setCameraFocus(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraFocus(
+                requestID: request.requestID,
+                mode: goal.mode,
+                position: goal.position
+            )
+        }
+
+        if case let .setCameraAbsoluteExposure(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraAbsoluteExposure(
+                requestID: request.requestID,
+                mode: goal.mode,
+                shutterCode: goal.shutterCode
+            )
+        }
+
+        if case let .setCameraFacePriority(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraFacePriority(requestID: request.requestID, enabled: goal.enabled)
+        }
+
+        if case let .setCameraAntiFlicker(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraAntiFlicker(requestID: request.requestID, mode: goal.mode)
+        }
+
+        if case let .setCameraImageTuning(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraImageTuning(requestID: request.requestID, goal: goal)
+        }
+
+        if case let .setNativeHumanTrackingPolicy(goal) = request.operation,
+           decision.status == .accepted {
+            return .nativeHumanTrackingPolicy(
+                requestID: request.requestID,
+                speed: goal.speed,
+                motionTracking: goal.motionTracking,
+                foreTarget: goal.foreTarget,
+                adaptiveComposition: goal.adaptiveComposition,
+                adaptivePanGain: goal.adaptivePanGain,
+                adaptivePitchGain: goal.adaptivePitchGain,
+                panGain: goal.panGain,
+                pitchGain: goal.pitchGain
+            )
+        }
+
+        if case let .setCameraFieldOfView(goal) = request.operation,
+           decision.status == .accepted {
+            return .cameraFieldOfView(requestID: request.requestID, degrees: goal.degrees)
+        }
+
+        if case let .setDeviceSoundFollowing(goal) = request.operation,
+           !goal.enabled,
+           decision.status == .accepted {
+            activeRequest = nil
+            lastFingerprint = nil
+            return .deviceSoundFollowing(
+                requestID: request.requestID,
+                enabled: false,
+                expiresAtNS: nil
             )
         }
 
@@ -217,6 +374,18 @@ public struct EmbodimentMotorCoordinator: Sendable {
                 expression: expression,
                 expiresAtNS: request.lease.expiresAtNS
             )
+        case .setOpticalZoom, .setAudioCaptureMode, .setAudioInputGain, .setCameraWhiteBalance, .setCameraExposureLock, .setCameraFocus, .setCameraAbsoluteExposure, .setCameraFacePriority, .setCameraAntiFlicker, .setCameraImageTuning, .setNativeHumanTrackingPolicy, .setCameraFieldOfView:
+            return .suspend(
+                requestID: request.requestID,
+                reason: "sensor_control_not_motor_lease",
+                expiresAtNS: request.lease.expiresAtNS
+            )
+        case let .setDeviceSoundFollowing(goal):
+            intent = .deviceSoundFollowing(
+                requestID: request.requestID,
+                enabled: goal.enabled,
+                expiresAtNS: goal.enabled ? request.lease.expiresAtNS : nil
+            )
         case .registerTarget, .removeTarget, .setAttentionPolicy, .release:
             return nil
         }
@@ -304,6 +473,34 @@ public struct EmbodimentMotorCoordinator: Sendable {
             return "capture|\(requestID)|\(reference ?? "none")|\(sceneID ?? "none")|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(bucket(fieldOfView))|\(expiresAtNS)"
         case let .captureCurrent(requestID, fieldOfView, expiresAtNS):
             return "capture_current|\(requestID)|\(bucket(fieldOfView))|\(expiresAtNS)"
+        case let .opticalZoom(requestID, factor):
+            return "optical_zoom|\(requestID)|\(bucket(factor))"
+        case let .audioCaptureMode(requestID, mode):
+            return "audio_capture_mode|\(requestID)|\(mode.rawValue)"
+        case let .audioInputGain(requestID, percent):
+            return "audio_input_gain|\(requestID)|\(percent)"
+        case let .cameraWhiteBalance(requestID, mode, temperatureKelvin):
+            return "camera_white_balance|\(requestID)|\(mode.rawValue)|\(temperatureKelvin.map(String.init) ?? "automatic")"
+        case let .cameraExposureLock(requestID, locked):
+            return "camera_exposure_lock|\(requestID)|\(locked)"
+        case let .cameraFocus(requestID, mode, position):
+            return "camera_focus|\(requestID)|\(mode.rawValue)|\(position.map(String.init) ?? "automatic")"
+        case let .cameraAbsoluteExposure(requestID, mode, shutterCode):
+            return "camera_absolute_exposure|\(requestID)|\(mode.rawValue)|\(shutterCode.map(String.init) ?? "automatic")"
+        case let .cameraFacePriority(requestID, enabled):
+            return "camera_face_priority|\(requestID)|\(enabled)"
+        case let .cameraAntiFlicker(requestID, mode):
+            return "camera_anti_flicker|\(requestID)|\(mode.rawValue)"
+        case let .cameraImageTuning(requestID, goal):
+            return "camera_image_tuning|\(requestID)|\(goal.brightness.map(String.init) ?? "keep")|\(goal.contrast.map(String.init) ?? "keep")|\(goal.hue.map(String.init) ?? "keep")|\(goal.saturation.map(String.init) ?? "keep")|\(goal.sharpness.map(String.init) ?? "keep")"
+        case let .nativeHumanTrackingPolicy(requestID, speed, motionTracking, foreTarget, adaptiveComposition, adaptivePanGain, adaptivePitchGain, panGain, pitchGain):
+            let panGainValue = panGain.map { String($0) } ?? "keep"
+            let pitchGainValue = pitchGain.map { String($0) } ?? "keep"
+            return "native_human_tracking_policy|\(requestID)|\(speed.rawValue)|\(motionTracking)|\(foreTarget)|\(adaptiveComposition)|\(adaptivePanGain)|\(adaptivePitchGain)|\(panGainValue)|\(pitchGainValue)"
+        case let .cameraFieldOfView(requestID, degrees):
+            return "camera_field_of_view|\(requestID)|\(degrees)"
+        case let .deviceSoundFollowing(requestID, enabled, expiresAtNS):
+            return "device_sound_following|\(requestID)|\(enabled)|\(expiresAtNS.map(String.init) ?? "none")"
         case let .explore(requestID, policy, expiresAtNS):
             return "explore|\(requestID)|\(policy.mode.rawValue)|\(expiresAtNS)"
         case let .express(requestID, expression, expiresAtNS):

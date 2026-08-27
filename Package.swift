@@ -22,6 +22,7 @@ let package = Package(
         .executable(name: "soma-probe", targets: ["SOMAProbe"]),
         .executable(name: "soma-subconscious", targets: ["SOMASubconscious"]),
         .executable(name: "soma-core-check", targets: ["SOMACoreChecks"]),
+        .executable(name: "soma-memory-recover", targets: ["SOMAMemoryRecovery"]),
         .executable(name: "soma-vad-eval", targets: ["SOMAVADEval"]),
         .executable(name: "soma-event-eval", targets: ["SOMAEventEval"]),
         .executable(name: "soma-embodiment", targets: ["SOMAEmbodimentMCP"]),
@@ -71,6 +72,7 @@ let package = Package(
             ]
         ),
         .executableTarget(name: "SOMACoreChecks", dependencies: ["SOMACore"]),
+        .executableTarget(name: "SOMAMemoryRecovery", dependencies: ["SOMACore"]),
         .executableTarget(name: "SOMAVADEval", dependencies: ["SOMACore", "SOMAVADModel"]),
         .executableTarget(
             name: "SOMAEventEval",

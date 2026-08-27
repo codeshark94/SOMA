@@ -21,6 +21,7 @@ final class SOMADiagnosticsModel: ObservableObject {
         let rect: Rect
         let faceVerified: Bool
         let identity: String?
+        let trackingHold: Bool
         var id: String { "\(label ?? "?"):\(rect.x):\(rect.y)" }
     }
 
@@ -436,7 +437,13 @@ struct SOMADiagnosticsView: View {
                             let w = max(2, CGFloat(candidate.rect.width) * drawRect.width)
                             let h = max(2, CGFloat(candidate.rect.height) * drawRect.height)
                             Rectangle()
-                                .stroke(color, lineWidth: 2)
+                                .stroke(
+                                    color,
+                                    style: StrokeStyle(
+                                        lineWidth: 2,
+                                        dash: candidate.trackingHold ? [5, 3] : []
+                                    )
+                                )
                                 .frame(width: w, height: h)
                                 .position(x: x + w / 2, y: y + h / 2)
                             if let label = candidate.label, !label.isEmpty {

@@ -98,6 +98,71 @@ private struct CaptureArguments: Codable {
     let goal: CaptureViewGoal
 }
 
+private struct OpticalZoomArguments: Codable {
+    let control: ControlArguments
+    let goal: OpticalZoomGoal
+}
+
+private struct AudioCaptureModeArguments: Codable {
+    let control: ControlArguments
+    let goal: AudioCaptureModeGoal
+}
+
+private struct AudioInputGainArguments: Codable {
+    let control: ControlArguments
+    let goal: AudioInputGainGoal
+}
+
+private struct CameraWhiteBalanceArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraWhiteBalanceGoal
+}
+
+private struct CameraExposureLockArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraExposureLockGoal
+}
+
+private struct CameraFocusArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraFocusGoal
+}
+
+private struct CameraAbsoluteExposureArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraAbsoluteExposureGoal
+}
+
+private struct CameraFacePriorityArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraFacePriorityGoal
+}
+
+private struct CameraAntiFlickerArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraAntiFlickerGoal
+}
+
+private struct CameraImageTuningArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraImageTuningGoal
+}
+
+private struct NativeHumanTrackingPolicyArguments: Codable {
+    let control: ControlArguments
+    let goal: NativeHumanTrackingPolicyGoal
+}
+
+private struct CameraFieldOfViewArguments: Codable {
+    let control: ControlArguments
+    let goal: CameraFieldOfViewGoal
+}
+
+private struct DeviceSoundFollowingArguments: Codable {
+    let control: ControlArguments
+    let goal: DeviceSoundFollowingGoal
+}
+
 private struct ExpressionArguments: Codable {
     let control: ControlArguments
     let expression: SocialGimbalExpression
@@ -392,7 +457,7 @@ private final class EmbodimentMCPServer {
             )
         case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
              "track_target", "orient_to", "set_exploration_policy", "capture_view",
-             "express_gimbal", "release_embodiment":
+             "set_camera_optical_zoom", "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance", "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure", "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning", "set_native_human_tracking_policy", "set_camera_field_of_view", "set_device_sound_following", "express_gimbal", "release_embodiment":
             let request = try embodimentRequest(for: name, arguments: toolArguments)
             let initial = try EmbodimentShadowSocketClient.send(
                 .init(
@@ -448,6 +513,45 @@ private final class EmbodimentMCPServer {
         case "capture_view":
             let value: CaptureArguments = try decode(arguments)
             return value.control.request(operation: .captureView(value.goal))
+        case "set_camera_optical_zoom":
+            let value: OpticalZoomArguments = try decode(arguments)
+            return value.control.request(operation: .setOpticalZoom(value.goal))
+        case "set_audio_capture_mode":
+            let value: AudioCaptureModeArguments = try decode(arguments)
+            return value.control.request(operation: .setAudioCaptureMode(value.goal))
+        case "set_audio_input_gain":
+            let value: AudioInputGainArguments = try decode(arguments)
+            return value.control.request(operation: .setAudioInputGain(value.goal))
+        case "set_camera_white_balance":
+            let value: CameraWhiteBalanceArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraWhiteBalance(value.goal))
+        case "set_camera_exposure_lock":
+            let value: CameraExposureLockArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraExposureLock(value.goal))
+        case "set_camera_focus":
+            let value: CameraFocusArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraFocus(value.goal))
+        case "set_camera_absolute_exposure":
+            let value: CameraAbsoluteExposureArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraAbsoluteExposure(value.goal))
+        case "set_camera_face_priority":
+            let value: CameraFacePriorityArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraFacePriority(value.goal))
+        case "set_camera_anti_flicker":
+            let value: CameraAntiFlickerArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraAntiFlicker(value.goal))
+        case "set_camera_image_tuning":
+            let value: CameraImageTuningArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraImageTuning(value.goal))
+        case "set_native_human_tracking_policy":
+            let value: NativeHumanTrackingPolicyArguments = try decode(arguments)
+            return value.control.request(operation: .setNativeHumanTrackingPolicy(value.goal))
+        case "set_camera_field_of_view":
+            let value: CameraFieldOfViewArguments = try decode(arguments)
+            return value.control.request(operation: .setCameraFieldOfView(value.goal))
+        case "set_device_sound_following":
+            let value: DeviceSoundFollowingArguments = try decode(arguments)
+            return value.control.request(operation: .setDeviceSoundFollowing(value.goal))
         case "express_gimbal":
             let value: ExpressionArguments = try decode(arguments)
             return value.control.request(operation: .express(value.expression))
@@ -671,6 +775,19 @@ private final class EmbodimentMCPServer {
             "orient_to",
             "set_exploration_policy",
             "capture_view",
+            "set_camera_optical_zoom",
+            "set_audio_capture_mode",
+            "set_audio_input_gain",
+            "set_camera_white_balance",
+            "set_camera_exposure_lock",
+            "set_camera_focus",
+            "set_camera_absolute_exposure",
+            "set_camera_face_priority",
+            "set_camera_anti_flicker",
+            "set_camera_image_tuning",
+            "set_native_human_tracking_policy",
+            "set_camera_field_of_view",
+            "set_device_sound_following",
             "express_gimbal",
             "release_embodiment",
             "get_person_context",
@@ -815,6 +932,58 @@ private final class EmbodimentMCPServer {
             tool("capture_view", "Capture a view and return it as MCP image content plus a short-lived local resource link. Use goal.current_frame=true for the immediate current camera frame without moving the gimbal; use target_reference or bearing only when a reframed view is needed.", objectSchema([
                 "control": controlSchema(),
                 "goal": captureGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_optical_zoom", "Set a physical camera zoom factor for a concrete detail-observation goal. L0 verifies the active device's reported factor and updates spatial projection before using later frames. Use 1.0 to restore the wide view.", objectSchema([
+                "control": controlSchema(),
+                "goal": opticalZoomGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_audio_capture_mode", "Choose the physical microphone capture mode for a concrete listening task. spatial_stereo preserves sound-direction evidence; conversation_front prioritizes a person already in front of the camera. L0 verifies the selected device mode.", objectSchema([
+                "control": controlSchema(),
+                "goal": audioCaptureModeGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_audio_input_gain", "Set microphone input gain for a specific listening task. This changes input level without changing spatial capture mode or moving the gimbal. L0 verifies firmware readback.", objectSchema([
+                "control": controlSchema(),
+                "goal": audioInputGainGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_white_balance", "Set camera white balance for a concrete visual task. auto retains adaptive color; manual locks a Kelvin temperature for stable repeated observations. L0 verifies the firmware-reported state before accepting later visual evidence.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraWhiteBalanceGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_exposure_lock", "Hold the camera's current automatic exposure for a stable visual observation, or release it back to automatic exposure. This does not take a gimbal lease; L0 verifies the firmware-reported setting.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraExposureLockGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_focus", "Set automatic focus or one explicit manual focal position for a bounded close inspection. This does not move the gimbal; L0 verifies the firmware-reported mode and position.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraFocusGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_absolute_exposure", "Return exposure to automatic mode or set one measured firmware shutter code for a specific visual task. L0 reads the active camera's permitted code range before applying it.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraAbsoluteExposureGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_face_priority", "Enable or disable the camera firmware's face-priority autofocus and auto-exposure. This does not select a person or move the gimbal; L0 verifies both firmware status bits.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraFacePriorityGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_anti_flicker", "Set the firmware anti-flicker mode for a visual observation. This does not move the gimbal; L0 verifies the reported camera setting.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraAntiFlickerGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_image_tuning", "Set one or more camera image controls as one verified transaction. If any requested firmware setting cannot be applied or read back, L0 restores every requested control to its original value.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraImageTuningGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_native_human_tracking_policy", "Configure Tiny 3 native human tracking response, retention, and adaptive or fixed pan/pitch gain. Fixed gains require both axes and disabled adaptive gains. It changes firmware tracking behavior but does not bypass L0 target selection, gimbal safety, or motor ownership.", objectSchema([
+                "control": controlSchema(),
+                "goal": nativeHumanTrackingPolicyGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_camera_field_of_view", "Set the camera's calibrated 86, 78, or 65 degree optical field of view for a concrete observation. L0 verifies firmware state and updates spherical projection before later visual evidence is interpreted.", objectSchema([
+                "control": controlSchema(),
+                "goal": cameraFieldOfViewGoalSchema(),
+            ], required: ["control", "goal"])),
+            tool("set_device_sound_following", "Temporarily delegate gimbal orientation to the Tiny 3 device's sound-source follower. This claims a motor lease, is disabled on expiry or visual preemption, and intentionally does not claim a raw sound bearing that firmware does not expose.", objectSchema([
+                "control": controlSchema(),
+                "goal": deviceSoundFollowingGoalSchema(),
             ], required: ["control", "goal"])),
             tool("express_gimbal", "Lease a bounded semantic social gimbal expression through L0.", objectSchema([
                 "control": controlSchema(),
@@ -966,6 +1135,98 @@ private final class EmbodimentMCPServer {
         return schema
     }
 
+    private func opticalZoomGoalSchema() -> [String: Any] {
+        objectSchema([
+            "factor": numberSchema(minimum: 1, maximum: 2),
+        ], required: ["factor"])
+    }
+
+    private func audioCaptureModeGoalSchema() -> [String: Any] {
+        objectSchema([
+            "mode": ["type": "string", "enum": MicrophoneCaptureMode.allCases.map(\.rawValue)],
+        ], required: ["mode"])
+    }
+
+    private func audioInputGainGoalSchema() -> [String: Any] {
+        objectSchema([
+            "percent": ["type": "integer", "minimum": 0, "maximum": 100],
+        ], required: ["percent"])
+    }
+
+    private func cameraWhiteBalanceGoalSchema() -> [String: Any] {
+        objectSchema([
+            "mode": ["type": "string", "enum": CameraWhiteBalanceMode.allCases.map(\.rawValue)],
+            "temperatureKelvin": ["type": "integer", "minimum": 2_000, "maximum": 9_000],
+        ], required: ["mode"])
+    }
+
+    private func cameraExposureLockGoalSchema() -> [String: Any] {
+        objectSchema([
+            "locked": ["type": "boolean"],
+        ], required: ["locked"])
+    }
+
+    private func cameraFocusGoalSchema() -> [String: Any] {
+        objectSchema([
+            "mode": ["type": "string", "enum": CameraFocusMode.allCases.map(\.rawValue)],
+            "position": ["type": "integer", "minimum": 0, "maximum": 100],
+        ], required: ["mode"])
+    }
+
+    private func cameraAbsoluteExposureGoalSchema() -> [String: Any] {
+        objectSchema([
+            "mode": ["type": "string", "enum": CameraAbsoluteExposureMode.allCases.map(\.rawValue)],
+            "shutterCode": ["type": "integer", "minimum": 0, "maximum": 100],
+        ], required: ["mode"])
+    }
+
+    private func cameraFacePriorityGoalSchema() -> [String: Any] {
+        objectSchema([
+            "enabled": ["type": "boolean"],
+        ], required: ["enabled"])
+    }
+
+    private func cameraAntiFlickerGoalSchema() -> [String: Any] {
+        objectSchema([
+            "mode": ["type": "string", "enum": CameraAntiFlickerMode.allCases.map(\.rawValue)],
+        ], required: ["mode"])
+    }
+
+    private func cameraImageTuningGoalSchema() -> [String: Any] {
+        objectSchema([
+            "brightness": numberSchema(minimum: 0, maximum: 100),
+            "contrast": numberSchema(minimum: 0, maximum: 100),
+            "hue": numberSchema(minimum: 0, maximum: 100),
+            "saturation": numberSchema(minimum: 0, maximum: 100),
+            "sharpness": numberSchema(minimum: 0, maximum: 100),
+        ], required: [])
+    }
+
+    private func nativeHumanTrackingPolicyGoalSchema() -> [String: Any] {
+        objectSchema([
+            "speed": ["type": "string", "enum": NativeHumanTrackingSpeed.allCases.map(\.rawValue)],
+            "motionTracking": ["type": "boolean"],
+            "foreTarget": ["type": "boolean"],
+            "adaptiveComposition": ["type": "boolean"],
+            "adaptivePanGain": ["type": "boolean"],
+            "adaptivePitchGain": ["type": "boolean"],
+            "panGain": numberSchema(minimum: 0.1, maximum: 1.0),
+            "pitchGain": numberSchema(minimum: 0.1, maximum: 1.0),
+        ], required: ["speed", "motionTracking", "foreTarget", "adaptiveComposition"])
+    }
+
+    private func cameraFieldOfViewGoalSchema() -> [String: Any] {
+        objectSchema([
+            "degrees": ["type": "integer", "enum": [65, 78, 86]],
+        ], required: ["degrees"])
+    }
+
+    private func deviceSoundFollowingGoalSchema() -> [String: Any] {
+        objectSchema([
+            "enabled": ["type": "boolean"],
+        ], required: ["enabled"])
+    }
+
     private func bearingSchema() -> [String: Any] {
         objectSchema([
             "azimuth_degrees": numberSchema(minimum: -180, maximum: 180),
@@ -1008,18 +1269,40 @@ private final class EmbodimentMCPServer {
     }
 }
 
-private func parseSocketURL(_ arguments: [String]) throws -> URL {
-    guard arguments.count == 2,
-          arguments[0] == "--socket",
-          arguments[1].hasPrefix("/") else {
-        throw ServerFailure.invalidArguments("usage: soma-embodiment --socket /absolute/path.sock")
+private enum Invocation {
+    case server(URL)
+    case runtimeShutdown(URL)
+}
+
+private func parseInvocation(_ arguments: [String]) throws -> Invocation {
+    if arguments.count == 2,
+       arguments[0] == "--socket",
+       arguments[1].hasPrefix("/") {
+        return .server(URL(fileURLWithPath: arguments[1]))
     }
-    return URL(fileURLWithPath: arguments[1])
+    if arguments.count == 3,
+       arguments[0] == "--runtime-shutdown",
+       arguments[1] == "--socket",
+       arguments[2].hasPrefix("/") {
+        return .runtimeShutdown(URL(fileURLWithPath: arguments[2]))
+    }
+    throw ServerFailure.invalidArguments("usage: soma-embodiment --socket /absolute/path.sock | --runtime-shutdown --socket /absolute/path.sock")
 }
 
 do {
-    let socketURL = try parseSocketURL(Array(CommandLine.arguments.dropFirst()))
-    EmbodimentMCPServer(socketURL: socketURL).run()
+    switch try parseInvocation(Array(CommandLine.arguments.dropFirst())) {
+    case let .server(socketURL):
+        EmbodimentMCPServer(socketURL: socketURL).run()
+    case let .runtimeShutdown(socketURL):
+        let reply = try EmbodimentShadowSocketClient.send(
+            .init(kind: .runtimeShutdown),
+            socketURL: socketURL,
+            timeoutSeconds: 24
+        )
+        guard reply.ok else {
+            throw ServerFailure.protocolViolation(reply.error ?? "runtime shutdown was rejected")
+        }
+    }
 } catch {
     FileHandle.standardError.write(Data("soma-embodiment: \(error.localizedDescription)\n".utf8))
     Foundation.exit(EXIT_FAILURE)

@@ -8,7 +8,8 @@ import Foundation
 /// settings blob.
 ///
 /// Each field maps to a `KEY=VALUE` line. Values are written verbatim and read
-/// back line-by-line, so hand-edits to the `.env` are respected.
+/// back line-by-line. Runtime and hardware keys outside this typed control
+/// surface are preserved when the Control Center saves the file.
 public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     public static let currentSchemaVersion = 1
 
@@ -257,8 +258,8 @@ public enum SOMAEnvStoreError: LocalizedError, Equatable, Sendable {
 }
 
 /// Reads and writes the SOMA layer configuration as a `.env` file with
-/// owner-only permissions. Unknown keys are preserved on write? — no, this
-/// store owns the file and rewrites it from `SOMAEnvSettings`.
+/// owner-only permissions. The typed settings replace their managed keys while
+/// other valid environment assignments are retained verbatim.
 public struct SOMAEnvStore: Sendable {
     public let fileURL: URL
 
@@ -329,13 +330,38 @@ public struct SOMAEnvStore: Sendable {
     public func save(_ settings: SOMAEnvSettings) throws {
         let fileManager = FileManager.default
         let directoryURL = fileURL.deletingLastPathComponent()
+        var unmanagedLines: [String] = []
+        if fileManager.fileExists(atPath: fileURL.path) {
+            try requireOwnerOnlyPermissions()
+            let existing: String
+            do {
+                existing = try String(contentsOf: fileURL, encoding: .utf8)
+            } catch {
+                throw SOMAEnvStoreError.corruptEnv
+            }
+            let managedKeys = Set(settings.lines().compactMap(Self.assignmentKey))
+                .union(["SOMA_L1_IDLE_CADENCE_SECONDS"])
+            unmanagedLines = existing
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map(String.init)
+                .filter { line in
+                    guard let key = Self.assignmentKey(line) else { return false }
+                    return !managedKeys.contains(key)
+                }
+        }
         try fileManager.createDirectory(
             at: directoryURL,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
-        let content = settings.lines().joined(separator: "\n") + "\n"
+        var outputLines = settings.lines()
+        if !unmanagedLines.isEmpty {
+            outputLines.append("")
+            outputLines.append("# Runtime and hardware settings retained outside Control Center.")
+            outputLines.append(contentsOf: unmanagedLines)
+        }
+        let content = outputLines.joined(separator: "\n") + "\n"
         try Data(content.utf8).write(to: fileURL, options: .atomic)
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
     }
@@ -352,6 +378,19 @@ public struct SOMAEnvStore: Sendable {
               permissions.intValue & 0o077 == 0 else {
             throw SOMAEnvStoreError.insecurePermissions
         }
+    }
+
+    private static func assignmentKey(_ rawLine: String) -> String? {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, !line.hasPrefix("#"), let equalIndex = line.firstIndex(of: "=") else {
+            return nil
+        }
+        let key = String(line[..<equalIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty,
+              key.allSatisfy({ $0 == "_" || $0.isNumber || ($0.isLetter && $0.isASCII) }) else {
+            return nil
+        }
+        return key
     }
 
     private func boolValue(_ raw: String?, default defaultValue: Bool) -> Bool {

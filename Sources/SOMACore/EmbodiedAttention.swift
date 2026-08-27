@@ -219,6 +219,25 @@ public struct NativeHumanTrackingGate: Sendable {
         return .start
     }
 
+    /// Begins a device-native acquisition from two temporally matched ANE face
+    /// observations.  This is deliberately separate from `update`: the world
+    /// model's decayed posterior represents sustained attention, whereas the
+    /// native tracker needs the current image-space box before a fast-moving
+    /// face leaves the frame.  Callers must first establish the bounded
+    /// provisional FaceLockLease; this method never confers identity,
+    /// conversation, or persistent social authority by itself.
+    public mutating func acquireFromTemporalFaceEvidence(
+        at monotonicNS: UInt64
+    ) -> NativeHumanTrackingAction {
+        guard !active else {
+            return heartbeatIfActive(at: monotonicNS)
+        }
+        eligibleSinceNS = nil
+        active = true
+        lastHeartbeatNS = monotonicNS
+        return .start
+    }
+
     public mutating func stop() -> NativeHumanTrackingAction {
         eligibleSinceNS = nil
         guard active else { return .none }

@@ -16,6 +16,30 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
     public var centerX: Double { x + width / 2 }
     public var centerY: Double { y + height / 2 }
 
+    /// Returns the visible portion of a detector rectangle in normalized image
+    /// coordinates. Detectors may legitimately report a box that straddles an
+    /// image edge; hardware target-selection commands require the box itself
+    /// to remain inside the unit square.
+    public func clippedToUnitSquare() -> NormalizedRect? {
+        guard x.isFinite, y.isFinite, width.isFinite, height.isFinite,
+              width > 0, height > 0 else {
+            return nil
+        }
+        let minimumX = max(0, x)
+        let minimumY = max(0, y)
+        let maximumX = min(1, x + width)
+        let maximumY = min(1, y + height)
+        guard maximumX > minimumX, maximumY > minimumY else {
+            return nil
+        }
+        return NormalizedRect(
+            x: minimumX,
+            y: minimumY,
+            width: maximumX - minimumX,
+            height: maximumY - minimumY
+        )
+    }
+
     func blended(toward other: NormalizedRect, weight: Double) -> NormalizedRect {
         let w = clamp(weight)
         return NormalizedRect(
@@ -47,6 +71,14 @@ public enum AttentionTargetKind: String, Codable, Equatable, Sendable {
     case unknown
 }
 
+/// Landmark gaze has three states because a missing pupil measurement is not
+/// evidence that the person has deliberately looked away.
+public enum VisualGazeEvidence: String, Codable, Equatable, Sendable {
+    case direct
+    case averted
+    case unavailable
+}
+
 public struct VisualObservation: Sendable {
     public let rect: NormalizedRect
     public let confidence: Double
@@ -64,6 +96,9 @@ public struct VisualObservation: Sendable {
     /// A transient, non-identifying estimate that a landmark-verified face is
     /// front-facing with both pupils directed through the social fovea.
     public let isEyeContactEligible: Bool
+    /// The underlying landmark assessment. This stays transient and is used
+    /// only to keep social presentation stable through measurement gaps.
+    public let gazeEvidence: VisualGazeEvidence
 
     public init(
         rect: NormalizedRect,
@@ -77,7 +112,8 @@ public struct VisualObservation: Sendable {
         stabilityMilliseconds: Double = 0,
         isActionEligible: Bool = false,
         isFaceVerified: Bool = false,
-        isEyeContactEligible: Bool = false
+        isEyeContactEligible: Bool = false,
+        gazeEvidence: VisualGazeEvidence = .unavailable
     ) {
         self.rect = rect
         self.confidence = clamp(confidence)
@@ -91,6 +127,7 @@ public struct VisualObservation: Sendable {
         self.isActionEligible = isActionEligible
         self.isFaceVerified = isFaceVerified
         self.isEyeContactEligible = isEyeContactEligible
+        self.gazeEvidence = gazeEvidence
     }
 }
 
@@ -144,6 +181,32 @@ public struct AttentionTarget: Codable, Equatable, Sendable {
     public let posteriorProbability: Double
     public let stabilityMilliseconds: Double
     public let isActionEligible: Bool
+
+    public init(
+        id: String,
+        rect: NormalizedRect,
+        confidence: Double,
+        velocityX: Double,
+        velocityY: Double,
+        kind: AttentionTargetKind,
+        label: String?,
+        attentionWeight: Double,
+        posteriorProbability: Double,
+        stabilityMilliseconds: Double,
+        isActionEligible: Bool
+    ) {
+        self.id = id
+        self.rect = rect
+        self.confidence = confidence
+        self.velocityX = velocityX
+        self.velocityY = velocityY
+        self.kind = kind
+        self.label = label
+        self.attentionWeight = attentionWeight
+        self.posteriorProbability = posteriorProbability
+        self.stabilityMilliseconds = stabilityMilliseconds
+        self.isActionEligible = isActionEligible
+    }
 
     /// L0 has no identity or task-level intent. It may physically fixate only
     /// on current face evidence. Attention weights remain reasoning evidence.

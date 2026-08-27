@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "panSign": 1,
+  "pitchSign": -1,
+  "maximumPanDegreesPerSecond": 180,
+  "maximumPitchDegreesPerSecond": 90
+}

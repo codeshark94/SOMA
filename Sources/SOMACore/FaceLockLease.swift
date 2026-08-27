@@ -31,18 +31,19 @@ public struct FaceLockLease: Sendable {
     /// only the bounded provisional re-centering path. They do not grant
     /// persistent/native tracking authority by themselves.
     ///
-    /// The confidence bar is deliberately lower than the verifier's own
-    /// threshold: a real face seen while the gimbal is sweeping is motion
-    /// blurred and off-axis, so its blended track confidence lands well below
-    /// 0.90 even though the raw ANE detector score cleared its 0.75 gate. The
-    /// `observationCount >= 2` requirement plus the bounded provisional lease
-    /// (which still requires independent verification for full motor
-    /// authority) keep a face-shaped texture from becoming a permanent person.
+    /// The detector has already applied its own calibrated confidence threshold
+    /// before an observation reaches SceneField.  While the gimbal is moving,
+    /// that score is not stable enough to be a second admission threshold: a
+    /// real face at the edge can alternate between strong and merely-admitted
+    /// scores on adjacent frames.  Instead require two geometrically matched
+    /// detector observations, then bound the resulting lease until independent
+    /// verification or an explicit rejection.  A static lookalike therefore
+    /// gets one short opportunity to be checked, never persistent authority.
     public static func permitsProvisionalExplorationInterception(
         observationCount: Int,
         confidence: Double
     ) -> Bool {
-        observationCount >= 2 && confidence >= 0.75
+        observationCount >= 2 && confidence.isFinite && confidence > 0
     }
 
     public mutating func record(sceneID: String, at monotonicNS: UInt64) {

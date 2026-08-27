@@ -46,6 +46,15 @@ public enum OBSBOTTiny2LiteOptics {
     }
 }
 
+public enum OBSBOTTiny3LiteOptics {
+    public static let wideHorizontalDegrees = OBSBOTDeviceProfile.tiny3Lite.capabilities
+        .nominalWideHorizontalFieldOfViewDegrees
+
+    public static func horizontalDegrees(forFOVMode modeDegrees: Double) -> Double? {
+        OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forSDKMode: modeDegrees)
+    }
+}
+
 /// A gimbal-relative direction, in degrees, anchored at the camera's home
 /// orientation rather than at a geographic reference frame.
 public struct GimbalRelativeBearing: Codable, Equatable, Sendable {
@@ -116,6 +125,16 @@ public struct GimbalKinematicEnvelope: Codable, Equatable, Sendable {
         maximumTrackingPitchDegrees: 34,
         maximumAutonomousPanDegrees: 110,
         maximumAutonomousPitchDegrees: 24
+    )
+
+    /// Tiny 3 Lite's controllable tilt is asymmetric (-60°...32°). Keep the
+    /// autonomous envelope inside the common central range until a route has
+    /// a measured product-specific calibration.
+    public static let obsbotTiny3Lite = GimbalKinematicEnvelope(
+        maximumTrackingPanDegrees: 126,
+        maximumTrackingPitchDegrees: 28,
+        maximumAutonomousPanDegrees: 110,
+        maximumAutonomousPitchDegrees: 20
     )
 
     public func containsTrackingCenter(_ bearing: GimbalRelativeBearing) -> Bool {
@@ -250,9 +269,9 @@ public struct TrackingBoundary: Equatable, Sendable {
             && rect.centerY <= maximumY
     }
 
-    /// The social fovea in Vision's lower-left coordinate system. A seated
-    /// face normally appears high in the camera image (large y); desk/floor
-    /// texture appears low (small y).
+    /// The social fovea in the runtime's top-left image coordinate system. A
+    /// seated face normally appears high in the camera image (small y);
+    /// desk/floor texture appears low (large y).
     public static func allowsFaceLockAcquisition(_ rect: NormalizedRect) -> Bool {
         rect.centerX >= 0.22 && rect.centerX <= 0.78
             && rect.centerY >= 0.08 && rect.centerY <= 0.92
@@ -281,6 +300,10 @@ public struct SceneCandidate: Sendable {
     /// and is consumed only while this candidate is observed in the frame.
     public let eyeContactEligible: Bool
     public let trackingBoundary: TrackingBoundary
+    /// The unsmoothed bearing from this completed camera frame. Persistent
+    /// scene bearings are intentionally filtered for map continuity, while the
+    /// motor servo needs the current measurement to react to rapid movement.
+    public let observedBearing: GimbalRelativeBearing?
     public let bearing: GimbalRelativeBearing?
     public let spatialConfidence: Double
     public let lastSeenMilliseconds: Double
@@ -298,7 +321,8 @@ public struct SceneCandidate: Sendable {
             stabilityMilliseconds: stabilityMilliseconds,
             isActionEligible: isActionEligible,
             isFaceVerified: faceVerificationEligible,
-            isEyeContactEligible: eyeContactEligible
+            isEyeContactEligible: eyeContactEligible,
+            gazeEvidence: observation.gazeEvidence
         )
     }
 }
@@ -323,11 +347,13 @@ public struct SceneField: Sendable {
         var faceMotorEvidence: Bool
         var faceVerified: Bool
         var eyeContactEligible: Bool
+        var gazeEvidence: VisualGazeEvidence
         var firstSeenNS: UInt64
         var lastSeenNS: UInt64
         var observationCount: Int
         var sources: Set<VisualObservationSource>
         var observedThisFrame: Bool
+        var observedBearing: GimbalRelativeBearing?
         var bearing: GimbalRelativeBearing?
         var trackingBoundary: TrackingBoundary
         var lastFaceActivityNS: UInt64?
@@ -378,7 +404,10 @@ public struct SceneField: Sendable {
         poseProjection: GimbalPoseProjection = .identity,
         cameraProjectionModel: CameraProjectionModel? = nil
     ) -> [SceneCandidate] {
-        for index in tracks.indices { tracks[index].observedThisFrame = false }
+        for index in tracks.indices {
+            tracks[index].observedThisFrame = false
+            tracks[index].observedBearing = nil
+        }
         var claimedSources: [Int: Set<VisualObservationSource>] = [:]
         let trackingBoundary = TrackingBoundary(
             cameraPose: cameraPose,
@@ -420,11 +449,13 @@ public struct SceneField: Sendable {
                     faceMotorEvidence: observation.isActionEligible,
                     faceVerified: observation.isFaceVerified,
                     eyeContactEligible: observation.isEyeContactEligible,
+                    gazeEvidence: observation.gazeEvidence,
                     firstSeenNS: monotonicNS,
                     lastSeenNS: monotonicNS,
                     observationCount: 1,
                     sources: [observation.source],
                     observedThisFrame: true,
+                    observedBearing: bearing,
                     bearing: bearing,
                     trackingBoundary: trackingBoundary,
                     lastFaceActivityNS: nil,
@@ -529,11 +560,13 @@ public struct SceneField: Sendable {
             track.faceMotorEvidence = observation.isActionEligible
             track.faceVerified = observation.isFaceVerified
             track.eyeContactEligible = observation.isEyeContactEligible
+            track.gazeEvidence = observation.gazeEvidence
         }
         track.lastSeenNS = monotonicNS
         track.observationCount += 1
         track.sources.insert(observation.source)
         track.observedThisFrame = true
+        track.observedBearing = bearing
         track.trackingBoundary = trackingBoundary
         if let bearing {
             track.bearing = blendedBearing(track.bearing, toward: bearing)
@@ -672,7 +705,8 @@ public struct SceneField: Sendable {
             source: track.source,
             kind: track.kind,
             label: track.label,
-            attentionWeight: track.attentionWeight
+            attentionWeight: track.attentionWeight,
+            gazeEvidence: track.gazeEvidence
         )
         let spatialConfidence = track.kind == .human
             ? track.confidence
@@ -689,6 +723,7 @@ public struct SceneField: Sendable {
             faceVerificationEligible: faceVerificationEligible,
             eyeContactEligible: track.observedThisFrame && track.eyeContactEligible,
             trackingBoundary: track.trackingBoundary,
+            observedBearing: track.observedThisFrame ? track.observedBearing : nil,
             bearing: track.bearing,
             spatialConfidence: spatialConfidence,
             lastSeenMilliseconds: lastSeenMilliseconds
@@ -714,7 +749,12 @@ public struct SceneField: Sendable {
             let idealRay = cameraProjectionModel.actualToIdeal(actualRay)
             let panSign = poseProjection.panImageSign >= 0 ? 1.0 : -1.0
             let pitchSign = poseProjection.pitchImageSign >= 0 ? 1.0 : -1.0
-            let cameraAzimuth = cameraPose.panDegrees * panSign * .pi / 180
+            // `panImageSign` measures how an image point moves when the SDK
+            // attitude increases. Camera yaw has the inverse horizontal
+            // relation: panning the camera right moves a fixed world point
+            // left in its image. Bearings remain in SDK-attitude coordinates
+            // because motor routing consumes them directly.
+            let cameraAzimuth = -cameraPose.panDegrees * panSign * .pi / 180
             let cameraElevation = cameraPose.pitchDegrees * pitchSign * .pi / 180
             let forward = (
                 cos(cameraElevation) * sin(cameraAzimuth),
@@ -728,14 +768,14 @@ public struct SceneField: Sendable {
                 -sin(cameraElevation) * cos(cameraAzimuth)
             )
             let world = (
-                right.0 * idealRay.0 - up.0 * idealRay.1 + forward.0 * idealRay.2,
-                right.1 * idealRay.0 - up.1 * idealRay.1 + forward.1 * idealRay.2,
-                right.2 * idealRay.0 - up.2 * idealRay.1 + forward.2 * idealRay.2
+                right.0 * idealRay.0 + up.0 * idealRay.1 + forward.0 * idealRay.2,
+                right.1 * idealRay.0 + up.1 * idealRay.1 + forward.1 * idealRay.2,
+                right.2 * idealRay.0 + up.2 * idealRay.1 + forward.2 * idealRay.2
             )
             let canonicalAzimuth = atan2(world.0, world.2) * 180 / .pi
             let canonicalElevation = atan2(world.1, hypot(world.0, world.2)) * 180 / .pi
             return GimbalRelativeBearing(
-                azimuthDegrees: canonicalAzimuth / panSign,
+                azimuthDegrees: -canonicalAzimuth / panSign,
                 elevationDegrees: canonicalElevation / pitchSign
             )
         }
@@ -744,8 +784,8 @@ public struct SceneField: Sendable {
         let horizontalOffset = atan((rect.centerX - 0.5) * 2 * tan(horizontalHalfRadians)) * 180 / .pi
         let verticalOffset = atan((rect.centerY - 0.5) * 2 * tan(verticalHalfRadians)) * 180 / .pi
         return GimbalRelativeBearing(
-            azimuthDegrees: cameraPose.panDegrees + poseProjection.panImageSign * horizontalOffset,
-            elevationDegrees: cameraPose.pitchDegrees + poseProjection.pitchImageSign * verticalOffset
+            azimuthDegrees: cameraPose.panDegrees - poseProjection.panImageSign * horizontalOffset,
+            elevationDegrees: cameraPose.pitchDegrees - poseProjection.pitchImageSign * verticalOffset
         )
     }
 

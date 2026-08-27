@@ -54,7 +54,10 @@ public struct FacePersonFusion: Sendable {
                 let fusedFace = VisualObservation(
                     rect: face.rect,
                     confidence: confidence,
-                    source: .neuralFaceDetector,
+                    // Preserve the detector that supplied the face geometry.
+                    // Person corroboration changes motor authority, not the
+                    // provenance of the measurement that the servo follows.
+                    source: face.source,
                     kind: .human,
                     label: "face",
                     attentionWeight: face.attentionWeight,
@@ -63,7 +66,14 @@ public struct FacePersonFusion: Sendable {
                     stabilityMilliseconds: face.stabilityMilliseconds,
                     // A face enclosed by an independent person detection is
                     // strong enough to own the L0 motor loop.
-                    isActionEligible: true
+                    isActionEligible: true,
+                    // Fusion changes geometry/provenance but must not discard
+                    // independent facial-landmark evidence. Losing this bit
+                    // forces an already validated face to wait for another
+                    // verifier cycle after its enclosing person box appears.
+                    isFaceVerified: face.isFaceVerified,
+                    isEyeContactEligible: face.isEyeContactEligible,
+                    gazeEvidence: face.gazeEvidence
                 )
                 anchor = Anchor(
                     faceRect: face.rect,
@@ -94,7 +104,10 @@ public struct FacePersonFusion: Sendable {
                     posteriorProbability: face.posteriorProbability,
                     sceneID: face.sceneID,
                     stabilityMilliseconds: face.stabilityMilliseconds,
-                    isActionEligible: true
+                    isActionEligible: true,
+                    isFaceVerified: face.isFaceVerified,
+                    isEyeContactEligible: face.isEyeContactEligible,
+                    gazeEvidence: face.gazeEvidence
                 ))
                 self.anchor = Anchor(
                     faceRect: face.rect,

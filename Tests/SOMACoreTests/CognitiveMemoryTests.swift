@@ -402,6 +402,82 @@ final class CognitiveMemoryTests: XCTestCase {
         }
     }
 
+    func testRecoveryStagesVerifiedPrefixWithoutChangingCorruptSourceJournal() async throws {
+        let directory = temporaryDirectory("recovery-source")
+        let recoveryDirectory = temporaryDirectory("recovery-candidate")
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(at: recoveryDirectory)
+        }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let start = Date(timeIntervalSince1970: 5_250)
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let first = try await store.insert(
+            taskDraft(
+                summary: "Retain the verified first entry",
+                status: .active,
+                tier: .shortTerm,
+                expiresAt: start.addingTimeInterval(60),
+                at: start
+            ),
+            at: start
+        )
+        _ = try await store.insert(
+            taskDraft(
+                summary: "Corrupt this entry in the fixture",
+                status: .active,
+                tier: .shortTerm,
+                expiresAt: start.addingTimeInterval(60),
+                at: start.addingTimeInterval(1)
+            ),
+            at: start.addingTimeInterval(1)
+        )
+        _ = try await store.insert(
+            taskDraft(
+                summary: "Do not promote unverified suffix entries",
+                status: .active,
+                tier: .shortTerm,
+                expiresAt: start.addingTimeInterval(60),
+                at: start.addingTimeInterval(2)
+            ),
+            at: start.addingTimeInterval(2)
+        )
+        try await store.close()
+
+        let journalURL = directory.appendingPathComponent(CognitiveMemoryStore.journalFilename)
+        let original = try Data(contentsOf: journalURL)
+        let lines = original.split(separator: 0x0A, omittingEmptySubsequences: true)
+        XCTAssertEqual(lines.count, 3)
+        var corruptLine = Data(lines[1])
+        let corruptionIndex = corruptLine.index(corruptLine.startIndex, offsetBy: corruptLine.count / 2)
+        corruptLine[corruptionIndex] ^= 0x01
+        var corrupted = Data()
+        for (index, line) in lines.enumerated() {
+            corrupted.append(contentsOf: index == 1 ? corruptLine : line)
+            corrupted.append(0x0A)
+        }
+        try corrupted.write(to: journalURL, options: .atomic)
+
+        XCTAssertThrowsError(try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)) { error in
+            XCTAssertEqual(error as? CognitiveMemoryError, .corruptJournal(line: 2))
+        }
+
+        let report = try CognitiveMemoryStore.stageRecoverablePrefix(
+            from: directory,
+            encryptionKey: key,
+            into: recoveryDirectory
+        )
+        XCTAssertEqual(report.sourceEntryCount, 3)
+        XCTAssertEqual(report.recoveredEntryCount, 1)
+        XCTAssertEqual(report.firstRejectedLine, 2)
+        XCTAssertEqual(try Data(contentsOf: journalURL), corrupted)
+
+        let recoveredStore = try CognitiveMemoryStore(directoryURL: recoveryDirectory, encryptionKey: key)
+        let recoveredFirst = try await recoveredStore.record(id: first.id, at: start)
+        XCTAssertEqual(recoveredFirst, first)
+        try await recoveredStore.close()
+    }
+
     func testCompactionRetainsRevisionTailAsAValidReplayBaseline() async throws {
         let directory = temporaryDirectory("compacted-revision-tail")
         defer { try? FileManager.default.removeItem(at: directory) }

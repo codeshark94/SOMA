@@ -60,6 +60,24 @@ public struct CameraProjectionModel: Codable, Equatable, Sendable {
             + atan((1 - principalYNormalized) / focalYNormalized)) * 180 / .pi
     }
 
+    /// Models the camera's centered digital/optical crop in the same
+    /// normalized-image coordinate system.  Scaling focal length keeps the
+    /// calibrated principal point, lens distortion, and camera-to-gimbal
+    /// extrinsics intact while narrowing the visual ray field.
+    public func withOpticalZoom(_ factor: Double) -> CameraProjectionModel? {
+        guard factor.isFinite, factor >= 1, factor <= 2 else { return nil }
+        let zoomed = CameraProjectionModel(
+            focalXNormalized: focalXNormalized * factor,
+            focalYNormalized: focalYNormalized * factor,
+            principalXNormalized: principalXNormalized,
+            principalYNormalized: principalYNormalized,
+            cameraToIdealRotation: cameraToIdealRotation,
+            radialK1: radialK1 ?? 0,
+            radialK2: radialK2 ?? 0
+        )
+        return zoomed.isValid ? zoomed : nil
+    }
+
     public var isValid: Bool {
         guard focalXNormalized.isFinite,
               focalYNormalized.isFinite,
@@ -167,14 +185,15 @@ public struct CameraProjectionModel: Codable, Equatable, Sendable {
         let idealRay = actualToIdeal(actualRay)
         guard idealRay.2.isFinite, idealRay.2 > 0 else { return nil }
         let panOffset = atan2(idealRay.0, idealRay.2) * 180 / .pi
-        // Image y is top-down after Vision-to-camera conversion. Positive
-        // ideal y is therefore a downward visual ray and lowers elevation.
+        // The runtime normalizes all detections to a top-left image origin.
+        // Positive ideal y is an upward visual ray, so placing a fixed target
+        // there requires a lower camera elevation.
         let elevationOffset = -atan2(idealRay.1, hypot(idealRay.0, idealRay.2)) * 180 / .pi
         let panSign = poseProjection.panImageSign >= 0 ? 1.0 : -1.0
         let pitchSign = poseProjection.pitchImageSign >= 0 ? 1.0 : -1.0
         return GimbalRelativeBearing(
-            azimuthDegrees: target.azimuthDegrees - panSign * panOffset,
-            elevationDegrees: target.elevationDegrees - pitchSign * elevationOffset
+            azimuthDegrees: target.azimuthDegrees + panSign * panOffset,
+            elevationDegrees: target.elevationDegrees + pitchSign * elevationOffset
         )
     }
 }
@@ -232,7 +251,7 @@ public struct CameraGeometryCalibration: Codable, Equatable, Sendable {
 
     public var isValid: Bool {
         schemaVersion == 1
-            && deviceProfile == "obsbot_tiny_2_lite"
+            && resolvedDeviceProfile != nil
             && [65, 78, 86].contains(fovMode)
             && imageWidth >= 640 && imageHeight >= 360
             && projection.isValid
@@ -248,5 +267,17 @@ public struct CameraGeometryCalibration: Codable, Equatable, Sendable {
             && calibratedRMSEPixels < initialRMSEPixels
             && calibratedRMSEPixels <= initialRMSEPixels * 0.8
             && calibratedP90Pixels <= 12
+    }
+
+    public var resolvedDeviceProfile: OBSBOTDeviceProfile? {
+        switch deviceProfile {
+        case "obsbot_tiny_2_lite": .tiny2Lite
+        case "obsbot_tiny_3_lite": .tiny3Lite
+        default: OBSBOTDeviceProfile(rawValue: deviceProfile)
+        }
+    }
+
+    public func applies(to profile: OBSBOTDeviceProfile) -> Bool {
+        resolvedDeviceProfile == profile
     }
 }

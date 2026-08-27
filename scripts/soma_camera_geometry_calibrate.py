@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-directory", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--diagnostics", type=Path)
+    parser.add_argument(
+        "--device-profile",
+        choices=("tiny_2_lite", "tiny_3_lite"),
+        required=True,
+    )
     return parser.parse_args()
 
 
@@ -325,7 +330,11 @@ def error_statistics(parameters: np.ndarray, pairs: list[Pair], width: int, heig
 
 def fit(frames: list[Frame], pairs: list[Pair]) -> tuple[np.ndarray, list[Pair], dict[str, float]]:
     width, height = frames[0].width, frames[0].height
-    nominal_focal = width / (2 * math.tan(math.radians(67.2 / 2)))
+    nominal_horizontal_fov = {
+        "tiny_2_lite": 67.2,
+        "tiny_3_lite": 72.0,
+    }[args.device_profile]
+    nominal_focal = width / (2 * math.tan(math.radians(nominal_horizontal_fov / 2)))
     initial = np.array([
         math.log(nominal_focal),
         math.log(nominal_focal),
@@ -437,7 +446,7 @@ def main() -> None:
     intrinsic, extrinsic, distortion = unpack(parameters, frames[0].width, frames[0].height)
     output = {
         "schemaVersion": 1,
-        "deviceProfile": "obsbot_tiny_2_lite",
+        "deviceProfile": args.device_profile,
         "fovMode": frames[0].fov_mode,
         "imageWidth": frames[0].width,
         "imageHeight": frames[0].height,

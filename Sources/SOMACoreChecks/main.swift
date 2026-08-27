@@ -97,12 +97,12 @@ indicatorInputs.interactionState = .conversation
 require(indicatorInputs.resolvedState == .conversation, "conversation LED priority is wrong")
 indicatorInputs.interactionState = .preparingReply
 require(indicatorInputs.resolvedState == .working, "working LED priority is wrong")
-let contactReadyRendering = SOMALEDSettings().signal(for: .contactReady).deviceRendering
-let humanDetectedRendering = SOMALEDSettings().signal(for: .humanDetected).deviceRendering
+let contactReadyRendering = SOMALEDSettings().deviceRendering(for: .contactReady, on: .tiny3Lite)
+let humanDetectedRendering = SOMALEDSettings().deviceRendering(for: .humanDetected, on: .tiny3Lite)
 require(
-    contactReadyRendering == .init(stateID: 54, pulseEnabled: false)
-        && humanDetectedRendering == .init(stateID: 57, pulseEnabled: false),
-    "LED state does not resolve contact-ready and human presence independently"
+    contactReadyRendering == .init(directRGB: .blue, pattern: .firmwareAnimation)
+        && humanDetectedRendering == .init(directRGB: .blue, pattern: .steady),
+    "LED state does not resolve contact-ready and human presence to their configured device patterns"
 )
 require(
     SubconsciousIndicatorState.contactReady.humanMeaning == "ready_speak_now"
@@ -259,7 +259,7 @@ require(validatedCameraGeometry.isValid, "independently validated camera geometr
 var calibratedSceneField = SceneField()
 let calibratedUpperCandidate = calibratedSceneField.ingest(
     [VisualObservation(
-        rect: NormalizedRect(x: 0.45, y: 0.70, width: 0.10, height: 0.10),
+        rect: NormalizedRect(x: 0.45, y: 0.15, width: 0.10, height: 0.10),
         confidence: 0.9,
         source: .neuralDetector,
         kind: .object,
@@ -274,7 +274,7 @@ let calibratedUpperCandidate = calibratedSceneField.ingest(
 ).first
 require(
     (calibratedUpperCandidate?.bearing?.elevationDegrees ?? -90) > 0,
-    "Vision bottom-left coordinates were not converted into calibrated camera pixels"
+    "top-left detector coordinates were not converted into calibrated camera pixels"
 )
 _ = model.ingestVisual(VisualObservation(rect: rect(0.30), confidence: 0.95, source: .neuralFaceDetector), at: start)
 _ = model.ingestVisual(VisualObservation(rect: rect(0.40), confidence: 0.95, source: .tracker), at: start + 100_000_000)
@@ -1292,12 +1292,12 @@ require(
     "one exploration face frame opened provisional motor authority"
 )
 require(
-    !FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 3, confidence: 0.74),
-    "a weak exploration face opened provisional motor authority"
+    !FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 3, confidence: 0),
+    "invalid exploration face evidence opened provisional motor authority"
 )
 require(
-    FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 2, confidence: 0.75),
-    "repeated high-confidence exploration face could not preempt coverage"
+    FaceLockLease.permitsProvisionalExplorationInterception(observationCount: 2, confidence: 0.55),
+    "repeated detector evidence could not preempt coverage"
 )
 
 var sceneField = SceneField()
@@ -1540,7 +1540,8 @@ let spatialInitial = spatialSceneField.ingest(
     )],
     at: start,
     cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 20, monotonicNS: start),
-    horizontalFieldOfViewDegrees: 70
+    horizontalFieldOfViewDegrees: 70,
+    poseProjection: .obsbotTiny2Lite
 )
 require(spatialInitial.first?.bearing != nil, "gimbal pose did not project a scene candidate into space")
 let spatialReacquired = spatialSceneField.ingest(
@@ -1555,7 +1556,8 @@ let spatialReacquired = spatialSceneField.ingest(
     )],
     at: start + 1_000_000_000,
     cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 50, monotonicNS: start + 1_000_000_000),
-    horizontalFieldOfViewDegrees: 70
+    horizontalFieldOfViewDegrees: 70,
+    poseProjection: .obsbotTiny2Lite
 )
 require(spatialReacquired.count == 1 && spatialReacquired.first?.id == spatialInitial.first?.id, "spatial re-observation created a duplicate scene")
 let spatialInterveningFrame = spatialSceneField.ingest([], at: start + 1_075_000_000)
@@ -1582,7 +1584,7 @@ let refreshedSpatialMemory = spatialSceneField.ingest([
         label: "face",
         isActionEligible: true
     )
-], at: start + 61_100_000_000, cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 50, monotonicNS: start + 61_100_000_000), horizontalFieldOfViewDegrees: 70)
+], at: start + 61_100_000_000, cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 50, monotonicNS: start + 61_100_000_000), horizontalFieldOfViewDegrees: 70, poseProjection: .obsbotTiny2Lite)
 require(
     refreshedSpatialMemory.count == 1
         && refreshedSpatialMemory[0].id == spatialInitial.first?.id

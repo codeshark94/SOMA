@@ -55,50 +55,57 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: JSONEncoder().encode(settings)
         )
 
-        XCTAssertEqual(decoded.led.signal(for: .conversation).color, .blue)
+        XCTAssertEqual(decoded.led.signal(for: .conversation).color, .green)
         XCTAssertEqual(decoded.led.signal(for: .conversation).pattern, .steady)
-        XCTAssertEqual(decoded.led.signal(for: .exploring).color, .yellow)
+        XCTAssertEqual(decoded.led.signal(for: .exploring).color, .green)
         XCTAssertEqual(decoded.led.signal(for: .exploring).pattern, .steady)
         XCTAssertEqual(SOMALEDColor.yellow.displayName, "Yellow")
         XCTAssertEqual(SOMALEDColor.green.displayName, "Green")
-        XCTAssertEqual(SOMALEDColor.blue.firmwareStateID, 57)
-        XCTAssertEqual(decoded.led.signal(for: .contactReady).firmwareStateID, 54)
+        XCTAssertEqual(SOMALEDColor.blue.displayName, "Blue")
+        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.firmwareIndicatorStateID(for: .green))
+        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .green), .green)
+        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .yellow), .yellow)
+        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .blue), .blue)
         XCTAssertEqual(
-            decoded.led.signal(for: .contactReady).deviceRendering,
-            .init(stateID: 54, pulseEnabled: false)
+            decoded.led.signal(for: .contactReady).deviceRendering(for: .tiny3Lite),
+            .init(directRGB: .blue, pattern: .firmwareAnimation)
         )
     }
 
-    func testLegacyBlinkNormalizesToAVisiblePaletteState() {
-        let legacy = SOMALEDSettings(
+    func testBlueContactBlinkPreservesItsDevicePalettePosition() {
+        let settings = SOMALEDSettings(
             signals: [.contactReady: .init(color: .blue, pattern: .blink)]
         )
         XCTAssertEqual(
-            legacy.signal(for: .contactReady),
-            .init(color: .blue, pattern: .steady)
+            settings.signal(for: .contactReady),
+            .init(color: .blue, pattern: .blink)
         )
     }
 
-    func testVoiceSessionPulsesTheCurrentVisualAttentionSignal() {
+    func testVoiceSessionDoesNotManufactureContactReadyBlink() {
         let settings = SOMALEDSettings(
             signals: [
-                .exploring: .init(color: .yellow, pattern: .steady),
+                .exploring: .init(color: .green, pattern: .steady),
                 .humanDetected: .init(color: .blue, pattern: .steady),
                 .contactReady: .init(color: .green, pattern: .steady),
             ]
         )
 
         XCTAssertEqual(
-            settings.deviceRendering(for: .humanDetected, voiceSessionOpen: false),
-            .init(stateID: 57, pulseEnabled: false)
+            settings.deviceRendering(for: .humanDetected, on: .tiny3Lite),
+            .init(directRGB: .blue, pattern: .steady)
         )
         XCTAssertEqual(
-            settings.deviceRendering(for: .humanDetected, voiceSessionOpen: true),
-            .init(stateID: 57, pulseEnabled: true)
+            settings.deviceRendering(for: .contactReady, on: .tiny3Lite),
+            .init(directRGB: .green, pattern: .steady)
+        )
+
+        let expressiveContact = SOMALEDSettings(
+            signals: [.contactReady: .init(color: .green, pattern: .heartbeat)]
         )
         XCTAssertEqual(
-            settings.deviceRendering(for: .contactReady, voiceSessionOpen: true),
-            .init(stateID: 54, pulseEnabled: true)
+            expressiveContact.deviceRendering(for: .contactReady, on: .tiny3Lite),
+            .init(directRGB: .green, pattern: .heartbeat)
         )
     }
 
@@ -121,11 +128,11 @@ final class SOMAControlSettingsTests: XCTestCase {
 
         XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
         XCTAssertEqual(migrated.led.signals.count, SubconsciousIndicatorState.configurationStates.count)
-        XCTAssertEqual(migrated.led.signal(for: .conversation).color, .blue)
+        XCTAssertEqual(migrated.led.signal(for: .conversation).color, .green)
         XCTAssertEqual(migrated.led.signal(for: .conversation).pattern, .steady)
     }
 
-    func testVersionTwoPresetSettingsMigrateToVisibleSteadyPaletteState() throws {
+    func testVersionTwoPresetSettingsMigrateToCurrentSocialSignalContract() throws {
         let legacy = """
         {
           "schemaVersion": 2,
@@ -145,12 +152,12 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: Data(legacy.utf8)
         )
 
-        XCTAssertEqual(migrated.schemaVersion, 5)
-        XCTAssertEqual(migrated.led.signal(for: .contactReady).color, .green)
-        XCTAssertEqual(migrated.led.signal(for: .contactReady).pattern, .steady)
+        XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
+        XCTAssertEqual(migrated.led.signal(for: .contactReady).color, .blue)
+        XCTAssertEqual(migrated.led.signal(for: .contactReady).pattern, .firmwareAnimation)
     }
 
-    func testUnsupportedHostCadenceMigratesToVerifiedSteadyDeviceState() throws {
+    func testVisibleHostCadenceSurvivesMigrationToTheDevice() throws {
         let legacy = """
         {
           "schemaVersion": 3,
@@ -169,7 +176,32 @@ final class SOMAControlSettingsTests: XCTestCase {
         )
 
         XCTAssertEqual(migrated.led.signal(for: .working).color, .green)
-        XCTAssertEqual(migrated.led.signal(for: .working).pattern, .steady)
+        XCTAssertEqual(migrated.led.signal(for: .working).pattern, .heartbeat)
+    }
+
+    func testSchemaFiveSteadyContactReadyMigratesToBlink() throws {
+        let legacy = """
+        {
+          "schemaVersion": 5,
+          "led": {
+            "signals": [
+              "contact_ready",
+              { "color": "green", "pattern": "steady" }
+            ]
+          }
+        }
+        """
+
+        let migrated = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: Data(legacy.utf8)
+        )
+
+        XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
+        XCTAssertEqual(
+            migrated.led.signal(for: .contactReady).deviceRendering(for: .tiny3Lite),
+            .init(directRGB: .blue, pattern: .firmwareAnimation)
+        )
     }
 
     func testLegacyListeningAndSpeakingMigrateToOneConversationSignal() throws {
@@ -193,7 +225,7 @@ final class SOMAControlSettingsTests: XCTestCase {
         )
 
         XCTAssertEqual(migrated.led.signals.count, SubconsciousIndicatorState.configurationStates.count)
-        XCTAssertEqual(migrated.led.signal(for: .conversation).color, .blue)
+        XCTAssertEqual(migrated.led.signal(for: .conversation).color, .green)
         XCTAssertNil(migrated.led.signals[.listening])
         XCTAssertNil(migrated.led.signals[.speaking])
     }

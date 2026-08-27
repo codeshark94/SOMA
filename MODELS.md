@@ -95,12 +95,17 @@ to one 260 ms input window.
 - Source archive SHA-256:
   `80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f`.
 - Installed Core ML SHA-256: `model.mil`
-  `382fb18525e443c2f65d8334e7af7e617a3abd2a251a0eef271ea5ab48dc3ca6`,
+  `91c6ae2e6d8f8c4206ba78fb47fc8b3451bc55477b32a84d94d85a9bde47774c`,
   `weights/weight.bin`
-  `c28620613d146a56565eadaacc22bbe9dd54533000ba79a6d666995a123c1545`.
+  `144520cc668d73cda37fdece90776ad3c7fb57a9c39449dc546c8054723aa70a`.
 - Reproduction: `scripts/install-soma-face-identity-model.zsh` verifies the
-  archive, converts it with `scripts/convert_arcface_coreml.py`, and installs
-  the compiled model with owner-only permissions.
+  archive, locks Python 3.12, the complete conversion environment, and Xcode
+  build 17F113, converts it with `scripts/convert_arcface_coreml.py`, verifies
+  the deterministic model, weights, and metadata, then loads the compiled
+  package with Core ML before installing it with owner-only permissions. The
+  compiler-generated `coremldata.bin` containers vary between equivalent
+  compilations, so they are checked for presence and successful loading rather
+  than byte identity.
 
 The runtime aligns independently verified eye and nose landmarks to ArcFace's
 canonical template, then requests `.cpuAndNeuralEngine`. A deterministic probe

@@ -293,7 +293,12 @@ SOMALucasKanadeTranslationResult soma_lucas_kanade_translation_bgra(
         const float support = std::min(1.0F, static_cast<float>(inlier_count) / 48.0F);
         const float coherence = static_cast<float>(inlier_count) / static_cast<float>(horizontal.size());
         const float confidence = support * coherence;
-        if (confidence < 0.55F) {
+        // A deliberate gimbal pulse can produce a large, coherent feature set
+        // while a substantial part of the frame is independently moving. Do
+        // not discard that physical calibration response merely because those
+        // background outliers reduce a single blended score.
+        const bool denseCoherentResponse = inlier_count >= 48 && coherence >= 0.45F;
+        if (confidence < 0.55F && !denseCoherentResponse) {
             return optical_flow_result(
                 0,
                 inlier_count,
