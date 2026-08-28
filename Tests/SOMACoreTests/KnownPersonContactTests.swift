@@ -475,6 +475,33 @@ final class KnownPersonContactTests: XCTestCase {
             openingContent: .question(motiveID: UUID(), text: "제가 먼저 말을 걸어도 괜찮을까요?")
         )
         XCTAssertNil(L1PurposefulOpeningGate.resolve(decision: unrelated, informationNeeds: [need]))
+
+        let ungroundedMemoryNeed = L1InformationNeed(
+            motiveID: motive,
+            source: .retainedMemoryGap,
+            informationGoal: "A model inferred an unresolved detail from a camera observation.",
+            expectedInformationGain: 0.98
+        )
+        XCTAssertNil(
+            L1PurposefulOpeningGate.resolve(
+                decision: question,
+                informationNeeds: [ungroundedMemoryNeed]
+            )
+        )
+
+        let participantFollowUpNeed = L1InformationNeed(
+            motiveID: motive,
+            source: .conversationFollowUp,
+            informationGoal: "Follow up on an unresolved detail the participant raised earlier.",
+            expectedInformationGain: 0.82
+        )
+        XCTAssertEqual(
+            L1PurposefulOpeningGate.resolve(
+                decision: question,
+                informationNeeds: [participantFollowUpNeed]
+            )?.motiveID,
+            motive
+        )
     }
 
     func testAskFirstPreferenceRejectsSpokenL1Decision() {

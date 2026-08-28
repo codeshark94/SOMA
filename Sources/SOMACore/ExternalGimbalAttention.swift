@@ -8,6 +8,12 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
     public let pitchSign: Double
     public let maximumPanDegreesPerSecond: Double
     public let maximumPitchDegreesPerSecond: Double
+    /// Stable adapter identifier recorded with the calibration. This permits
+    /// a newly supported product to use the same calibration contract before
+    /// it needs a Swift enum case for product-specific semantics.
+    public let deviceIdentifier: String?
+    /// Legacy semantic profile retained for existing calibrations and their
+    /// product-specific pose rules.
     public let deviceProfile: OBSBOTDeviceProfile?
     /// Image displacement per positive SDK-attitude axis. These are observed
     /// alongside the velocity-pulse signs and make pose-space planning
@@ -31,6 +37,7 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
         pitchSign: Double,
         maximumPanDegreesPerSecond: Double,
         maximumPitchDegreesPerSecond: Double,
+        deviceIdentifier: String? = nil,
         deviceProfile: OBSBOTDeviceProfile? = nil,
         posePanImageSign: Double? = nil,
         posePitchImageSign: Double? = nil,
@@ -44,6 +51,7 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
         self.pitchSign = pitchSign
         self.maximumPanDegreesPerSecond = maximumPanDegreesPerSecond
         self.maximumPitchDegreesPerSecond = maximumPitchDegreesPerSecond
+        self.deviceIdentifier = deviceIdentifier ?? deviceProfile?.rawValue
         self.deviceProfile = deviceProfile
         self.posePanImageSign = posePanImageSign
         self.posePitchImageSign = posePitchImageSign
@@ -68,7 +76,64 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
             && Self.validOptionalFinite(homePanDegrees)
             && Self.validOptionalFinite(homePitchDegrees)
             && ((homePanDegrees == nil) == (homePitchDegrees == nil))
-            && (deviceProfile != .tiny3Lite || hasMeasuredAttitudeFrame)
+    }
+
+    public func matches(deviceIdentifier: String) -> Bool {
+        if let calibrationIdentifier = self.deviceIdentifier {
+            return calibrationIdentifier == deviceIdentifier
+        }
+        return deviceProfile?.rawValue == deviceIdentifier
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case panSign
+        case pitchSign
+        case maximumPanDegreesPerSecond
+        case maximumPitchDegreesPerSecond
+        case deviceIdentifier
+        case deviceProfile
+        case posePanImageSign
+        case posePitchImageSign
+        case velocityPanPoseSign
+        case velocityPitchPoseSign
+        case homePanDegrees
+        case homePitchDegrees
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        panSign = try container.decode(Double.self, forKey: .panSign)
+        pitchSign = try container.decode(Double.self, forKey: .pitchSign)
+        maximumPanDegreesPerSecond = try container.decode(Double.self, forKey: .maximumPanDegreesPerSecond)
+        maximumPitchDegreesPerSecond = try container.decode(Double.self, forKey: .maximumPitchDegreesPerSecond)
+        deviceProfile = try? container.decodeIfPresent(OBSBOTDeviceProfile.self, forKey: .deviceProfile)
+        deviceIdentifier = try container.decodeIfPresent(String.self, forKey: .deviceIdentifier)
+            ?? deviceProfile?.rawValue
+        posePanImageSign = try container.decodeIfPresent(Double.self, forKey: .posePanImageSign)
+        posePitchImageSign = try container.decodeIfPresent(Double.self, forKey: .posePitchImageSign)
+        velocityPanPoseSign = try container.decodeIfPresent(Double.self, forKey: .velocityPanPoseSign)
+        velocityPitchPoseSign = try container.decodeIfPresent(Double.self, forKey: .velocityPitchPoseSign)
+        homePanDegrees = try container.decodeIfPresent(Double.self, forKey: .homePanDegrees)
+        homePitchDegrees = try container.decodeIfPresent(Double.self, forKey: .homePitchDegrees)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(panSign, forKey: .panSign)
+        try container.encode(pitchSign, forKey: .pitchSign)
+        try container.encode(maximumPanDegreesPerSecond, forKey: .maximumPanDegreesPerSecond)
+        try container.encode(maximumPitchDegreesPerSecond, forKey: .maximumPitchDegreesPerSecond)
+        try container.encodeIfPresent(deviceIdentifier, forKey: .deviceIdentifier)
+        try container.encodeIfPresent(deviceProfile, forKey: .deviceProfile)
+        try container.encodeIfPresent(posePanImageSign, forKey: .posePanImageSign)
+        try container.encodeIfPresent(posePitchImageSign, forKey: .posePitchImageSign)
+        try container.encodeIfPresent(velocityPanPoseSign, forKey: .velocityPanPoseSign)
+        try container.encodeIfPresent(velocityPitchPoseSign, forKey: .velocityPitchPoseSign)
+        try container.encodeIfPresent(homePanDegrees, forKey: .homePanDegrees)
+        try container.encodeIfPresent(homePitchDegrees, forKey: .homePitchDegrees)
     }
 
     public var hasMeasuredPoseProjection: Bool {
@@ -142,6 +207,7 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
         pitchImageDelta: Double,
         maximumPanDegreesPerSecond: Double = 180,
         maximumPitchDegreesPerSecond: Double = 90,
+        deviceIdentifier: String? = nil,
         deviceProfile: OBSBOTDeviceProfile? = nil,
         panPoseDelta: Double? = nil,
         pitchPoseDelta: Double? = nil,
@@ -173,6 +239,7 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
             pitchSign: pitchImageDelta > 0 ? -1 : 1,
             maximumPanDegreesPerSecond: maximumPanDegreesPerSecond,
             maximumPitchDegreesPerSecond: maximumPitchDegreesPerSecond,
+            deviceIdentifier: deviceIdentifier,
             deviceProfile: deviceProfile,
             posePanImageSign: poseSigns.pan,
             posePitchImageSign: poseSigns.pitch,

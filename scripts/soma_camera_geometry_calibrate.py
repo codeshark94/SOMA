@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit Tiny 2 Lite intrinsics and camera-to-gimbal rotation from settled scans."""
+"""Fit camera intrinsics and camera-to-gimbal rotation from settled scans."""
 
 from __future__ import annotations
 
@@ -41,10 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-directory", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--diagnostics", type=Path)
+    parser.add_argument("--device-profile", required=True)
     parser.add_argument(
-        "--device-profile",
-        choices=("tiny_2_lite", "tiny_3_lite"),
-        required=True,
+        "--nominal-wide-horizontal-fov-degrees",
+        type=float,
+        help="Required for a device identifier that has no built-in optical seed.",
     )
     return parser.parse_args()
 
@@ -328,12 +329,12 @@ def error_statistics(parameters: np.ndarray, pairs: list[Pair], width: int, heig
     return float(np.sqrt(np.mean(values * values))), float(np.percentile(values, 90)), pair_medians
 
 
-def fit(frames: list[Frame], pairs: list[Pair]) -> tuple[np.ndarray, list[Pair], dict[str, float]]:
+def fit(
+    frames: list[Frame],
+    pairs: list[Pair],
+    nominal_horizontal_fov: float,
+) -> tuple[np.ndarray, list[Pair], dict[str, float]]:
     width, height = frames[0].width, frames[0].height
-    nominal_horizontal_fov = {
-        "tiny_2_lite": 67.2,
-        "tiny_3_lite": 72.0,
-    }[args.device_profile]
     nominal_focal = width / (2 * math.tan(math.radians(nominal_horizontal_fov / 2)))
     initial = np.array([
         math.log(nominal_focal),
@@ -404,6 +405,18 @@ def fit(frames: list[Frame], pairs: list[Pair]) -> tuple[np.ndarray, list[Pair],
 
 def main() -> None:
     args = parse_args()
+    known_nominal_fov = {
+        "tiny_2_lite": 67.2,
+        "tiny_3_lite": 72.0,
+    }
+    nominal_horizontal_fov = args.nominal_wide_horizontal_fov_degrees \
+        or known_nominal_fov.get(args.device_profile)
+    if nominal_horizontal_fov is None:
+        raise ValueError(
+            "--nominal-wide-horizontal-fov-degrees is required for an unrecognized device profile"
+        )
+    if not math.isfinite(nominal_horizontal_fov) or not 30.0 <= nominal_horizontal_fov <= 130.0:
+        raise ValueError("nominal horizontal FOV must be finite and within 30...130 degrees")
     if args.output.exists():
         raise ValueError(f"refusing to overwrite calibration: {args.output}")
     frames = load_frames(args.capture_directory)
@@ -412,14 +425,14 @@ def main() -> None:
     # held-out split. Near-field parallax and repeated texture can each produce
     # a valid homography that no single camera model can explain. This stage
     # curates pairs only; the final fit still never sees validation points.
-    _, consistent_pairs, consensus_metrics = fit(frames, pairs)
+    _, consistent_pairs, consensus_metrics = fit(frames, pairs, nominal_horizontal_fov)
     validation_pairs = [pair for index, pair in enumerate(consistent_pairs) if index % 4 == 0]
     training_pairs = [pair for index, pair in enumerate(consistent_pairs) if index % 4 != 0]
     if len(validation_pairs) < 3:
         raise ValueError("at least three untouched validation pairs are required")
-    parameters, retained, training_metrics = fit(frames, training_pairs)
+    parameters, retained, training_metrics = fit(frames, training_pairs, nominal_horizontal_fov)
     width, height = frames[0].width, frames[0].height
-    nominal_focal = width / (2 * math.tan(math.radians(67.2 / 2)))
+    nominal_focal = width / (2 * math.tan(math.radians(nominal_horizontal_fov / 2)))
     nominal_parameters = np.array([
         math.log(nominal_focal),
         math.log(nominal_focal),

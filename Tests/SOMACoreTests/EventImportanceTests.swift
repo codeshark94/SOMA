@@ -343,10 +343,9 @@ final class EventImportanceTests: XCTestCase {
         )
     }
 
-    func testDirectContactStartsConversationAndSocialPulseDoesNotRequireIt() {
+    func testDirectContactIsRequiredToStartUserConversation() {
         let start: UInt64 = 1_000_000_000
         var gate = ConversationContactGate(configuration: .init(
-            socialPulseResponseMilliseconds: 8_000,
             conversationInactivityMilliseconds: 60_000
         ))
         XCTAssertEqual(
@@ -357,16 +356,53 @@ final class EventImportanceTests: XCTestCase {
             gate.authorizeSpeechOnset(at: start, directContact: true),
             .voiceActivity
         )
+    }
 
-        gate.issueSocialPulse(at: start + 1_000_000_000)
-        XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 1_100_000_000, directContact: false),
-            .botInitiatedPulseResponse
+    func testNewConversationRequiresCurrentL0FixationRatherThanGazeHistory() {
+        let start: UInt64 = 1_000_000_000
+        var fixation = L0FaceFixationAdmission(freshnessMilliseconds: 500)
+        var conversation = ConversationContactGate()
+
+        // A detector can retain a direct-gaze history while L0 has already
+        // resumed coverage. Clearing the L0 fixation must make that history
+        // ineligible for a fresh voice session.
+        fixation.observeVerifiedFixation(
+            sceneID: "face-a",
+            directContact: true,
+            at: start
         )
-        XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 1_200_000_000, directContact: true),
-            .voiceActivity
+        XCTAssertTrue(fixation.permitsNewSession(at: start + 100_000_000))
+        fixation.clear()
+        XCTAssertFalse(fixation.permitsNewSession(at: start + 120_000_000))
+        XCTAssertNil(
+            conversation.authorizeSpeechOnset(
+                at: start + 120_000_000,
+                directContact: fixation.permitsNewSession(at: start + 120_000_000)
+            )
         )
+    }
+
+    func testCurrentVerifiedFaceFixationRequiresDirectGazeAndExpires() {
+        let start: UInt64 = 2_000_000_000
+        var fixation = L0FaceFixationAdmission(freshnessMilliseconds: 500)
+
+        fixation.observeVerifiedFixation(
+            sceneID: "face-a",
+            directContact: false,
+            at: start
+        )
+        XCTAssertEqual(fixation.state(at: start), .averted)
+        XCTAssertFalse(fixation.permitsNewSession(at: start))
+
+        fixation.observeVerifiedFixation(
+            sceneID: "face-a",
+            directContact: true,
+            at: start + 100_000_000
+        )
+        XCTAssertEqual(fixation.state(at: start + 100_000_000), .direct)
+        XCTAssertTrue(fixation.permitsNewSession(at: start + 599_000_000))
+        XCTAssertEqual(fixation.state(at: start + 601_000_000), .absent)
+        XCTAssertFalse(fixation.permitsNewSession(at: start + 601_000_000))
     }
 
     func testNewLiveConversationRequiresCurrentVerifiedHumanTarget() {
@@ -402,7 +438,6 @@ final class EventImportanceTests: XCTestCase {
     func testOpenedConversationAllowsFollowUpsUntilInactivityExpiry() {
         let start: UInt64 = 2_000_000_000
         var gate = ConversationContactGate(configuration: .init(
-            socialPulseResponseMilliseconds: 8_000,
             conversationInactivityMilliseconds: 60_000
         ))
         gate.markConversationOpened(at: start)
@@ -413,6 +448,30 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(
             gate.authorizeSpeechOnset(at: start + 60_000_000_000, directContact: true),
             .voiceActivity
+        )
+    }
+
+    func testConversationLeaseOnlyRenewsForConfirmedUserActivity() {
+        let start: UInt64 = 3_000_000_000
+        var gate = ConversationContactGate(configuration: .init(
+            conversationInactivityMilliseconds: 60_000
+        ))
+        gate.markConversationOpened(at: start)
+
+        // Speech transport/VAD may contain room noise or output echo. Without
+        // an explicit confirmed user turn, the lease must expire on schedule.
+        XCTAssertNil(
+            gate.authorizeSpeechOnset(at: start + 60_000_000_000, directContact: false)
+        )
+
+        gate.markConversationOpened(at: start)
+        gate.recordConversationActivity(at: start + 59_000_000_000)
+        XCTAssertEqual(
+            gate.authorizeSpeechOnset(at: start + 118_000_000_000, directContact: false),
+            .activeConversation
+        )
+        XCTAssertNil(
+            gate.authorizeSpeechOnset(at: start + 119_000_000_000, directContact: false)
         )
     }
 
@@ -462,18 +521,21 @@ final class EventImportanceTests: XCTestCase {
     }
 
     func testIndicatorSignalsResolveToFixedDeviceRenderings() {
+        let contract = tiny3LiteTestContract()
         XCTAssertEqual(SubconsciousIndicatorState.contactReady.humanMeaning, "ready_speak_now")
         XCTAssertEqual(SubconsciousIndicatorState.conversation.humanMeaning, "conversation_active")
-        XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "please_wait_preparing_reply")
-        let blue = SOMALEDDeviceRendering(directRGB: .blue, pattern: .steady)
-        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.firmwareIndicatorStateID(for: .green))
-        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.firmwareIndicatorStateID(for: .yellow))
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .green), .green)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .yellow), .yellow)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .blue), blue.directRGB)
+        XCTAssertEqual(SubconsciousIndicatorState.working.humanMeaning, "conversation_active")
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .green), 54)
+        XCTAssertFalse(contract.usesFirmwareDefaultIndicator(for: .green))
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .yellow), 16)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .blue), 57)
         XCTAssertEqual(
-            SOMALEDSettings().deviceRendering(for: .contactReady, on: .tiny3Lite),
-            SOMALEDDeviceRendering(directRGB: .blue, pattern: .firmwareAnimation)
+            SOMALEDSettings().deviceRendering(for: .contactReady, on: contract),
+            SOMALEDDeviceRendering(stateID: 57, pattern: .blink)
+        )
+        XCTAssertEqual(
+            SOMALEDSettings().deviceRendering(for: .conversation, on: contract),
+            SOMALEDDeviceRendering(stateID: 16, pattern: .steady)
         )
     }
 
@@ -492,6 +554,7 @@ final class EventImportanceTests: XCTestCase {
 
         lease.observe(sceneID: "face-a", at: start)
         XCTAssertTrue(lease.maintain(sceneID: "face-a", at: start + 100_000_000))
+        XCTAssertTrue(lease.maintain(sceneID: "face-b", at: start + 200_000_000))
         XCTAssertTrue(lease.isActive(at: start + 2_999_000_000))
         XCTAssertFalse(lease.maintain(sceneID: "face-a", at: start + 3_001_000_000))
         XCTAssertFalse(lease.maintain(sceneID: "face-b", at: start + 3_001_000_000))
@@ -510,10 +573,69 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(lease.observeAverted(sceneID: "face-a", at: start + 850_000_000))
         XCTAssertFalse(lease.isActive(at: start + 851_000_000))
 
+        lease.observe(sceneID: "face-a", at: start + 900_000_000)
+        XCTAssertTrue(lease.observeAverted(sceneID: "face-b", at: start + 1_000_000_000))
+        XCTAssertFalse(lease.observeAverted(sceneID: "face-b", at: start + 1_750_000_000))
+        XCTAssertFalse(lease.isActive(at: start + 1_751_000_000))
+
         lease.observe(sceneID: "face-a", at: start + 1_000_000_000)
         XCTAssertTrue(lease.observeAverted(sceneID: "face-a", at: start + 1_100_000_000))
         lease.observe(sceneID: "face-a", at: start + 1_500_000_000)
         XCTAssertTrue(lease.isActive(at: start + 2_249_000_000))
+    }
+
+    func testEyeContactIndicatorReducerNeverPromotesMissingOrAvertedGaze() {
+        let start: UInt64 = 25_000_000_000
+        var lease = EyeContactIndicatorLease(
+            holdMilliseconds: 3_000,
+            aversionConfirmationMilliseconds: 750
+        )
+
+        XCTAssertFalse(lease.update(
+            gazeEvidence: .unavailable,
+            sceneID: "face-a",
+            at: start
+        ))
+        XCTAssertFalse(lease.update(
+            gazeEvidence: .averted,
+            sceneID: "face-a",
+            at: start + 100_000_000
+        ))
+        XCTAssertTrue(lease.update(
+            gazeEvidence: .direct,
+            sceneID: "face-a",
+            at: start + 200_000_000
+        ))
+        XCTAssertTrue(lease.update(
+            gazeEvidence: .unavailable,
+            sceneID: "face-a",
+            at: start + 300_000_000
+        ))
+        XCTAssertTrue(lease.update(
+            gazeEvidence: .averted,
+            sceneID: "face-b",
+            at: start + 400_000_000
+        ))
+        XCTAssertFalse(lease.update(
+            gazeEvidence: .averted,
+            sceneID: "face-b",
+            at: start + 1_150_000_000
+        ))
+    }
+
+    func testDirectGazeWinsWhenAssociatedDetectorsDisagree() {
+        XCTAssertEqual(
+            VisualGazeEvidence.combined([.unavailable, .direct, .averted]),
+            .direct
+        )
+        XCTAssertEqual(
+            VisualGazeEvidence.combined([.unavailable, .averted]),
+            .averted
+        )
+        XCTAssertEqual(
+            VisualGazeEvidence.combined([.unavailable]),
+            .unavailable
+        )
     }
 
     func testLiveVoiceLaunchGateDebouncesAndHasBoundedRetry() {

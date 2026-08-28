@@ -6,6 +6,27 @@ import XCTest
 final class CognitiveMemoryTests: XCTestCase {
     private let keyData = Data((0 ..< 32).map(UInt8.init))
 
+    func testHistoricalMemoryPresentationCannotBeMistakenForLiveDialogue() {
+        let endedAt = Date(timeIntervalSince1970: 1_000)
+        let now = endedAt.addingTimeInterval(7 * 24 * 60 * 60)
+
+        let episode = MemoryContextPresentation.pastEpisode(
+            narrative: "The participant discussed a source-control project.",
+            endedAt: endedAt,
+            now: now
+        )
+        let durable = MemoryContextPresentation.durableMemory(
+            summary: "The participant has an interest in quantitative research.",
+            kind: .personFact,
+            lastRevisedAt: endedAt
+        )
+
+        XCTAssertTrue(episode.contains("historical evidence, not part of the active dialogue"))
+        XCTAssertTrue(episode.contains("age_seconds=604800"))
+        XCTAssertTrue(durable.contains("not an active-dialogue transcript"))
+        XCTAssertTrue(durable.contains("kind=person_fact"))
+    }
+
     func testEncryptedJournalPersistsTypedMemoryWithoutPlaintext() async throws {
         let directory = temporaryDirectory("persistence")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -181,6 +202,34 @@ final class CognitiveMemoryTests: XCTestCase {
         } catch let error as CognitiveMemoryError {
             guard case .validationFailed = error else { return XCTFail("unexpected error: \(error)") }
         }
+        try await store.close()
+    }
+
+    func testJournalCompactionPurgesExpiredEntriesWithoutRecursiveAppend() async throws {
+        let directory = temporaryDirectory("compaction-expiry")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+        let createdAt = Date(timeIntervalSince1970: 1_000)
+        let expiredAt = createdAt.addingTimeInterval(1)
+        let summary = String(repeating: "x", count: 4_096)
+
+        for _ in 0 ..< 900 {
+            _ = try await store.insert(
+                taskDraft(
+                    summary: summary,
+                    status: .planned,
+                    tier: .shortTerm,
+                    expiresAt: expiredAt,
+                    at: createdAt
+                ),
+                at: createdAt
+            )
+        }
+
+        _ = try await store.purgeExpired(at: Date())
+        let records = try await store.query(at: Date())
+        XCTAssertTrue(records.isEmpty)
         try await store.close()
     }
 

@@ -2606,6 +2606,52 @@ final class PredictiveWorldModelTests: XCTestCase {
         ))
     }
 
+    func testCoverageFieldInhibitsACommittedCorridorBeforeItCompletes() {
+        let start: UInt64 = 14_000_000_000
+        let origin = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
+        var field = SpatialCoverageField()
+        let committed = SpatialCoverageDirection(
+            bearing: GimbalRelativeBearing(azimuthDegrees: -72, elevationDegrees: 0),
+            probability: 1
+        )
+        let adjacent = GimbalRelativeBearing(azimuthDegrees: -54, elevationDegrees: 0)
+        let before = field.explorationProbability(
+            for: adjacent,
+            from: origin,
+            at: start + 1_000_000_000,
+            temperature: 1
+        )
+
+        field.recordExplorationCommit(to: committed, at: start)
+
+        let after = field.explorationProbability(
+            for: adjacent,
+            from: origin,
+            at: start + 1_000_000_000,
+            temperature: 1
+        )
+        XCTAssertLessThan(after ?? 1, before ?? 0)
+    }
+
+    func testCoverageFieldKeepsVerticalFrontiersCompetitive() {
+        let start: UInt64 = 15_000_000_000
+        let origin = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
+        let field = SpatialCoverageField()
+        let center = field.explorationProbability(
+            for: GimbalRelativeBearing(azimuthDegrees: 72, elevationDegrees: 0),
+            from: origin,
+            at: start,
+            temperature: 1
+        )
+        let upper = field.explorationProbability(
+            for: GimbalRelativeBearing(azimuthDegrees: 72, elevationDegrees: 26),
+            from: origin,
+            at: start,
+            temperature: 1
+        )
+        XCTAssertGreaterThan((upper ?? 0) / max(center ?? 0, .leastNonzeroMagnitude), 0.20)
+    }
+
     func testPanStallRecoveryRecentersOnlyAfterBothDirectionsFail() {
         var recovery = PanStallRecovery()
         XCTAssertEqual(

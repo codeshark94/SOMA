@@ -32,12 +32,45 @@ a SOMA capability until its active-device behavior has been verified.
 | Audio | firmware sound-follow distance | none | only `doa_range=1` persisted; values 2 and 3 silently remained 0 | withheld until its physical semantics are established |
 | Audio | audio distance field | none | `cameraSetAudioDistanceU` state round-trip verified for values 0, 1, and 2; 3, 4, and 15 silently reported 0 | withheld until the firmware's three distance settings and acoustic effect are established |
 | Audio | raw sound bearing | none | firmware does not expose a host-readable direction | calibration required |
-| LED | enabled and brightness | L0 indicator session | getter/setter | active |
-| LED | firmware status states | none | `sysMgSetIndicatorStateR` / `sysMgClearIndicatorStateR` are documented for a different OBSBOT product family; their asynchronous acknowledgement does not establish Tiny 3 Lite semantics | withheld |
-| LED | direct blue social signal | L0 indicator session | Tiny 3's observed RGB request `cmd_set=13`, `cmd_id=456`, payload `0,0,255` renders blue on firmware `6.5.10.1` | active for human presence; eye contact uses a direct-RGB brightness cadence without state-ID requests |
-| LED | arbitrary RGB and firmware-native patterns | none | the running firmware contains internal RGB palette and pattern routines, but the public host SDK exposes only status-state selection, enablement, and brightness | withheld: the blue diagnostic does not establish a general RGB command surface |
+| LED | enabled and brightness | L0 indicator session | getter/setter and readback | active |
+| LED | semantic exploration, human-presence, contact-ready, and conversation presentations | L0 indicator session | firmware state-machine reconstruction plus physical validation of green, blue, and yellow routes | active |
+| LED | direct RGB candidate | none | the private three-byte packet accepted transport but never produced a durable physical presentation | invalid; removed from the adapter contract |
 | Target framing | target view and target zoom presets | none | SDK documentation marks view presets as Air-series specific and offers no getter | withheld |
 | System | factory reset, firmware update, sleep, recording | none | destructive or outside embodied interaction | intentionally unavailable |
+
+## LED evidence ledger
+
+The Tiny 3 Lite adapter owns the LED mapping. Cognitive code requests a
+semantic state only; it must not send raw state IDs or RGB values.
+
+| Semantic presentation | Active device route | Evidence status |
+| --- | --- | --- |
+| Exploration / no selected target | `SYSTEM_READY(3)` + `NORMAL_WORKMODE(54)` | physically verified steady green; the native indicator session establishes and restores both states |
+| Human presence / native tracking | `SYSTEM_READY(3)` + `TRACK_WORKMODE(57)` | physically verified steady blue |
+| Contact ready | state `57` with the configured contact cadence | physically verified blue route; cadence is owned by the indicator session |
+| Conversation | `AI_TARGET_LOSE(16)` reused as the firmware yellow presentation | physically verified steady yellow; cleared when conversation ends |
+
+Tiny 3 Lite exposes a firmware status machine rather than an arbitrary RGB
+surface. The vendor manual and the recovered `6.5.10.1` state machine agree on
+the complete native presentation vocabulary:
+
+| Firmware condition | Vendor presentation | Firmware state evidence | SOMA policy |
+| --- | --- | --- | --- |
+| device initialization | blue cyclic animation | incomplete ready/work-mode state set | observed only |
+| no tracking target selected | steady green | `SYSTEM_READY(3)` + `NORMAL_WORKMODE(54)` | exploration baseline |
+| gesture or voice feedback | blink the current presentation twice, then restore it | `AI_GESTURE_RECOGNIZING(18)` and `DOA_SPEECH_RECOGNIZED(52)` | reserved for native feedback |
+| human tracking active | steady blue | `SYSTEM_READY(3)` + `TRACK_WORKMODE(57)` | human presence |
+| tracking target lost | steady yellow | `AI_TARGET_LOSE(16)` | yellow palette route |
+| hand tracking active | steady purple | `SYSTEM_READY(3)` + `HANDSTRACK_WORKMODE(59)` | not used by SOMA |
+| firmware upgrade | blue/yellow mixed animation | `UPGRADE_UPGRADING(30)` | never issued by SOMA |
+| firmware upgrade failure | slowly blinking red | `UPGRADE_ERROR(29)` | never issued by SOMA |
+| AI or device malfunction | steady red | `AI_ERROR(15)` and related error states | diagnostic output only |
+| privacy mode | off | device privacy state | firmware-owned |
+
+State-changing diagnostics must not clear a state that may already belong to
+the firmware baseline. The production bridge therefore keeps state `3`
+persistent, changes only the active semantic work state, and restores `3 + 54`
+on release or shutdown.
 
 ## Firmware-image boundary
 

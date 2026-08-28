@@ -233,6 +233,19 @@ struct L1MemoryContext: Sendable {
     let recalledEpisodes: [String]
 }
 
+private struct RecalledEpisode: Sendable {
+    let narrative: String
+    let endedAt: Date
+
+    func context(at date: Date) -> String {
+        MemoryContextPresentation.pastEpisode(
+            narrative: narrative,
+            endedAt: endedAt,
+            now: date
+        )
+    }
+}
+
 private final class SynchronousWriteResult: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Bool?
@@ -393,6 +406,36 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         "personal_context",
     ]
 
+    private static func informationNeedSource(
+        for record: CognitiveMemoryRecord
+    ) -> L1InformationMotiveSource {
+        let sourceIDs = record.provenance.map(\.sourceID)
+        if sourceIDs.contains("l1_initial_social_orientation") {
+            return .initialSocialOrientation
+        }
+        if sourceIDs.contains("l1_interest_discovery") {
+            return .interestDiscovery
+        }
+        if sourceIDs.contains(where: { $0.hasPrefix("l1_place_affiliation") }) {
+            return .placeAffiliation
+        }
+        return .retainedMemoryGap
+    }
+
+    private static func isUngroundedInferenceNeed(
+        _ record: CognitiveMemoryRecord
+    ) -> Bool {
+        record.provenance.contains { provenance in
+            let modelProposedQuestion = provenance.source == .l1Inference
+                && (provenance.sourceID == "l1_memory_proposal:open_question"
+                    || provenance.sourceID.hasPrefix("l1_conversation_consolidation"))
+            return modelProposedQuestion
+                && !provenance.evidenceIDs.contains(where: {
+                    $0.hasPrefix("conversation_turn:")
+                })
+        }
+    }
+
     private struct ConversationMemoryConsolidation: Decodable {
         enum Kind: String, Decodable {
             case personFact = "person_fact"
@@ -431,6 +474,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private var personContextByPersonID: [UUID: PersonContextSnapshot] = [:]
     private var personMemorySummariesByPersonID: [UUID: [String]] = [:]
     private var personInfoNeedsByPersonID: [UUID: [PersistedInformationNeed]] = [:]
+    private let legacyNeedSweepLock = NSLock()
+    private var legacyNeedSweepStarted = false
     private let placeAffiliationLock = NSLock()
     private var placeAffiliationBySpaceID: [UUID: L1PlaceAffiliationContext] = [:]
     private let conversationLock = NSLock()
@@ -474,6 +519,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
         do {
             let now = Date()
+            await retireUngroundedInferenceNeedsIfNeeded(at: now)
             if createPseudonymousEntity {
                 try await ensurePseudonymousEntity(entityID, in: store, at: now)
             }
@@ -507,17 +553,33 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     updatedAt: $0.updatedAt
                 )
             }
+            var inadmissibleInferenceNeedIDs: [UUID] = []
             var needs = allowed.compactMap { record -> L1InformationNeed? in
                 guard case let .openQuestion(question) = record.payload,
                       question.targetEntityID == entityID,
                       question.status == .open else {
                     return nil
                 }
+                let source = Self.informationNeedSource(for: record)
+                // A visual/model-only question is a useful transient thought,
+                // not durable evidence about a person. Older journals can
+                // contain these from before the admission rule existed; retire
+                // them here rather than allowing them to re-enter L1 context.
+                if Self.isUngroundedInferenceNeed(record) {
+                    inadmissibleInferenceNeedIDs.append(record.id)
+                    return nil
+                }
                 return L1InformationNeed(
                     motiveID: record.id,
-                    source: .retainedMemoryGap,
+                    source: source,
                     informationGoal: question.question,
                     expectedInformationGain: question.expectedInformationGain
+                )
+            }
+            for motiveID in inadmissibleInferenceNeedIDs {
+                _ = await dismissInformationNeed(
+                    motiveID: motiveID,
+                    reason: "ungrounded_l1_inference"
                 )
             }
             let contactHistory = records.compactMap { record -> L1SocialContactEvent? in
@@ -597,7 +659,16 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 )
             }
             cachePersonContext(personContext)
-            cachePersonMemorySummaries(projections.map(\.summary), for: entityID)
+            cachePersonMemorySummaries(
+                projections.map {
+                    MemoryContextPresentation.durableMemory(
+                        summary: $0.summary,
+                        kind: $0.kind,
+                        lastRevisedAt: $0.updatedAt
+                    )
+                }.filter { !$0.isEmpty },
+                for: entityID
+            )
             let persistedNeeds = await pendingInformationNeeds(for: entityID, at: now, respectCooldown: false)
             cacheInformationNeeds(persistedNeeds, for: entityID)
             // The needs are about to be handed to L1/L2 as a mission; put them
@@ -617,7 +688,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 preferredLanguageTag: personContext.preferredLanguageTag,
                 contactHistory: Array(contactHistory.prefix(16)),
                 personPreferences: personContext.preferenceDirectives().joined(separator: " "),
-                recalledEpisodes: recalled
+                recalledEpisodes: recalled.map { $0.context(at: now) }
             )
         } catch {
             onHealth("memory_unavailable", String(error.localizedDescription.prefix(192)))
@@ -631,6 +702,37 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 personPreferences: "",
                 recalledEpisodes: []
             )
+        }
+    }
+
+    /// Before evidence-bearing proposal records existed, an L1 visual guess
+    /// could become an open question in the encrypted journal. Sweep that
+    /// narrow legacy class once so it cannot keep resurfacing after upgrade.
+    private func retireUngroundedInferenceNeedsIfNeeded(at date: Date) async {
+        let shouldSweep = legacyNeedSweepLock.withLock {
+            guard !legacyNeedSweepStarted else { return false }
+            legacyNeedSweepStarted = true
+            return true
+        }
+        guard shouldSweep, let store else { return }
+
+        let records = (try? await store.query(.init(limit: 1_024), at: date)) ?? []
+        let motiveIDs = records.compactMap { record -> UUID? in
+            guard case let .openQuestion(question) = record.payload,
+                  question.status == .open,
+                  Self.isUngroundedInferenceNeed(record) else {
+                return nil
+            }
+            return record.id
+        }
+        for motiveID in motiveIDs {
+            _ = await dismissInformationNeed(
+                motiveID: motiveID,
+                reason: "ungrounded_l1_inference"
+            )
+        }
+        if !motiveIDs.isEmpty {
+            onHealth("info_need_legacy_sweep", "dismissed=\(motiveIDs.count)")
         }
     }
 
@@ -669,7 +771,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         query: String,
         limit: Int = 4,
         at date: Date
-    ) async -> [String] {
+    ) async -> [RecalledEpisode] {
         guard let store else { return [] }
         do {
             let episodes = try await store.query(
@@ -683,13 +785,17 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 : (scoped ? "conversation with this person about \(query)" : query)
             guard let queryEmbedding = await embeddingClient.embed(queryText) else {
                 return episodes
-                    .sorted { $0.updatedAt > $1.updatedAt }
+                    .sorted { lhs, rhs in
+                        (recalledEpisode(from: lhs)?.endedAt ?? lhs.updatedAt)
+                            > (recalledEpisode(from: rhs)?.endedAt ?? rhs.updatedAt)
+                    }
                     .prefix(limit)
-                    .compactMap { episodeNarrative($0) }
+                    .compactMap { recalledEpisode(from: $0) }
             }
-            var scored: [(narrative: String, similarity: Float, salience: Double, updatedAt: Date)] = []
+            var scored: [(episode: RecalledEpisode, similarity: Float, salience: Double)] = []
             for episode in episodes {
-                guard let narrative = episodeNarrative(episode), !narrative.isEmpty else { continue }
+                guard let recalled = recalledEpisode(from: episode) else { continue }
+                let narrative = recalled.narrative
                 let embedding: [Float]?
                 if let cached = embeddingCache.embedding(for: episode.id) {
                     embedding = cached
@@ -700,14 +806,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     embedding = nil
                 }
                 guard let embedding, let sim = cosineSimilarity(queryEmbedding, embedding) else { continue }
-                scored.append((narrative, sim, episodeSalience(episode), episode.updatedAt))
+                scored.append((recalled, sim, episodeSalience(episode)))
             }
             let ranked = scored.sorted { lhs, rhs in
-                let l = Double(lhs.similarity) * 0.6 + lhs.salience * 0.3 + recencyScore(lhs.updatedAt, now: date) * 0.1
-                let r = Double(rhs.similarity) * 0.6 + rhs.salience * 0.3 + recencyScore(rhs.updatedAt, now: date) * 0.1
+                let l = Double(lhs.similarity) * 0.6 + lhs.salience * 0.3 + recencyScore(lhs.episode.endedAt, now: date) * 0.1
+                let r = Double(rhs.similarity) * 0.6 + rhs.salience * 0.3 + recencyScore(rhs.episode.endedAt, now: date) * 0.1
                 return l > r
             }
-            return ranked.prefix(limit).map(\.narrative)
+            return ranked.prefix(limit).map(\.episode)
         } catch {
             return []
         }
@@ -721,12 +827,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         at date: Date = Date()
     ) async -> [String] {
         await recallEpisodes(entityID: entityID, query: query, limit: limit, at: date)
+            .map { $0.context(at: date) }
     }
 
-    private func episodeNarrative(_ record: CognitiveMemoryRecord) -> String? {
+    private func recalledEpisode(from record: CognitiveMemoryRecord) -> RecalledEpisode? {
         guard case let .episode(value) = record.payload else { return nil }
         let narrative = value.narrative.trimmingCharacters(in: .whitespacesAndNewlines)
-        return narrative.isEmpty ? nil : narrative
+        guard !narrative.isEmpty else { return nil }
+        return RecalledEpisode(narrative: narrative, endedAt: value.endedAt)
     }
 
     private func episodeSalience(_ record: CognitiveMemoryRecord) -> Double {
@@ -1568,6 +1676,60 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
+    /// Retires an information need whose premise was rejected or found to be
+    /// unsupported. The historical record remains auditable, but it can no
+    /// longer steer L1 or be surfaced to L2 as a future mission.
+    @discardableResult
+    func dismissInformationNeed(
+        motiveID: UUID,
+        reason: String,
+        at date: Date = Date()
+    ) async -> Bool {
+        guard let store else { return false }
+        do {
+            guard let previous = try await store.record(id: motiveID, at: date),
+                  case let .openQuestion(question) = previous.payload,
+                  question.status == .open else {
+                return false
+            }
+            _ = try await store.correct(
+                id: motiveID,
+                replacement: CognitiveMemoryDraft(
+                    tier: previous.tier,
+                    summary: "Dismissed information need: \(question.question)",
+                    payload: .openQuestion(OpenQuestionMemory(
+                        question: question.question,
+                        targetEntityID: question.targetEntityID,
+                        expectedInformationGain: question.expectedInformationGain,
+                        status: .dismissed
+                    )),
+                    confidence: previous.confidence,
+                    provenance: previous.provenance,
+                    sensitivity: previous.sensitivity,
+                    disclosure: previous.disclosure,
+                    expiresAt: previous.expiresAt
+                ),
+                reason: String(reason.prefix(96)),
+                at: date
+            )
+            if let entityID = question.targetEntityID {
+                cacheInformationNeeds(
+                    await pendingInformationNeeds(
+                        for: entityID,
+                        at: date,
+                        respectCooldown: false
+                    ),
+                    for: entityID
+                )
+            }
+            onHealth("info_need_dismissed", "motive=\(motiveID.uuidString.lowercased()); reason=\(String(reason.prefix(96)))")
+            return true
+        } catch {
+            onHealth("info_need_dismiss_failed", String(error.localizedDescription.prefix(160)))
+            return false
+        }
+    }
+
     /// Consume L1's model-proposed memory suggestions and persist those that
     /// clear the confidence bar. Person-linked kinds are bound to the recognized
     /// person when one is present; otherwise they degrade to a generic episode.
@@ -1582,6 +1744,13 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         for proposal in proposals where proposal.confidence >= 0.55 {
             guard proposal.kind != .relationship else {
                 onHealth("memory_proposal_rejected", "kind=relationship; source=contact_evidence")
+                continue
+            }
+            // A model may notice an uncertainty in an image, but an open
+            // question becomes a future social obligation. Require an actual
+            // participant turn from this cycle before making it durable.
+            guard proposal.kind != .openQuestion || !proposal.sourceTurnRecordIDs.isEmpty else {
+                onHealth("memory_proposal_rejected", "kind=open_question; reason=missing_participant_evidence")
                 continue
             }
             do {
@@ -1604,11 +1773,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         at date: Date
     ) -> CognitiveMemoryDraft {
         let summary = proposal.summary
+        let evidenceIDs = proposal.evidenceIDs + proposal.sourceTurnRecordIDs.map {
+            "conversation_turn:\($0.uuidString.lowercased())"
+        }
         let provenance = [MemoryProvenance(
             source: .l1Inference,
             sourceID: "l1_memory_proposal:\(proposal.kind.rawValue)",
             observedAt: date,
-            evidenceIDs: proposal.evidenceIDs,
+            evidenceIDs: evidenceIDs,
             modelID: "gemma4:31b-cloud"
         )]
         let payload: CognitiveMemoryPayload
@@ -2015,6 +2187,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         guard !normalizedThreadID.isEmpty,
               let personEntityID = activePersonEntityID(forThread: normalizedThreadID) else { return [] }
         return await recallEpisodes(entityID: personEntityID, query: text, at: date)
+            .map { $0.context(at: date) }
     }
 
     /// Reads the stored preference directives for a person as one instruction

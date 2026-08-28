@@ -29,6 +29,7 @@ let package = Package(
         .executable(name: "soma-codex-bridge", targets: ["SOMACodexBridge"]),
         .executable(name: "soma-live-voice", targets: ["SOMALiveVoice"]),
         .executable(name: "soma-menu-bar", targets: ["SOMAMenuBar"]),
+        .executable(name: "soma-child-guardian", targets: ["SOMAChildGuardian"]),
     ],
     targets: [
         .target(name: "SOMACore"),
@@ -96,6 +97,7 @@ let package = Package(
             ]
         ),
         .executableTarget(name: "SOMAMenuBar", dependencies: ["SOMACore"]),
+        .executableTarget(name: "SOMAChildGuardian"),
         .testTarget(name: "SOMACoreTests", dependencies: ["SOMACore", "SOMAVADModel"]),
     ]
 )

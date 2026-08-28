@@ -77,6 +77,16 @@ public enum VisualGazeEvidence: String, Codable, Equatable, Sendable {
     case direct
     case averted
     case unavailable
+
+    /// Combines concurrent estimates for one visually associated face.
+    /// A direct landmark observation is positive evidence and therefore wins
+    /// over a stale or lower-fidelity averted estimate. Missing landmarks do
+    /// not contribute negative evidence.
+    public static func combined(_ evidence: [Self]) -> Self {
+        if evidence.contains(.direct) { return .direct }
+        if evidence.contains(.averted) { return .averted }
+        return .unavailable
+    }
 }
 
 public struct VisualObservation: Sendable {

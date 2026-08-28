@@ -559,17 +559,29 @@ public struct SpatialCoverageField: Sendable {
             ?? 0
         cells[index].unproductiveVisits += 1
         cells[index].lastUnproductiveNS = visitNS
+        recordExplorationCommit(to: direction, at: visitNS)
+    }
+
+    /// Marks a selected direction before motion begins. This is deliberately
+    /// separate from an unproductive visit: the next draw must avoid the
+    /// current visual corridor even if a fresh target interrupts the move.
+    public mutating func recordExplorationCommit(
+        to direction: SpatialCoverageDirection,
+        at monotonicNS: UInt64
+    ) {
+        guard cells.contains(where: { $0.bearing == direction.bearing }) else { return }
         // Keep only the short-lived spatial context needed for inhibition of
-        // return. The longer-lived information value is already represented
-        // by the coverage and place-memory fields above.
+        // return. The longer-lived information value is represented by the
+        // coverage and place-memory fields above.
         recentExplorationVisits.removeAll {
-            visitNS >= $0.monotonicNS && visitNS - $0.monotonicNS > 75_000_000_000
+            monotonicNS >= $0.monotonicNS && monotonicNS - $0.monotonicNS > 75_000_000_000
+                || $0.bearing == direction.bearing
         }
         recentExplorationVisits.append(
-            ExplorationVisit(bearing: direction.bearing, monotonicNS: visitNS)
+            ExplorationVisit(bearing: direction.bearing, monotonicNS: monotonicNS)
         )
-        if recentExplorationVisits.count > 8 {
-            recentExplorationVisits.removeFirst(recentExplorationVisits.count - 8)
+        if recentExplorationVisits.count > 10 {
+            recentExplorationVisits.removeFirst(recentExplorationVisits.count - 10)
         }
     }
 
@@ -607,19 +619,18 @@ public struct SpatialCoverageField: Sendable {
                 for: cell.bearing,
                 at: monotonicNS
             )
-            // Prefer a natural eye-level scan. With a weak divisor the
-            // exploration regularly dives to a low cell and sweeps nose-down,
-            // which reads as "tucking the head and turning". A stronger
-            // horizontal preference keeps the sweep near eye level while still
-            // allowing gentle up/down coverage.
-            let elevationComfort = exp(-abs(cell.bearing.elevationDegrees) / 10)
+            // Eye level remains somewhat more comfortable for social contact,
+            // but passive coverage must still move through vertical frontiers.
+            // A sharply centre-biased prior collapses a spherical atlas into a
+            // horizontal sweep whenever the room is otherwise unfamiliar.
+            let elevationComfort = exp(-abs(cell.bearing.elevationDegrees) / 30)
             let boundaryClearance = min(route.panClearanceDegrees / 20, route.pitchClearanceDegrees / 12)
             let boundaryComfort = 0.55 + 0.45 * min(max(boundaryClearance, 0), 1)
             return pow(
                 max(
                     0.001,
                     observationNeed * exp(-routeDistance / 120) * failurePenalty
-                        * (1 - 0.85 * returnInhibition) * elevationComfort * boundaryComfort
+                        * (1 - 0.94 * returnInhibition) * elevationComfort * boundaryComfort
                 ),
                 inverseTemperature
             )
@@ -669,9 +680,9 @@ public struct SpatialCoverageField: Sendable {
             } else {
                 ageSeconds = 0
             }
-            let temporalDecay = exp(-ageSeconds / 35)
+            let temporalDecay = exp(-ageSeconds / 45)
             let distance = sphericalDistanceDegrees(bearing, visit.bearing)
-            let spatialFalloff = exp(-0.5 * pow(distance / 30, 2))
+            let spatialFalloff = exp(-0.5 * pow(distance / 42, 2))
             return max(strongest, temporalDecay * spatialFalloff)
         }
     }
@@ -970,6 +981,15 @@ public final class SphericalSceneAtlasStore: @unchecked Sendable {
     ) {
         lock.lock()
         coverage.recordUnproductiveVisit(to: direction, at: monotonicNS)
+        lock.unlock()
+    }
+
+    public func recordExplorationCommit(
+        to direction: SpatialCoverageDirection,
+        at monotonicNS: UInt64
+    ) {
+        lock.lock()
+        coverage.recordExplorationCommit(to: direction, at: monotonicNS)
         lock.unlock()
     }
 

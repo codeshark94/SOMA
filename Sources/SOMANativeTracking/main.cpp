@@ -31,6 +31,8 @@
 #include <dev/devs.hpp>
 #include <mach/mach_time.h>
 
+#include "OBSBOTDeviceContract.hpp"
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -43,95 +45,6 @@ std::atomic_bool interrupted = false;
 // transactions. stderrMutex keeps pipe-protocol lines from interleaving.
 std::mutex sdkMutex;
 std::mutex stderrMutex;
-
-struct Tiny3FixedRGB {
-    uint8_t red = 0;
-    uint8_t green = 0;
-    uint8_t blue = 0;
-
-    bool operator==(const Tiny3FixedRGB &other) const {
-        return red == other.red && green == other.green && blue == other.blue;
-    }
-};
-
-constexpr Tiny3FixedRGB kTiny3SemanticGreen {0, 255, 0};
-constexpr Tiny3FixedRGB kTiny3SemanticYellow {255, 210, 0};
-constexpr Tiny3FixedRGB kTiny3SemanticBlue {0, 0, 255};
-constexpr uintptr_t kBundledSysMgSetIndicatorStateOffset = 0x447f4;
-constexpr uintptr_t kBundledSendMsgSyncOffset = 0x59f54;
-constexpr uint16_t kTiny3PaletteCommandSet = 13;
-constexpr uint16_t kTiny3PaletteCommandID = 456;
-constexpr uint16_t kTiny3SystemManagerTarget = 11;
-constexpr uint16_t kFrmPacketHeaderSize = 12;
-constexpr size_t kTiny3FrameCapacity = 0x1820;
-
-using SendMsgSync = int32_t (*)(void *, void *, uint8_t *, int32_t, bool);
-
-void writeU16LE(uint8_t *destination, uint16_t value) {
-    destination[0] = static_cast<uint8_t>(value & 0xff);
-    destination[1] = static_cast<uint8_t>(value >> 8);
-}
-
-void writeU64LE(uint8_t *destination, uint64_t value) {
-    for (size_t index = 0; index < 8; ++index) {
-        destination[index] = static_cast<uint8_t>(value >> (index * 8));
-    }
-}
-
-std::optional<uintptr_t> bundledLibdevBase(std::string &failure) {
-    const auto indicatorMember = &Device::sysMgSetIndicatorStateR;
-    void *indicatorSymbol = nullptr;
-    static_assert(sizeof(indicatorMember) >= sizeof(indicatorSymbol));
-    std::memcpy(&indicatorSymbol, &indicatorMember, sizeof(indicatorSymbol));
-    Dl_info image {};
-    if (!indicatorSymbol || dladdr(indicatorSymbol, &image) == 0 || !image.dli_fbase) {
-        failure = "sdk_image_unavailable";
-        return std::nullopt;
-    }
-    const auto imageBase = reinterpret_cast<uintptr_t>(image.dli_fbase);
-    if (reinterpret_cast<uintptr_t>(indicatorSymbol) - imageBase != kBundledSysMgSetIndicatorStateOffset) {
-        failure = "unsupported_sdk_layout";
-        return std::nullopt;
-    }
-    return imageBase;
-}
-
-struct Tiny3NativePaletteMessage {
-    std::array<uint8_t, kTiny3FrameCapacity> bytes {};
-    void *devicePrivate = nullptr;
-    SendMsgSync sendSync = nullptr;
-};
-
-std::optional<Tiny3NativePaletteMessage> makeTiny3NativePaletteMessage(
-    Device *device,
-    Tiny3FixedRGB color,
-    std::string &failure
-) {
-    const auto imageBase = bundledLibdevBase(failure);
-    if (!imageBase) return std::nullopt;
-
-    auto *const devicePrivate = *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(device) + 8);
-    if (!devicePrivate) {
-        failure = "sdk_device_private_unavailable";
-        return std::nullopt;
-    }
-
-    Tiny3NativePaletteMessage message;
-    message.devicePrivate = devicePrivate;
-    message.sendSync = reinterpret_cast<SendMsgSync>(*imageBase + kBundledSendMsgSyncOffset);
-    writeU16LE(message.bytes.data(), kFrmPacketHeaderSize + 3);
-    writeU64LE(message.bytes.data() + 4, 0x0014000000000000ULL);
-    writeU16LE(message.bytes.data() + 12, kTiny3SystemManagerTarget);
-    writeU16LE(message.bytes.data() + 14, kTiny3PaletteCommandID);
-    writeU16LE(message.bytes.data() + 16, kTiny3PaletteCommandSet);
-    const auto *const privateBytes = reinterpret_cast<const uint8_t *>(devicePrivate);
-    std::memcpy(message.bytes.data() + 20, privateBytes + 0x12f8, sizeof(uint32_t));
-    std::memcpy(message.bytes.data() + 24, privateBytes + 0x14, sizeof(uint32_t));
-    message.bytes[28] = color.red;
-    message.bytes[29] = color.green;
-    message.bytes[30] = color.blue;
-    return message;
-}
 
 void handleSignal(int) {
     interrupted = true;
@@ -441,26 +354,11 @@ std::string discoveryFailure() {
 
 struct DiscoveryResult {
     std::shared_ptr<Device> device;
-    enum class Profile {
-        tiny2Lite,
-        tiny3Lite,
-    } profile = Profile::tiny2Lite;
+    const soma::OBSBOTDeviceAdapter *adapter = nullptr;
     bool interrupted;
 };
 
-struct DeviceCapabilities {
-    const char *identifier;
-    bool calibratedMotorControl;
-    bool boundedCalibrationPulses;
-    bool firmwareIndicatorPalette;
-    bool directIndicatorRGB;
-    bool indicatorEnableAndBrightness;
-    bool selectableAudioModes;
-    bool soundLocalization;
-    bool requiresMeasuredAttitudeFrame;
-    double maximumPanDegreesPerSecond;
-    double maximumPitchDegreesPerSecond;
-};
+using DeviceCapabilities = soma::OBSBOTDeviceContract;
 
 struct NativeTargetBox {
     double x = 0;
@@ -493,22 +391,9 @@ std::string nativeHumanTrackingGainDescription(const std::optional<float> &gain)
     return gain ? std::to_string(*gain) : "keep";
 }
 
-std::optional<DiscoveryResult::Profile> supportedProfile(ObsbotProductType productType) {
-    switch (productType) {
-    case ObsbotProdTiny2Lite: return DiscoveryResult::Profile::tiny2Lite;
-    case ObsbotProdTiny3Lite: return DiscoveryResult::Profile::tiny3Lite;
-    default: return std::nullopt;
-    }
-}
-
-const DeviceCapabilities &capabilitiesFor(DiscoveryResult::Profile profile) {
-    static const DeviceCapabilities tiny2Lite {
-        "tiny_2_lite", true, false, true, false, true, false, false, false, 180, 90,
-    };
-    static const DeviceCapabilities tiny3Lite {
-        "tiny_3_lite", false, true, false, true, true, true, true, true, 90, 45,
-    };
-    return profile == DiscoveryResult::Profile::tiny3Lite ? tiny3Lite : tiny2Lite;
+const soma::OBSBOTDeviceAdapter *supportedAdapter(ObsbotProductType productType) noexcept {
+    const auto &adapter = soma::obsbotDeviceAdapter(productType);
+    return adapter.contract().nativeBridge ? &adapter : nullptr;
 }
 
 DiscoveryResult waitForSupportedDevice() {
@@ -516,19 +401,19 @@ DiscoveryResult waitForSupportedDevice() {
     prepareDiscovery(devices);
     const auto deadline = Clock::now() + std::chrono::seconds(10);
     while (Clock::now() < deadline) {
-        if (interrupted) return {nullptr, DiscoveryResult::Profile::tiny2Lite, true};
+        if (interrupted) return {nullptr, nullptr, true};
         const std::string serial = discoveredSerial();
         if (!serial.empty()) {
             const auto device = devices.getDevBySn(serial);
             if (device) {
-                if (const auto profile = supportedProfile(device->productType())) {
-                    return {device, *profile, false};
+                if (const auto adapter = supportedAdapter(device->productType())) {
+                    return {device, adapter, false};
                 }
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    return {nullptr, DiscoveryResult::Profile::tiny2Lite, false};
+    return {nullptr, nullptr, false};
 }
 
 int cameraStatusMode(const std::shared_ptr<Device> &device) {
@@ -791,33 +676,29 @@ void inspectAudioFrontEnd(
 
 bool setCameraAudioMode(
     const std::shared_ptr<Device> &device,
-    DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     int requestedMode,
     const std::string &commandID
 ) noexcept {
-    using SetAudioMode = int32_t (*)(Device *, Device::AudioMode);
-    if (profile != DiscoveryResult::Profile::tiny3Lite || requestedMode < Device::AudioModeOmni
-        || requestedMode >= Device::AudioModeButt) {
+    if (!adapter.supportsAudioMode(requestedMode)) {
         trace.event("audio.ack", "fault", "audio_mode_unsupported", RM_RET_ERR,
-                    "requested_mode=" + std::to_string(requestedMode), commandID);
+                    "profile=" + std::string(adapter.contract().identifier)
+                        + "; requested_mode=" + std::to_string(requestedMode), commandID);
         return false;
     }
-    const auto set = reinterpret_cast<SetAudioMode>(
-        dlsym(RTLD_DEFAULT, "_ZN6Device19cameraSetAudioModeUENS_9AudioModeE")
-    );
     Device::CameraStatus initialStatus {};
     int statusResult = RM_RET_ERR;
     int setResult = RM_RET_ERR;
     {
         std::lock_guard<std::mutex> lock(sdkMutex);
         try { statusResult = device->cameraGetCameraStatusU(initialStatus); } catch (...) {}
-        if (statusResult == RM_RET_OK && set) {
-            const Device::AudioMode audioMode {
+        if (statusResult == RM_RET_OK) {
+            setResult = adapter.setAudioMode(
+                device.get(),
                 initialStatus.tiny.audio_mode.source,
                 static_cast<uint8_t>(requestedMode)
-            };
-            try { setResult = set(device.get(), audioMode); } catch (...) {}
+            );
         }
     }
     std::optional<uint8_t> confirmedMode;
@@ -863,14 +744,14 @@ bool setCameraAudioMode(
 
 bool setCameraAudioInputGain(
     const std::shared_ptr<Device> &device,
-    DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     int requestedPercent,
     const std::string &commandID
 ) noexcept {
     using GetAudioVolume = int (*)(Device *, int16_t &);
-    using SetAudioVolume = int (*)(Device *, int16_t);
-    if (profile != DiscoveryResult::Profile::tiny3Lite || requestedPercent < 0 || requestedPercent > 100) {
+    if (requestedPercent < 0 || requestedPercent > 100
+        || !adapter.contract().selectableAudioModes) {
         trace.event(
             "audio.ack", "fault", "audio_input_gain_unsupported", RM_RET_ERR,
             "requested_percent=" + std::to_string(requestedPercent), commandID
@@ -880,9 +761,6 @@ bool setCameraAudioInputGain(
     const auto get = reinterpret_cast<GetAudioVolume>(
         dlsym(RTLD_DEFAULT, "_ZN6Device21cameraGetAudioVolumeRERs")
     );
-    const auto set = reinterpret_cast<SetAudioVolume>(
-        dlsym(RTLD_DEFAULT, "_ZN6Device21cameraSetAudioVolumeREs")
-    );
     int16_t baseline = 0;
     int baselineResult = RM_RET_ERR;
     int setResult = RM_RET_ERR;
@@ -891,9 +769,7 @@ bool setCameraAudioInputGain(
         if (get) {
             try { baselineResult = get(device.get(), baseline); } catch (...) {}
         }
-        if (set) {
-            try { setResult = set(device.get(), static_cast<int16_t>(requestedPercent)); } catch (...) {}
-        }
+        setResult = adapter.setAudioInputGain(device.get(), static_cast<int16_t>(requestedPercent));
     }
     int16_t reported = 0;
     int getResult = RM_RET_ERR;
@@ -911,9 +787,9 @@ bool setCameraAudioInputGain(
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     int rollbackResult = RM_RET_OK;
-    if (!confirmed && baselineResult == RM_RET_OK && set) {
+    if (!confirmed && baselineResult == RM_RET_OK) {
         std::lock_guard<std::mutex> lock(sdkMutex);
-        try { rollbackResult = set(device.get(), baseline); } catch (...) { rollbackResult = RM_RET_ERR; }
+        rollbackResult = adapter.setAudioInputGain(device.get(), baseline);
     }
     trace.event(
         "audio.ack",
@@ -1972,10 +1848,11 @@ std::string nativeTrackingControlLimitsSummary(
 
 void inspectNativeTrackingFrontEnd(
     const std::shared_ptr<Device> &device,
-    DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace
 ) noexcept {
-    if (profile != DiscoveryResult::Profile::tiny3Lite) return;
+    if (adapter.contract().nativeTrackingTransport
+        != soma::OBSBOTNativeTrackingTransport::selectedHumanPortrait) return;
     int gimbalSpeedMode = -1;
     bool motionTracking = false;
     bool foreTracking = false;
@@ -2139,16 +2016,9 @@ void emitNativeTrackingState(
     const std::string &outcome = "stopped"
 ) noexcept;
 
-bool isTiny3Lite(const DiscoveryResult::Profile profile) noexcept {
-    return profile == DiscoveryResult::Profile::tiny3Lite;
-}
-
-int setTiny3NativeTrackingDisabled(const std::shared_ptr<Device> &device) noexcept {
-    try {
-        return device->cameraSetAiModeU(Device::AiWorkModeNone, 0);
-    } catch (...) {
-        return RM_RET_ERR;
-    }
+bool usesSelectedHumanPortrait(const soma::OBSBOTDeviceAdapter &adapter) noexcept {
+    return adapter.contract().nativeTrackingTransport
+        == soma::OBSBOTNativeTrackingTransport::selectedHumanPortrait;
 }
 
 int selectTiny3HumanTrackingTarget(
@@ -2423,7 +2293,7 @@ bool applyTiny3NativeHumanTrackingPolicy(
 
 bool requestManualStop(
     const std::shared_ptr<Device> &device,
-    const DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     const std::string &reason,
     const std::string &commandID,
@@ -2437,7 +2307,7 @@ bool requestManualStop(
     int attempts = 0;
     bool deactivated = false;
     std::string verification = "mode_none";
-    if (isTiny3Lite(profile)) {
+    if (usesSelectedHumanPortrait(adapter)) {
         // Tiny 3 has two distinct owners.  A native portrait/human owner has
         // to be observed in AiWorkModeNone before it is released.  A direct
         // velocity owner is already in manual mode: the authoritative safe
@@ -2449,8 +2319,8 @@ bool requestManualStop(
         for (attempts = 1; attempts <= maximumStopAttempts; ++attempts) {
             {
                 std::lock_guard<std::mutex> lock(sdkMutex);
-                try { zeroVelocityResult = device->gimbalSpeedCtrlR(0, 0, 0); } catch (...) {}
-                stopResult = setTiny3NativeTrackingDisabled(device);
+                zeroVelocityResult = adapter.stopNativeMotion(device.get());
+                stopResult = adapter.disableNativeTracking(device.get());
             }
             observedMode = cameraStatusMode(device);
 
@@ -2488,8 +2358,8 @@ bool requestManualStop(
     } else {
         {
             std::lock_guard<std::mutex> lock(sdkMutex);
-            try { stopResult = device->cameraSetAiModeU(Device::AiWorkModeNone); } catch (...) {}
-            try { stopMotionResult = device->aiSetGimbalStop(); } catch (...) {}
+            stopResult = adapter.disableNativeTracking(device.get());
+            stopMotionResult = adapter.stopNativeMotion(device.get());
         }
         try { deactivated = waitForMode(device, Device::AiWorkModeNone, 2'000); } catch (...) {}
     }
@@ -2499,14 +2369,14 @@ bool requestManualStop(
             deactivated ? "manual" : "fault",
             deactivated ? "manual_active" : "stop_unconfirmed",
             deactivated ? RM_RET_OK : RM_RET_ERR,
-            "profile=" + std::string(capabilitiesFor(profile).identifier)
-                + "; camera_status_ai_mode=" + std::to_string(isTiny3Lite(profile) ? observedMode : cameraStatusMode(device))
+            "profile=" + std::string(adapter.contract().identifier)
+                + "; camera_status_ai_mode=" + std::to_string(usesSelectedHumanPortrait(adapter) ? observedMode : cameraStatusMode(device))
                 + "; ai_mode_none_result=" + std::to_string(stopResult)
                 + "; gimbal_stop_result=" + std::to_string(stopMotionResult)
                 + "; zero_velocity_result=" + std::to_string(zeroVelocityResult)
                 + "; stop_attempts=" + std::to_string(attempts)
                 + "; verification=" + verification
-                + "; profile_native_stop=" + (isTiny3Lite(profile) ? "tiny3_human_portrait_off" : "human_track_off"),
+                + "; profile_native_stop=" + (usesSelectedHumanPortrait(adapter) ? "selected_human_portrait_off" : "legacy_human_track_off"),
             commandID
         );
     } catch (...) {}
@@ -2523,22 +2393,24 @@ bool requestManualStop(
 
 bool setDoaFindBack(
     const std::shared_ptr<Device> &device,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     bool enabled,
     const std::string &commandID = "doa-find-back-1"
 ) noexcept {
-    using SetDoaFindBack = int (*)(Device *, uint8_t);
-    const auto set = reinterpret_cast<SetDoaFindBack>(
-        dlsym(RTLD_DEFAULT, "_ZN6Device20cameraSetDoaFindBackEh")
-    );
+    if (!adapter.contract().soundLocalization) {
+        trace.event(
+            "audio.doa", "fault", "sound_source_tracking_unavailable", RM_RET_ERR,
+            "profile=" + std::string(adapter.contract().identifier), commandID
+        );
+        return false;
+    }
     int result = RM_RET_ERR;
     Device::CameraStatus status{};
     int statusResult = RM_RET_ERR;
     {
         std::lock_guard<std::mutex> lock(sdkMutex);
-        if (set) {
-            try { result = set(device.get(), enabled ? 1 : 0); } catch (...) {}
-        }
+        result = adapter.setSoundFollowing(device.get(), enabled);
         try { statusResult = device->cameraGetCameraStatusU(status); } catch (...) {}
     }
     const bool confirmed = result == RM_RET_OK
@@ -2721,17 +2593,30 @@ void emitDeviceCapabilities(
             statusResult = device->cameraGetCameraStatusU(status);
         }
         std::lock_guard<std::mutex> lock(stderrMutex);
-        std::cerr << "SOMA_OBSBOT_CAPABILITY profile=" << capabilities.identifier
+        std::cerr << "SOMA_OBSBOT_CAPABILITY contract=2"
+                  << " profile=" << capabilities.identifier
+                  << " product_type=" << static_cast<int>(device->productType())
+                  << " native_bridge=" << (capabilities.nativeBridge ? "true" : "false")
                   << " motor_calibrated=" << (capabilities.calibratedMotorControl ? "true" : "false")
                   << " bounded_calibration_pulses=" << (capabilities.boundedCalibrationPulses ? "true" : "false")
+                  << " native_human_tracking=" << (capabilities.nativeHumanTracking ? "true" : "false")
                   << " indicator_palette=" << (capabilities.firmwareIndicatorPalette ? "true" : "false")
-                  << " indicator_direct_rgb=" << (capabilities.directIndicatorRGB ? "true" : "false")
+                  << " indicator_default_green=" << (capabilities.firmwareDefaultIndicatorGreen ? "true" : "false")
+                  << " indicator_direct_rgb=" << (capabilities.directIndicatorColorMask != 0 ? "true" : "false")
+                  << " indicator_direct_rgb_mask=" << static_cast<int>(capabilities.directIndicatorColorMask)
                   << " indicator_basic=" << (capabilities.indicatorEnableAndBrightness ? "true" : "false")
                   << " selectable_audio_modes=" << (capabilities.selectableAudioModes ? "true" : "false")
+                  << " supported_audio_mode_mask=" << static_cast<int>(capabilities.supportedAudioModeMask)
                   << " sound_localization=" << (capabilities.soundLocalization ? "true" : "false")
                   << " requires_measured_attitude_frame=" << (capabilities.requiresMeasuredAttitudeFrame ? "true" : "false")
+                  << " indicator_base_state_id=" << capabilities.indicatorBaseStateID
+                  << " indicator_yellow_state_id=" << capabilities.yellowIndicatorStateID
+                  << " indicator_green_state_id=" << capabilities.greenIndicatorStateID
+                  << " indicator_blue_state_id=" << capabilities.blueIndicatorStateID
                   << " maximum_pan_degrees_per_second=" << capabilities.maximumPanDegreesPerSecond
                   << " maximum_pitch_degrees_per_second=" << capabilities.maximumPitchDegreesPerSecond
+                  << " nominal_wide_horizontal_fov_degrees=" << capabilities.nominalWideHorizontalFieldOfViewDegrees
+                  << " native_tracking_transport=" << static_cast<int>(capabilities.nativeTrackingTransport)
                   << " audio_mode=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.audio_mode.mode) : "unknown")
                   << " doa_find_back=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.doa_set.doa_find_back) : "unknown")
                   << " doa_range=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.doa_set.doa_range) : "unknown")
@@ -2756,7 +2641,7 @@ void emitNativeTrackingState(
 
 bool requestExternalVelocity(
     const std::shared_ptr<Device> &device,
-    const DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     const DeviceCapabilities &capabilities,
     const std::string &commandID,
@@ -2782,7 +2667,7 @@ bool requestExternalVelocity(
         commandID
     );
     if (!alreadyExternal) {
-        if (!requestManualStop(device, profile, trace, "external_control_acquire", "acquire-" + commandID, "external")) {
+        if (!requestManualStop(device, adapter, trace, "external_control_acquire", "acquire-" + commandID, "external")) {
             trace.event("camera.ack", "fault", "external_acquire_unconfirmed", RM_RET_ERR, "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)), commandID);
             return false;
         }
@@ -2790,11 +2675,9 @@ bool requestExternalVelocity(
     int speedResult = RM_RET_ERR;
     {
         std::lock_guard<std::mutex> lock(sdkMutex);
-        try {
-            speedResult = isTiny3Lite(profile)
-                ? device->gimbalSpeedCtrlR(pitch, pan)
-                : device->aiSetGimbalSpeedCtrlR(pitch, pan);
-        } catch (...) {}
+        speedResult = adapter.setExternalVelocity(
+            device.get(), static_cast<float>(pitch), static_cast<float>(pan)
+        );
     }
     trace.event(
         "camera.ack",
@@ -2804,13 +2687,13 @@ bool requestExternalVelocity(
         "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)) + "; attitude=reported_by_poller",
         commandID
     );
-    if (speedResult != RM_RET_OK) requestManualStop(device, profile, trace, "external_speed_rejected", "cleanup-" + commandID, "external");
+    if (speedResult != RM_RET_OK) requestManualStop(device, adapter, trace, "external_speed_rejected", "cleanup-" + commandID, "external");
     return speedResult == RM_RET_OK;
 }
 
 bool requestExternalPosition(
     const std::shared_ptr<Device> &device,
-    const DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     const std::string &commandID,
     double pitch,
@@ -2831,7 +2714,7 @@ bool requestExternalPosition(
         commandID
     );
     if (!alreadyExternal) {
-        if (!requestManualStop(device, profile, trace, "external_control_acquire", "acquire-" + commandID, "external")) {
+        if (!requestManualStop(device, adapter, trace, "external_control_acquire", "acquire-" + commandID, "external")) {
             trace.event("camera.ack", "fault", "external_acquire_unconfirmed", RM_RET_ERR, "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)), commandID);
             return false;
         }
@@ -2852,13 +2735,13 @@ bool requestExternalPosition(
         "camera_status_ai_mode=" + std::to_string(cameraStatusMode(device)) + "; attitude=reported_by_poller",
         commandID
     );
-    if (positionResult != RM_RET_OK) requestManualStop(device, profile, trace, "external_position_rejected", "cleanup-" + commandID, "external");
+    if (positionResult != RM_RET_OK) requestManualStop(device, adapter, trace, "external_position_rejected", "cleanup-" + commandID, "external");
     return positionResult == RM_RET_OK;
 }
 
 bool requestCenter(
     const std::shared_ptr<Device> &device,
-    const DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     const std::string &commandID
 ) noexcept {
@@ -2867,14 +2750,8 @@ bool requestCenter(
     int positionResult = RM_RET_ERR;
     {
         std::lock_guard<std::mutex> lock(sdkMutex);
-        disableAIResult = isTiny3Lite(profile)
-            ? setTiny3NativeTrackingDisabled(device)
-            : device->cameraSetAiModeU(Device::AiWorkModeNone);
-        try {
-            positionResult = isTiny3Lite(profile)
-                ? device->gimbalRstPosR()
-                : device->gimbalSetSpeedPositionR(0, 0, 0, 0, 60, 90);
-        } catch (...) {}
+        disableAIResult = adapter.disableNativeTracking(device.get());
+        positionResult = adapter.center(device.get());
     }
     trace.event(
         "camera.ack",
@@ -2914,54 +2791,123 @@ bool setDeviceRunStatus(
 
 bool parkAtRestPoseAndSleep(
     const std::shared_ptr<Device> &device,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     const std::string &commandID
 ) noexcept {
     constexpr double arrivalToleranceDegrees = 1.5;
-    constexpr auto arrivalDeadline = std::chrono::seconds(15);
+    constexpr auto arrivalDeadline = std::chrono::seconds(4);
+    constexpr auto tiny3VelocityFallbackDelay = std::chrono::milliseconds(800);
+    constexpr float tiny3MaximumPitchHomeSpeedDegreesPerSecond = 30;
+    constexpr float tiny3MaximumPanHomeSpeedDegreesPerSecond = 60;
 
+    const bool usesMeasuredPose = adapter.contract().requiresMeasuredAttitudeFrame;
+    std::string control = "adapter_center";
     trace.event(
         "camera.command",
         "manual",
         "rest_pose_sent",
         0,
-        "target_pitch_degrees=0; target_pan_degrees=0; control=firmware_gimbal_reset",
+        std::string("target_pitch_degrees=0; target_pan_degrees=0; control=") + control,
         commandID
     );
-    int resetResult = RM_RET_ERR;
+
+    int restPoseResult = RM_RET_ERR;
+    int positionFallbackResult = RM_RET_ERR;
+    int velocityFallbackResult = RM_RET_ERR;
+    bool velocityFallbackActive = false;
     {
         std::lock_guard<std::mutex> lock(sdkMutex);
-        try { resetResult = device->gimbalRstPosR(); } catch (...) {}
+        try {
+            restPoseResult = adapter.center(device.get());
+            if (usesMeasuredPose && restPoseResult != RM_RET_OK) {
+                positionFallbackResult = device->gimbalSetSpeedPositionR(0, 0, 0, 0, 90, 90);
+                if (positionFallbackResult == RM_RET_OK) control = "stabilised_pose_fast_fallback";
+            }
+        } catch (...) {}
     }
-    if (resetResult != RM_RET_OK) {
+    if (restPoseResult != RM_RET_OK && positionFallbackResult != RM_RET_OK) {
         trace.event(
             "camera.ack",
             "fault",
             "rest_pose_rejected",
-            resetResult,
-            "control=firmware_gimbal_reset; sleep_withheld=true",
+            positionFallbackResult != RM_RET_ERR ? positionFallbackResult : restPoseResult,
+            std::string("control=") + control
+                + "; firmware_reset_result=" + std::to_string(restPoseResult)
+                + "; position_fallback_result=" + std::to_string(positionFallbackResult)
+                + "; sleep_withheld=true",
             commandID
         );
         return false;
     }
     const auto deadline = Clock::now() + arrivalDeadline;
+    const auto fallbackDeadline = Clock::now() + tiny3VelocityFallbackDelay;
     bool arrived = false;
-    std::optional<GimbalAttitude> initialAttitude;
+    bool observedMotion = false;
+    std::optional<GimbalAttitude> initialAttitude = readGimbalAttitude(device);
     std::optional<GimbalAttitude> lastAttitude;
+    double initialDistance = std::numeric_limits<double>::infinity();
+    if (initialAttitude) initialDistance = std::hypot(initialAttitude->pitch, initialAttitude->pan);
     while (Clock::now() < deadline && !interrupted) {
         const auto attitude = readGimbalAttitude(device);
         if (!attitude) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
-        if (!initialAttitude) initialAttitude = attitude;
+        if (!initialAttitude) {
+            initialAttitude = attitude;
+            initialDistance = std::hypot(attitude->pitch, attitude->pan);
+        }
         lastAttitude = attitude;
         if (std::abs(attitude->pitch) <= arrivalToleranceDegrees
             && std::abs(attitude->pan) <= arrivalToleranceDegrees) {
             arrived = true;
             break;
         }
+        const double currentDistance = std::hypot(attitude->pitch, attitude->pan);
+        observedMotion = observedMotion || currentDistance + 0.75 < initialDistance;
+        if (usesMeasuredPose && !velocityFallbackActive && Clock::now() >= fallbackDeadline && !observedMotion) {
+            control = "firmware_reset_with_velocity_feedback_fallback";
+            trace.event(
+                "camera.command",
+                "manual",
+                "rest_pose_velocity_fallback_sent",
+                0,
+                "target_pitch_degrees=0; target_pan_degrees=0; initial_pitch_degrees="
+                    + std::to_string(initialAttitude ? initialAttitude->pitch : 0)
+                    + "; initial_pan_degrees=" + std::to_string(initialAttitude ? initialAttitude->pan : 0),
+                commandID
+            );
+            velocityFallbackActive = true;
+        }
+        if (velocityFallbackActive) {
+            const auto boundedHomeVelocity = [](double error, float maximum) {
+                const double requested = -error * 4.0;
+                return static_cast<float>(std::clamp(
+                    requested,
+                    -static_cast<double>(maximum),
+                    static_cast<double>(maximum)
+                ));
+            };
+            const float pitchVelocity = boundedHomeVelocity(
+                attitude->pitch,
+                tiny3MaximumPitchHomeSpeedDegreesPerSecond
+            );
+            const float panVelocity = boundedHomeVelocity(
+                attitude->pan,
+                tiny3MaximumPanHomeSpeedDegreesPerSecond
+            );
+            {
+                std::lock_guard<std::mutex> lock(sdkMutex);
+                velocityFallbackResult = adapter.setExternalVelocity(device.get(), pitchVelocity, panVelocity);
+            }
+            if (velocityFallbackResult != RM_RET_OK) break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (usesMeasuredPose && velocityFallbackActive) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        adapter.setExternalVelocity(device.get(), 0, 0);
     }
     trace.event(
         "camera.ack",
@@ -2973,7 +2919,10 @@ bool parkAtRestPoseAndSleep(
             + "; initial_pan_degrees=" + (initialAttitude ? std::to_string(initialAttitude->pan) : std::string("unavailable"))
             + "; final_pitch_degrees=" + (lastAttitude ? std::to_string(lastAttitude->pitch) : std::string("unavailable"))
             + "; final_pan_degrees=" + (lastAttitude ? std::to_string(lastAttitude->pan) : std::string("unavailable"))
-            + "; reset_result=" + std::to_string(resetResult)
+            + "; control=" + control
+            + "; rest_pose_result=" + std::to_string(restPoseResult)
+            + "; position_fallback_result=" + std::to_string(positionFallbackResult)
+            + "; velocity_fallback_result=" + std::to_string(velocityFallbackResult)
             + "; sleep_withheld=" + std::string(arrived ? "false" : "true"),
         commandID
     );
@@ -2983,7 +2932,7 @@ bool parkAtRestPoseAndSleep(
 
 bool requestNativeHumanTracking(
     const std::shared_ptr<Device> &device,
-    const DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     const std::string &commandID,
     const std::string &cleanupCommandID,
@@ -2991,7 +2940,7 @@ bool requestNativeHumanTracking(
     const NativeHumanTrackingPolicy &policy = {},
     const std::function<void(const std::string &)> &reassertIndicator = {}
 ) noexcept {
-    if (isTiny3Lite(profile)) {
+    if (usesSelectedHumanPortrait(adapter)) {
         trace.event(
             "camera.command",
             "native_ai",
@@ -3071,7 +3020,7 @@ bool requestNativeHumanTracking(
             commandID
         );
         if (!activated) {
-            requestManualStop(device, profile, trace, "tiny3_start_rejected", cleanupCommandID);
+            requestManualStop(device, adapter, trace, "tiny3_start_rejected", cleanupCommandID);
             emitNativeTrackingState("inactive", commandID, "start_rejected");
         } else {
             if (reassertIndicator) reassertIndicator("tracking_active");
@@ -3095,7 +3044,7 @@ bool requestNativeHumanTracking(
     }
     if (startResult != RM_RET_OK) {
         trace.event("camera.ack", "fault", "start_rejected", startResult, "SDK rejected native human tracking", commandID);
-        requestManualStop(device, profile, trace, "start_rejected", cleanupCommandID);
+        requestManualStop(device, adapter, trace, "start_rejected", cleanupCommandID);
         emitNativeTrackingState("inactive", commandID, "start_rejected");
         return false;
     }
@@ -3157,7 +3106,7 @@ bool requestNativeHumanTracking(
         commandID
     );
     if (!activated) {
-        requestManualStop(device, profile, trace, "start_acknowledgement_timed_out", cleanupCommandID);
+        requestManualStop(device, adapter, trace, "start_acknowledgement_timed_out", cleanupCommandID);
         emitNativeTrackingState("inactive", commandID, "start_rejected");
     } else {
         emitNativeTrackingState("active", commandID, "active");
@@ -3195,9 +3144,9 @@ enum class BridgeCommandType {
     indicatorEnabled,
     indicatorEnforce,
     indicatorReconcile,
-    indicatorRGBEnforce,
-    indicatorRGBReconcile,
-    indicatorRGBClear,
+    indicatorColorEnforce,
+    indicatorColorReconcile,
+    indicatorColorClear,
     shutdown,
     invalid
 };
@@ -3226,6 +3175,22 @@ std::optional<IndicatorPattern> parseIndicatorPattern(const std::string &value) 
     if (value == "heartbeat") return IndicatorPattern::heartbeat;
     if (value == "blink") return IndicatorPattern::blink;
     return std::nullopt;
+}
+
+std::optional<soma::OBSBOTIndicatorColor> parseIndicatorColor(const std::string &value) {
+    if (value == "yellow") return soma::OBSBOTIndicatorColor::yellow;
+    if (value == "green") return soma::OBSBOTIndicatorColor::green;
+    if (value == "blue") return soma::OBSBOTIndicatorColor::blue;
+    return std::nullopt;
+}
+
+const char *indicatorColorName(soma::OBSBOTIndicatorColor color) {
+    switch (color) {
+    case soma::OBSBOTIndicatorColor::yellow: return "yellow";
+    case soma::OBSBOTIndicatorColor::green: return "green";
+    case soma::OBSBOTIndicatorColor::blue: return "blue";
+    }
+    return "yellow";
 }
 
 const char *indicatorPatternName(IndicatorPattern pattern) {
@@ -3274,7 +3239,7 @@ struct BridgeCommand {
     bool whiteBalanceAutomatic = true;
     float zoom = 1.0f;
     IndicatorPattern indicatorPattern = IndicatorPattern::steady;
-    std::optional<Tiny3FixedRGB> indicatorRGB;
+    soma::OBSBOTIndicatorColor indicatorColor = soma::OBSBOTIndicatorColor::yellow;
     std::optional<NativeTargetBox> nativeTarget;
     bool exposureLocked = false;
     bool focusAutomatic = true;
@@ -3293,27 +3258,6 @@ bool validCommandID(const std::string &value) {
         && std::all_of(value.begin(), value.end(), [](unsigned char character) {
             return std::isalnum(character) || character == '-' || character == '_';
         });
-}
-
-bool validFirmwareIndicatorStateID(DiscoveryResult::Profile profile, int stateID) {
-    switch (profile) {
-    case DiscoveryResult::Profile::tiny2Lite:
-        return stateID == 16 || stateID == 17 || stateID == 18
-            || stateID == 54 || stateID == 57;
-    case DiscoveryResult::Profile::tiny3Lite:
-        return stateID == 16 || stateID == 17 || stateID == 54 || stateID == 57;
-    }
-    return false;
-}
-
-bool isSupportedTiny3DirectRGB(
-    DiscoveryResult::Profile profile,
-    const Tiny3FixedRGB &color
-) {
-    if (profile != DiscoveryResult::Profile::tiny3Lite) return false;
-    return color == kTiny3SemanticGreen
-        || color == kTiny3SemanticYellow
-        || color == kTiny3SemanticBlue;
 }
 
 bool parseImageTuningValue(const std::string &token, std::optional<int32_t> &value) {
@@ -3350,7 +3294,7 @@ bool parseNativeHumanTrackingGain(const std::string &token, std::optional<float>
 
 BridgeCommand parseBridgeCommand(
     const std::string &line,
-    DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     const DeviceCapabilities &capabilities
 ) {
     std::istringstream input(line);
@@ -3601,7 +3545,7 @@ BridgeCommand parseBridgeCommand(
         if (!(input >> stateID) || (input >> extra)) return {};
         // Raw state IDs are deliberately not a general command surface. Each
         // product may expose only its firmware-confirmed status entries.
-        if (!capabilities.firmwareIndicatorPalette || !validFirmwareIndicatorStateID(profile, stateID)) return {};
+        if (!capabilities.firmwareIndicatorPalette || !adapter.supportsIndicatorStateID(stateID)) return {};
         BridgeCommand command;
         command.type = verb == "indicator_set"
             ? BridgeCommandType::indicatorSet
@@ -3632,7 +3576,7 @@ BridgeCommand parseBridgeCommand(
         int stateID = -1;
         std::string patternName;
         if (!(input >> stateID >> patternName) || (input >> extra)) return {};
-        if (!capabilities.firmwareIndicatorPalette || !validFirmwareIndicatorStateID(profile, stateID)) return {};
+        if (!capabilities.firmwareIndicatorPalette || !adapter.supportsIndicatorStateID(stateID)) return {};
         BridgeCommand command;
         command.type = BridgeCommandType::indicatorEnforce;
         command.commandID = commandID;
@@ -3646,7 +3590,7 @@ BridgeCommand parseBridgeCommand(
         int stateID = -1;
         std::string patternName;
         if (!(input >> stateID >> patternName) || (input >> extra)
-            || !capabilities.firmwareIndicatorPalette || !validFirmwareIndicatorStateID(profile, stateID)) return {};
+            || !capabilities.firmwareIndicatorPalette || !adapter.supportsIndicatorStateID(stateID)) return {};
         BridgeCommand command;
         command.type = BridgeCommandType::indicatorReconcile;
         command.commandID = commandID;
@@ -3656,36 +3600,25 @@ BridgeCommand parseBridgeCommand(
         command.indicatorPattern = *pattern;
         return command;
     }
-    if (verb == "indicator_rgb_clear") {
-        if (input >> extra || profile != DiscoveryResult::Profile::tiny3Lite) return {};
-        BridgeCommand command;
-        command.type = BridgeCommandType::indicatorRGBClear;
-        command.commandID = commandID;
-        return command;
-    }
-    if (verb == "indicator_rgb_enforce" || verb == "indicator_rgb_reconcile") {
-        int red = -1;
-        int green = -1;
-        int blue = -1;
+    if (verb == "indicator_color_enforce" || verb == "indicator_color_reconcile") {
+        std::string colorName;
         std::string patternName;
-        if (!(input >> red >> green >> blue >> patternName) || (input >> extra)
-            || red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255) return {};
-        const Tiny3FixedRGB color {
-            static_cast<uint8_t>(red),
-            static_cast<uint8_t>(green),
-            static_cast<uint8_t>(blue),
-        };
-        if (!isSupportedTiny3DirectRGB(profile, color)) return {};
+        if (!(input >> colorName >> patternName) || (input >> extra)) return {};
+        const auto color = parseIndicatorColor(colorName);
         const auto pattern = parseIndicatorPattern(patternName);
-        if (!pattern) return {};
+        if (!color || !pattern || !adapter.supportsIndicatorColor(*color)) return {};
         BridgeCommand command;
-        command.type = verb == "indicator_rgb_enforce"
-            ? BridgeCommandType::indicatorRGBEnforce
-            : BridgeCommandType::indicatorRGBReconcile;
+        command.type = verb == "indicator_color_enforce"
+            ? BridgeCommandType::indicatorColorEnforce
+            : BridgeCommandType::indicatorColorReconcile;
         command.commandID = commandID;
-        command.indicatorRGB = color;
+        command.indicatorColor = *color;
         command.indicatorPattern = *pattern;
         return command;
+    }
+    if (verb == "indicator_color_clear") {
+        if (input >> extra || capabilities.directIndicatorColorMask == 0) return {};
+        return {BridgeCommandType::indicatorColorClear, commandID};
     }
     if (verb == "shutdown") return (input >> extra) ? BridgeCommand {} : BridgeCommand {BridgeCommandType::shutdown, commandID};
     if (input >> extra) return {};
@@ -3698,9 +3631,14 @@ BridgeCommand parseBridgeCommand(
 
 class IndicatorSession {
 public:
-    IndicatorSession(std::shared_ptr<Device> device, Trace &trace, DeviceCapabilities capabilities)
-        : device_(std::move(device)), trace_(trace), capabilities_(capabilities) {
+    IndicatorSession(
+        std::shared_ptr<Device> device,
+        Trace &trace,
+        const soma::OBSBOTDeviceAdapter &adapter
+    )
+        : device_(std::move(device)), trace_(trace), adapter_(adapter), capabilities_(adapter.contract()) {
         readBaseline();
+        establishFirmwareBaseline("startup", "indicator-baseline-startup");
     }
 
     ~IndicatorSession() {
@@ -3725,9 +3663,13 @@ public:
         const bool visibilityRestored = restorePulseLEDVisibility();
         int result = RM_RET_ERR;
         if (visibilityRestored) {
-            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+            result = adapter_.clearIndicatorState(device_.get(), static_cast<uint8_t>(stateID));
         }
         if (result == RM_RET_OK && activeState_ && *activeState_ == stateID) activeState_.reset();
+        const bool requiresBaseline = !desiredState_ && !desiredColor_;
+        const bool baselineRestored = result == RM_RET_OK
+            && (!requiresBaseline || establishFirmwareBaseline("clear_state", commandID));
+        if (!baselineRestored) result = RM_RET_ERR;
         trace_.event(
             "indicator.ack",
             result == RM_RET_OK ? "firmware" : "fault",
@@ -3745,7 +3687,6 @@ public:
         if (result == RM_RET_OK) {
             requestedBrightness_ = static_cast<uint8_t>(brightness);
             brightnessChanged_ = true;
-            pulseBrightnessDimmed_ = false;
         }
         trace_.event(
             "indicator.ack",
@@ -3787,75 +3728,104 @@ public:
         activate(stateID, pattern, "enforce_state", commandID);
     }
 
-    void reconcile(int stateID, IndicatorPattern pattern, const std::string &commandID) noexcept {
-        if (!requireFirmwarePalette("reconcile_state", commandID)) return;
-        activate(stateID, pattern, "reconcile_state", commandID);
+    void enforceColor(
+        soma::OBSBOTIndicatorColor color,
+        IndicatorPattern pattern,
+        const std::string &commandID
+    ) noexcept {
+        if (!requireDirectColor(color, "enforce_color", commandID)) return;
+        activateColor(color, pattern, "enforce_color", commandID);
     }
 
-    void enforceRGB(Tiny3FixedRGB color, IndicatorPattern pattern, const std::string &commandID) noexcept {
-        if (!requireTiny3DirectRGB(color, "enforce_rgb", commandID)) return;
-        activateRGB(color, pattern, "enforce_rgb", commandID);
-    }
-
-    void reconcileRGB(Tiny3FixedRGB color, IndicatorPattern pattern, const std::string &commandID) noexcept {
-        if (!requireTiny3DirectRGB(color, "reconcile_rgb", commandID)) return;
-        activateRGB(color, pattern, "reconcile_rgb", commandID);
-    }
-
-    void clearRGB(const std::string &commandID) noexcept {
-        if (!desiredRGB_ && !activeRGB_) {
-            trace_.event("indicator.ack", "soma", "rgb_already_cleared", RM_RET_OK, "presentation_cleared=true", commandID);
-            return;
-        }
-        trace_.event("indicator.command", "soma", "clear_rgb", 0, "presentation_cleared=true", commandID);
-        desiredRGB_.reset();
-        pattern_ = IndicatorPattern::steady;
-        patternPhaseIndex_ = 0;
-        pulseVisible_ = false;
-        nextPulseTransition_.reset();
-        const bool visibilityRestored = restorePulseLEDVisibility();
+    void clearColor(const std::string &commandID) noexcept {
+        trace_.event("indicator.command", "soma", "clear_color", 0, "direct_dark=true", commandID);
         int result = RM_RET_ERR;
-        if (visibilityRestored) {
-            result = callSetEnabled(false);
-            if (result == RM_RET_OK) {
-                pulseLEDDisabled_ = true;
-                pulseChangedEnabled_ = true;
-                activeRGB_.reset();
-            }
+        {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            result = adapter_.setIndicatorDark(device_.get());
+        }
+        if (result == RM_RET_OK) {
+            activeColor_.reset();
+            desiredColor_.reset();
+            pattern_ = IndicatorPattern::steady;
+            patternPhaseIndex_ = 0;
+            pulseVisible_ = false;
+            nextPulseTransition_.reset();
         }
         trace_.event(
             "indicator.ack",
-            result == RM_RET_OK ? "firmware" : "fault",
-            result == RM_RET_OK ? "rgb_cleared" : "rgb_clear_rejected",
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "color_cleared" : "color_clear_rejected",
             result,
-            "presentation_cleared=true; baseline_restored=" + std::string(result == RM_RET_OK ? "true" : "false"),
+            "direct_dark=" + std::string(result == RM_RET_OK ? "true" : "false"),
             commandID
         );
+    }
+
+    void reconcile(int stateID, IndicatorPattern pattern, const std::string &commandID) noexcept {
+        if (!requireFirmwarePalette("reconcile_state", commandID)) return;
+        // Firmware-owned camera modes may replace the visible LED state without
+        // changing the SDK result. A matching desired state is therefore not
+        // evidence that the physical indicator still presents it.
+        if (desiredState_ && *desiredState_ == stateID && pattern_ == pattern) {
+            if (pattern != IndicatorPattern::steady && !pulseVisible_) {
+                trace_.event(
+                    "indicator.ack",
+                    "soma",
+                    "state_reassertion_deferred_to_pulse",
+                    RM_RET_OK,
+                    "state_id=" + std::to_string(stateID)
+                        + "; pattern=" + indicatorPatternName(pattern),
+                    commandID
+                );
+                return;
+            }
+            reassertState(stateID, "reconcile_state", commandID);
+            return;
+        }
+        activate(stateID, pattern, "reconcile_state", commandID);
+    }
+
+    void reconcileColor(
+        soma::OBSBOTIndicatorColor color,
+        IndicatorPattern pattern,
+        const std::string &commandID
+    ) noexcept {
+        if (!requireDirectColor(color, "reconcile_color", commandID)) return;
+        if (desiredColor_ && *desiredColor_ == color && pattern_ == pattern) {
+            if (pattern != IndicatorPattern::steady && !pulseVisible_) {
+                trace_.event(
+                    "indicator.ack", "soma", "color_reassertion_deferred_to_pulse", RM_RET_OK,
+                    "color=" + std::string(indicatorColorName(color))
+                        + "; pattern=" + indicatorPatternName(pattern),
+                    commandID
+                );
+                return;
+            }
+            reassertColor(color, "reconcile_color", commandID);
+            return;
+        }
+        activateColor(color, pattern, "reconcile_color", commandID);
     }
 
     /// A camera AI mode transition may overwrite the segmented LED with its
     /// firmware status animation. Reapply the already-selected semantic
     /// presentation without changing the presentation state or pulse phase.
     void reassertAfterCameraModeTransition(const std::string &commandID) noexcept {
-        if (!desiredState_ && !desiredRGB_) return;
+        if (desiredColor_) {
+            reassertColor(*desiredColor_, "reassert_after_ai_transition", commandID);
+            return;
+        }
+        if (!desiredState_) return;
         const bool visibilityRestored = restorePulseLEDVisibility();
         int result = RM_RET_ERR;
-        std::string presentation;
-        if (visibilityRestored && desiredRGB_) {
-            presentation = "rgb=" + rgbDescription(*desiredRGB_);
-            result = callTiny3FixedRGB(*desiredRGB_);
-            if (result == RM_RET_OK) activeRGB_ = desiredRGB_;
-        } else if (visibilityRestored && desiredState_) {
-            presentation = "state_id=" + std::to_string(*desiredState_);
+        const std::string presentation = "state_id=" + std::to_string(*desiredState_);
+        if (visibilityRestored) {
             {
                 std::lock_guard<std::mutex> lock(sdkMutex);
-                try { result = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(*desiredState_)); } catch (...) {}
+                result = adapter_.setIndicatorState(device_.get(), static_cast<uint8_t>(*desiredState_));
             }
             if (result == RM_RET_OK) activeState_ = desiredState_;
-        } else {
-            presentation = desiredRGB_
-                ? "rgb=" + rgbDescription(*desiredRGB_)
-                : "state_id=" + std::to_string(*desiredState_);
         }
         trace_.event(
             "indicator.ack",
@@ -3873,24 +3843,39 @@ public:
 
     void tick(Clock::time_point now) noexcept {
         if (pattern_ == IndicatorPattern::steady
-            || (!desiredState_ && !desiredRGB_)
+            || (!desiredState_ && !desiredColor_)
             || !nextPulseTransition_ || now < *nextPulseTransition_) return;
 
-        const std::string presentation = desiredRGB_
-            ? "rgb=" + rgbDescription(*desiredRGB_)
+        const std::string presentation = desiredColor_
+            ? "color=" + std::string(indicatorColorName(*desiredColor_))
             : "state_id=" + std::to_string(*desiredState_);
         const auto &phases = indicatorPatternPhases(pattern_);
         const size_t nextPhaseIndex = (patternPhaseIndex_ + 1) % phases.size();
         const auto &nextPhase = phases[nextPhaseIndex];
         if (!nextPhase.illuminated) {
-            // State clearing and LED enable control both hand the segmented
-            // bar back to the camera firmware. A pulse must retain the
-            // selected state and only lower its brightness for the dark phase.
             trace_.event("indicator.command", "soma", "pulse_off", 0, presentation);
-            const int result = callSetBrightness(0);
-            if (result == RM_RET_OK) {
-                pulseBrightnessDimmed_ = true;
-                brightnessChanged_ = true;
+            int result = RM_RET_ERR;
+            bool reportedEnabled = true;
+            int readbackResult = RM_RET_ERR;
+            bool disabled = false;
+            if (desiredColor_) {
+                std::lock_guard<std::mutex> lock(sdkMutex);
+                result = adapter_.setIndicatorDark(device_.get());
+                disabled = result == RM_RET_OK;
+            } else {
+                // State-based products need the global enable bit for the
+                // dark phase; Tiny 3 Lite uses a direct black presentation.
+                result = callSetEnabled(false);
+                readbackResult = callGetEnabled(reportedEnabled);
+                disabled = result == RM_RET_OK
+                    && readbackResult == RM_RET_OK
+                    && !reportedEnabled;
+            }
+            if (disabled) {
+                if (!desiredColor_) {
+                    pulseLEDDisabled_ = true;
+                    pulseChangedEnabled_ = true;
+                }
                 pulseVisible_ = false;
                 patternPhaseIndex_ = nextPhaseIndex;
                 nextPulseTransition_ = now + std::chrono::milliseconds(nextPhase.durationMilliseconds);
@@ -3899,26 +3884,39 @@ public:
             }
             trace_.event(
                 "indicator.ack",
-                result == RM_RET_OK ? "soma" : "fault",
-                result == RM_RET_OK ? "pulse_off" : "pulse_off_rejected",
-                result,
-                presentation + "; brightness=0; presentation_retained=true"
+                disabled ? "soma" : "fault",
+                disabled ? "pulse_off" : "pulse_off_rejected",
+                disabled ? RM_RET_OK : RM_RET_ERR,
+                presentation
+                    + (desiredColor_
+                        ? "; direct_dark=true"
+                        : std::string("; enabled=false; readback=")
+                            + (readbackResult == RM_RET_OK ? (reportedEnabled ? "true" : "false") : "unavailable"))
+                    + "; presentation_retained=true"
             );
             return;
         }
 
         trace_.event("indicator.command", "soma", "pulse_on", 0, presentation);
-        const bool enabled = restorePulseLEDVisibility();
         int presentationResult = RM_RET_ERR;
-        if (enabled) {
-            if (desiredRGB_) {
-                presentationResult = callTiny3FixedRGB(*desiredRGB_);
-            } else {
-                try { presentationResult = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(*desiredState_)); } catch (...) {}
-            }
+        bool presentationStagedWhileDark = false;
+        if (!desiredColor_ && pulseLEDDisabled_) {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            presentationResult = adapter_.setIndicatorState(
+                device_.get(), static_cast<uint8_t>(*desiredState_)
+            );
+            presentationStagedWhileDark = presentationResult == RM_RET_OK;
+        }
+        const bool enabled = (!pulseLEDDisabled_ || presentationStagedWhileDark)
+            && restorePulseLEDVisibility();
+        if (enabled && !presentationStagedWhileDark) {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            presentationResult = desiredColor_
+                ? adapter_.setIndicatorColor(device_.get(), *desiredColor_)
+                : adapter_.setIndicatorState(device_.get(), static_cast<uint8_t>(*desiredState_));
         }
         if (enabled && presentationResult == RM_RET_OK) {
-            if (desiredRGB_) activeRGB_ = *desiredRGB_;
+            if (desiredColor_) activeColor_ = *desiredColor_;
             else activeState_ = *desiredState_;
             pulseVisible_ = true;
             patternPhaseIndex_ = nextPhaseIndex;
@@ -3926,15 +3924,16 @@ public:
         } else {
             nextPulseTransition_ = now + std::chrono::milliseconds(kPulseRetryMilliseconds);
         }
-            trace_.event(
-                "indicator.ack",
+        trace_.event(
+            "indicator.ack",
             enabled && presentationResult == RM_RET_OK ? "soma" : "fault",
             enabled && presentationResult == RM_RET_OK ? "pulse_on" : "pulse_on_rejected",
             enabled ? presentationResult : RM_RET_ERR,
             presentation
                 + "; presentation_brightness=" + (enabled ? std::to_string(pulseBrightness()) : "restore_failed")
+                + "; staged_while_dark=" + (presentationStagedWhileDark ? "true" : "false")
                 + "; presentation_set=" + (presentationResult == RM_RET_OK ? "true" : "false")
-            );
+        );
     }
 
     void restore() noexcept {
@@ -3943,16 +3942,22 @@ public:
         bool clearSucceeded = true;
         const bool visibilityRestored = restorePulseLEDVisibility();
         clearSucceeded = clearSucceeded && visibilityRestored;
-        if (capabilities_.firmwareIndicatorPalette && visibilityRestored && activeState_) {
+        if (capabilities_.firmwareIndicatorPalette && visibilityRestored && activeState_
+            && *activeState_ != capabilities_.greenIndicatorStateID) {
             int result = RM_RET_ERR;
-            try { result = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(*activeState_)); } catch (...) {}
+            result = adapter_.clearIndicatorState(device_.get(), static_cast<uint8_t>(*activeState_));
             clearSucceeded = clearSucceeded && result == RM_RET_OK;
         }
-        if (visibilityRestored && activeRGB_) activeRGB_.reset();
+        if (activeColor_) {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            clearSucceeded = adapter_.setIndicatorDark(device_.get()) == RM_RET_OK && clearSucceeded;
+        }
+        clearSucceeded = establishFirmwareBaseline("shutdown", "indicator-baseline-shutdown")
+            && clearSucceeded;
         activeState_.reset();
         desiredState_.reset();
-        activeRGB_.reset();
-        desiredRGB_.reset();
+        activeColor_.reset();
+        desiredColor_.reset();
         pattern_ = IndicatorPattern::steady;
         patternPhaseIndex_ = 0;
         pulseVisible_ = false;
@@ -3990,19 +3995,44 @@ private:
         return false;
     }
 
-    bool requireTiny3DirectRGB(
-        Tiny3FixedRGB color,
+    bool establishFirmwareBaseline(
         const std::string &operation,
         const std::string &commandID
     ) noexcept {
-        if (capabilities_.directIndicatorRGB && isSupportedTiny3DirectRGB(DiscoveryResult::Profile::tiny3Lite, color)) return true;
+        if (capabilities_.indicatorBaseStateID < 0) return true;
+        int result = RM_RET_ERR;
+        {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            result = adapter_.establishIndicatorBaseline(device_.get());
+        }
+        if (result == RM_RET_OK && capabilities_.greenIndicatorStateID >= 0) {
+            activeState_ = capabilities_.greenIndicatorStateID;
+            pulseVisible_ = true;
+        }
         trace_.event(
             "indicator.ack",
-            "firmware",
-            "fixed_rgb_unavailable_for_profile",
-            RM_RET_ERR,
-            "profile=" + std::string(capabilities_.identifier) + "; operation=" + operation
-                + "; rgb=" + rgbDescription(color),
+            result == RM_RET_OK ? "firmware" : "fault",
+            result == RM_RET_OK ? "baseline_active" : "baseline_rejected",
+            result,
+            "operation=" + operation
+                + "; base_state_id=" + std::to_string(capabilities_.indicatorBaseStateID)
+                + "; idle_state_id=" + std::to_string(capabilities_.greenIndicatorStateID),
+            commandID
+        );
+        return result == RM_RET_OK;
+    }
+
+    bool requireDirectColor(
+        soma::OBSBOTIndicatorColor color,
+        const std::string &operation,
+        const std::string &commandID
+    ) noexcept {
+        if (adapter_.supportsIndicatorColor(color)) return true;
+        trace_.event(
+            "indicator.ack", "firmware", "direct_color_unsupported", RM_RET_ERR,
+            "profile=" + std::string(capabilities_.identifier)
+                + "; color=" + indicatorColorName(color)
+                + "; operation=" + operation,
             commandID
         );
         return false;
@@ -4021,82 +4051,61 @@ private:
         return false;
     }
 
-    static std::string rgbDescription(Tiny3FixedRGB color) {
-        return std::to_string(color.red) + "," + std::to_string(color.green) + "," + std::to_string(color.blue);
-    }
-
-    void activateRGB(
-        Tiny3FixedRGB color,
-        IndicatorPattern pattern,
+    void reassertState(
+        int stateID,
         const std::string &operation,
         const std::string &commandID
     ) noexcept {
-        const bool sameActiveColor = desiredRGB_ && activeRGB_
-            && *desiredRGB_ == color && *activeRGB_ == color;
-        if (sameActiveColor) {
-            const bool visibilityRestored = restorePulseLEDVisibility();
-            pattern_ = pattern;
-            patternPhaseIndex_ = 0;
-            pulseVisible_ = visibilityRestored && activeRGB_ && *activeRGB_ == color;
-            if (pulseVisible_ && pattern_ != IndicatorPattern::steady) {
-                nextPulseTransition_ = Clock::now() + std::chrono::milliseconds(
-                    indicatorPatternPhases(pattern_).front().durationMilliseconds
-                );
-            } else {
-                nextPulseTransition_.reset();
-            }
-            trace_.event(
-                "indicator.ack",
-                visibilityRestored ? "soma" : "fault",
-                visibilityRestored ? "rgb_pattern_armed" : "rgb_restore_rejected",
-                visibilityRestored ? RM_RET_OK : RM_RET_ERR,
-                "rgb=" + rgbDescription(color) + "; pattern=" + indicatorPatternName(pattern)
-                    + "; rgb_reused=true; pulse_armed=" + (pulseVisible_ && pattern_ != IndicatorPattern::steady ? "true" : "false")
-                    + "; brightness_restored=" + (visibilityRestored ? "true" : "false"),
-                commandID
-            );
-            return;
-        }
-
         trace_.event(
             "indicator.command",
             "soma",
             operation,
             0,
-            "rgb=" + rgbDescription(color) + "; pattern=" + indicatorPatternName(pattern),
+            "state_id=" + std::to_string(stateID) + "; physical_reassertion=true",
             commandID
         );
         const bool visibilityRestored = restorePulseLEDVisibility();
-        bool priorCleared = true;
-        if (visibilityRestored && activeState_) {
-            int clearResult = RM_RET_ERR;
-            try { clearResult = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(*activeState_)); } catch (...) {}
-            priorCleared = clearResult == RM_RET_OK;
-            if (priorCleared) activeState_.reset();
+        int result = RM_RET_ERR;
+        if (visibilityRestored) {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            result = adapter_.setIndicatorState(device_.get(), static_cast<uint8_t>(stateID));
         }
-
-        desiredState_.reset();
-        desiredRGB_ = color;
-        pattern_ = pattern;
-        patternPhaseIndex_ = 0;
-        nextPulseTransition_.reset();
-        int setResult = visibilityRestored ? callTiny3FixedRGB(color) : RM_RET_ERR;
-        if (setResult == RM_RET_OK) activeRGB_ = color;
-        pulseVisible_ = activeRGB_ && *activeRGB_ == color;
-        if (pulseVisible_ && pattern_ != IndicatorPattern::steady) {
-            nextPulseTransition_ = Clock::now() + std::chrono::milliseconds(indicatorPatternPhases(pattern_).front().durationMilliseconds);
-        }
-        const bool succeeded = visibilityRestored && priorCleared && setResult == RM_RET_OK;
+        if (result == RM_RET_OK) activeState_ = stateID;
         trace_.event(
             "indicator.ack",
-            succeeded ? "soma" : "fault",
-            succeeded ? "rgb_active" : "rgb_transition_incomplete",
-            succeeded ? RM_RET_OK : RM_RET_ERR,
-            "rgb=" + rgbDescription(color)
-                + "; pattern=" + indicatorPatternName(pattern)
-                + "; led_enabled=" + (visibilityRestored ? "true" : "restore_failed")
-                + "; previous_state_cleared=" + (priorCleared ? "true" : "false")
-                + "; rgb_sent=" + (setResult == RM_RET_OK ? "true" : "false"),
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "state_reasserted" : "state_reassertion_rejected",
+            result,
+            "state_id=" + std::to_string(stateID)
+                + "; led_enabled=" + (visibilityRestored ? "true" : "restore_failed"),
+            commandID
+        );
+    }
+
+    void reassertColor(
+        soma::OBSBOTIndicatorColor color,
+        const std::string &operation,
+        const std::string &commandID
+    ) noexcept {
+        trace_.event(
+            "indicator.command", "soma", operation, 0,
+            "color=" + std::string(indicatorColorName(color)) + "; physical_reassertion=true",
+            commandID
+        );
+        const bool visibilityRestored = restorePulseLEDVisibility();
+        int result = RM_RET_ERR;
+        if (visibilityRestored) {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            result = adapter_.setIndicatorColor(device_.get(), color);
+        }
+        if (result == RM_RET_OK) activeColor_ = color;
+        trace_.event(
+            "indicator.ack",
+            result == RM_RET_OK ? "soma" : "fault",
+            result == RM_RET_OK ? "color_reasserted" : "color_reassertion_rejected",
+            result,
+            "color=" + std::string(indicatorColorName(color))
+                + "; led_enabled=" + (visibilityRestored ? "true" : "restore_failed"),
             commandID
         );
     }
@@ -4128,17 +4137,19 @@ private:
         );
         const bool visibilityRestored = restorePulseLEDVisibility();
         bool priorCleared = true;
+        activeColor_.reset();
+        desiredColor_.reset();
         const bool startsFirmwareAnimation = pattern == IndicatorPattern::firmwareAnimation;
         if (visibilityRestored && activeState_
             && (*activeState_ != stateID || startsFirmwareAnimation)) {
             int clearResult = RM_RET_ERR;
-            try { clearResult = device_->sysMgClearIndicatorStateR(static_cast<uint8_t>(*activeState_)); } catch (...) {}
+            clearResult = adapter_.clearIndicatorState(
+                device_.get(), static_cast<uint8_t>(*activeState_)
+            );
             priorCleared = clearResult == RM_RET_OK;
             if (priorCleared) activeState_.reset();
         }
 
-        activeRGB_.reset();
-        desiredRGB_.reset();
         desiredState_ = stateID;
         pattern_ = pattern;
         patternPhaseIndex_ = 0;
@@ -4146,7 +4157,7 @@ private:
         int setResult = visibilityRestored ? RM_RET_OK : RM_RET_ERR;
         if (visibilityRestored && !activeState_) {
             setResult = RM_RET_ERR;
-            try { setResult = device_->sysMgSetIndicatorStateR(static_cast<uint8_t>(stateID)); } catch (...) {}
+            setResult = adapter_.setIndicatorState(device_.get(), static_cast<uint8_t>(stateID));
             if (setResult == RM_RET_OK) activeState_ = stateID;
         }
         pulseVisible_ = activeState_ && *activeState_ == stateID;
@@ -4169,42 +4180,91 @@ private:
         );
     }
 
-    using GetEnabled = int (*)(Device *, bool &);
-    using SetEnabled = int (*)(Device *, bool);
-    using GetBrightness = int (*)(Device *, uint8_t &);
-    using SetBrightness = int (*)(Device *, uint8_t);
+    void activateColor(
+        soma::OBSBOTIndicatorColor color,
+        IndicatorPattern pattern,
+        const std::string &operation,
+        const std::string &commandID
+    ) noexcept {
+        const bool desiredMatches = desiredColor_ && *desiredColor_ == color && pattern_ == pattern;
+        if (desiredMatches && (pattern != IndicatorPattern::steady
+            || (activeColor_ && *activeColor_ == color))) {
+            trace_.event(
+                "indicator.ack", "soma", "color_already_active", RM_RET_OK,
+                "color=" + std::string(indicatorColorName(color))
+                    + "; pattern=" + indicatorPatternName(pattern)
+                    + "; no_reassertion",
+                commandID
+            );
+            return;
+        }
 
-    template <typename Function>
-    static Function symbol(const char *name) noexcept {
-        return reinterpret_cast<Function>(dlsym(RTLD_DEFAULT, name));
+        trace_.event(
+            "indicator.command", "soma", operation, 0,
+            "color=" + std::string(indicatorColorName(color))
+                + "; pattern=" + indicatorPatternName(pattern),
+            commandID
+        );
+        const bool visibilityRestored = restorePulseLEDVisibility();
+        bool priorCleared = true;
+        if (activeState_) {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            priorCleared = adapter_.clearIndicatorState(
+                device_.get(), static_cast<uint8_t>(*activeState_)
+            ) == RM_RET_OK;
+        }
+        activeState_.reset();
+        desiredState_.reset();
+        desiredColor_ = color;
+        pattern_ = pattern;
+        patternPhaseIndex_ = 0;
+        nextPulseTransition_.reset();
+        int setResult = RM_RET_ERR;
+        if (visibilityRestored) {
+            std::lock_guard<std::mutex> lock(sdkMutex);
+            setResult = adapter_.setIndicatorColor(device_.get(), color);
+        }
+        if (setResult == RM_RET_OK) activeColor_ = color;
+        pulseVisible_ = setResult == RM_RET_OK;
+        if (pulseVisible_ && pattern_ != IndicatorPattern::steady) {
+            nextPulseTransition_ = Clock::now()
+                + std::chrono::milliseconds(indicatorPatternPhases(pattern_).front().durationMilliseconds);
+        }
+        const bool succeeded = visibilityRestored && priorCleared && setResult == RM_RET_OK;
+        trace_.event(
+            "indicator.ack",
+            succeeded ? "soma" : "fault",
+            succeeded ? "color_active" : "color_transition_incomplete",
+            succeeded ? RM_RET_OK : RM_RET_ERR,
+            "color=" + std::string(indicatorColorName(color))
+                + "; pattern=" + indicatorPatternName(pattern)
+                + "; previous_state_cleared=" + (priorCleared ? "true" : "false")
+                + "; physical_color_set=" + (setResult == RM_RET_OK ? "true" : "false"),
+            commandID
+        );
     }
 
     void readBaseline() noexcept {
         bool enabled = false;
         uint8_t brightness = 0;
-        const auto getEnabled = symbol<GetEnabled>("_ZN6Device19sysMgGetLedEnabledRERb");
-        const auto getBrightness = symbol<GetBrightness>("_ZN6Device22sysMgGetLedBrightnessRERh");
         int enabledResult = RM_RET_ERR;
         int brightnessResult = RM_RET_ERR;
-        if (getEnabled || getBrightness) {
+        if (capabilities_.indicatorEnableAndBrightness) {
             std::lock_guard<std::mutex> lock(sdkMutex);
-            try {
-                if (getEnabled) enabledResult = getEnabled(device_.get(), enabled);
-                if (getBrightness) brightnessResult = getBrightness(device_.get(), brightness);
-            } catch (...) {
-                enabledResult = RM_RET_ERR;
-                brightnessResult = RM_RET_ERR;
-            }
+            enabledResult = adapter_.getIndicatorEnabled(device_.get(), enabled);
+            brightnessResult = adapter_.getIndicatorBrightness(device_.get(), brightness);
         }
         if (enabledResult == RM_RET_OK) baselineEnabled_ = enabled;
         if (brightnessResult == RM_RET_OK) baselineBrightness_ = brightness;
         trace_.event(
             "indicator.capability",
             "firmware",
-            capabilities_.firmwareIndicatorPalette ? "rgb_palette_available" : "basic_led_control_available",
+            capabilities_.firmwareIndicatorPalette ? "firmware_indicator_states_available" : "basic_led_control_available",
             enabledResult == RM_RET_OK && brightnessResult == RM_RET_OK ? RM_RET_OK : RM_RET_ERR,
             "profile=" + std::string(capabilities_.identifier)
-                + "; arbitrary_rgb=false; firmware_palette="
+                + "; arbitrary_rgb=false; semantic_direct_colors="
+                + std::to_string(capabilities_.directIndicatorColorMask)
+                + "; fixed_firmware_states="
                 + (capabilities_.firmwareIndicatorPalette ? "true" : "false")
                 + "; enabled="
                 + (baselineEnabled_ ? (*baselineEnabled_ ? std::string("true") : std::string("false")) : std::string("unavailable"))
@@ -4214,50 +4274,31 @@ private:
     }
 
     int callSetEnabled(bool enabled) noexcept {
-        const auto function = symbol<SetEnabled>("_ZN6Device19sysMgSetLedEnabledREb");
-        if (!function) return RM_RET_ERR;
         std::lock_guard<std::mutex> lock(sdkMutex);
-        try { return function(device_.get(), enabled); } catch (...) { return RM_RET_ERR; }
+        return adapter_.setIndicatorEnabled(device_.get(), enabled);
+    }
+
+    int callGetEnabled(bool &enabled) noexcept {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        return adapter_.getIndicatorEnabled(device_.get(), enabled);
     }
 
     int callSetBrightness(uint8_t brightness) noexcept {
-        const auto function = symbol<SetBrightness>("_ZN6Device22sysMgSetLedBrightnessREh");
-        if (!function) return RM_RET_ERR;
         std::lock_guard<std::mutex> lock(sdkMutex);
-        try { return function(device_.get(), brightness); } catch (...) { return RM_RET_ERR; }
-    }
-
-    int callTiny3FixedRGB(Tiny3FixedRGB color) noexcept {
-        std::string failure;
-        auto message = makeTiny3NativePaletteMessage(device_.get(), color, failure);
-        if (!message || !message->sendSync) return RM_RET_ERR;
-        std::array<uint8_t, kTiny3FrameCapacity> response {};
-        std::lock_guard<std::mutex> lock(sdkMutex);
-        try {
-            return message->sendSync(
-                message->devicePrivate,
-                message->bytes.data(),
-                response.data(),
-                1,
-                false
-            );
-        } catch (...) {
-            return RM_RET_ERR;
-        }
+        return adapter_.setIndicatorBrightness(device_.get(), brightness);
     }
 
     bool restorePulseLEDVisibility() noexcept {
         if (pulseLEDDisabled_) {
             const int result = callSetEnabled(true);
-            if (result != RM_RET_OK) return false;
+            bool reportedEnabled = false;
+            const int readbackResult = callGetEnabled(reportedEnabled);
+            if (result != RM_RET_OK || readbackResult != RM_RET_OK || !reportedEnabled) {
+                return false;
+            }
             pulseLEDDisabled_ = false;
             pulseChangedEnabled_ = true;
         }
-        if (!pulseBrightnessDimmed_) return true;
-        const int result = callSetBrightness(pulseBrightness());
-        if (result != RM_RET_OK) return false;
-        pulseBrightnessDimmed_ = false;
-        brightnessChanged_ = true;
         return true;
     }
 
@@ -4269,17 +4310,17 @@ private:
 
     std::shared_ptr<Device> device_;
     Trace &trace_;
+    const soma::OBSBOTDeviceAdapter &adapter_;
     DeviceCapabilities capabilities_;
     std::optional<int> activeState_;
     std::optional<int> desiredState_;
-    std::optional<Tiny3FixedRGB> activeRGB_;
-    std::optional<Tiny3FixedRGB> desiredRGB_;
+    std::optional<soma::OBSBOTIndicatorColor> activeColor_;
+    std::optional<soma::OBSBOTIndicatorColor> desiredColor_;
     IndicatorPattern pattern_ = IndicatorPattern::steady;
     size_t patternPhaseIndex_ = 0;
     bool pulseVisible_ = false;
     bool pulseLEDDisabled_ = false;
     bool pulseChangedEnabled_ = false;
-    bool pulseBrightnessDimmed_ = false;
     std::optional<Clock::time_point> nextPulseTransition_;
     std::optional<bool> baselineEnabled_;
     std::optional<uint8_t> baselineBrightness_;
@@ -4384,7 +4425,7 @@ private:
 
 int runBridgeServer(
     const std::shared_ptr<Device> &device,
-    DiscoveryResult::Profile profile,
+    const soma::OBSBOTDeviceAdapter &adapter,
     Trace &trace,
     int durationSeconds,
     bool calibrationMode,
@@ -4392,10 +4433,10 @@ int runBridgeServer(
 ) {
     constexpr auto nativeWatchdog = std::chrono::milliseconds(750);
     constexpr auto externalWatchdog = std::chrono::milliseconds(700);
-    const DeviceCapabilities &capabilities = capabilitiesFor(profile);
+    const DeviceCapabilities &capabilities = adapter.contract();
     if (!setDeviceRunStatus(device, Device::DevStatusRun, trace, "bridge-wake-1")) return 4;
     bool permitsProfileCalibratedMotion = profileCalibratedMotion
-        && profile == DiscoveryResult::Profile::tiny3Lite
+        && capabilities.requiresMeasuredAttitudeFrame
         && capabilities.boundedCalibrationPulses;
     emitDeviceCapabilities(device, capabilities);
     const bool needsRuntimeAttitudeReference = capabilities.requiresMeasuredAttitudeFrame
@@ -4430,7 +4471,7 @@ int runBridgeServer(
                 );
             }
         } else {
-            const bool centerAccepted = requestCenter(device, profile, trace, "calibration-home-1");
+            const bool centerAccepted = requestCenter(device, adapter, trace, "calibration-home-1");
             if (!centerAccepted) {
                 if (calibrationMode) return 4;
                 permitsProfileCalibratedMotion = false;
@@ -4445,7 +4486,7 @@ int runBridgeServer(
             } else {
                 const auto home = waitForSettledCenter(device);
                 if (!home) {
-                    requestManualStop(device, profile, trace, "calibration_home_unconfirmed", "calibration-home-stop-1", "manual");
+                    requestManualStop(device, adapter, trace, "calibration_home_unconfirmed", "calibration-home-stop-1", "manual");
                     if (calibrationMode) return 4;
                     permitsProfileCalibratedMotion = false;
                     trace.event(
@@ -4470,11 +4511,11 @@ int runBridgeServer(
             }
         }
     }
-    if (profile == DiscoveryResult::Profile::tiny2Lite) {
+    if (capabilities.nativeTrackingTransport == soma::OBSBOTNativeTrackingTransport::legacyHumanMode) {
         if (!configureFixedCameraZoom(device, trace)) return 5;
         disableHandGestures(device, trace);
         configureConversationAudioProcessing(device, trace);
-    } else if (profile == DiscoveryResult::Profile::tiny3Lite) {
+    } else if (capabilities.nativeTrackingTransport == soma::OBSBOTNativeTrackingTransport::selectedHumanPortrait) {
         // Tiny 3 Lite exposes the same optical zoom getters/setters, but a
         // transient firmware timeout must not take the entire perception loop
         // down.  The subsequent imaging read publishes the actual factor.
@@ -4492,10 +4533,10 @@ int runBridgeServer(
     }
     inspectAudioFrontEnd(device, capabilities, trace);
     inspectImagingFrontEnd(device, capabilities, trace);
-    inspectNativeTrackingFrontEnd(device, profile, trace);
+    inspectNativeTrackingFrontEnd(device, adapter, trace);
     if (const auto fieldOfView = cameraHorizontalFieldOfViewDegrees(device)) emitHorizontalFieldOfView(*fieldOfView);
     if (const auto attitude = readGimbalAttitude(device)) emitGimbalAttitude(*attitude);
-    IndicatorSession indicator(device, trace, capabilities);
+    IndicatorSession indicator(device, trace, adapter);
     trace.event(
         "camera.owner",
         "manual",
@@ -4554,7 +4595,7 @@ int runBridgeServer(
         if (polled > 0 && (descriptor.revents & POLLIN)) {
             const auto line = readBridgeLine();
             if (!line) break;
-            BridgeCommand command = parseBridgeCommand(*line, profile, capabilities);
+            BridgeCommand command = parseBridgeCommand(*line, adapter, capabilities);
             // Direct motion calls are synchronous in the Tiny SDK and take
             // longer than one camera/control period. Vision and the smooth
             // exploration loop can therefore publish several replacements
@@ -4571,7 +4612,7 @@ int runBridgeServer(
                     if (::poll(&pending, 1, 0) <= 0 || !(pending.revents & POLLIN)) break;
                     const auto newerLine = readBridgeLine();
                     if (!newerLine) break;
-                    const BridgeCommand newer = parseBridgeCommand(*newerLine, profile, capabilities);
+                    const BridgeCommand newer = parseBridgeCommand(*newerLine, adapter, capabilities);
                     if (isReplaceableDirectMotion(newer.type)) {
                         command = newer;
                         continue;
@@ -4587,7 +4628,7 @@ int runBridgeServer(
                 if (externalControl) {
                     const bool stopped = requestManualStop(
                         device,
-                        profile,
+                        adapter,
                         trace,
                         "external_yield_for_native",
                         "yield-" + command.commandID,
@@ -4608,7 +4649,7 @@ int runBridgeServer(
                     // None with a confirmed manual status resets it.
                     const bool manual = requestManualStop(
                         device,
-                        profile,
+                        adapter,
                         trace,
                         "reinit_for_native",
                         "reinit-" + command.commandID,
@@ -4620,7 +4661,7 @@ int runBridgeServer(
                 if (!nativeTracking) {
                     nativeTracking = requestNativeHumanTracking(
                         device,
-                        profile,
+                        adapter,
                         trace,
                         command.commandID,
                         "cleanup-" + command.commandID,
@@ -4664,7 +4705,7 @@ int runBridgeServer(
                 if (nativeTracking) {
                     const bool stopped = requestManualStop(
                         device,
-                        profile,
+                        adapter,
                         trace,
                         "native_yield_for_external",
                         "yield-" + command.commandID
@@ -4690,7 +4731,7 @@ int runBridgeServer(
                 externalControl = command.type == BridgeCommandType::externalPosition
                     ? requestExternalPosition(
                         device,
-                        profile,
+                        adapter,
                         trace,
                         command.commandID,
                         command.pitch,
@@ -4699,7 +4740,7 @@ int runBridgeServer(
                     )
                     : requestExternalVelocity(
                         device,
-                        profile,
+                        adapter,
                         trace,
                         capabilities,
                         command.commandID,
@@ -4735,10 +4776,10 @@ int runBridgeServer(
                 }
                 break;
             case BridgeCommandType::audioMode:
-                setCameraAudioMode(device, profile, trace, command.value, command.commandID);
+                setCameraAudioMode(device, adapter, trace, command.value, command.commandID);
                 break;
             case BridgeCommandType::audioInputGain:
-                setCameraAudioInputGain(device, profile, trace, command.value, command.commandID);
+                setCameraAudioInputGain(device, adapter, trace, command.value, command.commandID);
                 break;
             case BridgeCommandType::cameraWhiteBalance:
                 setCameraWhiteBalance(
@@ -4780,7 +4821,8 @@ int runBridgeServer(
                 setCameraImageTuning(device, trace, command.imageTuning, command.commandID);
                 break;
             case BridgeCommandType::nativeHumanTrackingPolicy:
-                if (profile != DiscoveryResult::Profile::tiny3Lite) {
+                if (capabilities.nativeTrackingTransport
+                    != soma::OBSBOTNativeTrackingTransport::selectedHumanPortrait) {
                     trace.event(
                         "camera.ack",
                         "fault",
@@ -4802,7 +4844,7 @@ int runBridgeServer(
                 setCameraFieldOfView(device, trace, command.value, command.commandID);
                 break;
             case BridgeCommandType::doaFollow:
-                setDoaFindBack(device, trace, command.value == 1, command.commandID);
+                setDoaFindBack(device, adapter, trace, command.value == 1, command.commandID);
                 break;
             case BridgeCommandType::externalVelocityOutOfRange:
                 trace.event("camera.ack", "fault", "external_velocity_rejected", RM_RET_ERR, "external_velocity_out_of_range", command.commandID);
@@ -4812,7 +4854,7 @@ int runBridgeServer(
                 break;
             case BridgeCommandType::externalStop:
                 if (externalControl) {
-                    const bool stopped = requestManualStop(device, profile, trace, "external_attention_released", command.commandID, "external");
+                    const bool stopped = requestManualStop(device, adapter, trace, "external_attention_released", command.commandID, "external");
                     externalControl = false;
                     appliedExternalVelocity.reset();
                     externalPulseDeadline.reset();
@@ -4825,7 +4867,7 @@ int runBridgeServer(
             case BridgeCommandType::manualStop:
                 if (nativeTracking || externalControl) {
                     const std::string owner = externalControl ? "external" : "native_ai";
-                    const bool stopped = requestManualStop(device, profile, trace, "attention_released", command.commandID, owner);
+                    const bool stopped = requestManualStop(device, adapter, trace, "attention_released", command.commandID, owner);
                     nativeTracking = false;
                     nativeCommandID.clear();
                     externalControl = false;
@@ -4844,7 +4886,7 @@ int runBridgeServer(
                 }
                 if (nativeTracking || externalControl) {
                     const std::string owner = externalControl ? "external" : "native_ai";
-                    const bool stopped = requestManualStop(device, profile, trace, "coverage_recenter", "yield-" + command.commandID, owner);
+                    const bool stopped = requestManualStop(device, adapter, trace, "coverage_recenter", "yield-" + command.commandID, owner);
                     nativeTracking = false;
                     nativeCommandID.clear();
                     externalControl = false;
@@ -4853,7 +4895,7 @@ int runBridgeServer(
                     externalPulseStopCommandID.clear();
                     if (!stopped) return 4;
                 }
-                if (!requestCenter(device, profile, trace, command.commandID)) return 4;
+                if (!requestCenter(device, adapter, trace, command.commandID)) return 4;
                 break;
             case BridgeCommandType::indicatorSet:
                 indicator.set(command.value, command.commandID);
@@ -4873,20 +4915,20 @@ int runBridgeServer(
             case BridgeCommandType::indicatorReconcile:
                 indicator.reconcile(command.value, command.indicatorPattern, command.commandID);
                 break;
-            case BridgeCommandType::indicatorRGBEnforce:
-                if (command.indicatorRGB) indicator.enforceRGB(*command.indicatorRGB, command.indicatorPattern, command.commandID);
+            case BridgeCommandType::indicatorColorEnforce:
+                indicator.enforceColor(command.indicatorColor, command.indicatorPattern, command.commandID);
                 break;
-            case BridgeCommandType::indicatorRGBReconcile:
-                if (command.indicatorRGB) indicator.reconcileRGB(*command.indicatorRGB, command.indicatorPattern, command.commandID);
+            case BridgeCommandType::indicatorColorReconcile:
+                indicator.reconcileColor(command.indicatorColor, command.indicatorPattern, command.commandID);
                 break;
-            case BridgeCommandType::indicatorRGBClear:
-                indicator.clearRGB(command.commandID);
+            case BridgeCommandType::indicatorColorClear:
+                indicator.clearColor(command.commandID);
                 break;
             case BridgeCommandType::shutdown:
                 {
                     const std::string owner = externalControl ? "external" : "native_ai";
                     if (nativeTracking || externalControl) {
-                        const bool stopped = requestManualStop(device, profile, trace, "bridge_shutdown", command.commandID, owner);
+                        const bool stopped = requestManualStop(device, adapter, trace, "bridge_shutdown", command.commandID, owner);
                         if (!stopped) {
                             trace.event(
                                 "camera.ack",
@@ -4900,7 +4942,7 @@ int runBridgeServer(
                     } else {
                         trace.event("camera.ack", "manual", "manual_active", RM_RET_OK, "bridge_shutdown_manual", command.commandID);
                     }
-                    return parkAtRestPoseAndSleep(device, trace, command.commandID) ? 0 : 4;
+                    return parkAtRestPoseAndSleep(device, adapter, trace, command.commandID) ? 0 : 4;
                 }
             case BridgeCommandType::invalid:
                 trace.event("camera.ack", "fault", "bridge_command_rejected", RM_RET_ERR, "invalid_local_command");
@@ -4911,7 +4953,7 @@ int runBridgeServer(
         if (externalControl && externalPulseDeadline && Clock::now() >= *externalPulseDeadline) {
             const bool stopped = requestManualStop(
                 device,
-                profile,
+                adapter,
                 trace,
                 "external_pulse_elapsed",
                 externalPulseStopCommandID,
@@ -4927,13 +4969,13 @@ int runBridgeServer(
         // Attitude reporting is owned by AttitudeReporter on its own thread;
         // the bridge loop must never gate the pose stream on its own latency.
         if (nativeTracking && Clock::now() - lastHeartbeat > nativeWatchdog) {
-            const bool stopped = requestManualStop(device, profile, trace, "attention_watchdog_expired", "watchdog-stop-1");
+            const bool stopped = requestManualStop(device, adapter, trace, "attention_watchdog_expired", "watchdog-stop-1");
             nativeTracking = false;
             nativeCommandID.clear();
             if (!stopped) return 4;
         }
         if (externalControl && Clock::now() - lastExternalCommand > externalWatchdog) {
-            const bool stopped = requestManualStop(device, profile, trace, "external_watchdog_expired", "external-watchdog-stop-1", "external");
+            const bool stopped = requestManualStop(device, adapter, trace, "external_watchdog_expired", "external-watchdog-stop-1", "external");
             externalControl = false;
             appliedExternalVelocity.reset();
             externalPulseDeadline.reset();
@@ -4945,7 +4987,7 @@ int runBridgeServer(
     if (nativeTracking || externalControl) {
         return requestManualStop(
             device,
-            profile,
+            adapter,
             trace,
             interrupted ? "signal_received" : continuous ? "bridge_input_closed" : "duration_elapsed",
             "manual-timebox-1",
@@ -4960,14 +5002,14 @@ class EmergencyManualStopGuard {
 public:
     EmergencyManualStopGuard(
         std::shared_ptr<Device> device,
-        const DiscoveryResult::Profile profile,
+        const soma::OBSBOTDeviceAdapter &adapter,
         Trace &trace
     )
-        : device_(std::move(device)), profile_(profile), trace_(trace) {}
+        : device_(std::move(device)), adapter_(adapter), trace_(trace) {}
 
     ~EmergencyManualStopGuard() {
         if (!armed_) return;
-        requestManualStop(device_, profile_, trace_, "exceptional_exit", "manual-stop-1");
+        requestManualStop(device_, adapter_, trace_, "exceptional_exit", "manual-stop-1");
     }
 
     void disarm() {
@@ -4976,7 +5018,7 @@ public:
 
 private:
     std::shared_ptr<Device> device_;
-    DiscoveryResult::Profile profile_;
+    const soma::OBSBOTDeviceAdapter &adapter_;
     Trace &trace_;
     bool armed_ = true;
 };
@@ -5001,7 +5043,7 @@ int main(int argc, char **argv) {
         trace.event("camera.owner", "manual", "discovering", 0, "motion_control_requested");
         devicesWereOpened = true;
         auto discovery = waitForSupportedDevice();
-        if (!discovery.device) {
+        if (!discovery.device || !discovery.adapter) {
             trace.event(
                 "camera.ack",
                 "fault",
@@ -5018,7 +5060,7 @@ int main(int argc, char **argv) {
         if (options.manualStop) {
             const bool stopped = requestManualStop(
                 discovery.device,
-                discovery.profile,
+                *discovery.adapter,
                 trace,
                 "explicit_manual_stop",
                 "manual-stop-1",
@@ -5034,9 +5076,10 @@ int main(int argc, char **argv) {
         }
 
         if (options.doaFindBack) {
-            const bool supported = discovery.profile == DiscoveryResult::Profile::tiny3Lite;
+            const bool supported = discovery.adapter->contract().soundLocalization;
             const bool configured = supported && setDoaFindBack(
                 discovery.device,
+                *discovery.adapter,
                 trace,
                 *options.doaFindBack
             );
@@ -5046,7 +5089,7 @@ int main(int argc, char **argv) {
                     "manual",
                     "sound_source_tracking_unavailable",
                     RM_RET_ERR,
-                    "profile=tiny_2_lite",
+                    "profile=" + std::string(discovery.adapter->contract().identifier),
                     "doa-find-back-1"
                 );
             }
@@ -5057,12 +5100,12 @@ int main(int argc, char **argv) {
         }
 
         const auto &device = discovery.device;
-        EmergencyManualStopGuard emergencyStop(device, discovery.profile, trace);
+        EmergencyManualStopGuard emergencyStop(device, *discovery.adapter, trace);
 
         if (options.serve) {
             const int result = runBridgeServer(
                 device,
-                discovery.profile,
+                *discovery.adapter,
                 trace,
                 options.durationSeconds,
                 options.allowDeviceCalibration,
@@ -5075,7 +5118,7 @@ int main(int argc, char **argv) {
         }
 
         if (options.center) {
-            if (!requestCenter(device, discovery.profile, trace, "center-1")) {
+            if (!requestCenter(device, *discovery.adapter, trace, "center-1")) {
                 emergencyStop.disarm();
                 Devices::get().close();
                 devicesWereOpened = false;
@@ -5087,7 +5130,7 @@ int main(int argc, char **argv) {
             }
             const bool stopped = requestManualStop(
                 device,
-                discovery.profile,
+                *discovery.adapter,
                 trace,
                 interrupted ? "signal_received" : "center_complete",
                 "center-stop-1",
@@ -5101,7 +5144,7 @@ int main(int argc, char **argv) {
 
         const bool activated = requestNativeHumanTracking(
             device,
-            discovery.profile,
+            *discovery.adapter,
             trace,
             "native-human-1",
             "manual-stop-1"
@@ -5120,7 +5163,7 @@ int main(int argc, char **argv) {
 
         const bool stopped = requestManualStop(
             device,
-            discovery.profile,
+            *discovery.adapter,
             trace,
             interrupted ? "signal_received" : "duration_elapsed",
             "manual-stop-1"

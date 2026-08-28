@@ -55,14 +55,24 @@ require(
     contactGate.authorizeSpeechOnset(at: start, directContact: true) == .voiceActivity,
     "direct contact did not authorize the first spoken turn"
 )
-contactGate.issueSocialPulse(at: start + 1_000_000_000)
 require(
-    contactGate.authorizeSpeechOnset(at: start + 1_100_000_000, directContact: false) == .botInitiatedPulseResponse,
-    "bot-initiated social pulse did not authorize its response"
+    contactGate.authorizeSpeechOnset(at: start + 1_100_000_000, directContact: false) == nil,
+    "speech without current direct contact authorized a new spoken turn"
+)
+var l0FaceFixationAdmission = L0FaceFixationAdmission(freshnessMilliseconds: 500)
+l0FaceFixationAdmission.observeVerifiedFixation(
+    sceneID: "face-a",
+    directContact: true,
+    at: start
 )
 require(
-    contactGate.authorizeSpeechOnset(at: start + 1_200_000_000, directContact: true) == .voiceActivity,
-    "direct contact did not remain admissible after a social pulse"
+    l0FaceFixationAdmission.permitsNewSession(at: start + 100_000_000),
+    "current verified L0 face fixation did not admit direct speech"
+)
+l0FaceFixationAdmission.clear()
+require(
+    !l0FaceFixationAdmission.permitsNewSession(at: start + 100_000_000),
+    "cleared L0 fixation still admitted historical gaze"
 )
 contactGate.markConversationOpened(at: start + 2_000_000_000)
 require(
@@ -97,16 +107,28 @@ indicatorInputs.interactionState = .conversation
 require(indicatorInputs.resolvedState == .conversation, "conversation LED priority is wrong")
 indicatorInputs.interactionState = .preparingReply
 require(indicatorInputs.resolvedState == .working, "working LED priority is wrong")
-let contactReadyRendering = SOMALEDSettings().deviceRendering(for: .contactReady, on: .tiny3Lite)
-let humanDetectedRendering = SOMALEDSettings().deviceRendering(for: .humanDetected, on: .tiny3Lite)
+let tiny3Contract = OBSBOTDeviceContract.parse(
+    "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite product_type=19 "
+        + "native_bridge=true motor_calibrated=false bounded_calibration_pulses=true "
+        + "native_human_tracking=true indicator_palette=true indicator_default_green=false indicator_direct_rgb=false "
+        + "indicator_direct_rgb_mask=0 indicator_basic=true selectable_audio_modes=true "
+        + "supported_audio_mode_mask=55 sound_localization=true requires_measured_attitude_frame=true "
+        + "native_tracking_transport=2 indicator_yellow_state_id=16 indicator_green_state_id=54 "
+        + "indicator_blue_state_id=57 maximum_pan_degrees_per_second=90 "
+        + "maximum_pitch_degrees_per_second=45 nominal_wide_horizontal_fov_degrees=72"
+)!
+let contactReadyRendering = SOMALEDSettings().deviceRendering(for: .contactReady, on: tiny3Contract)
+let humanDetectedRendering = SOMALEDSettings().deviceRendering(for: .humanDetected, on: tiny3Contract)
 require(
-    contactReadyRendering == .init(directRGB: .blue, pattern: .firmwareAnimation)
-        && humanDetectedRendering == .init(directRGB: .blue, pattern: .steady),
-    "LED state does not resolve contact-ready and human presence to their configured device patterns"
+    contactReadyRendering == SOMALEDDeviceRendering(stateID: 57, pattern: .blink)
+        && humanDetectedRendering == SOMALEDDeviceRendering(stateID: 57, pattern: .steady)
+        && SOMALEDSettings().deviceRendering(for: .conversation, on: tiny3Contract)
+            == SOMALEDDeviceRendering(stateID: 16, pattern: .steady),
+    "Tiny 3 LED contract did not expose its physically validated presentations"
 )
 require(
     SubconsciousIndicatorState.contactReady.humanMeaning == "ready_speak_now"
-        && SubconsciousIndicatorState.working.humanMeaning == "please_wait_preparing_reply",
+        && SubconsciousIndicatorState.working.humanMeaning == "conversation_active",
     "LED state does not expose a human-readable interaction affordance"
 )
 var indicatorLease = EyeContactIndicatorLease(holdMilliseconds: 3_000)
@@ -130,13 +152,14 @@ require(
 )
 indicatorLease.observe(sceneID: "face-a", at: start)
 require(
-    indicatorLease.maintain(sceneID: "face-a", at: start + 10_000_000_000)
-        && indicatorLease.isActive(at: start + 12_999_000_000),
+    indicatorLease.maintain(sceneID: "face-a", at: start + 100_000_000)
+        && indicatorLease.isActive(at: start + 2_999_000_000),
     "current locked face did not sustain the contact-ready indicator"
 )
 require(
-    !indicatorLease.maintain(sceneID: "face-b", at: start + 13_000_000_000),
-    "different face identity extended the contact-ready indicator"
+    !indicatorLease.maintain(sceneID: "face-a", at: start + 3_001_000_000)
+        && !indicatorLease.maintain(sceneID: "face-b", at: start + 3_001_000_000),
+    "contact-ready indicator outlived its bounded face lease"
 )
 var indicatorPresence = SubconsciousIndicatorInputs()
 indicatorPresence.observeHumanVisualPresence()

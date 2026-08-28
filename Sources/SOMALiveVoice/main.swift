@@ -7,7 +7,6 @@ private struct Command: Decodable {
     enum Kind: String, Decodable {
         case start
         case appendAudio = "append_audio"
-        case appendText = "append_text"
         case appendImage = "append_image"
         case stop
     }
@@ -24,8 +23,6 @@ private struct Command: Decodable {
     let cameraContextAutoInjected: Bool?
     let codexSandbox: String?
     let codexAdminOnly: Bool?
-    let text: String?
-    let role: String?
     let data: String?
     let sampleRate: Int?
     let samplesPerChannel: Int?
@@ -307,6 +304,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var preferredLanguageTag: String?
     private var languageStartInstruction: String?
     private var proactiveOpeningText: String?
+    private var isProactiveSession = false
     private var interactionAuthority: String?
     private var personContextReference: UUID?
     private var sessionCapability: String?
@@ -327,6 +325,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var realtimeSessionInitialized = false
     private var activeEmitted = false
     private var inputSpeechInProgress = false
+    private var naturalTurnTakingConfirmed = false
     private var observedRealtimeEventTypes: Set<String> = []
 
     init(emitter: JSONLineEmitter, workingDirectory: String, voice: String) {
@@ -376,6 +375,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             proactiveOpeningText = (command.proactiveOpeningText ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            isProactiveSession = proactiveOpeningText?.isEmpty == false
             interactionAuthority = (command.interactionAuthority ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let rawPersonContextReference = command.personContextReference ?? ""
@@ -393,25 +393,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             }
             codexAdminOnly = command.codexAdminOnly ?? false
             startAppServer()
-        case .appendText:
-            guard let threadID,
-                  let text = command.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty else { return }
-            let role = ["user", "developer", "assistant"].contains(command.role ?? "")
-                ? command.role!
-                : "developer"
-            connection.request(
-                method: "thread/realtime/appendText",
-                params: ["threadId": threadID, "text": String(text.prefix(8_192)), "role": role]
-            ) { [weak self] response in
-                guard response.value["error"] == nil else {
-                    self?.emitter.emit("context_rejected", fields: [
-                        "reason": AppServerConnection.responseMessage(response.value),
-                    ])
-                    return
-                }
-                self?.emitter.emit("context_appended", fields: ["role": role])
-            }
         case .appendImage:
             guard let threadID,
                   let dataURI = command.data,
@@ -551,6 +532,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 }
                 self.threadID = threadID
                 self.emitter.emit("thread_ready", fields: ["thread_id": threadID])
+                // Media startup must not wait for MCP capability probes. The
+                // session can begin listening while those independent local
+                // checks complete, and startRealtime records the capability
+                // state that is available when the offer arrives.
+                self.startWebRTCIfNeeded()
                 self.verifyEmbodimentMCP(for: threadID)
             }
         }
@@ -572,12 +558,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 self.embodimentMCPAvailable = response.value["error"] == nil
                     && tools?["capture_view"] != nil
                     && tools?["get_view_capture"] != nil
+                    && tools?["end_conversation"] != nil
                     && personToolsAvailable
                 guard self.embodimentMCPAvailable else {
                     self.finishEmbodimentMCPVerification(
                         available: false,
                         reason: response.value["error"] == nil
-                            ? (self.personContextReference == nil ? "capture_tools_missing" : "required_mcp_tools_missing")
+                            ? "required_mcp_tools_missing"
                             : AppServerConnection.responseMessage(response.value)
                     )
                     return
@@ -739,11 +726,18 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         let identityManagementInstruction = embodimentMCPAvailable
             ? "For an administrator's explicit request to register a person who is currently present, first call list_present_people. Enroll only one anonymous entry that the administrator unambiguously identifies in the current scene; then call enroll_present_identity with confirmed_by_user=true. Do not enroll a historical, absent, ambiguous, or merely detected face. After a successful enrollment, persist only identity facts the administrator explicitly supplied, such as a name or their stated relationship, with set_person_fact. Do not claim registration is complete until each required tool result succeeds."
             : ""
-        let stopConversationInstruction = embodimentMCPAvailable
-            ? "If the participant explicitly asks to stop, be quiet, or end this conversation, call end_conversation immediately and silently. It terminates only this live session, so do not give a farewell first."
-            : ""
+        let stopConversationInstruction = """
+        Action contract for ending this Live Voice session: before producing any spoken response, inspect the participant's latest actual speech. When they explicitly ask to end this conversation, stop listening, stop talking, be quiet, or turn the voice session off, treat it as an execution request rather than a conversational prompt. If end_conversation is available, your only valid next action is to call it immediately and silently. A spoken confirmation, farewell, promise to do it, or request to wait is a failure: do not emit audio before that tool call. The tool closes only this current Live Voice session.
+        """
+        let temporalMemoryInstruction = "Temporal discipline: context labelled DURABLE_MEMORY or PAST_EPISODE is historical evidence, not a transcript from this live session and not proof of the participant's current status. Use its explicit timestamp when it matters. Never call it just said, recent dialogue, current work, or a current preference unless the participant establishes that in this session."
+        let conversationOriginInstruction: String
+        if isProactiveSession {
+            conversationOriginInstruction = "This conversation was initiated by SOMA from a specific L1 social purpose, not by a participant request for help. Preserve that purpose privately across the exchange. After the exact opening, treat the participant's next utterance as an answer, reaction, or redirection of SOMA's opening unless they clearly make a separate request. Never reset into a generic service frame, ask what you can help with, or act as though the participant opened this session. One opening earns one listening turn: before the participant speaks, do not add another thought, question, summary, or filler."
+        } else {
+            conversationOriginInstruction = "This conversation was initiated by the participant. Respond to their most recent actual spoken message."
+        }
         let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
-        let instruction = [baseInstruction, stopConversationInstruction, languageInstruction(), proactiveOpeningInstruction()]
+        let instruction = [baseInstruction, conversationOriginInstruction, temporalMemoryInstruction, stopConversationInstruction, languageInstruction(), proactiveOpeningInstruction()]
             .compactMap { $0 }
             .joined(separator: "\n\n")
         var params: [String: Any] = [
@@ -878,11 +872,43 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         if type == "session.started" || type == "session.updated" {
             realtimeSessionInitialized = true
+            emitter.emit("realtime_session_configuration", fields: [
+                "source_event": type,
+                "interrupt_response": Self.interruptResponseState(in: object),
+                "session_keys": Self.sessionKeys(in: object),
+            ])
+            if type == "session.updated", Self.interruptResponseEnabled(in: object) {
+                if !naturalTurnTakingConfirmed {
+                    naturalTurnTakingConfirmed = true
+                    emitter.emit("natural_turn_taking_confirmed")
+                }
+            }
             activateIfReady()
+            return
+        }
+        if type == "error" {
+            let error = object["error"] as? [String: Any]
+            emitter.emit("realtime_protocol_error", fields: [
+                "event_id": String(((object["event_id"] as? String) ?? "unknown").prefix(128)),
+                "code": String(((error?["code"] as? String) ?? "unknown").prefix(128)),
+                "message": String(((error?["message"] as? String) ?? "unknown").prefix(256)),
+            ])
             return
         }
         if type.contains("speech_started") {
             observeInputSpeechStarted()
+            return
+        }
+        if type.contains("speech_stopped") {
+            inputSpeechInProgress = false
+            return
+        }
+        if type.contains("response.cancelled") || type.contains("response.canceled") {
+            emitter.emit("response_interrupted")
+            return
+        }
+        if type == "output_audio_buffer.cleared" || type.contains("conversation.item.truncated") {
+            emitter.emit("interrupted_audio_cleared", fields: ["type": String(type.prefix(128))])
             return
         }
         if type.hasPrefix("input_transcript.") {
@@ -906,6 +932,41 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         guard !inputSpeechInProgress else { return }
         inputSpeechInProgress = true
         emitter.emit("input_speech_started")
+    }
+
+    private static func interruptResponseEnabled(in event: [String: Any]) -> Bool {
+        guard let session = event["session"] as? [String: Any] else { return false }
+        if let audio = session["audio"] as? [String: Any],
+           let input = audio["input"] as? [String: Any],
+           let turnDetection = input["turn_detection"] as? [String: Any],
+           turnDetection["interrupt_response"] as? Bool == true {
+            return true
+        }
+        if let turnDetection = session["turn_detection"] as? [String: Any],
+           turnDetection["interrupt_response"] as? Bool == true {
+            return true
+        }
+        return false
+    }
+
+    private static func interruptResponseState(in event: [String: Any]) -> String {
+        guard let session = event["session"] as? [String: Any] else { return "missing_session" }
+        if let audio = session["audio"] as? [String: Any],
+           let input = audio["input"] as? [String: Any],
+           let turnDetection = input["turn_detection"] as? [String: Any],
+           let value = turnDetection["interrupt_response"] as? Bool {
+            return value ? "true" : "false"
+        }
+        if let turnDetection = session["turn_detection"] as? [String: Any],
+           let value = turnDetection["interrupt_response"] as? Bool {
+            return value ? "true" : "false"
+        }
+        return "missing"
+    }
+
+    private static func sessionKeys(in event: [String: Any]) -> String {
+        guard let session = event["session"] as? [String: Any] else { return "" }
+        return String(session.keys.sorted().joined(separator: ",").prefix(512))
     }
 
     private func activateIfReady() {
@@ -1221,8 +1282,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     cameraContextAutoInjected: nil,
                     codexSandbox: nil,
                     codexAdminOnly: nil,
-                    text: nil,
-                    role: nil,
                     data: nil,
                     sampleRate: nil,
                     samplesPerChannel: nil

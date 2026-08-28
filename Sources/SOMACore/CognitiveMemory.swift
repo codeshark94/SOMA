@@ -1211,6 +1211,7 @@ public actor CognitiveMemoryStore {
     private var sequence: UInt64
     private var current: [UUID: CognitiveMemoryRecord]
     private var historyByID: [UUID: [CognitiveMemoryRecord]]
+    private var journalMaintenanceInProgress = false
     private var closed = false
 
     private struct OpenedStore {
@@ -1478,6 +1479,13 @@ public actor CognitiveMemoryStore {
     @discardableResult
     public func purgeExpired(at date: Date = Date()) throws -> [UUID] {
         try ensureOpen()
+        guard !journalMaintenanceInProgress else { return [] }
+        journalMaintenanceInProgress = true
+        defer { journalMaintenanceInProgress = false }
+        return try purgeExpiredRecords(at: date)
+    }
+
+    private func purgeExpiredRecords(at date: Date) throws -> [UUID] {
         let expired = current.values.filter { $0.isExpired(at: date) }.map(\.id).sorted { $0.uuidString < $1.uuidString }
         guard !expired.isEmpty else { return [] }
         for id in expired {
@@ -1829,15 +1837,16 @@ public actor CognitiveMemoryStore {
         try journalHandle.write(contentsOf: data)
         try journalHandle.synchronize()
         sequence = entry.sequence
-        if try journalExceedsCompactionLimit() {
-            // The journal is append-only on the hot path; without a bound it
-            // grows without limit. On crossing the threshold, purge expired
-            // records first (their delete entries are folded away by the
-            // rewrite), then rewrite the journal as a compacted snapshot with
-            // per-record history trimmed.
-            if try purgeExpired(at: Date()).isEmpty {
-                try rewriteJournal()
-            }
+        guard !journalMaintenanceInProgress, try journalExceedsCompactionLimit() else { return }
+        try compactJournal(at: Date())
+    }
+
+    private func compactJournal(at date: Date) throws {
+        guard !journalMaintenanceInProgress else { return }
+        journalMaintenanceInProgress = true
+        defer { journalMaintenanceInProgress = false }
+        if try purgeExpiredRecords(at: date).isEmpty {
+            try rewriteJournal()
         }
     }
 

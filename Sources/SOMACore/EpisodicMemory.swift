@@ -88,6 +88,39 @@ public struct EpisodicRecall: Sendable, Equatable {
     }
 }
 
+/// Renders durable memory with temporal provenance before it enters a language
+/// model context. A stored memory can be useful without being evidence of what
+/// the participant has said in the active conversation.
+public enum MemoryContextPresentation {
+    public static func durableMemory(
+        summary: String,
+        kind: MemoryKind,
+        lastRevisedAt: Date
+    ) -> String {
+        let text = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        return "DURABLE_MEMORY (not an active-dialogue transcript; kind=\(kind.rawValue); last_revised_at_utc=\(timestamp(lastRevisedAt))): \(text)"
+    }
+
+    public static func pastEpisode(
+        narrative: String,
+        endedAt: Date,
+        now: Date
+    ) -> String {
+        let text = narrative.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        let ageSeconds = max(0, Int(now.timeIntervalSince(endedAt).rounded(.down)))
+        return "PAST_EPISODE (historical evidence, not part of the active dialogue; ended_at_utc=\(timestamp(endedAt)); age_seconds=\(ageSeconds)): \(text)"
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: date)
+    }
+}
+
 /// In-memory cache of episode embeddings keyed by record ID, so repeated
 /// recalls don't re-embed unchanged narratives. Bounded to avoid unbounded
 /// growth; evicts least-recently-used entries beyond the cap.

@@ -77,11 +77,16 @@ treated as sensorimotor bodies rather than passive webcams:
 
 The camera's vendor SDK is used only by a separately enabled local bridge. It
 does not become a direct model tool or a free-form velocity interface.
+The [device adapter contract](docs/OBSBOT_DEVICE_ADAPTER.md) carries the
+connected product's verified control surface from that bridge to the launcher
+and runtime. An unfamiliar OBSBOT remains a perception-and-conversation body
+until it has both an adapter and a matching calibration; replacing hardware
+does not silently borrow another camera's motor or LED assumptions.
 
 | SDK profile | Available without new calibration | Intentionally withheld |
 | --- | --- | --- |
 | `tiny_2_lite` | Video, USB audio, calibrated gimbal control, firmware indicator palette | — |
-| `tiny_3_lite` | Video, USB audio, selectable microphone modes, profile-calibrated L0 gimbal control, native human-track policy, Live Voice, basic LED enable/brightness | Tiny 2 motor calibration, confirmed color/pattern state IDs, and a host-readable sound bearing |
+| `tiny_3_lite` | Video, USB audio, selectable microphone modes, profile-calibrated L0 gimbal control, native human-track policy, firmware status LED, and Live Voice | Tiny 2 motor calibration and a host-readable sound bearing |
 
 This is a physical boundary, not a feature downgrade: calibration signs,
 motion envelopes, sound-localization semantics, and LED state IDs are
@@ -211,10 +216,12 @@ SOMA treats motion and light as part of interaction design:
   active conversation, and cognitive work legible from across the room.
 
 The Tiny 2 Lite exposes a firmware-defined RGB palette and pattern states—not
-arbitrary 24-bit color. The Tiny 3 Lite currently exposes only LED enable and
-brightness through the verified bridge. SOMA never claims a color or pulse is
-available until it has been physically validated for that model, and restores
-its own LED state on shutdown without overriding unrelated firmware states.
+arbitrary 24-bit color. Tiny 3 Lite uses its firmware status machine: persistent
+`SYSTEM_READY(3)` plus `NORMAL_WORKMODE(54)` is green exploration, work state
+`57` is blue human presence and contact cadence, and state `16` provides the
+yellow active-conversation presentation. The bridge restores `3 + 54` whenever
+a temporary state ends. Its experimental direct-RGB packet route was invalid
+and has been removed.
 
 ## Privacy and physical boundaries
 

@@ -58,8 +58,9 @@ public enum SOMALEDResponseMode: String, CaseIterable, Codable, Sendable {
     }
 }
 
-/// A user-facing colour available from the connected OBSBOT indicator. There
-/// is no public RGB API, so each entry maps to a firmware palette state.
+/// A user-facing semantic colour available from the connected OBSBOT
+/// indicator. The active device contract resolves it to a validated firmware
+/// state or the device's verified default presentation.
 public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
     case yellow
     case green
@@ -78,45 +79,35 @@ public enum SOMALEDColor: String, CaseIterable, Codable, Sendable {
 
 }
 
-public struct SOMALEDDirectRGB: Equatable, Sendable {
-    public let red: UInt8
-    public let green: UInt8
-    public let blue: UInt8
-
-    public init(red: UInt8, green: UInt8, blue: UInt8) {
-        self.red = red
-        self.green = green
-        self.blue = blue
-    }
-
-    /// The Tiny 3 indicator transport accepts semantic RGB values directly.
-    /// Keep the supported palette deliberately small: cognition selects a
-    /// social state, never an arbitrary decorative colour.
-    public static let green = Self(red: 0, green: 255, blue: 0)
-    public static let yellow = Self(red: 255, green: 210, blue: 0)
-    public static let blue = Self(red: 0, green: 0, blue: 255)
-}
-
 /// A device-specific status-indicator rendering. Palette state IDs and
-/// direct RGB requests are separate transports and must never be mixed.
+/// the firmware-owned default are separate presentations.
 public struct SOMALEDDeviceRendering: Equatable, Sendable {
     public let stateID: Int?
-    public let directRGB: SOMALEDDirectRGB?
+    public let directColor: SOMALEDColor?
+    public let usesFirmwareDefault: Bool
     public let pattern: SOMALEDPattern
 
     public init(stateID: Int, pattern: SOMALEDPattern) {
         self.stateID = stateID
-        directRGB = nil
+        directColor = nil
+        usesFirmwareDefault = false
         self.pattern = pattern
     }
 
-    public init(directRGB: SOMALEDDirectRGB, pattern: SOMALEDPattern) {
+    public init(firmwareDefaultPattern pattern: SOMALEDPattern = .steady) {
         stateID = nil
-        self.directRGB = directRGB
+        directColor = nil
+        usesFirmwareDefault = true
         self.pattern = pattern
     }
 
-    public var usesDirectRGB: Bool { directRGB != nil }
+    public init(directColor: SOMALEDColor, pattern: SOMALEDPattern) {
+        stateID = nil
+        self.directColor = directColor
+        usesFirmwareDefault = false
+        self.pattern = pattern
+    }
+
     public var pulseEnabled: Bool { pattern != .steady }
 }
 
@@ -230,12 +221,27 @@ public struct SOMALEDSignalSettings: Codable, Equatable, Sendable {
         self.pattern = pattern
     }
 
-    public func deviceRendering(for profile: OBSBOTDeviceProfile) -> SOMALEDDeviceRendering? {
-        if let directRGB = profile.directIndicatorRGB(for: color) {
-            return .init(directRGB: directRGB, pattern: pattern)
+    public func deviceRendering(for contract: OBSBOTDeviceContract) -> SOMALEDDeviceRendering? {
+        if contract.supportsDirectIndicatorColor(color) {
+            return .init(
+                directColor: color,
+                pattern: contract.indicatorPattern(for: pattern)
+            )
         }
-        guard let stateID = profile.firmwareIndicatorStateID(for: color) else { return nil }
-        return .init(stateID: stateID, pattern: pattern)
+        if contract.usesFirmwareDefaultIndicator(for: color) {
+            // Clearing all SOMA-owned states returns Tiny 3 Lite to its stable
+            // firmware green. It is not an addressable palette state, so it
+            // cannot carry a host-generated cadence.
+            return .init(firmwareDefaultPattern: .steady)
+        }
+        guard contract.capabilities.supportsFirmwareIndicatorPalette,
+              let stateID = contract.firmwareIndicatorStateID(for: color) else {
+            return nil
+        }
+        return .init(
+            stateID: stateID,
+            pattern: contract.indicatorPattern(for: pattern)
+        )
     }
 
     public func normalizedForDevice() -> Self {
@@ -282,6 +288,10 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
     /// Each meaningful interaction state has an independently selected colour
     /// and a physically supported device behavior.
     public var signals: [SubconsciousIndicatorState: SOMALEDSignalSettings]
+    /// Pre-unification conversation settings retained only while decoding an
+    /// older owner configuration. They are folded into `conversation` before
+    /// the settings are persisted again.
+    private var legacyConversationSignal: SOMALEDSignalSettings?
 
     public init(
         responseMode: SOMALEDResponseMode = .expressive,
@@ -290,7 +300,9 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
     ) {
         self.responseMode = responseMode
         self.brightness = min(max(brightness, 0), 3)
-        self.signals = Self.normalized(signals ?? [:])
+        let suppliedSignals = signals ?? [:]
+        self.legacyConversationSignal = Self.legacyConversationSignal(in: suppliedSignals)
+        self.signals = Self.normalized(suppliedSignals)
     }
 
     public func signal(for state: SubconsciousIndicatorState) -> SOMALEDSignalSettings {
@@ -299,7 +311,10 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
             return signal
         }
         if canonical == .conversation {
-            return signals[.speaking] ?? signals[.listening] ?? Self.defaultSignal(for: canonical)
+            return signals[.working]
+                ?? signals[.speaking]
+                ?? signals[.listening]
+                ?? Self.defaultSignal(for: canonical)
         }
         return Self.defaultSignal(for: canonical)
     }
@@ -309,9 +324,9 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
     /// eye-contact blink after visual contact has ended.
     public func deviceRendering(
         for state: SubconsciousIndicatorState,
-        on profile: OBSBOTDeviceProfile
+        on contract: OBSBOTDeviceContract
     ) -> SOMALEDDeviceRendering? {
-        signal(for: state).deviceRendering(for: profile)
+        signal(for: state).deviceRendering(for: contract)
     }
 
     private static func normalized(
@@ -329,7 +344,10 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
     ) -> SOMALEDSignalSettings {
         if let signal = signals[state] { return signal }
         if state == .conversation {
-            return signals[.speaking] ?? signals[.listening] ?? defaultSignal(for: state)
+            return signals[.working]
+                ?? signals[.speaking]
+                ?? signals[.listening]
+                ?? defaultSignal(for: state)
         }
         return defaultSignal(for: state)
     }
@@ -341,9 +359,24 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         case .exploring: .init(color: .green, pattern: .steady)
         case .humanDetected: .init(color: .blue, pattern: .steady)
         case .contactReady: .init(color: .blue, pattern: .firmwareAnimation)
-        case .conversation, .listening, .speaking: .init(color: .yellow, pattern: .steady)
-        case .working: .init(color: .green, pattern: .steady)
+        case .conversation, .working, .listening, .speaking: .init(color: .yellow, pattern: .steady)
         }
+    }
+
+    private static func legacyConversationSignal(
+        in signals: [SubconsciousIndicatorState: SOMALEDSignalSettings]
+    ) -> SOMALEDSignalSettings? {
+        signals[.working] ?? signals[.speaking] ?? signals[.listening]
+    }
+
+    var explicitLegacyConversationSignal: SOMALEDSignalSettings? {
+        legacyConversationSignal
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.responseMode == rhs.responseMode
+            && lhs.brightness == rhs.brightness
+            && lhs.signals == rhs.signals
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -356,9 +389,12 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         responseMode = try values.decodeIfPresent(SOMALEDResponseMode.self, forKey: .responseMode) ?? .expressive
         brightness = min(max(try values.decodeIfPresent(Int.self, forKey: .brightness) ?? 2, 0), 3)
-        signals = Self.normalized(
-            try values.decodeIfPresent([SubconsciousIndicatorState: SOMALEDSignalSettings].self, forKey: .signals) ?? [:]
-        )
+        let decodedSignals = try values.decodeIfPresent(
+            [SubconsciousIndicatorState: SOMALEDSignalSettings].self,
+            forKey: .signals
+        ) ?? [:]
+        legacyConversationSignal = Self.legacyConversationSignal(in: decodedSignals)
+        signals = Self.normalized(decodedSignals)
     }
 }
 
@@ -454,6 +490,9 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             decodedLED.signals[.humanDetected] = .init(color: .blue, pattern: .steady)
             decodedLED.signals[.contactReady] = .init(color: .blue, pattern: .blink)
             decodedLED.signals[.conversation] = .init(color: .green, pattern: .steady)
+            if let legacyConversationSignal = decodedLED.explicitLegacyConversationSignal {
+                decodedLED.signals[.conversation] = legacyConversationSignal.normalizedForDevice()
+            }
         }
         // A persisted signal is an operator-owned interaction contract. Older
         // schema versions may legitimately contain the explicit blue blink

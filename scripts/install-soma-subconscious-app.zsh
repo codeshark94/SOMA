@@ -9,6 +9,7 @@ soma_codex_bridge_source="$soma_build_root/soma-codex-bridge"
 soma_live_voice_source="$soma_build_root/soma-live-voice"
 soma_menu_bar_source="$soma_build_root/soma-menu-bar"
 soma_embodiment_source="$soma_build_root/soma-embodiment"
+soma_child_guardian_source="$soma_build_root/soma-child-guardian"
 soma_subconscious_resources="$soma_build_root/SOMA_SOMASubconscious.bundle"
 soma_vad_resources="$soma_build_root/SOMA_SOMAVADModel.bundle"
 soma_native_source="$soma_root/Sources/SOMANativeTracking"
@@ -25,6 +26,7 @@ soma_codex_bridge="$soma_app_root/Contents/Helpers/soma-codex-bridge"
 soma_live_voice="$soma_app_root/Contents/Helpers/soma-live-voice"
 soma_menu_bar="$soma_app_root/Contents/MacOS/soma-menu-bar"
 soma_embodiment="$soma_app_root/Contents/Helpers/soma-embodiment"
+soma_child_guardian="$soma_app_root/Contents/Helpers/soma-child-guardian"
 soma_native_helper="$soma_app_root/Contents/Helpers/soma-native-track"
 soma_device_probe="$soma_app_root/Contents/Helpers/soma-obsbot-probe"
 soma_lock="$soma_root/config/soma-dependencies.env"
@@ -79,6 +81,10 @@ if [[ ! -x "$soma_embodiment_source" ]]; then
     print -u2 "missing SOMA embodiment MCP: $soma_embodiment_source"
     exit 2
 fi
+if [[ ! -x "$soma_child_guardian_source" ]]; then
+    print -u2 "missing SOMA child guardian: $soma_child_guardian_source"
+    exit 2
+fi
 if [[ ! -x "$soma_native_binary" ]]; then
     print -u2 "missing SOMA native gimbal/audio helper: $soma_native_binary"
     exit 2
@@ -101,6 +107,7 @@ mkdir -p "$soma_app_root/Contents/MacOS" "$soma_app_root/Contents/Helpers"
 /usr/bin/ditto "$soma_live_voice_source" "$soma_live_voice"
 /usr/bin/ditto "$soma_menu_bar_source" "$soma_menu_bar"
 /usr/bin/ditto "$soma_embodiment_source" "$soma_embodiment"
+/usr/bin/ditto "$soma_child_guardian_source" "$soma_child_guardian"
 /usr/bin/ditto "$soma_native_binary" "$soma_native_helper"
 /usr/bin/ditto "$soma_native_probe" "$soma_device_probe"
 # SwiftPM's generated accessors retain the matching soma-live build paths.
@@ -114,6 +121,7 @@ chmod 755 "$soma_codex_bridge"
 chmod 755 "$soma_live_voice"
 chmod 755 "$soma_menu_bar"
 chmod 755 "$soma_embodiment"
+chmod 755 "$soma_child_guardian"
 chmod 755 "$soma_native_helper"
 chmod 755 "$soma_device_probe"
 

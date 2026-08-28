@@ -38,8 +38,8 @@ function(configure_obsbot_target target)
     set_target_properties(${target} PROPERTIES BUILD_RPATH "${OBSBOT_LIBRARY_DIR}")
 endfunction()
 
-add_executable(soma-native-track main.cpp)
+add_executable(soma-native-track main.cpp OBSBOTDeviceAdapter.cpp)
 configure_obsbot_target(soma-native-track)
 
-add_executable(soma-obsbot-probe DeviceProbe.cpp)
+add_executable(soma-obsbot-probe DeviceProbe.cpp OBSBOTDeviceAdapter.cpp)
 configure_obsbot_target(soma-obsbot-probe)

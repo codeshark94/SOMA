@@ -2,30 +2,27 @@
 set -eu
 
 if (( $# != 2 )); then
-  print -u2 -r -- 'Usage: soma-select-gimbal-calibration.zsh <soma-root> <tiny_2_lite|tiny_3_lite>'
+  print -u2 -r -- 'Usage: soma-select-gimbal-calibration.zsh <soma-root> <obsbot-device-identifier>'
   exit 64
 fi
 
 soma_calibration_root=$1
 soma_calibration_profile=$2
 
-case "$soma_calibration_profile" in
-  tiny_2_lite)
-    soma_profile_override=${SOMA_TINY2_LITE_EXTERNAL_GIMBAL_CALIBRATION:-}
-    soma_profile_default="$soma_calibration_root/config/obsbot/tiny2-lite-gimbal.json"
-    ;;
-  tiny_3_lite)
-    soma_profile_override=${SOMA_TINY3_LITE_EXTERNAL_GIMBAL_CALIBRATION:-}
-    soma_profile_default=''
-    ;;
-  *)
-    print -u2 -r -- "Unsupported OBSBOT profile: $soma_calibration_profile"
-    exit 64
-    ;;
-esac
+soma_profile_env_fragment=${soma_calibration_profile//_/-}
+soma_profile_env_fragment=${soma_profile_env_fragment//-/_}
+soma_profile_env_key="SOMA_OBSBOT_${(U)soma_profile_env_fragment}_EXTERNAL_GIMBAL_CALIBRATION"
+soma_profile_override="${(P)soma_profile_env_key:-}"
+soma_profile_default="$soma_calibration_root/config/obsbot/${soma_calibration_profile//_/-}-gimbal.json"
 
 function soma_declared_profile() {
   local soma_candidate=$1
+  local soma_identifier
+  soma_identifier=$(/usr/bin/plutil -extract deviceIdentifier raw -o - "$soma_candidate" 2>/dev/null || true)
+  if [[ -n "$soma_identifier" ]]; then
+    print -r -- "$soma_identifier"
+    return
+  fi
   /usr/bin/plutil -extract deviceProfile raw -o - "$soma_candidate" 2>/dev/null || true
 }
 
@@ -38,6 +35,7 @@ function soma_matches_profile() {
     [[ "$soma_declared" == "$soma_calibration_profile" ]]
     return
   fi
+  # Schema-1 Tiny 2 calibration predates device identifiers.
   [[ "$soma_calibration_profile" == 'tiny_2_lite' ]]
 }
 

@@ -427,21 +427,28 @@ final class LocalSpeechInteractionCoordinator: @unchecked Sendable {
     private let codexBridge: CodexVoiceHandoff?
     private let speechOutput: LocalSpeechOutput?
     private let onState: @Sendable (LocalSpeechInteractionState) -> Void
+    private let onConfirmedTranscript: @Sendable (String, CodexInteractionContext, UInt64) -> Void
+    private let onRejectedTurn: @Sendable (String, UInt64) -> Void
     private let interactionID: String
     private var segmenter = SpeechTurnSegmenter()
     private var preRoll: [SpeechAudioChunk] = []
     private var activeCapture: ActiveCapture?
     private var turnSequence: UInt64 = 0
+    private var remotePlaybackGate = LiveVoicePlaybackCaptureGate()
 
     init(
         localeIdentifier: String,
         codexBridgeURL: URL?,
         codexWorkingDirectoryURL: URL,
+        onConfirmedTranscript: @escaping @Sendable (String, CodexInteractionContext, UInt64) -> Void = { _, _, _ in },
+        onRejectedTurn: @escaping @Sendable (String, UInt64) -> Void = { _, _ in },
         onState: @escaping @Sendable (LocalSpeechInteractionState) -> Void
     ) throws {
         recognizer = try LocalOnDeviceSpeechRecognizer(localeIdentifier: localeIdentifier)
         currentLocaleIdentifier = localeIdentifier
         self.onState = onState
+        self.onConfirmedTranscript = onConfirmedTranscript
+        self.onRejectedTurn = onRejectedTurn
         interactionID = "voice-\(ProcessInfo.processInfo.processIdentifier)-\(DispatchTime.now().uptimeNanoseconds)"
         if let codexBridgeURL {
             let speechOutput = LocalSpeechOutput(onState: onState)
@@ -474,9 +481,41 @@ final class LocalSpeechInteractionCoordinator: @unchecked Sendable {
         currentLocaleIdentifier = localeIdentifier
     }
 
+    /// The realtime assistant plays through the system output while this
+    /// coordinator receives the OBSBOT microphone. Do not retain that output
+    /// as a possible user pre-roll or let it finish a participant turn.
+    func setRemoteAssistantOutput(active: Bool, at monotonicNS: UInt64) {
+        var cancellation: String?
+        lock.lock()
+        if active {
+            remotePlaybackGate.beginAssistantOutput(at: monotonicNS)
+            if activeCapture != nil {
+                activeCapture = nil
+                cancellation = "assistant_output_started"
+            }
+        } else {
+            remotePlaybackGate.endAssistantOutput(at: monotonicNS)
+        }
+        preRoll.removeAll(keepingCapacity: false)
+        segmenter.reset(at: monotonicNS)
+        lock.unlock()
+        if let cancellation { onState(.turnCancelled(reason: cancellation)) }
+    }
+
     func ingestAudio(_ chunk: SpeechAudioChunk) {
         var cancellation: String?
         lock.lock()
+        if remotePlaybackGate.suppressesMicrophone(at: chunk.endNS) {
+            if activeCapture != nil {
+                activeCapture = nil
+                segmenter.reset(at: chunk.captureNS)
+                cancellation = "assistant_output"
+            }
+            preRoll.removeAll(keepingCapacity: false)
+            lock.unlock()
+            if let cancellation { onState(.turnCancelled(reason: cancellation)) }
+            return
+        }
         if !chunk.continuous, activeCapture != nil {
             activeCapture = nil
             segmenter.reset(at: chunk.captureNS)
@@ -504,6 +543,10 @@ final class LocalSpeechInteractionCoordinator: @unchecked Sendable {
         var started: SpeechTurnStart?
         var completed: (SpeechTurnFinish, [SpeechAudioChunk], CodexInteractionContext)?
         lock.lock()
+        guard !remotePlaybackGate.suppressesMicrophone(at: monotonicNS) else {
+            lock.unlock()
+            return
+        }
         if let transition = segmenter.observe(
             voiceActive: active,
             at: monotonicNS,
@@ -564,12 +607,20 @@ final class LocalSpeechInteractionCoordinator: @unchecked Sendable {
             guard let self else { return }
             switch result {
             case .failure(let error):
-                self.onState(.recognitionFailed(reason: String(error.localizedDescription.prefix(192))))
+                let reason = String(error.localizedDescription.prefix(192))
+                self.onRejectedTurn(reason, DispatchTime.now().uptimeNanoseconds)
+                self.onState(.recognitionFailed(reason: reason))
             case .success(let recognition):
                 guard !recognition.transcript.isEmpty else {
+                    self.onRejectedTurn("empty_transcript", recognition.completedNS)
                     self.onState(.recognitionFailed(reason: "empty_transcript"))
                     return
                 }
+                self.onConfirmedTranscript(
+                    recognition.transcript,
+                    context,
+                    recognition.completedNS
+                )
                 self.lock.lock()
                 self.turnSequence += 1
                 let turnID = "turn-\(self.turnSequence)"

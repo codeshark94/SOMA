@@ -36,11 +36,21 @@ function soma_stop() {
     print -r -- 'SOMA is already stopped.'
     return
   fi
+  local graceful_shutdown=false
   if [[ -x "$soma_runtime_control" && -S "$soma_runtime_socket" ]]; then
-    if "$soma_runtime_control" --runtime-shutdown --socket "$soma_runtime_socket"; then
-      :
-    else
-      print -u2 -r -- 'SOMA graceful shutdown endpoint failed; unloading the service directly.'
+    # The endpoint becomes available after the perception runtime has bound
+    # its local socket. A launchd restart can make the socket pathname visible
+    # just before accept() is ready, so retry the same idempotent lifecycle
+    # request instead of immediately cutting off the gimbal park sequence.
+    for attempt in {1..12}; do
+      if "$soma_runtime_control" --runtime-shutdown --socket "$soma_runtime_socket"; then
+        graceful_shutdown=true
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$graceful_shutdown" != true ]]; then
+      print -u2 -r -- 'SOMA graceful shutdown endpoint did not become ready; unloading the service directly.'
     fi
   else
     print -u2 -r -- 'SOMA graceful shutdown endpoint is unavailable; unloading the service directly.'

@@ -2,29 +2,35 @@ import XCTest
 @testable import SOMACore
 
 final class OBSBOTDeviceProfileTests: XCTestCase {
-    func testTiny2LiteKeepsTheCompleteSemanticIndicatorPalette() {
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny2Lite.firmwareIndicatorStateID(for: .yellow), 16)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny2Lite.firmwareIndicatorStateID(for: .green), 57)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny2Lite.firmwareIndicatorStateID(for: .blue), 54)
-        XCTAssertNil(OBSBOTDeviceProfile.tiny2Lite.directIndicatorRGB(for: .blue))
+    func testTiny2LiteCommandsComeFromTheNativeContract() {
+        let contract = tiny2LiteTestContract()
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .yellow), 16)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .green), 57)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .blue), 54)
+        XCTAssertFalse(contract.usesFirmwareDefaultIndicator(for: .blue))
+        XCTAssertEqual(contract.nativeTrackingTransport, .legacyHumanMode)
     }
 
-    func testTiny3LiteUsesItsOwnMotorAndIndicatorCapabilities() {
-        let capabilities = OBSBOTDeviceProfile.tiny3Lite.capabilities
+    func testTiny3LiteUsesOnlyItsVerifiedIndicatorRoutes() {
+        let contract = tiny3LiteTestContract()
+        let capabilities = contract.capabilities
 
         XCTAssertFalse(capabilities.supportsCalibratedMotorControl)
         XCTAssertTrue(capabilities.supportsBoundedCalibrationPulses)
-        XCTAssertFalse(capabilities.supportsFirmwareIndicatorPalette)
-        XCTAssertTrue(capabilities.supportsDirectIndicatorRGB)
+        XCTAssertTrue(capabilities.supportsFirmwareIndicatorPalette)
+        XCTAssertFalse(capabilities.supportsDirectIndicatorRGB)
         XCTAssertTrue(capabilities.supportsIndicatorEnableAndBrightness)
         XCTAssertTrue(capabilities.supportsSelectableAudioModes)
         XCTAssertTrue(capabilities.supportsDeviceSoundLocalization)
         XCTAssertTrue(capabilities.requiresMeasuredAttitudeFrame)
         XCTAssertEqual(capabilities.maximumPanDegreesPerSecond, 90)
         XCTAssertEqual(capabilities.maximumPitchDegreesPerSecond, 45)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.supportedFirmwareIndicatorStateIDs, [])
-        XCTAssertFalse(OBSBOTDeviceProfile.tiny3Lite.supportsFirmwareIndicatorStateID(57))
-        XCTAssertFalse(OBSBOTDeviceProfile.tiny3Lite.supportsFirmwareIndicatorStateID(18))
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .yellow), 16)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .green), 54)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .blue), 57)
+        XCTAssertFalse(contract.usesFirmwareDefaultIndicator(for: .green))
+        XCTAssertFalse(contract.usesFirmwareDefaultIndicator(for: .yellow))
+        XCTAssertEqual(contract.nativeTrackingTransport, .selectedHumanPortrait)
     }
 
     func testTiny3LiteFOVUsesItsOwnWideOpticsProfile() {
@@ -40,14 +46,15 @@ final class OBSBOTDeviceProfileTests: XCTestCase {
         XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forSDKMode: 70))
     }
 
-    func testTiny3LiteMapsEverySemanticMicrophoneModeToFirmware() {
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.firmwareAudioMode(for: .ambientOmni), 0)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.firmwareAudioMode(for: .spatialStereo), 1)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.firmwareAudioMode(for: .conversationFront), 2)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.firmwareAudioMode(for: .rear), 3)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.firmwareAudioMode(for: .bidirectional), 4)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.firmwareAudioMode(for: .music), 5)
-        XCTAssertNil(OBSBOTDeviceProfile.tiny2Lite.firmwareAudioMode(for: .spatialStereo))
+    func testTiny3LiteMapsOnlyRetainedMicrophoneModesToFirmware() {
+        let contract = tiny3LiteTestContract()
+        XCTAssertEqual(contract.firmwareAudioMode(for: .ambientOmni), 0)
+        XCTAssertEqual(contract.firmwareAudioMode(for: .spatialStereo), 1)
+        XCTAssertEqual(contract.firmwareAudioMode(for: .conversationFront), 2)
+        XCTAssertNil(contract.firmwareAudioMode(for: .rear))
+        XCTAssertEqual(contract.firmwareAudioMode(for: .bidirectional), 4)
+        XCTAssertEqual(contract.firmwareAudioMode(for: .music), 5)
+        XCTAssertNil(tiny2LiteTestContract().firmwareAudioMode(for: .spatialStereo))
     }
 
     func testTiny3CalibrationRequiresMeasuredPoseProjectionForMotionAuthority() {

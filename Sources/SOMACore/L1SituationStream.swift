@@ -338,6 +338,7 @@ public enum L1InformationMotiveSource: String, Codable, Equatable, Sendable {
     case initialSocialOrientation = "initial_social_orientation"
     case interestDiscovery = "interest_discovery"
     case placeAffiliation = "place_affiliation"
+    case conversationFollowUp = "conversation_follow_up"
 }
 
 /// An information motive for a recognized person. The goal is not a script:
@@ -363,6 +364,18 @@ public struct L1InformationNeed: Codable, Equatable, Sendable {
         self.expectedInformationGain = expectedInformationGain.isFinite
             ? min(max(expectedInformationGain, 0), 1)
             : 0
+    }
+
+    /// A retained uncertainty may guide L1's private reasoning or an ongoing
+    /// conversation, but only needs grounded in a canonical social goal or a
+    /// prior participant conversation may initiate speech from silence.
+    public var permitsProactiveSpokenOpening: Bool {
+        switch source {
+        case .initialSocialOrientation, .interestDiscovery, .conversationFollowUp:
+            true
+        case .retainedMemoryGap, .placeAffiliation:
+            false
+        }
     }
 }
 

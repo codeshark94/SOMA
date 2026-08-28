@@ -251,7 +251,7 @@ public struct CameraGeometryCalibration: Codable, Equatable, Sendable {
 
     public var isValid: Bool {
         schemaVersion == 1
-            && resolvedDeviceProfile != nil
+            && !deviceProfile.isEmpty
             && [65, 78, 86].contains(fovMode)
             && imageWidth >= 640 && imageHeight >= 360
             && projection.isValid
@@ -278,6 +278,15 @@ public struct CameraGeometryCalibration: Codable, Equatable, Sendable {
     }
 
     public func applies(to profile: OBSBOTDeviceProfile) -> Bool {
-        resolvedDeviceProfile == profile
+        applies(toDeviceIdentifier: profile.rawValue)
+    }
+
+    public func applies(toDeviceIdentifier identifier: String) -> Bool {
+        if deviceProfile == identifier { return true }
+        switch deviceProfile {
+        case "obsbot_tiny_2_lite": return identifier == OBSBOTDeviceProfile.tiny2Lite.rawValue
+        case "obsbot_tiny_3_lite": return identifier == OBSBOTDeviceProfile.tiny3Lite.rawValue
+        default: return false
+        }
     }
 }

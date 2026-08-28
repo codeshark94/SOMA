@@ -584,6 +584,13 @@ LED signals are secondary and redundant with speech and gimbal behaviour. They
 must respect quiet/privacy preferences and must not override firmware status or
 claim that the microphone is muted when only a cosmetic light changed.
 
+Tiny 3 Lite exposes a narrower verified contract. Exploration, human presence,
+and eye contact leave its firmware-owned blue animation untouched because
+states `54` and `57` acknowledge host requests without producing distinct
+physical presentations. Conversation uses the verified yellow state `16`. The experimental private
+three-byte RGB command is not a valid device capability and is absent from the
+adapter and bridge.
+
 ## Panoramic spatial memory
 
 A panorama is useful when treated as a time-aware spatial atlas, not as one

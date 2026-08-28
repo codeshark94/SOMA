@@ -47,8 +47,7 @@ public enum OBSBOTTiny2LiteOptics {
 }
 
 public enum OBSBOTTiny3LiteOptics {
-    public static let wideHorizontalDegrees = OBSBOTDeviceProfile.tiny3Lite.capabilities
-        .nominalWideHorizontalFieldOfViewDegrees
+    public static let wideHorizontalDegrees = 72.0
 
     public static func horizontalDegrees(forFOVMode modeDegrees: Double) -> Double? {
         OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forSDKMode: modeDegrees)

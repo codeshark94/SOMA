@@ -41,12 +41,13 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertTrue(SOMALEDResponseMode.expressive.permits(.exploring))
         XCTAssertFalse(SOMALEDResponseMode.contextual.permits(.humanDetected))
         XCTAssertTrue(SOMALEDResponseMode.contextual.permits(.conversation))
-        XCTAssertFalse(SOMALEDResponseMode.quiet.permits(.working))
+        XCTAssertTrue(SOMALEDResponseMode.quiet.permits(.working))
         XCTAssertTrue(SOMALEDResponseMode.quiet.permits(.conversation))
         XCTAssertFalse(SOMALEDResponseMode.off.permits(.conversation))
     }
 
     func testLEDSignalsPersistPerStateColorAndCadence() throws {
+        let contract = tiny3LiteTestContract()
         var settings = SOMAControlSettings()
         settings.led.signals[.conversation] = .init(color: .green, pattern: .steady)
 
@@ -62,13 +63,13 @@ final class SOMAControlSettingsTests: XCTestCase {
         XCTAssertEqual(SOMALEDColor.yellow.displayName, "Yellow")
         XCTAssertEqual(SOMALEDColor.green.displayName, "Green")
         XCTAssertEqual(SOMALEDColor.blue.displayName, "Blue")
-        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.firmwareIndicatorStateID(for: .green))
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .green), .green)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .yellow), .yellow)
-        XCTAssertEqual(OBSBOTDeviceProfile.tiny3Lite.directIndicatorRGB(for: .blue), .blue)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .green), 54)
+        XCTAssertFalse(contract.usesFirmwareDefaultIndicator(for: .green))
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .yellow), 16)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .blue), 57)
         XCTAssertEqual(
-            decoded.led.signal(for: .contactReady).deviceRendering(for: .tiny3Lite),
-            .init(directRGB: .blue, pattern: .firmwareAnimation)
+            decoded.led.signal(for: .contactReady).deviceRendering(for: contract),
+            .init(stateID: 57, pattern: .blink)
         )
     }
 
@@ -83,30 +84,22 @@ final class SOMAControlSettingsTests: XCTestCase {
     }
 
     func testVoiceSessionDoesNotManufactureContactReadyBlink() {
+        let contract = tiny3LiteTestContract()
         let settings = SOMALEDSettings(
             signals: [
                 .exploring: .init(color: .green, pattern: .steady),
                 .humanDetected: .init(color: .blue, pattern: .steady),
-                .contactReady: .init(color: .green, pattern: .steady),
+                .contactReady: .init(color: .blue, pattern: .steady),
             ]
         )
 
-        XCTAssertEqual(
-            settings.deviceRendering(for: .humanDetected, on: .tiny3Lite),
-            .init(directRGB: .blue, pattern: .steady)
-        )
-        XCTAssertEqual(
-            settings.deviceRendering(for: .contactReady, on: .tiny3Lite),
-            .init(directRGB: .green, pattern: .steady)
-        )
+        XCTAssertEqual(settings.deviceRendering(for: .humanDetected, on: contract), .init(stateID: 57, pattern: .steady))
+        XCTAssertEqual(settings.deviceRendering(for: .contactReady, on: contract), .init(stateID: 57, pattern: .steady))
 
         let expressiveContact = SOMALEDSettings(
-            signals: [.contactReady: .init(color: .green, pattern: .heartbeat)]
+            signals: [.contactReady: .init(color: .blue, pattern: .heartbeat)]
         )
-        XCTAssertEqual(
-            expressiveContact.deviceRendering(for: .contactReady, on: .tiny3Lite),
-            .init(directRGB: .green, pattern: .heartbeat)
-        )
+        XCTAssertEqual(expressiveContact.deviceRendering(for: .contactReady, on: contract), .init(stateID: 57, pattern: .heartbeat))
     }
 
     func testVersionOneSettingsMigrateToStateSignals() throws {
@@ -199,8 +192,8 @@ final class SOMAControlSettingsTests: XCTestCase {
 
         XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
         XCTAssertEqual(
-            migrated.led.signal(for: .contactReady).deviceRendering(for: .tiny3Lite),
-            .init(directRGB: .blue, pattern: .blink)
+            migrated.led.signal(for: .contactReady).deviceRendering(for: tiny3LiteTestContract()),
+            .init(stateID: 57, pattern: .blink)
         )
     }
 

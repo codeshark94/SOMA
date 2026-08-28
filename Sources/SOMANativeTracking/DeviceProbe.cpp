@@ -12,8 +12,11 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <dev/devs.hpp>
+
+#include "OBSBOTDeviceContract.hpp"
 
 namespace {
 
@@ -27,172 +30,8 @@ void deviceChanged(std::string serial, bool connected, void *) {
     }
 }
 
-const char *profileName(ObsbotProductType type) {
-    switch (type) {
-    case ObsbotProdTiny2Lite: return "tiny_2_lite";
-    case ObsbotProdTiny3Lite: return "tiny_3_lite";
-    default: return "unsupported";
-    }
-}
-
-bool supported(ObsbotProductType type) {
-    return type == ObsbotProdTiny2Lite || type == ObsbotProdTiny3Lite;
-}
-
-struct Capabilities {
-    bool calibratedMotorControl;
-    bool firmwareIndicatorPalette;
-    bool indicatorEnableAndBrightness;
-    bool selectableAudioModes;
-    bool soundLocalization;
-    bool requiresMeasuredAttitudeFrame;
-    double maximumPanDegreesPerSecond;
-    double maximumPitchDegreesPerSecond;
-};
-
-Capabilities capabilitiesFor(ObsbotProductType type) {
-    if (type == ObsbotProdTiny3Lite) {
-        return {false, true, true, true, true, true, 90, 45};
-    }
-    return {true, true, true, false, false, false, 180, 90};
-}
-
-constexpr uintptr_t kBundledSysMgSetIndicatorStateOffset = 0x447f4;
-constexpr uintptr_t kBundledConvertFrameV3Offset = 0x3e32c;
-constexpr uintptr_t kBundledFinalizeFrameV3Offset = 0x3d9e0;
-constexpr uintptr_t kBundledSendMsgAsyncOffset = 0x5ad20;
-constexpr uintptr_t kBundledSendMsgSyncOffset = 0x59f54;
-constexpr uint16_t kTiny3PaletteCommandSet = 13;
-// Tiny 3 Lite firmware 6.5.10.1 dispatches the three-byte palette payload
-// through the indicator service at operation 456.
-constexpr uint16_t kTiny3PaletteCommandID = 456;
-constexpr uint16_t kTiny3SystemManagerTarget = 11;
-constexpr uint16_t kFrmPacketHeaderSize = 12;
-constexpr size_t kTiny3FrameCapacity = 0x1820;
-
-using ConvertFrameV3 = void (*)(void *, uint8_t *, bool);
-using FinalizeFrameV3 = void (*)(uint8_t *);
-using TransparentTransmit = int32_t (*)(Device *, uint8_t *, size_t, uint8_t *, size_t &);
-using SendMsgAsync = int32_t (*)(void *, void *, bool, bool);
-using SendMsgSync = int32_t (*)(void *, void *, uint8_t *, int32_t, bool);
-
-struct PrivatePaletteFrame {
-    std::array<uint8_t, 64> bytes {};
-    size_t length = 0;
-};
-
-void writeU16LE(uint8_t *destination, uint16_t value) {
-    destination[0] = static_cast<uint8_t>(value & 0xff);
-    destination[1] = static_cast<uint8_t>(value >> 8);
-}
-
-uint16_t readU16LE(const uint8_t *source) {
-    return static_cast<uint16_t>(source[0])
-        | (static_cast<uint16_t>(source[1]) << 8);
-}
-
-void writeU32LE(uint8_t *destination, uint32_t value) {
-    for (size_t index = 0; index < 4; ++index) {
-        destination[index] = static_cast<uint8_t>(value >> (index * 8));
-    }
-}
-
-void writeU64LE(uint8_t *destination, uint64_t value) {
-    for (size_t index = 0; index < 8; ++index) {
-        destination[index] = static_cast<uint8_t>(value >> (index * 8));
-    }
-}
-
-std::string hexBytes(const uint8_t *bytes, size_t length) {
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (size_t index = 0; index < length; ++index) {
-        if (index > 0) output << ':';
-        output << std::setw(2) << static_cast<unsigned int>(bytes[index]);
-    }
-    return output.str();
-}
-
-std::optional<uintptr_t> bundledLibdevBase(std::string &failure) {
-    const auto indicatorMember = &Device::sysMgSetIndicatorStateR;
-    void *indicatorSymbol = nullptr;
-    static_assert(sizeof(indicatorMember) >= sizeof(indicatorSymbol));
-    std::memcpy(&indicatorSymbol, &indicatorMember, sizeof(indicatorSymbol));
-    Dl_info image {};
-    if (!indicatorSymbol || dladdr(indicatorSymbol, &image) == 0 || !image.dli_fbase) {
-        failure = "bundled_sdk_image_unavailable";
-        return std::nullopt;
-    }
-    const auto imageBase = reinterpret_cast<uintptr_t>(image.dli_fbase);
-    const auto indicatorOffset = reinterpret_cast<uintptr_t>(indicatorSymbol) - imageBase;
-    if (indicatorOffset != kBundledSysMgSetIndicatorStateOffset) {
-        failure = "unsupported_libdev_layout";
-        return std::nullopt;
-    }
-    return imageBase;
-}
-
-std::optional<PrivatePaletteFrame> makeTiny3PaletteFrame(
-    Device *device,
-    uint8_t red,
-    uint8_t green,
-    uint8_t blue,
-    bool synchronous,
-    std::string &failure
-) {
-    const auto imageBase = bundledLibdevBase(failure);
-    if (!imageBase) return std::nullopt;
-
-    const auto convert = reinterpret_cast<ConvertFrameV3>(*imageBase + kBundledConvertFrameV3Offset);
-    const auto finalize = reinterpret_cast<FinalizeFrameV3>(*imageBase + kBundledFinalizeFrameV3Offset);
-    if (!convert || !finalize) {
-        failure = "bundled_sdk_protocol_helpers_unavailable";
-        return std::nullopt;
-    }
-
-    std::array<uint8_t, kTiny3FrameCapacity> frame {};
-    writeU16LE(frame.data(), 13);
-    writeU32LE(frame.data() + 4, 1);
-    frame[11] = 20;
-    frame[12] = 11;
-    writeU16LE(frame.data() + 14, 17);
-    writeU16LE(frame.data() + 16, kTiny3PaletteCommandSet);
-    writeU32LE(frame.data() + 24, static_cast<uint32_t>(device->devMode()));
-
-    PrivatePaletteFrame result;
-    convert(frame.data(), result.bytes.data(), false);
-    const uint16_t generatedFrameLength = readU16LE(frame.data());
-    const uint16_t generatedHeaderLength = readU16LE(result.bytes.data() + 4);
-    if (result.bytes[0] != 0xaa || generatedHeaderLength != 12
-        || generatedFrameLength != 17 || result.bytes[12] != 1) {
-        failure = "unexpected_v3_frame_shape=" + hexBytes(result.bytes.data(), 24);
-        return std::nullopt;
-    }
-
-    const uint16_t packedCommand = static_cast<uint16_t>(
-        (kTiny3PaletteCommandID << 6) | kTiny3PaletteCommandSet
-    );
-    writeU16LE(result.bytes.data() + 10, packedCommand);
-    writeU16LE(result.bytes.data() + 12, 3);
-    result.bytes[14] = 0;
-    result.bytes[15] = 0;
-    result.bytes[16] = red;
-    result.bytes[17] = green;
-    result.bytes[18] = blue;
-    if (synchronous) result.bytes[1] &= static_cast<uint8_t>(~0x1c);
-    finalize(result.bytes.data());
-
-    result.length = 19;
-    return result;
-}
-
-struct NativePaletteMessage {
-    std::array<uint8_t, kTiny3FrameCapacity> bytes {};
-    void *devicePrivate = nullptr;
-    SendMsgAsync send = nullptr;
-    SendMsgSync sendSync = nullptr;
-};
-
+using SetTallyLight = int32_t (*)(Device *, bool);
+using GetTallyAndBatteryLight = int32_t (*)(Device *, bool &, int32_t &, bool &);
 struct NativeHumanTrackingPolicy {
     int speedMode = Device::DevGimCtrlSpeedModeFast;
     bool motionTracking = true;
@@ -210,43 +49,14 @@ struct AbsoluteExposureRequest {
     bool automatic = true;
 };
 
+struct TallyLightRequest {
+    bool enabled = false;
+    std::chrono::milliseconds hold {0};
+};
+
 bool validNativeHumanTrackingSpeedMode(int speedMode) {
     return speedMode >= Device::DevGimCtrlSpeedModeSuperLazy
         && speedMode <= Device::DevGimCtrlSpeedModeCrazy;
-}
-
-std::optional<NativePaletteMessage> makeTiny3NativePaletteMessage(
-    Device *device,
-    uint8_t red,
-    uint8_t green,
-    uint8_t blue,
-    std::string &failure
-) {
-    const auto imageBase = bundledLibdevBase(failure);
-    if (!imageBase) return std::nullopt;
-
-    auto *const devicePrivate = *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(device) + 8);
-    if (!devicePrivate) {
-        failure = "bundled_sdk_device_private_unavailable";
-        return std::nullopt;
-    }
-
-    NativePaletteMessage message;
-    message.devicePrivate = devicePrivate;
-    message.send = reinterpret_cast<SendMsgAsync>(*imageBase + kBundledSendMsgAsyncOffset);
-    message.sendSync = reinterpret_cast<SendMsgSync>(*imageBase + kBundledSendMsgSyncOffset);
-    writeU16LE(message.bytes.data(), kFrmPacketHeaderSize + 3);
-    writeU64LE(message.bytes.data() + 4, 0x0014000000000000ULL);
-    writeU16LE(message.bytes.data() + 12, kTiny3SystemManagerTarget);
-    writeU16LE(message.bytes.data() + 14, kTiny3PaletteCommandID);
-    writeU16LE(message.bytes.data() + 16, kTiny3PaletteCommandSet);
-    const auto *const privateBytes = reinterpret_cast<const uint8_t *>(devicePrivate);
-    std::memcpy(message.bytes.data() + 20, privateBytes + 0x12f8, sizeof(uint32_t));
-    std::memcpy(message.bytes.data() + 24, privateBytes + 0x14, sizeof(uint32_t));
-    message.bytes[28] = red;
-    message.bytes[29] = green;
-    message.bytes[30] = blue;
-    return message;
 }
 
 }  // namespace
@@ -254,6 +64,8 @@ std::optional<NativePaletteMessage> makeTiny3NativePaletteMessage(
 int main(int argc, char *argv[]) {
     std::optional<bool> requestedLedEnabled;
     std::optional<uint8_t> requestedIndicatorState;
+    std::vector<uint8_t> requestedIndicatorSets;
+    std::vector<uint8_t> requestedIndicatorClears;
     std::optional<float> requestedZoomVerification;
     std::optional<uint8_t> requestedAudioModeVerification;
     std::optional<Device::DevAudioVQEType> requestedAudioVQEVerification;
@@ -272,16 +84,57 @@ int main(int argc, char *argv[]) {
     std::optional<int32_t> requestedAntiFlickerVerification;
     std::optional<Device::FovType> requestedFOVVerification;
     std::optional<bool> requestedDoaFindBackVerification;
-    std::optional<std::array<uint8_t, 3>> requestedPrivatePalette;
-    std::optional<std::array<uint8_t, 3>> requestedNativePalette;
-    std::optional<uint8_t> nativePaletteClearState;
-    bool nativePaletteSynchronous = false;
-    bool privatePaletteSynchronous = false;
-    bool inspectPrivatePalette = false;
+    std::optional<TallyLightRequest> requestedTallyLight;
+    std::chrono::milliseconds indicatorStateHold {1200};
+    std::chrono::milliseconds nativeTrackingDisabledHold {0};
+    bool disableNativeTracking = false;
     bool inspectOptics = false;
     bool inspectGimbalTracking = false;
     bool inspectNativeTrackingTuning = false;
-    if (argc == 3 && std::string(argv[1]) == "--set-led-enabled") {
+    if (argc == 2 && std::string(argv[1]) == "--disable-native-tracking") {
+        disableNativeTracking = true;
+    } else if (argc == 3 && std::string(argv[1]) == "--disable-native-tracking-for") {
+        try {
+            size_t consumed = 0;
+            const int holdMilliseconds = std::stoi(argv[2], &consumed);
+            if (consumed != std::string(argv[2]).size() || holdMilliseconds < 1'000 || holdMilliseconds > 60'000) {
+                throw std::out_of_range("hold duration");
+            }
+            disableNativeTracking = true;
+            nativeTrackingDisabledHold = std::chrono::milliseconds(holdMilliseconds);
+        } catch (...) {
+            std::cerr << "Usage: soma-obsbot-probe --disable-native-tracking-for HOLD_MS(1000..60000)\n";
+            return 64;
+        }
+    } else if (argc >= 3 && std::string(argv[1]) == "--set-indicator-states") {
+        try {
+            for (int index = 2; index < argc; ++index) {
+                size_t consumed = 0;
+                const int state = std::stoi(argv[index], &consumed);
+                if (consumed != std::string(argv[index]).size() || state < 0 || state > 255) {
+                    throw std::out_of_range("indicator state");
+                }
+                requestedIndicatorSets.push_back(static_cast<uint8_t>(state));
+            }
+        } catch (...) {
+            std::cerr << "Usage: soma-obsbot-probe --set-indicator-states STATE...\n";
+            return 64;
+        }
+    } else if (argc >= 3 && std::string(argv[1]) == "--clear-indicator-states") {
+        try {
+            for (int index = 2; index < argc; ++index) {
+                size_t consumed = 0;
+                const int state = std::stoi(argv[index], &consumed);
+                if (consumed != std::string(argv[index]).size() || state < 0 || state > 255) {
+                    throw std::out_of_range("indicator state");
+                }
+                requestedIndicatorClears.push_back(static_cast<uint8_t>(state));
+            }
+        } catch (...) {
+            std::cerr << "Usage: soma-obsbot-probe --clear-indicator-states STATE...\n";
+            return 64;
+        }
+    } else if (argc == 3 && std::string(argv[1]) == "--set-led-enabled") {
         const std::string value = argv[2];
         if (value == "0") {
             requestedLedEnabled = false;
@@ -299,6 +152,39 @@ int main(int argc, char *argv[]) {
             requestedIndicatorState = static_cast<uint8_t>(state);
         } catch (...) {
             std::cerr << "Usage: soma-obsbot-probe [--set-led-enabled 0|1 | --verify-indicator-state 0..255]\n";
+            return 64;
+        }
+    } else if (argc == 4 && std::string(argv[1]) == "--verify-indicator-state-for") {
+        try {
+            size_t consumed = 0;
+            const int state = std::stoi(argv[2], &consumed);
+            if (consumed != std::string(argv[2]).size() || state < 0 || state > 255) throw std::out_of_range("state");
+            consumed = 0;
+            const int holdMilliseconds = std::stoi(argv[3], &consumed);
+            if (consumed != std::string(argv[3]).size() || holdMilliseconds < 250 || holdMilliseconds > 10'000) {
+                throw std::out_of_range("hold duration");
+            }
+            requestedIndicatorState = static_cast<uint8_t>(state);
+            indicatorStateHold = std::chrono::milliseconds(holdMilliseconds);
+        } catch (...) {
+            std::cerr << "Usage: soma-obsbot-probe --verify-indicator-state-for STATE(0..255) HOLD_MS(250..10000)\n";
+            return 64;
+        }
+    } else if (argc == 4 && std::string(argv[1]) == "--verify-tally-light-for") {
+        try {
+            size_t consumed = 0;
+            const int enabled = std::stoi(argv[2], &consumed);
+            if (consumed != std::string(argv[2]).size() || (enabled != 0 && enabled != 1)) {
+                throw std::out_of_range("tally enabled");
+            }
+            consumed = 0;
+            const int holdMilliseconds = std::stoi(argv[3], &consumed);
+            if (consumed != std::string(argv[3]).size() || holdMilliseconds < 250 || holdMilliseconds > 10'000) {
+                throw std::out_of_range("tally hold duration");
+            }
+            requestedTallyLight = TallyLightRequest {enabled == 1, std::chrono::milliseconds(holdMilliseconds)};
+        } catch (...) {
+            std::cerr << "Usage: soma-obsbot-probe --verify-tally-light-for ENABLED(0|1) HOLD_MS(250..10000)\n";
             return 64;
         }
     } else if (argc == 3 && std::string(argv[1]) == "--verify-zoom") {
@@ -546,57 +432,8 @@ int main(int argc, char *argv[]) {
         inspectGimbalTracking = true;
     } else if (argc == 2 && std::string(argv[1]) == "--inspect-native-tracking-tuning") {
         inspectNativeTrackingTuning = true;
-    } else if (argc == 2 && std::string(argv[1]) == "--inspect-private-palette") {
-        inspectPrivatePalette = true;
-    } else if (argc == 6 && std::string(argv[1]) == "--verify-native-palette-after-clear") {
-        std::array<uint8_t, 3> colour {};
-        try {
-            size_t consumed = 0;
-            const int state = std::stoi(argv[2], &consumed);
-            if (consumed != std::string(argv[2]).size() || state < 0 || state > 255) throw std::out_of_range("state");
-            for (size_t index = 0; index < colour.size(); ++index) {
-                consumed = 0;
-                const int value = std::stoi(argv[index + 3], &consumed);
-                if (consumed != std::string(argv[index + 3]).size() || value < 0 || value > 255) {
-                    throw std::out_of_range("colour");
-                }
-                colour[index] = static_cast<uint8_t>(value);
-            }
-            requestedNativePalette = colour;
-            nativePaletteClearState = static_cast<uint8_t>(state);
-            nativePaletteSynchronous = true;
-        } catch (...) {
-            std::cerr << "Usage: soma-obsbot-probe [--set-led-enabled 0|1 | --verify-indicator-state 0..255 | --inspect-private-palette | --verify-private-palette R G B | --verify-private-palette-sync R G B | --verify-native-palette R G B | --verify-native-palette-sync R G B | --verify-native-palette-after-clear STATE R G B]\n";
-            return 64;
-        }
-    } else if (argc == 5 && (std::string(argv[1]) == "--verify-private-palette"
-        || std::string(argv[1]) == "--verify-private-palette-sync"
-        || std::string(argv[1]) == "--verify-native-palette"
-        || std::string(argv[1]) == "--verify-native-palette-sync")) {
-        std::array<uint8_t, 3> colour {};
-        try {
-            for (size_t index = 0; index < colour.size(); ++index) {
-                size_t consumed = 0;
-                const int value = std::stoi(argv[index + 2], &consumed);
-                if (consumed != std::string(argv[index + 2]).size() || value < 0 || value > 255) {
-                    throw std::out_of_range("colour");
-                }
-                colour[index] = static_cast<uint8_t>(value);
-            }
-            if (std::string(argv[1]) == "--verify-native-palette"
-                || std::string(argv[1]) == "--verify-native-palette-sync") {
-                requestedNativePalette = colour;
-                nativePaletteSynchronous = std::string(argv[1]) == "--verify-native-palette-sync";
-            } else {
-                requestedPrivatePalette = colour;
-                privatePaletteSynchronous = std::string(argv[1]) == "--verify-private-palette-sync";
-            }
-        } catch (...) {
-            std::cerr << "Usage: soma-obsbot-probe [--set-led-enabled 0|1 | --verify-indicator-state 0..255 | --inspect-private-palette | --verify-private-palette R G B | --verify-private-palette-sync R G B | --verify-native-palette R G B | --verify-native-palette-sync R G B | --verify-native-palette-after-clear STATE R G B]\n";
-            return 64;
-        }
     } else if (argc != 1) {
-        std::cerr << "Usage: soma-obsbot-probe [--set-led-enabled 0|1 | --verify-indicator-state 0..255 | --inspect-private-palette | --verify-private-palette R G B | --verify-private-palette-sync R G B | --verify-native-palette R G B | --verify-native-palette-sync R G B | --verify-native-palette-after-clear STATE R G B]\n";
+        std::cerr << "Usage: soma-obsbot-probe [--set-led-enabled 0|1 | --verify-indicator-state 0..255]\n";
         return 64;
     }
 
@@ -619,9 +456,16 @@ int main(int argc, char *argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    if (!device || !supported(device->productType())) {
-        std::cerr << "SOMA_OBSBOT_CAPABILITY unavailable=true reason=device_unavailable_or_unsupported\n";
+    if (!device) {
+        std::cerr << "SOMA_OBSBOT_CAPABILITY contract=2 profile=unknown native_bridge=false unavailable=true reason=device_unavailable\n";
         return 2;
+    }
+    const auto &adapter = soma::obsbotDeviceAdapter(device->productType());
+    const int disableNativeTrackingResult = disableNativeTracking
+        ? adapter.disableNativeTracking(device.get())
+        : RM_RET_OK;
+    if (disableNativeTrackingResult == RM_RET_OK && nativeTrackingDisabledHold.count() > 0) {
+        std::this_thread::sleep_for(nativeTrackingDisabledHold);
     }
 
     Device::CameraStatus status{};
@@ -2048,6 +1892,30 @@ int main(int argc, char *argv[]) {
     int indicatorSetResult = RM_RET_OK;
     int indicatorClearResult = RM_RET_OK;
     int indicatorRestoreResult = RM_RET_OK;
+    int indicatorBaselineRestoreResult = RM_RET_OK;
+    int indicatorBulkSetResult = RM_RET_OK;
+    int indicatorBulkClearResult = RM_RET_OK;
+    for (const uint8_t state : requestedIndicatorSets) {
+        try {
+            if (device->sysMgSetIndicatorStateR(state) != RM_RET_OK) {
+                indicatorBulkSetResult = RM_RET_ERR;
+            }
+        } catch (...) {
+            indicatorBulkSetResult = RM_RET_ERR;
+        }
+    }
+    for (const uint8_t state : requestedIndicatorClears) {
+        try {
+            if (device->sysMgClearIndicatorStateR(state) != RM_RET_OK) {
+                indicatorBulkClearResult = RM_RET_ERR;
+            }
+        } catch (...) {
+            indicatorBulkClearResult = RM_RET_ERR;
+        }
+    }
+    if (!requestedIndicatorClears.empty()) {
+        indicatorBaselineRestoreResult = adapter.establishIndicatorBaseline(device.get());
+    }
     if (requestedIndicatorState) {
         if (ledEnabledResult == RM_RET_OK && !baselineLedEnabled) {
             indicatorRestoreResult = setLedEnabled ? setLedEnabled(device.get(), true) : RM_RET_ERR;
@@ -2058,11 +1926,14 @@ int main(int argc, char *argv[]) {
             } catch (...) {
                 indicatorSetResult = RM_RET_ERR;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+            std::this_thread::sleep_for(indicatorStateHold);
             try {
                 indicatorClearResult = device->sysMgClearIndicatorStateR(*requestedIndicatorState);
             } catch (...) {
                 indicatorClearResult = RM_RET_ERR;
+            }
+            if (indicatorClearResult == RM_RET_OK) {
+                indicatorBaselineRestoreResult = adapter.establishIndicatorBaseline(device.get());
             }
         } else {
             indicatorSetResult = RM_RET_ERR;
@@ -2072,78 +1943,46 @@ int main(int argc, char *argv[]) {
             indicatorRestoreResult = setLedEnabled(device.get(), false);
         }
     }
-    std::string privatePaletteFailure;
-    std::optional<PrivatePaletteFrame> privatePaletteFrame;
-    if (inspectPrivatePalette || requestedPrivatePalette) {
-        const auto colour = requestedPrivatePalette.value_or(std::array<uint8_t, 3> {0, 0, 255});
-        privatePaletteFrame = makeTiny3PaletteFrame(
-            device.get(), colour[0], colour[1], colour[2], privatePaletteSynchronous, privatePaletteFailure
+    int tallyBaselineResult = RM_RET_ERR;
+    bool tallyBaselineEnabled = false;
+    int32_t tallyBaselineBrightness = 0;
+    bool batteryBaselineEnabled = false;
+    int tallySetResult = RM_RET_OK;
+    int tallyRestoreResult = RM_RET_OK;
+    if (requestedTallyLight) {
+        const auto setTally = reinterpret_cast<SetTallyLight>(
+            dlsym(RTLD_DEFAULT, "_ZN6Device20cameraSetTallyLightREb")
         );
-    }
-    int privatePaletteResult = RM_RET_OK;
-    size_t privatePaletteResponseLength = 0;
-    std::array<uint8_t, 64> privatePaletteResponse {};
-    if (requestedPrivatePalette && privatePaletteFrame) {
-        const auto transparentTransmit = reinterpret_cast<TransparentTransmit>(
-            dlsym(RTLD_DEFAULT, "_ZN6Device19transparentTransmitEPhmS0_Rm")
+        const auto getTally = reinterpret_cast<GetTallyAndBatteryLight>(
+            dlsym(RTLD_DEFAULT, "_ZN6Device30cameraGetTallyAndBatteryLightRERbRiS0_")
         );
-        if (!transparentTransmit) {
-            privatePaletteResult = RM_RET_ERR;
-            privatePaletteFailure = "bundled_sdk_transparent_transport_unavailable";
+        if (!setTally) {
+            tallySetResult = RM_RET_ERR;
+            tallyRestoreResult = RM_RET_ERR;
         } else {
-            privatePaletteResponseLength = privatePaletteResponse.size();
+            if (getTally) {
+                try {
+                    tallyBaselineResult = getTally(
+                        device.get(), tallyBaselineEnabled, tallyBaselineBrightness, batteryBaselineEnabled
+                    );
+                } catch (...) {
+                    tallyBaselineResult = RM_RET_ERR;
+                }
+            }
             try {
-                privatePaletteResult = transparentTransmit(
-                    device.get(),
-                    privatePaletteFrame->bytes.data(),
-                    privatePaletteFrame->length,
-                    privatePaletteResponse.data(),
-                    privatePaletteResponseLength
+                tallySetResult = setTally(device.get(), requestedTallyLight->enabled);
+            } catch (...) {
+                tallySetResult = RM_RET_ERR;
+            }
+            std::this_thread::sleep_for(requestedTallyLight->hold);
+            try {
+                tallyRestoreResult = setTally(
+                    device.get(), tallyBaselineResult == RM_RET_OK ? tallyBaselineEnabled : false
                 );
             } catch (...) {
-                privatePaletteResult = RM_RET_ERR;
-                privatePaletteFailure = "private_palette_transport_exception";
+                tallyRestoreResult = RM_RET_ERR;
             }
         }
-    } else if (requestedPrivatePalette && !privatePaletteFrame) {
-        privatePaletteResult = RM_RET_ERR;
-    }
-    std::string nativePaletteFailure;
-    std::optional<NativePaletteMessage> nativePaletteMessage;
-    if (requestedNativePalette) {
-        nativePaletteMessage = makeTiny3NativePaletteMessage(
-            device.get(), (*requestedNativePalette)[0], (*requestedNativePalette)[1], (*requestedNativePalette)[2], nativePaletteFailure
-        );
-    }
-    int nativePaletteResult = RM_RET_OK;
-    int nativePaletteClearResult = RM_RET_OK;
-    int nativePaletteRestoreResult = RM_RET_OK;
-    std::array<uint8_t, kTiny3FrameCapacity> nativePaletteResponse {};
-    if (requestedNativePalette && nativePaletteMessage) {
-        try {
-            if (nativePaletteClearState) {
-                nativePaletteClearResult = device->sysMgClearIndicatorStateR(*nativePaletteClearState);
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-            if (nativePaletteSynchronous) {
-                nativePaletteResult = nativePaletteMessage->sendSync(
-                    nativePaletteMessage->devicePrivate, nativePaletteMessage->bytes.data(), nativePaletteResponse.data(), 1, false
-                );
-            } else {
-                nativePaletteResult = nativePaletteMessage->send(
-                    nativePaletteMessage->devicePrivate, nativePaletteMessage->bytes.data(), false, false
-                );
-            }
-            if (nativePaletteClearState) {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                nativePaletteRestoreResult = device->sysMgSetIndicatorStateR(*nativePaletteClearState);
-            }
-        } catch (...) {
-            nativePaletteResult = RM_RET_ERR;
-            nativePaletteFailure = "native_palette_transport_exception";
-        }
-    } else if (requestedNativePalette) {
-        nativePaletteResult = RM_RET_ERR;
     }
     int32_t imageBrightness = 0;
     int32_t imageContrast = 0;
@@ -2172,18 +2011,35 @@ int main(int argc, char *argv[]) {
     const int gimbalStatusResult = getGimbalAllInfo
         ? getGimbalAllInfo(device.get(), gimbalStatus)
         : RM_RET_ERR;
-    const auto capabilities = capabilitiesFor(device->productType());
+    const auto &capabilities = adapter.contract();
 
-    std::cout << "SOMA_OBSBOT_PROFILE=" << profileName(device->productType()) << "\n";
-    std::cout << "SOMA_OBSBOT_CAPABILITY profile=" << profileName(device->productType())
+    std::cout << "SOMA_OBSBOT_CAPABILITY contract=2"
+              << " profile=" << capabilities.identifier
+              << " product_type=" << static_cast<int>(device->productType())
+              << " native_bridge=" << (capabilities.nativeBridge ? "true" : "false")
               << " motor_calibrated=" << (capabilities.calibratedMotorControl ? "true" : "false")
+              << " bounded_calibration_pulses=" << (capabilities.boundedCalibrationPulses ? "true" : "false")
+              << " native_human_tracking=" << (capabilities.nativeHumanTracking ? "true" : "false")
               << " indicator_palette=" << (capabilities.firmwareIndicatorPalette ? "true" : "false")
+              << " indicator_default_green=" << (capabilities.firmwareDefaultIndicatorGreen ? "true" : "false")
+              << " indicator_direct_rgb=" << (capabilities.directIndicatorColorMask != 0 ? "true" : "false")
+              << " indicator_direct_rgb_mask=" << static_cast<int>(capabilities.directIndicatorColorMask)
               << " indicator_basic=" << (capabilities.indicatorEnableAndBrightness ? "true" : "false")
               << " selectable_audio_modes=" << (capabilities.selectableAudioModes ? "true" : "false")
+              << " supported_audio_mode_mask=" << static_cast<int>(capabilities.supportedAudioModeMask)
               << " sound_localization=" << (capabilities.soundLocalization ? "true" : "false")
               << " requires_measured_attitude_frame=" << (capabilities.requiresMeasuredAttitudeFrame ? "true" : "false")
+              << " indicator_base_state_id=" << capabilities.indicatorBaseStateID
+              << " indicator_yellow_state_id=" << capabilities.yellowIndicatorStateID
+              << " indicator_green_state_id=" << capabilities.greenIndicatorStateID
+              << " indicator_blue_state_id=" << capabilities.blueIndicatorStateID
               << " maximum_pan_degrees_per_second=" << capabilities.maximumPanDegreesPerSecond
               << " maximum_pitch_degrees_per_second=" << capabilities.maximumPitchDegreesPerSecond
+              << " nominal_wide_horizontal_fov_degrees=" << capabilities.nominalWideHorizontalFieldOfViewDegrees
+              << " native_tracking_transport=" << static_cast<int>(capabilities.nativeTrackingTransport)
+              << " disable_native_tracking_result=" << (disableNativeTracking ? std::to_string(disableNativeTrackingResult) : "not_requested")
+              << " firmware=" << device->devVersion()
+              << " serial=" << device->devSn()
               << " attitude_pitch=" << (attitudeResult == RM_RET_OK ? std::to_string(attitudeXYZ[1]) : "unknown")
               << " attitude_pan=" << (attitudeResult == RM_RET_OK ? std::to_string(attitudeXYZ[2]) : "unknown")
               << " gimbal_status_result=" << gimbalStatusResult
@@ -2197,6 +2053,10 @@ int main(int argc, char *argv[]) {
               << " gimbal_pitch_motor=" << (gimbalStatusResult == RM_RET_OK ? std::to_string(gimbalStatus.pitch_motor_d) : "unknown")
               << " gimbal_pan_motor=" << (gimbalStatusResult == RM_RET_OK ? std::to_string(gimbalStatus.pan_motor_d) : "unknown")
               << " device_status=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.dev_status) : "unknown")
+              << " ai_mode=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.ai_mode) : "unknown")
+              << " ai_sub_mode=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.ai_sub_mode) : "unknown")
+              << " ai_target=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.ai_target) : "unknown")
+              << " boot_mode=" << (statusResult == RM_RET_OK ? std::to_string(status.tiny.boot_mode) : "unknown")
               << " zoom_baseline_result=" << baselineZoomResult
               << " zoom_baseline=" << (baselineZoomResult == RM_RET_OK ? std::to_string(baselineZoom) : "unknown")
               << " zoom_requested=" << (requestedZoomVerification ? std::to_string(*requestedZoomVerification) : "not_requested")
@@ -2363,21 +2223,18 @@ int main(int argc, char *argv[]) {
               << " indicator_set_result=" << (requestedIndicatorState ? std::to_string(indicatorSetResult) : "not_requested")
               << " indicator_clear_result=" << (requestedIndicatorState ? std::to_string(indicatorClearResult) : "not_requested")
               << " indicator_restore_result=" << (requestedIndicatorState ? std::to_string(indicatorRestoreResult) : "not_requested")
-              << " private_palette_frame=" << (privatePaletteFrame ? hexBytes(privatePaletteFrame->bytes.data(), privatePaletteFrame->length) : "unavailable")
-              << " private_palette_result=" << (requestedPrivatePalette ? std::to_string(privatePaletteResult) : "not_requested")
-              << " private_palette_response=" << (requestedPrivatePalette && privatePaletteResult == RM_RET_OK
-                    ? hexBytes(privatePaletteResponse.data(), privatePaletteResponseLength)
-                    : "not_available")
-              << " private_palette_failure=" << (privatePaletteFailure.empty() ? "none" : privatePaletteFailure)
-              << " native_palette_result=" << (requestedNativePalette ? std::to_string(nativePaletteResult) : "not_requested")
-              << " native_palette_message=" << (nativePaletteMessage ? hexBytes(nativePaletteMessage->bytes.data(), 31) : "unavailable")
-              << " native_palette_response=" << (requestedNativePalette && nativePaletteSynchronous && nativePaletteResult == RM_RET_OK
-                    ? hexBytes(nativePaletteResponse.data(), 16)
-                    : "not_available")
-              << " native_palette_clear_state=" << (nativePaletteClearState ? std::to_string(*nativePaletteClearState) : "not_requested")
-              << " native_palette_clear_result=" << (nativePaletteClearState ? std::to_string(nativePaletteClearResult) : "not_requested")
-              << " native_palette_restore_result=" << (nativePaletteClearState ? std::to_string(nativePaletteRestoreResult) : "not_requested")
-              << " native_palette_failure=" << (nativePaletteFailure.empty() ? "none" : nativePaletteFailure)
+              << " indicator_baseline_restore_result=" << (requestedIndicatorState || !requestedIndicatorClears.empty() ? std::to_string(indicatorBaselineRestoreResult) : "not_requested")
+              << " indicator_bulk_set_count=" << requestedIndicatorSets.size()
+              << " indicator_bulk_set_result=" << (!requestedIndicatorSets.empty() ? std::to_string(indicatorBulkSetResult) : "not_requested")
+              << " indicator_bulk_clear_count=" << requestedIndicatorClears.size()
+              << " indicator_bulk_clear_result=" << (!requestedIndicatorClears.empty() ? std::to_string(indicatorBulkClearResult) : "not_requested")
+              << " tally_requested=" << (requestedTallyLight ? (*requestedTallyLight).enabled ? "true" : "false" : "not_requested")
+              << " tally_baseline_result=" << (requestedTallyLight ? std::to_string(tallyBaselineResult) : "not_requested")
+              << " tally_baseline_enabled=" << (requestedTallyLight && tallyBaselineResult == RM_RET_OK ? tallyBaselineEnabled ? "true" : "false" : "not_available")
+              << " tally_baseline_brightness=" << (requestedTallyLight && tallyBaselineResult == RM_RET_OK ? std::to_string(tallyBaselineBrightness) : "not_available")
+              << " battery_baseline_enabled=" << (requestedTallyLight && tallyBaselineResult == RM_RET_OK ? batteryBaselineEnabled ? "true" : "false" : "not_available")
+              << " tally_set_result=" << (requestedTallyLight ? std::to_string(tallySetResult) : "not_requested")
+              << " tally_restore_result=" << (requestedTallyLight ? std::to_string(tallyRestoreResult) : "not_requested")
               << " image_brightness=" << (imageBrightnessResult == RM_RET_OK ? std::to_string(imageBrightness) : "unknown")
               << " image_contrast=" << (imageContrastResult == RM_RET_OK ? std::to_string(imageContrast) : "unknown")
               << " image_hue=" << (imageHueResult == RM_RET_OK ? std::to_string(imageHue) : "unknown")

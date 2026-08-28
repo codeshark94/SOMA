@@ -41,7 +41,7 @@ final class PersistentAppServerBroker: @unchecked Sendable {
 
     private let lock = NSLock()
     private let onHealth: HealthHandler
-    private var process: Process?
+    private var process: ParentBoundProcess?
     private var endpoint: URL?
 
     init(capability: String, onHealth: @escaping HealthHandler) throws {
@@ -63,50 +63,50 @@ final class PersistentAppServerBroker: @unchecked Sendable {
         if let endpoint, let process, process.isRunning, Self.isReady(endpoint) {
             return .success(endpoint)
         }
-        if let process, process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
-        }
+        process?.stop()
         process = nil
         endpoint = nil
         guard let executable = Self.codexURL() else {
             return .failure(BrokerError.codexNotFound)
         }
 
+        guard let guardianURL = ParentBoundProcess.installedGuardianURL() else {
+            return .failure(BrokerError.launchFailed("child_guardian_unavailable"))
+        }
+
         let basePort = Int.random(in: 38_000...48_000)
         for offset in 0..<8 {
             let port = basePort + offset
             guard let endpoint = URL(string: "ws://127.0.0.1:\(port)") else { continue }
-            let process = Process()
-            process.executableURL = executable
-            process.arguments = [
+            let arguments = [
                 "app-server",
                 "--listen", endpoint.absoluteString,
                 "--enable", "realtime_conversation",
                 "--config", "mcp_servers.soma_embodiment.env={SOMA_SESSION_TOKEN=\"\(capability)\"}",
             ]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            let guardianProcess: ParentBoundProcess
             do {
-                try process.run()
+                guardianProcess = try ParentBoundProcess(
+                    guardianURL: guardianURL,
+                    executableURL: executable,
+                    arguments: arguments
+                )
+                try guardianProcess.run()
             } catch {
                 continue
             }
             let deadline = Date().addingTimeInterval(max(0.1, timeout / 8))
             while Date() < deadline {
                 if Self.isReady(endpoint) {
-                    self.process = process
+                    self.process = guardianProcess
                     self.endpoint = endpoint
                     onHealth("ready", "transport=dedicated_persistent_app_server; realtime_active=false; model_turn_active=false")
                     return .success(endpoint)
                 }
-                if !process.isRunning { break }
+                if !guardianProcess.isRunning { break }
                 Thread.sleep(forTimeInterval: 0.025)
             }
-            if process.isRunning {
-                process.terminate()
-                process.waitUntilExit()
-            }
+            guardianProcess.stop()
         }
         return .failure(BrokerError.endpointUnavailable)
     }
@@ -114,10 +114,7 @@ final class PersistentAppServerBroker: @unchecked Sendable {
     func stop() {
         lock.lock()
         defer { lock.unlock() }
-        if let process, process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
-        }
+        process?.stop()
         process = nil
         endpoint = nil
     }
@@ -139,9 +136,12 @@ final class PersistentAppServerBroker: @unchecked Sendable {
            FileManager.default.isExecutableFile(atPath: override) {
             return URL(fileURLWithPath: override)
         }
-        let applicationURL = URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex")
-        if FileManager.default.isExecutableFile(atPath: applicationURL.path) {
-            return applicationURL
+        let applicationCandidates = [
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+        ]
+        for path in applicationCandidates where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
         }
         let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
         for component in path.split(separator: ":") {

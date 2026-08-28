@@ -1299,8 +1299,7 @@ private struct LEDSignalRow: View {
         case .humanDetected: "Person noticed"
         case .contactReady: "Ready to talk"
         case .conversation: "Conversation"
-        case .working: "Preparing reply"
-        case .listening, .speaking: "Conversation"
+        case .working, .listening, .speaking: "Conversation"
         }
     }
 

@@ -664,7 +664,8 @@ public enum L1PurposefulOpeningGate {
     ) -> L1PurposefulOpening? {
         guard decision.action == .spokenOpening,
               case let .question(motiveID, question)? = decision.openingContent,
-              let need = informationNeeds.first(where: { $0.motiveID == motiveID }) else {
+              let need = informationNeeds.first(where: { $0.motiveID == motiveID }),
+              need.permitsProactiveSpokenOpening else {
             return nil
         }
         let objective = need.informationGoal.trimmingCharacters(in: .whitespacesAndNewlines)
