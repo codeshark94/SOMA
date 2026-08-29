@@ -41,6 +41,23 @@ final class L1SituationStreamTests: XCTestCase {
         XCTAssertNil(LiveVoiceOpeningControllerEvent.make(opening: " \n ", languageTag: "ko"))
     }
 
+    func testLiveVoiceConversationFrameDoesNotAssumeEveryContactIsAServiceRequest() {
+        let participantOrigin = LiveVoiceConversationFrame.originInstruction(
+            isProactiveSession: false
+        )
+        XCTAssertTrue(participantOrigin.contains("contact alone is not evidence of a service request"))
+        XCTAssertTrue(participantOrigin.contains("unfinished fragment"))
+        XCTAssertTrue(LiveVoiceConversationFrame.socialStanceInstruction.contains(
+            "Enter assistance mode only when the participant actually expresses a request"
+        ))
+
+        let proactiveOrigin = LiveVoiceConversationFrame.originInstruction(
+            isProactiveSession: true
+        )
+        XCTAssertTrue(proactiveOrigin.contains("specific L1 social purpose"))
+        XCTAssertTrue(proactiveOrigin.contains("Never reset into a generic service frame"))
+    }
+
     func testContactEpisodeRecordsOnlyObservedResponseAndClosure() {
         var episode = L1ConversationContactEpisode()
         XCTAssertFalse(episode.observeFinalizedTurn(role: .assistant))
