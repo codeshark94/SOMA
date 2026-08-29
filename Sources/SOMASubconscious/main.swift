@@ -1546,6 +1546,7 @@ private final class ConversationContactRuntime: @unchecked Sendable {
                 && candidate.observation.label == "face"
                 && candidate.isActionEligible
                 && candidate.faceVerificationEligible
+                && candidate.faceInteractionLivenessEligible
                 && candidate.eyeContactEligible
         }
         lock.lock()
@@ -1586,7 +1587,8 @@ private final class ConversationContactRuntime: @unchecked Sendable {
 
     func observeVoiceActivity(
         active: Bool,
-        at monotonicNS: UInt64
+        at monotonicNS: UInt64,
+        confidence: Double
     ) -> ConversationOpeningAuthorization? {
         lock.lock()
         defer { lock.unlock() }
@@ -1599,7 +1601,8 @@ private final class ConversationContactRuntime: @unchecked Sendable {
         return gate.observeVoiceActivity(
             active: active,
             at: monotonicNS,
-            directContact: directContact
+            directContact: directContact,
+            voiceConfidence: confidence
         )
     }
 
@@ -2660,6 +2663,7 @@ private struct SceneEvent: Encodable, Sendable {
     let actionEligible: Bool
     let faceActivityEligible: Bool
     let faceVerified: Bool
+    let faceInteractionLivenessEligible: Bool
     let trackingMinimumCenterX: Double
     let trackingMaximumCenterX: Double
     let trackingMinimumCenterY: Double
@@ -3931,8 +3935,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// cognitive sound-following request. A brief new voice onset can recruit
     /// the device microphone array while no face is visible, but it may never
     /// preempt L1/L2 motor ownership or outlive fresh visual evidence.
-    private var auditoryOrientingRequestID: String?
-    private var auditoryOrientingGeneration = 0
+    private var auditoryOrientingAdmission = SOMACore.AuditoryOrientingAdmission()
+    private var auditoryOrientingLease = SOMACore.AuditoryOrientingLease()
+    private let auditoryMotionQualificationDelayNS: UInt64 = 900_000_000
     private struct AuditoryOrientationTrajectory {
         let requestID: String
         let onsetNS: UInt64
@@ -3949,7 +3954,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var coverageScanBlockedByMotorLease: Bool {
         activeCognitiveMotorRequestID != nil
             || deviceSoundFollowingRequestID != nil
-            || auditoryOrientingRequestID != nil
+            || auditoryOrientingLease.isActive
             || nativeTrackingActive
             || nativeTrackingStartPending
     }
@@ -5406,83 +5411,104 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
-    /// A salient acoustic onset outside established social engagement is an
-    /// orienting event, not an invitation to begin a conversation. Tiny 3
-    /// Lite's firmware updates its DOA estimate in the rotating microphone-head
-    /// frame while it moves, so L0 delegates this closed loop instead of
-    /// treating a head-relative bearing as a fixed room coordinate. The lease
-    /// is short and always yields to an explicit higher cognitive motor lease.
-    func ingestAuditoryOnset(
-        levelDB: Double,
-        thresholdDB: Double,
-        at monotonicNS: UInt64
-    ) {
+    /// Raw acoustic onsets enter perception immediately but do not own the
+    /// motor merely because room level crossed an adaptive threshold. Speech
+    /// corroboration or a genuinely sharp transient must admit the reflex.
+    func ingestAuditoryOnset(_ evidence: SOMACore.AuditoryOnsetEvidence) {
         queue.async { [weak self] in
-            guard let self,
-                  case .running = self.state,
-                  self.helperReady,
-                  self.process.isRunning,
-                  self.deviceCapabilities?.supportsDeviceSoundLocalization == true,
-                  self.activeCognitiveMotorRequestID == nil,
-                  self.deviceSoundFollowingRequestID == nil,
-                  !self.auditoryOrientingProtectedBySocialEngagement else {
-                return
-            }
-
-            self.auditoryOrientingGeneration += 1
-            let generation = self.auditoryOrientingGeneration
-            let requestID = self.nextCommandID(prefix: "auditory-orient")
-            self.auditoryOrientingRequestID = requestID
-            self.auditoryOrientationTrajectory = AuditoryOrientationTrajectory(
-                requestID: requestID,
-                onsetNS: monotonicNS,
-                activationNS: nil,
-                activationPose: nil
-            )
-            self.cancelScan()
-            if self.externalCommandID != nil {
-                self.cancelExternalStop()
-                self.sendExternalStop(state: "auditory_orienting_acquired", at: monotonicNS)
-            }
-            if self.firmwareSoundFollowingActive == true {
-                self.armAuditoryOrientationTrajectory(at: monotonicNS)
-            } else {
-                self.requestFirmwareSoundFollowing(
-                    enabled: true,
-                    at: monotonicNS,
-                    reason: "auditory_onset"
-                )
-            }
-            self.writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNS,
-                source: "obsbot_audio_doa",
-                state: "auditory_orienting_requested",
-                message: String(
-                    format: "request_id=%@; source=audio_onset; level_db=%.1f; threshold_db=%.1f; social_engagement=false; lease_ms=4500",
-                    requestID,
-                    levelDB,
-                    thresholdDB
-                )
-            ))
-            self.scheduleAuditoryOrientingExpiry(
-                requestID: requestID,
-                generation: generation,
-                at: monotonicNS
-            )
+            guard let self else { return }
+            guard let admitted = self.auditoryOrientingAdmission.observeOnset(evidence) else { return }
+            self.beginAuditoryOrienting(from: admitted, corroboration: "salient_transient")
         }
     }
 
-    private func scheduleAuditoryOrientingExpiry(
-        requestID: String,
-        generation: Int,
+    func ingestAuditoryVoiceActivity(
+        active: Bool,
+        confidence: Double,
         at monotonicNS: UInt64
     ) {
-        let durationNS: UInt64 = 4_500_000_000
-        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(durationNS))) { [weak self] in
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let admitted = self.auditoryOrientingAdmission.observeVoiceActivity(
+                active: active,
+                confidence: confidence,
+                at: monotonicNS
+            ) else { return }
+            self.beginAuditoryOrienting(from: admitted, corroboration: "neural_voice")
+        }
+    }
+
+    /// Tiny 3 Lite exposes firmware sound following as a motor mode, not as a
+    /// passive direction sensor. It therefore receives authority only after
+    /// evidence admission, and never while a live person already owns visual
+    /// attention.
+    private func beginAuditoryOrienting(
+        from evidence: SOMACore.AuditoryOnsetEvidence,
+        corroboration: String
+    ) {
+        let monotonicNS = max(evidence.monotonicNS, monotonicNanoseconds())
+        guard case .running = state,
+              helperReady,
+              process.isRunning,
+              deviceCapabilities?.supportsDeviceSoundLocalization == true,
+              activeCognitiveMotorRequestID == nil,
+              deviceSoundFollowingRequestID == nil,
+              !auditoryMotorOrientationBlocked(at: monotonicNS) else {
+            return
+        }
+
+        let requestID = nextCommandID(prefix: "auditory-orient")
+        guard let episode = auditoryOrientingLease.begin(
+            requestID: requestID,
+            at: monotonicNS
+        ) else {
+            return
+        }
+        auditoryOrientationTrajectory = AuditoryOrientationTrajectory(
+            requestID: requestID,
+            onsetNS: evidence.monotonicNS,
+            activationNS: nil,
+            activationPose: nil
+        )
+        cancelScan()
+        if externalCommandID != nil {
+            cancelExternalStop()
+            sendExternalStop(state: "auditory_orienting_acquired", at: monotonicNS)
+            // External/manual mode invalidates firmware motor ownership even
+            // when the last API readback still says sound following is active.
+            firmwareSoundFollowingActive = nil
+        }
+        if firmwareSoundFollowingActive == true {
+            armAuditoryOrientationTrajectory(at: monotonicNS)
+        } else {
+            requestFirmwareSoundFollowing(
+                enabled: true,
+                at: monotonicNS,
+                reason: "auditory_evidence_admitted"
+            )
+        }
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "obsbot_audio_doa",
+            state: "auditory_orienting_requested",
+            message: String(
+                format: "request_id=%@; corroboration=%@; level_db=%.1f; threshold_db=%.1f; onset_confidence=%.3f; transient=%@; visual_human=false; lease_ms=4500",
+                requestID,
+                corroboration,
+                evidence.levelDB,
+                evidence.thresholdDB,
+                evidence.confidence,
+                evidence.transient ? "true" : "false"
+            )
+        ))
+        scheduleAuditoryOrientingExpiry(episode)
+    }
+
+    private func scheduleAuditoryOrientingExpiry(_ episode: SOMACore.AuditoryOrientingEpisode) {
+        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(auditoryOrientingLease.durationNS))) { [weak self] in
             guard let self,
-                  self.auditoryOrientingGeneration == generation,
-                  self.auditoryOrientingRequestID == requestID else {
+                  self.auditoryOrientingLease.contains(requestID: episode.requestID) else {
                 return
             }
             self.stopAuditoryOrienting(
@@ -5498,14 +5524,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         at monotonicNS: UInt64,
         resumeExploration: Bool
     ) {
-        guard let requestID = auditoryOrientingRequestID else { return }
+        guard let episode = auditoryOrientingLease.end() else { return }
+        let requestID = episode.requestID
         finalizeAuditoryOrientation(
             requestID: requestID,
             state: state,
             at: monotonicNS
         )
-        auditoryOrientingRequestID = nil
-        auditoryOrientingGeneration += 1
         reconcileFirmwareSoundFollowing(at: monotonicNS, reason: state)
         writer.write(RuntimeEvent(
             event: "source.health",
@@ -5523,7 +5548,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     private func armAuditoryOrientationTrajectory(at monotonicNS: UInt64) {
         guard var trajectory = auditoryOrientationTrajectory,
-              trajectory.requestID == auditoryOrientingRequestID,
+              trajectory.requestID == auditoryOrientingLease.activeRequestID,
               trajectory.activationNS == nil,
               let pose = poseStore.current(maximumAgeNS: 600_000_000) ?? poseStore.lastKnown() else {
             return
@@ -5544,6 +5569,39 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 pose.pitchDegrees
             )
         ))
+        scheduleAuditoryMotionQualification(for: trajectory)
+    }
+
+    private func scheduleAuditoryMotionQualification(
+        for trajectory: AuditoryOrientationTrajectory
+    ) {
+        queue.asyncAfter(
+            deadline: .now() + .nanoseconds(Int(auditoryMotionQualificationDelayNS))
+        ) { [weak self] in
+            guard let self,
+                  self.auditoryOrientingLease.contains(requestID: trajectory.requestID),
+                  let current = self.auditoryOrientationTrajectory,
+                  current.requestID == trajectory.requestID,
+                  let activationNS = current.activationNS,
+                  let activationPose = current.activationPose else {
+                return
+            }
+            let samples = self.poseStore.trajectory(
+                from: activationNS,
+                through: monotonicNanoseconds()
+            )
+            guard !SOMACore.FirmwareSoundSourceEstimator.hasMeasuredDirectionalMotion(
+                startingPose: activationPose,
+                trajectory: samples
+            ) else {
+                return
+            }
+            self.stopAuditoryOrienting(
+                state: "auditory_orienting_no_measured_motion",
+                at: monotonicNanoseconds(),
+                resumeExploration: true
+            )
+        }
     }
 
     private func finalizeAuditoryOrientation(
@@ -6047,6 +6105,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         if !socialHumanCandidates.isEmpty {
             lastFreshHumanObservationNS = monotonicNS
+            if auditoryOrientingLease.isActive {
+                stopAuditoryOrienting(
+                    state: "visual_human_preempted_auditory_orientation",
+                    at: monotonicNS,
+                    resumeExploration: false
+                )
+            }
             let priorVisualState = indicatorInputs.visualState
             indicatorInputs.observeHumanVisualPresence()
             // A person is in view but the ready-to-speak blink must still
@@ -6196,13 +6261,15 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                             }
                             .map(\.observation.gazeEvidence)
                     )
-                    lockedGazeEvidence = associatedGazeEvidence
+                    lockedGazeEvidence = observedFace.faceInteractionLivenessEligible
+                        ? associatedGazeEvidence
+                        : .unavailable
                     // Eye contact is perceptual evidence from the current
-                    // face lock. Native liveness separately protects motor
-                    // ownership and must not delay the social response when a
-                    // person is already looking at the camera.
+                    // face lock, but static face geometry is insufficient for
+                    // social admission. Interaction liveness is established
+                    // independently from the landmark gaze classifier.
                     let contactReady = eyeContactIndicatorLease.update(
-                        gazeEvidence: associatedGazeEvidence,
+                        gazeEvidence: lockedGazeEvidence,
                         sceneID: observedFace.id,
                         at: monotonicNS
                     )
@@ -7889,15 +7956,19 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         }
         let explicitSoundLease = deviceSoundFollowingRequestID != nil
-        let orienting = auditoryOrientingRequestID != nil
-        let autonomousStandby = allowsMotorControl
-            && activeCognitiveMotorRequestID == nil
-            && !auditoryOrientingProtectedBySocialEngagement
+        let orienting = auditoryOrientingLease.isActive
         requestFirmwareSoundFollowing(
-            enabled: explicitSoundLease || orienting || autonomousStandby,
+            enabled: explicitSoundLease || orienting,
             at: monotonicNS,
             reason: reason
         )
+    }
+
+    private func auditoryMotorOrientationBlocked(at monotonicNS: UInt64) -> Bool {
+        auditoryOrientingProtectedBySocialEngagement
+            || nativeTrackingOwnsMotor
+            || faceLock.permitsMotor(at: monotonicNS)
+            || hasRecentObservedHuman(at: monotonicNS)
     }
 
     /// Presence and momentary eye contact do not disable hearing. Only an
@@ -8233,6 +8304,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         guard let lastObservedFaceNS else { return false }
         guard monotonicNS >= lastObservedFaceNS else { return true }
         return monotonicNS - lastObservedFaceNS <= 600_000_000
+    }
+
+    private func hasRecentObservedHuman(at monotonicNS: UInt64) -> Bool {
+        guard let lastFreshHumanObservationNS else { return false }
+        guard monotonicNS >= lastFreshHumanObservationNS else { return true }
+        return monotonicNS - lastFreshHumanObservationNS <= 600_000_000
     }
 
     private func scheduleScanControlTick(generation: Int, afterMilliseconds: Int = 0) {
@@ -9307,7 +9384,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
     private let speechInteraction: LocalSpeechInteractionCoordinator?
     private let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     private let auditoryOnsetGate = AcousticOnsetGate()
-    private let auditoryOnsetHandler: (Double, Double, UInt64) -> Void
+    private let auditoryOnsetHandler: (SOMACore.AuditoryOnsetEvidence) -> Void
     private var rejectedAudioFormatReported = false
 
     init(
@@ -9320,7 +9397,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
         calibrationRecorder: TDOACalibrationRecorder?,
         speechInteraction: LocalSpeechInteractionCoordinator?,
         liveVoiceLauncher: AppServerLiveVoiceLauncher?,
-        auditoryOnsetHandler: @escaping (Double, Double, UInt64) -> Void
+        auditoryOnsetHandler: @escaping (SOMACore.AuditoryOnsetEvidence) -> Void
     ) {
         self.worldModel = worldModel
         self.publisher = publisher
@@ -9376,7 +9453,13 @@ private final class AudioAnalyzer: @unchecked Sendable {
                     auditoryOnset.transient ? "true" : "false"
                 )
             ))
-            auditoryOnsetHandler(audio.levelDB, auditoryOnset.thresholdDB, now)
+            auditoryOnsetHandler(SOMACore.AuditoryOnsetEvidence(
+                monotonicNS: now,
+                levelDB: audio.levelDB,
+                thresholdDB: auditoryOnset.thresholdDB,
+                confidence: auditoryOnset.confidence,
+                transient: auditoryOnset.transient
+            ))
         }
         let frame = AudioVADFrame(
             samples: audio.samples,
@@ -9916,6 +9999,7 @@ private final class SystemSaliencyDetector: @unchecked Sendable {
 private struct SystemFaceEvidence: Sendable {
     let rect: SOMACore.NormalizedRect
     let gazeState: SOMACore.VisualGazeEvidence
+    let directGazeConfidence: Double
     /// Raw Vision gaze features for diagnostics. Kept separate from the boolean
     /// so the live trace can reveal why a face is (or is not) contact-ready
     /// without re-deriving them.
@@ -9933,6 +10017,7 @@ private struct SystemFaceEvidence: Sendable {
         Self(
             rect: rect,
             gazeState: gazeState,
+            directGazeConfidence: directGazeConfidence,
             yaw: yaw,
             pitch: pitch,
             pupilOffsetX: pupilOffsetX,
@@ -10043,6 +10128,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             return SystemFaceEvidence(
                 rect: rect,
                 gazeState: gaze.state,
+                directGazeConfidence: gaze.directConfidence,
                 yaw: gaze.yaw,
                 pitch: gaze.pitch,
                 pupilOffsetX: gaze.pupilOffsetX,
@@ -10057,7 +10143,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
     private func refinedGaze(
         in pixelBuffer: CVPixelBuffer,
         faceRect: SOMACore.NormalizedRect
-    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, signedPupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence)? {
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, signedPupilOffsetY: Double?, meanEyeAperture: Double?, directConfidence: Double, state: SOMACore.VisualGazeEvidence)? {
         guard let crop = faceCropCGImage(from: pixelBuffer, rect: faceRect) else { return nil }
         let request = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cgImage: crop, options: [:])
@@ -10141,13 +10227,13 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         observation: VNFaceObservation,
         landmarks: VNFaceLandmarks2D,
         rect: SOMACore.NormalizedRect
-    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, signedPupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence) {
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, signedPupilOffsetY: Double?, meanEyeAperture: Double?, directConfidence: Double, state: SOMACore.VisualGazeEvidence) {
         let yaw = observation.yaw?.doubleValue
         let pitch = observation.pitch?.doubleValue
         guard rect.centerX >= 0.26, rect.centerX <= 0.74,
               rect.centerY >= 0.13, rect.centerY <= 0.89,
               rect.width * rect.height >= 0.008 else {
-            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, 0, .unavailable)
         }
 
         // On the Tiny 3 stream Vision supplies yaw consistently, but pitch is
@@ -10155,24 +10241,24 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         // optional feature into a permanent rejection. Direct contact still
         // requires bilateral pupil evidence below.
         guard let yaw else {
-            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, 0, .unavailable)
         }
         // Vision's yaw is coarse on this camera (roughly 0, 45, and 90
         // degrees). A pronounced head turn is reliable negative evidence;
         // vertical head pose is not available from this device's Vision
         // result and must not be guessed from it.
         if abs(yaw) > 0.65 {
-            return (yaw, pitch, nil, nil, nil, nil, .averted)
+            return (yaw, pitch, nil, nil, nil, nil, 0, .averted)
         }
         guard let leftEye = landmarks.leftEye,
               let rightEye = landmarks.rightEye,
               let leftPupil = landmarks.leftPupil,
               let rightPupil = landmarks.rightPupil else {
-            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, 0, .unavailable)
         }
         guard let left = pupilOffset(leftPupil, in: leftEye),
               let right = pupilOffset(rightPupil, in: rightEye) else {
-            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, 0, .unavailable)
         }
         let leftGeometry = SOMACore.EyeLandmarkGeometry(
             pupilOffsetX: left.x,
@@ -10186,7 +10272,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             signedPupilOffsetY: right.signedY,
             apertureRatio: right.aperture
         )
-        let state = SOMACore.LandmarkGazeClassifier.classify(
+        let assessment = SOMACore.LandmarkGazeClassifier.assess(
             yaw: yaw,
             pitch: pitch,
             leftEye: leftGeometry,
@@ -10200,7 +10286,8 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             max(left.y, right.y),
             (left.signedY + right.signedY) / 2,
             (left.aperture + right.aperture) / 2,
-            state
+            assessment.directConfidence,
+            assessment.evidence
         )
     }
 
@@ -11183,6 +11270,7 @@ private final class VisionWorker: @unchecked Sendable {
                     SOMACore.DirectGazeConsensusSample(
                         rect: $0.rect,
                         evidence: $0.gazeState,
+                        directConfidence: $0.directGazeConfidence,
                         capturedNS: verification.captureNS
                     )
                 })
@@ -11206,7 +11294,8 @@ private final class VisionWorker: @unchecked Sendable {
                         let pupilY = evidence.pupilOffsetY.map { String(format: "%.3f", $0) } ?? "na"
                         let signedPupilY = evidence.signedPupilOffsetY.map { String(format: "%.3f", $0) } ?? "na"
                         let aperture = evidence.meanEyeAperture.map { String(format: "%.3f", $0) } ?? "na"
-                        return "yaw=\(yaw); pitch=\(pitch); pupil_offset_x=\(pupilX); pupil_offset_y=\(pupilY); pupil_signed_y=\(signedPupilY); eye_aperture=\(aperture)"
+                        let confidence = String(format: "%.3f", evidence.directGazeConfidence)
+                        return "yaw=\(yaw); pitch=\(pitch); pupil_offset_x=\(pupilX); pupil_offset_y=\(pupilY); pupil_signed_y=\(signedPupilY); eye_aperture=\(aperture); gaze_confidence=\(confidence)"
                     } ?? "none"
                     writer.write(RuntimeEvent(
                         event: "source.health",
@@ -11531,6 +11620,7 @@ private final class VisionWorker: @unchecked Sendable {
                 actionEligible: candidate.isActionEligible,
                 faceActivityEligible: candidate.faceActivityEligible,
                 faceVerified: candidate.faceVerificationEligible,
+                faceInteractionLivenessEligible: candidate.faceInteractionLivenessEligible,
                 trackingMinimumCenterX: candidate.trackingBoundary.minimumCenterX,
                 trackingMaximumCenterX: candidate.trackingBoundary.maximumCenterX,
                 trackingMinimumCenterY: candidate.trackingBoundary.minimumCenterY,
@@ -12858,7 +12948,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=user_voice_activity_and_current_eye_contact; new_session_requires=current_verified_human_target; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -13795,6 +13885,11 @@ private func run(_ options: Options) throws {
                 confidence: evidence.probability,
                 at: completedNS
             )
+            attentionGimbalBridge?.ingestAuditoryVoiceActivity(
+                active: evidence.active,
+                confidence: evidence.probability,
+                at: frame.captureNS
+            )
             let visualAdmission = LiveConversationVisualAdmission.permitsNewSession(for: belief)
             // The contact gate observes every VAD state, including an onset
             // without gaze. Once an episode starts without current direct
@@ -13802,7 +13897,8 @@ private func run(_ options: Options) throws {
             // a user request; a new voice onset is required.
             let openingAuthorization = conversationContact.observeVoiceActivity(
                 active: evidence.active,
-                at: completedNS
+                at: completedNS,
+                confidence: evidence.probability
             )
             if evidence.changed, options.l2LiveVoice {
                 attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
@@ -13841,7 +13937,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: completedNS,
                     source: "l2_live_voice",
                     state: "opening_suppressed",
-                    message: "speech_episode_started_without_direct_contact"
+                    message: "new_conversation_evidence_unconfirmed"
                 ))
             }
             if let openingAuthorization,
@@ -13960,12 +14056,8 @@ private func run(_ options: Options) throws {
         calibrationRecorder: calibrationRecorder,
         speechInteraction: speechInteraction,
         liveVoiceLauncher: liveVoiceLauncher,
-        auditoryOnsetHandler: { [weak attentionGimbalBridge] levelDB, thresholdDB, onsetNS in
-            attentionGimbalBridge?.ingestAuditoryOnset(
-                levelDB: levelDB,
-                thresholdDB: thresholdDB,
-                at: onsetNS
-            )
+        auditoryOnsetHandler: { [weak attentionGimbalBridge] evidence in
+            attentionGimbalBridge?.ingestAuditoryOnset(evidence)
         }
     )
     let session = AVCaptureSession()

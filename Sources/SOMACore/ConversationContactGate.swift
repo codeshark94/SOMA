@@ -7,12 +7,87 @@ public enum ConversationOpeningAuthorization: String, Equatable, Sendable {
 
 public struct ConversationContactConfiguration: Equatable, Sendable {
     public let conversationInactivityMilliseconds: UInt64
+    public let immediateOpeningVoiceConfidence: Double
+    public let supportingOpeningVoiceConfidence: Double
+    public let requiredSupportingVoiceWindows: Int
+    public let maximumSupportingVoiceGapMilliseconds: UInt64
 
     public init(
-        conversationInactivityMilliseconds: UInt64 = 60_000
+        conversationInactivityMilliseconds: UInt64 = 60_000,
+        immediateOpeningVoiceConfidence: Double = 0.50,
+        supportingOpeningVoiceConfidence: Double = 0.35,
+        requiredSupportingVoiceWindows: Int = 2,
+        maximumSupportingVoiceGapMilliseconds: UInt64 = 400
     ) {
         precondition(conversationInactivityMilliseconds > 0)
+        precondition((0...1).contains(immediateOpeningVoiceConfidence))
+        precondition((0...1).contains(supportingOpeningVoiceConfidence))
+        precondition(supportingOpeningVoiceConfidence <= immediateOpeningVoiceConfidence)
+        precondition(requiredSupportingVoiceWindows >= 2)
+        precondition(maximumSupportingVoiceGapMilliseconds > 0)
+        precondition(maximumSupportingVoiceGapMilliseconds <= UInt64.max / 1_000_000)
         self.conversationInactivityMilliseconds = conversationInactivityMilliseconds
+        self.immediateOpeningVoiceConfidence = immediateOpeningVoiceConfidence
+        self.supportingOpeningVoiceConfidence = supportingOpeningVoiceConfidence
+        self.requiredSupportingVoiceWindows = requiredSupportingVoiceWindows
+        self.maximumSupportingVoiceGapMilliseconds = maximumSupportingVoiceGapMilliseconds
+    }
+}
+
+/// Accumulates calibrated voice evidence without assigning social meaning to
+/// it. Consumers decide whether the admitted evidence belongs to a direct
+/// conversation, an acoustic orienting reflex, or another interaction.
+public struct SustainedVoiceEvidenceAccumulator: Sendable {
+    public let immediateConfidence: Double
+    public let supportingConfidence: Double
+    public let requiredSupportingWindows: Int
+    public let maximumSupportingGapNS: UInt64
+
+    private var supportingWindowCount = 0
+    private var lastSupportingWindowNS: UInt64?
+
+    public init(
+        immediateConfidence: Double = 0.50,
+        supportingConfidence: Double = 0.35,
+        requiredSupportingWindows: Int = 2,
+        maximumSupportingGapMilliseconds: UInt64 = 400
+    ) {
+        precondition((0...1).contains(immediateConfidence))
+        precondition((0...1).contains(supportingConfidence))
+        precondition(supportingConfidence <= immediateConfidence)
+        precondition(requiredSupportingWindows >= 2)
+        precondition(maximumSupportingGapMilliseconds > 0)
+        precondition(maximumSupportingGapMilliseconds <= UInt64.max / 1_000_000)
+        self.immediateConfidence = immediateConfidence
+        self.supportingConfidence = supportingConfidence
+        self.requiredSupportingWindows = requiredSupportingWindows
+        maximumSupportingGapNS = maximumSupportingGapMilliseconds * 1_000_000
+    }
+
+    public mutating func observe(confidence rawConfidence: Double, at monotonicNS: UInt64) -> Bool {
+        let confidence = min(max(rawConfidence, 0), 1)
+        if confidence >= immediateConfidence {
+            reset()
+            return true
+        }
+        guard confidence >= supportingConfidence else { return false }
+
+        if let lastSupportingWindowNS,
+           monotonicNS >= lastSupportingWindowNS,
+           monotonicNS - lastSupportingWindowNS <= maximumSupportingGapNS {
+            supportingWindowCount += 1
+        } else {
+            supportingWindowCount = 1
+        }
+        lastSupportingWindowNS = monotonicNS
+        guard supportingWindowCount >= requiredSupportingWindows else { return false }
+        reset()
+        return true
+    }
+
+    public mutating func reset() {
+        supportingWindowCount = 0
+        lastSupportingWindowNS = nil
     }
 }
 
@@ -23,9 +98,16 @@ public struct ConversationContactGate: Sendable {
     public let configuration: ConversationContactConfiguration
     private var conversationExpiresAtNS: UInt64?
     private var speechEpisodeActive = false
+    private var openingVoiceEvidence: SustainedVoiceEvidenceAccumulator
 
     public init(configuration: ConversationContactConfiguration = .init()) {
         self.configuration = configuration
+        openingVoiceEvidence = SustainedVoiceEvidenceAccumulator(
+            immediateConfidence: configuration.immediateOpeningVoiceConfidence,
+            supportingConfidence: configuration.supportingOpeningVoiceConfidence,
+            requiredSupportingWindows: configuration.requiredSupportingVoiceWindows,
+            maximumSupportingGapMilliseconds: configuration.maximumSupportingVoiceGapMilliseconds
+        )
     }
 
     /// Evaluates a voice-activity episode exactly once, at its onset. Direct
@@ -34,19 +116,34 @@ public struct ConversationContactGate: Sendable {
     public mutating func observeVoiceActivity(
         active: Bool,
         at monotonicNS: UInt64,
-        directContact: Bool
+        directContact: Bool,
+        voiceConfidence: Double = 1
     ) -> ConversationOpeningAuthorization? {
         expire(at: monotonicNS)
         guard active else {
             speechEpisodeActive = false
+            openingVoiceEvidence.reset()
             return nil
         }
         guard !speechEpisodeActive else { return nil }
-        speechEpisodeActive = true
         if let conversationExpiresAtNS, monotonicNS < conversationExpiresAtNS {
+            speechEpisodeActive = true
+            openingVoiceEvidence.reset()
             return .activeConversation
         }
-        guard directContact else { return nil }
+        // Gaze and speech must coexist throughout the opening evidence, not
+        // merely overlap for one callback. Once an episode begins without
+        // current direct contact it cannot be upgraded by a later gaze sample.
+        guard directContact else {
+            speechEpisodeActive = true
+            openingVoiceEvidence.reset()
+            return nil
+        }
+        guard openingVoiceEvidence.observe(
+            confidence: voiceConfidence,
+            at: monotonicNS
+        ) else { return nil }
+        speechEpisodeActive = true
         return .voiceActivity
     }
 

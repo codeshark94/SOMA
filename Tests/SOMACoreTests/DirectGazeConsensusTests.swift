@@ -9,7 +9,7 @@ struct DirectGazeConsensusTests {
         var consensus = DirectGazeConsensus()
 
         let state = consensus.stabilize([
-            .init(rect: face, evidence: .direct, capturedNS: 1_000_000_000),
+            .init(rect: face, evidence: .direct, directConfidence: 0.90, capturedNS: 1_000_000_000),
         ])
 
         #expect(state == [.unavailable])
@@ -21,6 +21,7 @@ struct DirectGazeConsensusTests {
         let sample = DirectGazeConsensusSample(
             rect: face,
             evidence: .direct,
+            directConfidence: 0.90,
             capturedNS: 1_000_000_000
         )
 
@@ -29,15 +30,52 @@ struct DirectGazeConsensusTests {
     }
 
     @Test
-    func twoIndependentDirectCapturesAuthorizeContact() {
+    func sustainedHighConfidenceCapturesAuthorizeContact() {
         var consensus = DirectGazeConsensus()
 
         #expect(consensus.stabilize([
-            .init(rect: face, evidence: .direct, capturedNS: 1_000_000_000),
+            .init(rect: face, evidence: .direct, directConfidence: 0.90, capturedNS: 1_000_000_000),
         ]) == [.unavailable])
         #expect(consensus.stabilize([
-            .init(rect: face, evidence: .direct, capturedNS: 1_080_000_000),
+            .init(rect: face, evidence: .direct, directConfidence: 0.88, capturedNS: 1_080_000_000),
+        ]) == [.unavailable])
+        #expect(consensus.stabilize([
+            .init(rect: face, evidence: .direct, directConfidence: 0.92, capturedNS: 1_160_000_000),
         ]) == [.direct])
+    }
+
+    @Test
+    func observedCenteredContactConfidenceStillAuthorizesPromptly() {
+        var consensus = DirectGazeConsensus()
+        let confidences = [0.65, 0.63, 0.66]
+
+        for (index, confidence) in confidences.enumerated() {
+            let state = consensus.stabilize([
+                .init(
+                    rect: face,
+                    evidence: .direct,
+                    directConfidence: confidence,
+                    capturedNS: 1_000_000_000 + UInt64(index) * 80_000_000
+                ),
+            ])
+            #expect(state == (index == confidences.count - 1 ? [.direct] : [.unavailable]))
+        }
+    }
+
+    @Test
+    func repeatedWeakOffAxisEvidenceNeverAuthorizesContact() {
+        var consensus = DirectGazeConsensus()
+
+        for index in 0..<8 {
+            #expect(consensus.stabilize([
+                .init(
+                    rect: face,
+                    evidence: .direct,
+                    directConfidence: index.isMultiple(of: 2) ? 0.38 : 0.48,
+                    capturedNS: 1_000_000_000 + UInt64(index) * 80_000_000
+                ),
+            ]) == [.unavailable])
+        }
     }
 
     @Test
@@ -45,13 +83,13 @@ struct DirectGazeConsensusTests {
         var consensus = DirectGazeConsensus()
 
         _ = consensus.stabilize([
-            .init(rect: face, evidence: .direct, capturedNS: 1_000_000_000),
+            .init(rect: face, evidence: .direct, directConfidence: 0.90, capturedNS: 1_000_000_000),
         ])
         #expect(consensus.stabilize([
-            .init(rect: face, evidence: .averted, capturedNS: 1_080_000_000),
+            .init(rect: face, evidence: .averted, directConfidence: 0, capturedNS: 1_080_000_000),
         ]) == [.averted])
         #expect(consensus.stabilize([
-            .init(rect: face, evidence: .direct, capturedNS: 1_160_000_000),
+            .init(rect: face, evidence: .direct, directConfidence: 0.90, capturedNS: 1_160_000_000),
         ]) == [.unavailable])
     }
 }

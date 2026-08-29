@@ -32,6 +32,26 @@ public struct FirmwareSoundSourceEstimate: Equatable, Sendable {
 }
 
 public enum FirmwareSoundSourceEstimator {
+    /// Confirms that firmware sound following produced physical motor evidence.
+    /// A confirmed API mode with a stationary pose is not a direction estimate
+    /// and must not retain an exclusive motor lease.
+    public static func hasMeasuredDirectionalMotion(
+        startingPose: GimbalPose,
+        trajectory: [GimbalPose],
+        minimumDisplacementDegrees: Double = 0.75
+    ) -> Bool {
+        precondition(minimumDisplacementDegrees > 0)
+        return trajectory.contains { pose in
+            pose.monotonicNS >= startingPose.monotonicNS
+                && pose.pitchDegrees.isFinite
+                && pose.panDegrees.isFinite
+                && hypot(
+                    pose.pitchDegrees - startingPose.pitchDegrees,
+                    pose.panDegrees - startingPose.panDegrees
+                ) >= minimumDisplacementDegrees
+        }
+    }
+
     /// Infers a source bearing from measured SDK attitudes that follow a
     /// confirmed firmware sound-following activation.  The tail median rejects
     /// a single delayed poll without fabricating a source when no measured

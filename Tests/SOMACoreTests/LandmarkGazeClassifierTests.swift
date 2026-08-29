@@ -4,7 +4,7 @@ import Testing
 struct LandmarkGazeClassifierTests {
     @Test
     func directCameraGazeRequiresBilateralOpenCenteredEyes() {
-        let state = LandmarkGazeClassifier.classify(
+        let assessment = LandmarkGazeClassifier.assess(
             yaw: 0,
             pitch: nil,
             leftEye: EyeLandmarkGeometry(
@@ -21,7 +21,8 @@ struct LandmarkGazeClassifierTests {
             )
         )
 
-        #expect(state == .direct)
+        #expect(assessment.evidence == .direct)
+        #expect(assessment.directConfidence > 0.80)
     }
 
     @Test
@@ -120,5 +121,70 @@ struct LandmarkGazeClassifierTests {
             leftEye: downwardEye,
             rightEye: downwardEye
         ) == .averted)
+    }
+
+    @Test
+    func observedOffAxisFalsePositiveHasInsufficientContactConfidence() {
+        let first = EyeLandmarkGeometry(
+            pupilOffsetX: 0.356,
+            pupilOffsetY: 0.234,
+            signedPupilOffsetY: 0.183,
+            apertureRatio: 0.354
+        )
+        let second = EyeLandmarkGeometry(
+            pupilOffsetX: 0.305,
+            pupilOffsetY: 0.166,
+            signedPupilOffsetY: 0.156,
+            apertureRatio: 0.321
+        )
+
+        let firstAssessment = LandmarkGazeClassifier.assess(
+            yaw: 0,
+            pitch: nil,
+            leftEye: first,
+            rightEye: first,
+            pupilCenteringScale: 0.9
+        )
+        let secondAssessment = LandmarkGazeClassifier.assess(
+            yaw: 0,
+            pitch: nil,
+            leftEye: second,
+            rightEye: second,
+            pupilCenteringScale: 0.9
+        )
+
+        #expect(firstAssessment.evidence == .direct)
+        #expect(secondAssessment.evidence == .direct)
+        #expect(firstAssessment.directConfidence < 0.60)
+        #expect(secondAssessment.directConfidence < 0.60)
+    }
+
+    @Test
+    func observedCenteredContactRetainsSufficientConfidence() {
+        let first = EyeLandmarkGeometry(
+            pupilOffsetX: 0.176,
+            pupilOffsetY: 0.191,
+            signedPupilOffsetY: 0.174,
+            apertureRatio: 0.395
+        )
+        let second = EyeLandmarkGeometry(
+            pupilOffsetX: 0.161,
+            pupilOffsetY: 0.266,
+            signedPupilOffsetY: 0.247,
+            apertureRatio: 0.404
+        )
+
+        let assessments = [first, second].map { eye in
+            LandmarkGazeClassifier.assess(
+                yaw: 0,
+                pitch: nil,
+                leftEye: eye,
+                rightEye: eye,
+                pupilCenteringScale: 0.9
+            )
+        }
+
+        #expect(assessments.allSatisfy { $0.evidence == .direct })
+        #expect(assessments.allSatisfy { $0.directConfidence >= 0.62 })
     }
 }

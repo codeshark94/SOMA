@@ -295,6 +295,13 @@ public struct SceneCandidate: Sendable {
     /// Current System Vision validation that can promote a provisional face
     /// lock without waiting for a deliberate movement.
     public let faceVerificationEligible: Bool
+    /// Current interaction liveness for a verified face. Independent face
+    /// geometry may own motor tracking, but it cannot by itself authorize eye
+    /// contact or a new spoken interaction because static faces and displays
+    /// can satisfy landmark detection. Two coherent world-space motion samples
+    /// establish this state, which persists while the face remains continuously
+    /// observed.
+    public let faceInteractionLivenessEligible: Bool
     /// Current directed-contact evidence. It never persists as motor authority
     /// and is consumed only while this candidate is observed in the frame.
     public let eyeContactEligible: Bool
@@ -357,12 +364,14 @@ public struct SceneField: Sendable {
         var trackingBoundary: TrackingBoundary
         var lastFaceActivityNS: UInt64?
         var pendingFaceMotion: FaceMotionSample?
+        var faceInteractionLivenessValidated: Bool
     }
 
     private var tracks: [Track] = []
     private var nextID = 1
     private let requiresFaceActivity: Bool
     private let faceActivityLeaseNS: UInt64 = 1_500_000_000
+    private let faceInteractionContinuityNS: UInt64 = 750_000_000
     private let unverifiedFaceTrackGapNS: UInt64 = 250_000_000
 
     public init(requiresFaceActivity: Bool = false) {
@@ -458,7 +467,8 @@ public struct SceneField: Sendable {
                     bearing: bearing,
                     trackingBoundary: trackingBoundary,
                     lastFaceActivityNS: nil,
-                    pendingFaceMotion: nil
+                    pendingFaceMotion: nil,
+                    faceInteractionLivenessValidated: false
                 ))
                 claimedSources[newIndex, default: []].insert(observation.source)
                 nextID += 1
@@ -499,6 +509,13 @@ public struct SceneField: Sendable {
         at monotonicNS: UInt64
     ) {
         var track = tracks[index]
+        if track.kind == .human,
+           track.label == "face",
+           monotonicNS >= track.lastSeenNS,
+           monotonicNS - track.lastSeenNS > faceInteractionContinuityNS {
+            track.faceInteractionLivenessValidated = false
+            track.pendingFaceMotion = nil
+        }
         if requiresFaceActivity,
            track.kind == .human,
            track.label == "face",
@@ -523,7 +540,7 @@ public struct SceneField: Sendable {
                     monotonicNS: monotonicNS
                 )
                 if let pending = track.pendingFaceMotion,
-                   monotonicNS >= pending.monotonicNS,
+                   monotonicNS > pending.monotonicNS,
                    monotonicNS - pending.monotonicNS <= 160_000_000,
                    pending.azimuthDelta * sample.azimuthDelta
                         + pending.elevationDelta * sample.elevationDelta > 0 {
@@ -532,6 +549,7 @@ public struct SceneField: Sendable {
                     // consistent motion sample is a low-latency acquisition
                     // cue; once locked, later stillness is allowed.
                     track.lastFaceActivityNS = monotonicNS
+                    track.faceInteractionLivenessValidated = true
                     track.pendingFaceMotion = nil
                 } else {
                     track.pendingFaceMotion = sample
@@ -695,6 +713,10 @@ public struct SceneField: Sendable {
         let faceVerificationEligible = isFace
             && actionEligible
             && track.faceVerified
+        let faceInteractionLivenessEligible = isFace
+            && actionEligible
+            && track.observedThisFrame
+            && track.faceInteractionLivenessValidated
         let lastSeenMilliseconds = monotonicNS >= track.lastSeenNS
             ? Double(monotonicNS - track.lastSeenNS) / 1_000_000
             : 0
@@ -720,6 +742,7 @@ public struct SceneField: Sendable {
             isActionEligible: actionEligible,
             faceActivityEligible: faceActivityEligible,
             faceVerificationEligible: faceVerificationEligible,
+            faceInteractionLivenessEligible: faceInteractionLivenessEligible,
             eyeContactEligible: track.observedThisFrame && track.eyeContactEligible,
             trackingBoundary: track.trackingBoundary,
             observedBearing: track.observedThisFrame ? track.observedBearing : nil,

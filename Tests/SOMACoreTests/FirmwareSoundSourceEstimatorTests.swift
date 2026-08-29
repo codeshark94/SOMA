@@ -3,6 +3,30 @@ import XCTest
 @testable import SOMACore
 
 final class FirmwareSoundSourceEstimatorTests: XCTestCase {
+    func testPhysicalMotionQualificationRejectsAStationaryFirmwareMode() {
+        let start = GimbalPose(pitchDegrees: 3, panDegrees: -8, monotonicNS: 1_000)
+        XCTAssertFalse(FirmwareSoundSourceEstimator.hasMeasuredDirectionalMotion(
+            startingPose: start,
+            trajectory: [
+                start,
+                GimbalPose(pitchDegrees: 3.1, panDegrees: -8.1, monotonicNS: 2_000),
+                GimbalPose(pitchDegrees: 2.9, panDegrees: -7.9, monotonicNS: 3_000),
+            ]
+        ))
+    }
+
+    func testPhysicalMotionQualificationAcceptsMeasuredOrientation() {
+        let start = GimbalPose(pitchDegrees: 3, panDegrees: -8, monotonicNS: 1_000)
+        XCTAssertTrue(FirmwareSoundSourceEstimator.hasMeasuredDirectionalMotion(
+            startingPose: start,
+            trajectory: [
+                start,
+                GimbalPose(pitchDegrees: 3.2, panDegrees: -8.1, monotonicNS: 2_000),
+                GimbalPose(pitchDegrees: 3.4, panDegrees: -9.0, monotonicNS: 3_000),
+            ]
+        ))
+    }
+
     func testSettledTrajectoryProducesMeasuredSoundBearing() throws {
         let start = GimbalPose(pitchDegrees: -3, panDegrees: 11, monotonicNS: 1_000)
         let estimate = try XCTUnwrap(FirmwareSoundSourceEstimator.estimate(

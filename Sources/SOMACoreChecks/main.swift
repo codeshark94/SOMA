@@ -866,6 +866,7 @@ let stationaryFaceCandidate = faceActivityField.ingest(
 ).first
 require(stationaryFaceCandidate?.isActionEligible == true, "current confirmed face evidence was discarded")
 require(stationaryFaceCandidate?.faceActivityEligible == false, "stationary face started motor authority")
+require(stationaryFaceCandidate?.faceInteractionLivenessEligible == false, "stationary face authorized social interaction")
 let singleJitterFace = VisualObservation(
     rect: NormalizedRect(x: 0.393, y: 0.35, width: 0.16, height: 0.20),
     confidence: 0.95, source: .neuralFaceDetector, kind: .human, label: "face", isActionEligible: true
@@ -876,6 +877,7 @@ let jitteredFaceCandidate = faceActivityField.ingest(
         cameraSettled: true
     ).first
 require(jitteredFaceCandidate?.faceActivityEligible == false, "one detector jitter started motor authority")
+require(jitteredFaceCandidate?.faceInteractionLivenessEligible == false, "one detector jitter established interaction liveness")
 let activeFace = VisualObservation(
     rect: NormalizedRect(x: 0.43, y: 0.35, width: 0.16, height: 0.20),
     confidence: 0.95, source: .neuralFaceDetector, kind: .human, label: "face", isActionEligible: true
@@ -887,6 +889,7 @@ let activeFaceCandidate = faceActivityField.ingest(
     ).first
 require(activeFaceCandidate?.isActionEligible == true, "current confirmed face evidence was discarded")
 require(activeFaceCandidate?.faceActivityEligible == true, "consistent real face motion did not activate motor authority")
+require(activeFaceCandidate?.faceInteractionLivenessEligible == true, "consistent real face motion did not establish interaction liveness")
 let expiredFaceCandidate = faceActivityField.ingest(
         [activeFace], at: start + 1_700_000_001,
         cameraPose: GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start + 1_700_000_001),
@@ -894,6 +897,7 @@ let expiredFaceCandidate = faceActivityField.ingest(
     ).first
 require(expiredFaceCandidate?.isActionEligible == true, "current confirmed face evidence was discarded")
 require(expiredFaceCandidate?.faceActivityEligible == false, "inactive face retained acquisition authority")
+require(expiredFaceCandidate?.faceInteractionLivenessEligible == false, "discontinuous face retained interaction liveness")
 let fusionPerson = VisualObservation(
     rect: NormalizedRect(x: 0.20, y: 0.15, width: 0.50, height: 0.70),
     confidence: 0.85, source: .neuralDetector, kind: .human, label: "person"

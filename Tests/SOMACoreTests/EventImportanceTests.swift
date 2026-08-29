@@ -431,6 +431,97 @@ final class EventImportanceTests: XCTestCase {
         )
     }
 
+    func testWeakSingleVADWindowCannotOpenNewConversation() {
+        let start: UInt64 = 1_000_000_000
+        var gate = ConversationContactGate()
+
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: true,
+            at: start,
+            directContact: true,
+            voiceConfidence: 0.374
+        ))
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: true,
+            at: start + 260_000_000,
+            directContact: true,
+            voiceConfidence: 0.08
+        ))
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: false,
+            at: start + 520_000_000,
+            directContact: true,
+            voiceConfidence: 0
+        ))
+    }
+
+    func testSustainedModerateVoiceEvidenceOpensWithContinuousDirectContact() {
+        let start: UInt64 = 1_000_000_000
+        var gate = ConversationContactGate()
+
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: true,
+            at: start,
+            directContact: true,
+            voiceConfidence: 0.42
+        ))
+        XCTAssertEqual(gate.observeVoiceActivity(
+            active: true,
+            at: start + 260_000_000,
+            directContact: true,
+            voiceConfidence: 0.44
+        ), .voiceActivity)
+    }
+
+    func testStrongVoiceEvidenceOpensImmediatelyButCannotSubstituteForGaze() {
+        let start: UInt64 = 1_000_000_000
+        var admitted = ConversationContactGate()
+        XCTAssertEqual(admitted.observeVoiceActivity(
+            active: true,
+            at: start,
+            directContact: true,
+            voiceConfidence: 0.85
+        ), .voiceActivity)
+
+        var rejected = ConversationContactGate()
+        XCTAssertNil(rejected.observeVoiceActivity(
+            active: true,
+            at: start,
+            directContact: false,
+            voiceConfidence: 0.85
+        ))
+        XCTAssertNil(rejected.observeVoiceActivity(
+            active: true,
+            at: start + 260_000_000,
+            directContact: true,
+            voiceConfidence: 0.90
+        ))
+    }
+
+    func testAvertedGazeBreaksPendingModerateVoiceAdmission() {
+        let start: UInt64 = 1_000_000_000
+        var gate = ConversationContactGate()
+
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: true,
+            at: start,
+            directContact: true,
+            voiceConfidence: 0.42
+        ))
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: true,
+            at: start + 260_000_000,
+            directContact: false,
+            voiceConfidence: 0.44
+        ))
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: true,
+            at: start + 520_000_000,
+            directContact: true,
+            voiceConfidence: 0.90
+        ))
+    }
+
     func testCurrentVerifiedFaceFixationRequiresDirectGazeAndExpires() {
         let start: UInt64 = 2_000_000_000
         var fixation = L0FaceFixationAdmission(freshnessMilliseconds: 500)

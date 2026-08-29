@@ -373,6 +373,10 @@ final class PredictiveWorldModelTests: XCTestCase {
         let stationary = field.ingest([face], at: start, cameraPose: pose, cameraSettled: true)[0]
         XCTAssertTrue(stationary.isActionEligible, "current confirmed face evidence was discarded")
         XCTAssertFalse(stationary.faceActivityEligible, "a stationary face must not acquire motor control")
+        XCTAssertFalse(
+            stationary.faceInteractionLivenessEligible,
+            "a stationary face authorized social interaction"
+        )
         let singleJitter = VisualObservation(
             rect: NormalizedRect(x: 0.393, y: 0.35, width: 0.16, height: 0.20),
             confidence: 0.95,
@@ -388,6 +392,10 @@ final class PredictiveWorldModelTests: XCTestCase {
             cameraSettled: true
         )
         XCTAssertFalse(jittered[0].faceActivityEligible, "one detector jitter acquired motor authority")
+        XCTAssertFalse(
+            jittered[0].faceInteractionLivenessEligible,
+            "one detector jitter established interaction liveness"
+        )
         let movedFace = VisualObservation(
             rect: NormalizedRect(x: 0.43, y: 0.35, width: 0.16, height: 0.20),
             confidence: 0.95,
@@ -404,6 +412,10 @@ final class PredictiveWorldModelTests: XCTestCase {
         )
         XCTAssertTrue(active[0].isActionEligible, "current confirmed face evidence was discarded")
         XCTAssertTrue(active[0].faceActivityEligible, "consistent real face motion did not acquire motor authority")
+        XCTAssertTrue(
+            active[0].faceInteractionLivenessEligible,
+            "consistent face motion did not establish interaction liveness"
+        )
         let expired = field.ingest(
             [movedFace],
             at: start + 1_700_000_001,
@@ -412,6 +424,76 @@ final class PredictiveWorldModelTests: XCTestCase {
         )
         XCTAssertTrue(expired[0].isActionEligible, "current confirmed face evidence was discarded")
         XCTAssertFalse(expired[0].faceActivityEligible, "inactive face retained acquisition authority")
+        XCTAssertFalse(
+            expired[0].faceInteractionLivenessEligible,
+            "a discontinuous face observation retained interaction liveness"
+        )
+    }
+
+    func testIndependentFaceGeometryDoesNotSubstituteForInteractionLiveness() {
+        var field = SceneField(requiresFaceActivity: true)
+        let start: UInt64 = 1_000_000_000
+        let pose = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
+        let staticVerifiedFace = VisualObservation(
+            rect: NormalizedRect(x: 0.38, y: 0.35, width: 0.16, height: 0.20),
+            confidence: 0.95,
+            source: .systemFaceDetector,
+            kind: .human,
+            label: "face",
+            isActionEligible: true,
+            isFaceVerified: true,
+            isEyeContactEligible: true,
+            gazeEvidence: .direct
+        )
+
+        let candidate = field.ingest(
+            [staticVerifiedFace],
+            at: start,
+            cameraPose: pose,
+            cameraSettled: true
+        )[0]
+        XCTAssertTrue(candidate.faceVerificationEligible)
+        XCTAssertTrue(candidate.eyeContactEligible)
+        XCTAssertFalse(
+            candidate.faceInteractionLivenessEligible,
+            "independent face landmarks turned a static face into an interaction partner"
+        )
+    }
+
+    func testSameFrameDetectorDisagreementCannotManufactureInteractionLiveness() {
+        var field = SceneField(requiresFaceActivity: true)
+        let start: UInt64 = 1_000_000_000
+        let pose = GimbalPose(pitchDegrees: 0, panDegrees: 0, monotonicNS: start)
+        let first = VisualObservation(
+            rect: NormalizedRect(x: 0.36, y: 0.35, width: 0.16, height: 0.20),
+            confidence: 0.95,
+            source: .neuralFaceDetector,
+            kind: .human,
+            label: "face",
+            isActionEligible: true
+        )
+        let second = VisualObservation(
+            rect: NormalizedRect(x: 0.40, y: 0.35, width: 0.16, height: 0.20),
+            confidence: 0.95,
+            source: .systemFaceDetector,
+            kind: .human,
+            label: "face",
+            isActionEligible: true,
+            isFaceVerified: true,
+            isEyeContactEligible: true,
+            gazeEvidence: .direct
+        )
+
+        let candidate = field.ingest(
+            [first, second],
+            at: start,
+            cameraPose: pose,
+            cameraSettled: true
+        )[0]
+        XCTAssertFalse(
+            candidate.faceInteractionLivenessEligible,
+            "two detector boxes from one camera frame were counted as biological motion"
+        )
     }
 
     func testVoiceReweightsPersistentVisualTargetTowardReadyInteraction() {

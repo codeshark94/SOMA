@@ -3,36 +3,66 @@ import Foundation
 public struct DirectGazeConsensusSample: Equatable, Sendable {
     public let rect: NormalizedRect
     public let evidence: VisualGazeEvidence
+    public let directConfidence: Double
     public let capturedNS: UInt64
 
-    public init(rect: NormalizedRect, evidence: VisualGazeEvidence, capturedNS: UInt64) {
+    public init(
+        rect: NormalizedRect,
+        evidence: VisualGazeEvidence,
+        directConfidence: Double,
+        capturedNS: UInt64
+    ) {
         self.rect = rect
         self.evidence = evidence
+        self.directConfidence = min(max(directConfidence, 0), 1)
         self.capturedNS = capturedNS
     }
 }
 
-/// Stabilizes direct-gaze evidence across independent camera captures. Reusing
-/// one landmark result across several L0 frames cannot satisfy the consensus.
+/// Integrates direct-gaze confidence across a short series of independent
+/// camera captures. This is perceptual accumulation, not a time cooldown: weak
+/// off-axis samples cannot become contact merely by repeating, while strong
+/// camera-directed samples cross the boundary within a few capture intervals.
 public struct DirectGazeConsensus: Sendable {
+    private struct Observation: Sendable {
+        let capturedNS: UInt64
+        let confidence: Double
+    }
+
     private struct Track: Sendable {
         var rect: NormalizedRect
         var lastCaptureNS: UInt64
-        var consecutiveDirectSamples: Int
+        var observations: [Observation]
     }
 
     private let requiredIndependentSamples: Int
+    private let minimumSustainedNS: UInt64
     private let maximumInterSampleNS: UInt64
+    private let integrationWindowNS: UInt64
+    private let minimumMeanConfidence: Double
+    private let minimumSampleConfidence: Double
     private var tracks: [Track] = []
 
     public init(
-        requiredIndependentSamples: Int = 2,
-        maximumInterSampleMilliseconds: UInt64 = 350
+        requiredIndependentSamples: Int = 3,
+        minimumSustainedMilliseconds: UInt64 = 140,
+        maximumInterSampleMilliseconds: UInt64 = 250,
+        integrationWindowMilliseconds: UInt64 = 500,
+        minimumMeanConfidence: Double = 0.62,
+        minimumSampleConfidence: Double = 0.50
     ) {
         precondition(requiredIndependentSamples >= 2)
+        precondition(minimumSustainedMilliseconds > 0)
         precondition(maximumInterSampleMilliseconds > 0)
+        precondition(integrationWindowMilliseconds >= minimumSustainedMilliseconds)
+        precondition((0...1).contains(minimumMeanConfidence))
+        precondition((0...1).contains(minimumSampleConfidence))
         self.requiredIndependentSamples = requiredIndependentSamples
+        self.minimumSustainedNS = minimumSustainedMilliseconds * 1_000_000
         self.maximumInterSampleNS = maximumInterSampleMilliseconds * 1_000_000
+        self.integrationWindowNS = integrationWindowMilliseconds * 1_000_000
+        self.minimumMeanConfidence = minimumMeanConfidence
+        self.minimumSampleConfidence = minimumSampleConfidence
     }
 
     /// Returns one stabilized state per input sample, preserving input order.
@@ -66,7 +96,7 @@ public struct DirectGazeConsensus: Sendable {
                 tracks.append(Track(
                     rect: sample.rect,
                     lastCaptureNS: 0,
-                    consecutiveDirectSamples: 0
+                    observations: []
                 ))
                 index = tracks.index(before: tracks.endIndex)
                 claimedTrackIndices.insert(index)
@@ -74,19 +104,25 @@ public struct DirectGazeConsensus: Sendable {
 
             var track = tracks[index]
             let isIndependentCapture = sample.capturedNS > track.lastCaptureNS
-            let continuesRun = isIndependentCapture
-                && sample.capturedNS - track.lastCaptureNS <= maximumInterSampleNS
-
             switch sample.evidence {
             case .direct:
                 if isIndependentCapture {
-                    track.consecutiveDirectSamples = continuesRun
-                        ? track.consecutiveDirectSamples + 1
-                        : 1
+                    if track.lastCaptureNS > 0,
+                       sample.capturedNS - track.lastCaptureNS > maximumInterSampleNS {
+                        track.observations.removeAll(keepingCapacity: true)
+                    }
+                    track.observations.append(Observation(
+                        capturedNS: sample.capturedNS,
+                        confidence: sample.directConfidence
+                    ))
+                    track.observations.removeAll { observation in
+                        sample.capturedNS > observation.capturedNS
+                            && sample.capturedNS - observation.capturedNS > integrationWindowNS
+                    }
                     track.lastCaptureNS = sample.capturedNS
                 }
             case .averted, .unavailable:
-                track.consecutiveDirectSamples = 0
+                track.observations.removeAll(keepingCapacity: true)
                 if isIndependentCapture {
                     track.lastCaptureNS = sample.capturedNS
                 }
@@ -95,7 +131,18 @@ public struct DirectGazeConsensus: Sendable {
             tracks[index] = track
 
             guard sample.evidence == .direct else { return sample.evidence }
-            return track.consecutiveDirectSamples >= requiredIndependentSamples
+            guard track.observations.count >= requiredIndependentSamples,
+                  let first = track.observations.first,
+                  let last = track.observations.last,
+                  last.capturedNS >= first.capturedNS,
+                  last.capturedNS - first.capturedNS >= minimumSustainedNS else {
+                return .unavailable
+            }
+            let meanConfidence = track.observations.reduce(0) { $0 + $1.confidence }
+                / Double(track.observations.count)
+            let weakestConfidence = track.observations.map(\.confidence).min() ?? 0
+            return meanConfidence >= minimumMeanConfidence
+                && weakestConfidence >= minimumSampleConfidence
                 ? .direct
                 : .unavailable
         }

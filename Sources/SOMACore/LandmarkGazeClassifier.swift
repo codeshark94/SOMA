@@ -30,6 +30,20 @@ public struct EyeLandmarkGeometry: Equatable, Sendable {
     }
 }
 
+/// One-frame gaze interpretation. `evidence` carries hard geometric facts,
+/// while `directConfidence` preserves how centrally the pupils and face pose
+/// support camera-directed gaze. Temporal admission consumes the confidence;
+/// a permissive binary boundary alone must never authorize a conversation.
+public struct LandmarkGazeAssessment: Equatable, Sendable {
+    public let evidence: VisualGazeEvidence
+    public let directConfidence: Double
+
+    public init(evidence: VisualGazeEvidence, directConfidence: Double) {
+        self.evidence = evidence
+        self.directConfidence = min(max(directConfidence, 0), 1)
+    }
+}
+
 /// Reduces bilateral eye geometry and face pose into transient gaze evidence.
 /// Pupil centring alone is insufficient because eyelid motion can translate
 /// the measured pupil and eye contour together during a downward glance.
@@ -43,6 +57,26 @@ public enum LandmarkGazeClassifier {
         minimumMeanEyeAperture: Double = 0.27,
         minimumMeanSignedPupilOffsetY: Double = -0.05
     ) -> VisualGazeEvidence {
+        assess(
+            yaw: yaw,
+            pitch: pitch,
+            leftEye: leftEye,
+            rightEye: rightEye,
+            pupilCenteringScale: pupilCenteringScale,
+            minimumMeanEyeAperture: minimumMeanEyeAperture,
+            minimumMeanSignedPupilOffsetY: minimumMeanSignedPupilOffsetY
+        ).evidence
+    }
+
+    public static func assess(
+        yaw: Double?,
+        pitch: Double?,
+        leftEye: EyeLandmarkGeometry,
+        rightEye: EyeLandmarkGeometry,
+        pupilCenteringScale: Double = 1,
+        minimumMeanEyeAperture: Double = 0.27,
+        minimumMeanSignedPupilOffsetY: Double = -0.05
+    ) -> LandmarkGazeAssessment {
         let values = [
             leftEye.pupilOffsetX,
             leftEye.pupilOffsetY,
@@ -61,17 +95,25 @@ public enum LandmarkGazeClassifier {
               minimumMeanEyeAperture > 0,
               let yaw,
               yaw.isFinite else {
-            return .unavailable
+            return LandmarkGazeAssessment(evidence: .unavailable, directConfidence: 0)
         }
 
-        if abs(yaw) > 0.65 { return .averted }
-        if let pitch, pitch.isFinite, abs(pitch) > 0.45 { return .averted }
+        if abs(yaw) > 0.65 {
+            return LandmarkGazeAssessment(evidence: .averted, directConfidence: 0)
+        }
+        if let pitch, pitch.isFinite, abs(pitch) > 0.45 {
+            return LandmarkGazeAssessment(evidence: .averted, directConfidence: 0)
+        }
 
+        let horizontalLimit = 0.60 * pupilCenteringScale
+        let verticalLimit = 0.50 * pupilCenteringScale
         let pupilIsCentered = [leftEye, rightEye].allSatisfy { eye in
-            eye.pupilOffsetX <= 0.60 * pupilCenteringScale
-                && eye.pupilOffsetY <= 0.50 * pupilCenteringScale
+            eye.pupilOffsetX <= horizontalLimit
+                && eye.pupilOffsetY <= verticalLimit
         }
-        guard pupilIsCentered else { return .averted }
+        guard pupilIsCentered else {
+            return LandmarkGazeAssessment(evidence: .averted, directConfidence: 0)
+        }
 
         // The previous absolute-only Y offset discarded the distinction
         // between looking up and looking down. A sustained glance toward a
@@ -82,15 +124,26 @@ public enum LandmarkGazeClassifier {
             leftEye.signedPupilOffsetY + rightEye.signedPupilOffsetY
         ) / 2
         guard meanSignedPupilOffsetY >= minimumMeanSignedPupilOffsetY else {
-            return .averted
+            return LandmarkGazeAssessment(evidence: .averted, directConfidence: 0)
         }
 
         let meanAperture = (leftEye.apertureRatio + rightEye.apertureRatio) / 2
         let minimumBilateralAperture = minimumMeanEyeAperture * 0.70
         guard meanAperture >= minimumMeanEyeAperture,
               min(leftEye.apertureRatio, rightEye.apertureRatio) >= minimumBilateralAperture else {
-            return .averted
+            return LandmarkGazeAssessment(evidence: .averted, directConfidence: 0)
         }
-        return .direct
+
+        let maximumHorizontalOffset = max(leftEye.pupilOffsetX, rightEye.pupilOffsetX)
+        let maximumVerticalOffset = max(leftEye.pupilOffsetY, rightEye.pupilOffsetY)
+        let horizontalSupport = max(0, 1 - maximumHorizontalOffset / horizontalLimit)
+        let verticalSupport = max(0, 1 - maximumVerticalOffset / verticalLimit)
+        let pupilSupport = horizontalSupport * 0.75 + verticalSupport * 0.25
+        let yawSupport = max(0, 1 - abs(yaw) / 0.65)
+        let pitchSupport = pitch.map { max(0, 1 - abs($0) / 0.45) } ?? 1
+        return LandmarkGazeAssessment(
+            evidence: .direct,
+            directConfidence: min(pupilSupport, yawSupport, pitchSupport)
+        )
     }
 }
