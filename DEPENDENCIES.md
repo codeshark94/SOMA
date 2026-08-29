@@ -37,18 +37,31 @@ dylib's deployment target so it cannot approve an unloadable local build.
 
 ## Clean-Mac installation
 
-Install Xcode command-line tools and Homebrew first, then run:
+Install Xcode command-line tools and Homebrew first, create the local signing
+identity described below, obtain the SDK through the
+[official OBSBOT application](https://www.obsbot.com/sdk), place the archive in
+`~/Downloads`, then run:
 
 ```sh
 xcode-select --install
 git clone https://github.com/codeshark94/SOMA.git
 cd SOMA
 
-# Installs CMake, OpenCV, and the Ollama app from Brewfile. The SDK archive is
-# supplied separately because its redistribution terms are not part of SOMA.
-scripts/bootstrap-soma.zsh \
-  --sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip
+scripts/setup-soma.zsh
 ```
+
+The setup command is safe to rerun. It discovers the exact supported SDK
+archive, invokes the existing locked bootstrap, starts Ollama and provisions
+the L1 model when absent, runs the tests and runtime doctor, installs the signed
+app, and verifies that the process remains active. Use `--plan` for a read-only
+preview, `--sdk-archive` for a different archive location, or `--with-l05` for
+the optional local semantic helper.
+
+The SDK is not published in this public repository or its release assets. The
+vendor-supplied archive contains no public redistribution grant and the official
+delivery flow is tied to an approved OBSBOT account. If the archive is missing,
+the setup command opens the official application page instead of fetching an
+unverified third-party copy.
 
 The supported SDK archive has SHA-256
 `8f938156575280d966f27395fa9f5d7f132e2bdb69c714843f5fbfb524688792`.
@@ -80,7 +93,8 @@ usable persistent identity and never fall back to ad-hoc signing, so macOS TCC
 permissions remain attached to a stable installed application identity across
 rebuilds.
 
-Verify the clean checkout before installation:
+For debugging an individual setup stage, the lower-level commands remain
+available:
 
 ```sh
 scripts/soma-doctor.zsh --build

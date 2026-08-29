@@ -286,20 +286,23 @@ SOMA's Swift package has no remote SwiftPM dependencies. A full runtime uses:
 - Ollama with the configured L1 model
 - A compatible signed-in Codex installation when L2 Live Voice is enabled
 
-For a clean Mac, use the dependency-aware bootstrap and then verify both the
-build and runtime boundaries:
+For a clean Mac, obtain `libdev_v2.1.0_8.zip` through the
+[official OBSBOT SDK application](https://www.obsbot.com/sdk), place it in
+`~/Downloads`, and run the idempotent setup command:
 
 ```sh
-scripts/bootstrap-soma.zsh \
-  --sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip
-scripts/soma-doctor.zsh --build
-swift build
-swift test
-scripts/soma-doctor.zsh --runtime
+scripts/setup-soma.zsh
 ```
 
-The proprietary OBSBOT SDK is intentionally not stored in Git. Bootstrap
-verifies its exact archive and stages it locally; `soma-doctor` verifies tool
+Use `--sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip` when the archive is
+elsewhere, and `--with-l05` to provision the optional local semantic helper.
+The command reuses the lower-level bootstrap, doctor, test, signing, and
+LaunchAgent installation boundaries rather than duplicating them.
+
+The proprietary OBSBOT SDK is intentionally not stored in Git: the supplied
+archive contains no public redistribution grant and OBSBOT distributes it
+through an account application. Bootstrap verifies its exact archive and
+stages it locally; `soma-doctor` verifies tool
 versions, bundled-model hashes, the SDK signature and hashes, Ollama/model
 availability, conditional Codex support, and optional MLX/ArcFace assets. See
 [`DEPENDENCIES.md`](DEPENDENCIES.md) for the full clean-Mac procedure and
@@ -348,17 +351,12 @@ enabling physical camera control.
 <br>
 
 ```sh
-scripts/bootstrap-soma.zsh \
-  --sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip
-# Review the owner-only configuration created by bootstrap before installation.
-scripts/soma-doctor.zsh --runtime
-# `auto` selects a single connected OBSBOT; use explicit IDs for multiple cameras.
-scripts/install-soma-subconscious-app.zsh
-scripts/soma.zsh start
-scripts/soma.zsh status
+scripts/setup-soma.zsh
 ```
 
-The installer rebuilds the Swift and native helpers, signs a local app bundle,
+The setup command finds the supported SDK in `~/Downloads`, installs locked
+dependencies, provisions the L1 model, runs the full verification suite, then
+rebuilds the Swift and native helpers, signs a local app bundle,
 writes `com.soma.menu-bar` and `com.soma.reactive-l0` LaunchAgents, and starts or
 restarts them. macOS may then request Camera, Microphone, Speech Recognition,
 and Accessibility permissions. The installed runtime is intended for a local
