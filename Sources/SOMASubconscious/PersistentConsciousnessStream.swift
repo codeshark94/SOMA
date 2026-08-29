@@ -78,9 +78,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     private var evidenceQueue: [MentalEvidenceEvent] = []
     private var forcedPeriodicEvidenceIDs: Set<String> = []
     private var evidenceInFlight = false
-    private var lastContactPattern: L1ContactPattern?
+    private var contactIntegrator = L1SocialContactTemporalIntegrator()
     private var lastSocialAvailability = L1SocialAvailability()
-    private var contactContextInitialized = false
     private var lastBehaviorSignature: String?
     private var stopped = false
     private var awarenessTimer: DispatchSourceTimer?
@@ -485,7 +484,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             visualResourceOffers: environment.visualResourceOffers,
             visuals: [visual].compactMap { $0 },
             socialOpportunity: state?.opportunity,
-            contactPattern: socialContactPatternProvider(),
+            contactPattern: contactIntegrator.snapshot(at: DispatchTime.now().uptimeNanoseconds),
             behaviorContext: behaviorContextProvider(),
             curiosityContext: curiosityContextProvider(),
             personPreferences: memory?.personPreferences,
@@ -539,7 +538,14 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                     }
                 } catch {
                     queue.async { [weak self] in
-                        self?.onHealth("thought_held", "reason=\(String(error.localizedDescription.prefix(240)))")
+                        if case let PersistentMentalWorkspaceError.staleRevision(expected, actual) = error {
+                            self?.onHealth(
+                                "thought_superseded",
+                                "expected_revision=\(expected); actual_revision=\(actual); pending_evidence_is_coalesced=true"
+                            )
+                        } else {
+                            self?.onHealth("thought_held", "reason=\(String(error.localizedDescription.prefix(240)))")
+                        }
                     }
                 }
             }
@@ -850,13 +856,12 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     private func observeContactAndBehavior(at monotonicNS: UInt64) {
         let contact = socialContactPatternProvider()
         let availability = socialAvailability()
-        if !contactContextInitialized {
-            lastContactPattern = contact
-            lastSocialAvailability = availability
-            contactContextInitialized = true
-        } else if contact?.eyeContactActive != lastContactPattern?.eyeContactActive
-            || availability != lastSocialAvailability {
-            let active = contact?.eyeContactActive ?? false
+        let transition = contactIntegrator.observe(
+            rawEyeContactActive: contact?.eyeContactActive ?? false,
+            at: monotonicNS
+        )
+        if let transition {
+            let active = transition == .began
             enqueueEvidence(MentalEvidenceEvent(
                 id: "contact:\(monotonicNS):\(active ? "eye_on" : "eye_off")",
                 kind: active ? .directSocialBid : .ordinaryObservation,
@@ -876,7 +881,29 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                 )
             ))
         }
-        lastContactPattern = contact
+
+        if availability.conversationActive != lastSocialAvailability.conversationActive {
+            let active = availability.conversationActive
+            enqueueEvidence(MentalEvidenceEvent(
+                id: "conversation:\(monotonicNS):\(active ? "active" : "inactive")",
+                kind: .conversationOutcome,
+                summary: active
+                    ? "A live conversation session began."
+                    : "The live conversation session ended.",
+                subjectEntityID: presences.keys.first,
+                confidence: 1,
+                novelty: 0.75,
+                contextPatch: MentalContextPatch(
+                    presentEntityIDs: Array(presences.keys),
+                    participantSpeaking: active ? availability.participantSpeaking : false,
+                    conversationActive: active
+                ),
+                driveSignal: MentalDriveSignal(
+                    socialInterest: active ? 0.1 : -0.1,
+                    interruptionPressure: active ? -1 : -0.5
+                )
+            ))
+        }
         lastSocialAvailability = availability
 
         guard let behavior = behaviorContextProvider() else { return }

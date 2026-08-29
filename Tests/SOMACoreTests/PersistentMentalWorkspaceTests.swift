@@ -226,6 +226,182 @@ final class PersistentMentalWorkspaceTests: XCTestCase {
         XCTAssertGreaterThan(curiousProbability, quietProbability)
     }
 
+    func testDriveDecayIsIncrementalAndDoesNotCompoundFromOriginalTimestamp() async {
+        let start = Date(timeIntervalSince1970: 550)
+        let policy = MentalDynamicsPolicy(
+            curiosityDriveHalfLifeSeconds: 10,
+            concernDriveHalfLifeSeconds: 10,
+            boredomDriveHalfLifeSeconds: 10,
+            socialDriveHalfLifeSeconds: 10,
+            interruptionDriveHalfLifeSeconds: 10
+        )
+        let workspace = PersistentMentalWorkspace(
+            snapshot: MentalWorkspaceSnapshot(
+                updatedAt: start,
+                drives: MentalDriveState(
+                    curiosity: 0.8,
+                    concern: 0.8,
+                    boredom: 0.8,
+                    socialInterest: 0.8,
+                    interruptionPressure: 0.8
+                )
+            ),
+            policy: policy
+        )
+
+        let first = await workspace.snapshot(at: start.addingTimeInterval(10))
+        let second = await workspace.snapshot(at: start.addingTimeInterval(20))
+
+        XCTAssertEqual(first.drives.curiosity, 0.4, accuracy: 0.000_001)
+        XCTAssertEqual(second.drives.curiosity, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(second.drives.interruptionPressure, 0.2, accuracy: 0.000_001)
+    }
+
+    func testResolvingCuriosityHypothesisSatisfiesCuriosityDrive() async throws {
+        let start = Date(timeIntervalSince1970: 580)
+        let workspace = PersistentMentalWorkspace(snapshot: MentalWorkspaceSnapshot(updatedAt: start))
+        let evidence = MentalEvidenceEvent(
+            id: "curiosity:answerable",
+            observedAt: start,
+            kind: .memoryAssociation,
+            summary: "A concrete question remains unresolved.",
+            confidence: 1,
+            novelty: 0.8,
+            hypothesis: MentalHypothesisSeed(
+                kind: .curiosity,
+                content: "I want to know what this device is for.",
+                confidence: 0.9,
+                salience: 0.8
+            ),
+            driveSignal: MentalDriveSignal(curiosity: 0.9)
+        )
+        let ingested = await workspace.ingest(evidence)
+        let hypothesisID = try XCTUnwrap(ingested.after.hypotheses.first?.id)
+        let update = L1ThoughtUpdate(
+            expectedRevision: ingested.after.revision,
+            evidenceIDs: [evidence.id],
+            innerMonologue: "The answer resolves that specific question, so its pressure can subside.",
+            channel: .selfCorrection,
+            continuity: .retire,
+            confidence: 1,
+            salience: 0.6,
+            novelty: 0.5,
+            hypothesisMutations: [MentalHypothesisMutation(
+                operation: .resolve,
+                hypothesisID: hypothesisID,
+                strength: 1,
+                evidenceIDs: [evidence.id]
+            )]
+        )
+
+        let resolved = try await workspace.applyThoughtUpdate(update, at: start)
+        XCTAssertEqual(resolved.after.hypotheses.first?.status, .resolved)
+        XCTAssertLessThan(resolved.after.drives.curiosity, 0.2)
+        XCTAssertTrue(resolved.delta.changedFields.contains("drive_satisfied:curiosity"))
+    }
+
+    func testRecentForegroundPaysContinuousRepetitionCost() async throws {
+        let start = Date(timeIntervalSince1970: 590)
+        let workspace = PersistentMentalWorkspace(snapshot: MentalWorkspaceSnapshot(updatedAt: start))
+        let event = MentalEvidenceEvent(
+            id: "social:stable",
+            observedAt: start,
+            kind: .directSocialBid,
+            summary: "A stable social opportunity exists.",
+            confidence: 1,
+            novelty: 0.8
+        )
+        let ingested = await workspace.ingest(event)
+        let first = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: ingested.after.revision,
+            evidenceIDs: [event.id],
+            innerMonologue: "The person is socially available.",
+            channel: .social,
+            continuity: .continue,
+            confidence: 0.9,
+            salience: 0.8,
+            novelty: 0.8
+        ), at: start, draw: 0)
+        XCTAssertEqual(first.after.foregroundThought?.channel, .social)
+
+        let second = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: first.after.revision,
+            evidenceIDs: [event.id],
+            innerMonologue: "The quiet interval also gives me room to reconsider an unresolved question.",
+            channel: .curiosity,
+            continuity: .associate,
+            confidence: 0.9,
+            salience: 0.8,
+            novelty: 0.8
+        ), at: start.addingTimeInterval(1), draw: 0.5)
+        XCTAssertEqual(second.after.foregroundThought?.channel, .curiosity)
+    }
+
+    func testRepeatedThoughtCannotRefreshItsOwnNoveltyToOne() async throws {
+        let start = Date(timeIntervalSince1970: 595)
+        let workspace = PersistentMentalWorkspace(snapshot: MentalWorkspaceSnapshot(updatedAt: start))
+        let event = MentalEvidenceEvent(
+            id: "scene:stable",
+            observedAt: start,
+            kind: .ordinaryObservation,
+            summary: "The scene remains stable.",
+            confidence: 1,
+            novelty: 0.6
+        )
+        let ingested = await workspace.ingest(event)
+        let text = "The same stable scene does not require a new interpretation."
+        let first = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: ingested.after.revision,
+            evidenceIDs: [event.id],
+            innerMonologue: text,
+            channel: .idle,
+            continuity: .idle,
+            confidence: 0.9,
+            salience: 0.7,
+            novelty: 0.5
+        ), at: start, draw: 0)
+        let repeated = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: first.after.revision,
+            evidenceIDs: [event.id],
+            innerMonologue: text,
+            channel: .idle,
+            continuity: .continue,
+            confidence: 0.9,
+            salience: 1,
+            novelty: 1
+        ), at: start.addingTimeInterval(1), draw: 0)
+
+        XCTAssertEqual(repeated.after.thoughtCandidates.count, 1)
+        XCTAssertLessThanOrEqual(repeated.after.thoughtCandidates[0].novelty, 0.20)
+        XCTAssertLessThan(repeated.after.thoughtCandidates[0].salience, 0.9)
+    }
+
+    func testExecutingSocialIntentionDischargesInterruptionPressure() async {
+        let intention = MentalIntention(
+            domain: "social",
+            objective: "Make one bounded social invitation.",
+            pressure: 1,
+            evidenceIDs: ["social:episode"]
+        )
+        let workspace = PersistentMentalWorkspace(snapshot: MentalWorkspaceSnapshot(
+            revision: 2,
+            updatedAt: Date(timeIntervalSince1970: 599),
+            drives: MentalDriveState(
+                curiosity: 0.8,
+                socialInterest: 0.9,
+                interruptionPressure: 1
+            ),
+            intentions: [intention]
+        ))
+
+        let marked = await workspace.markIntentionExecuted(intention.id)
+        XCTAssertTrue(marked)
+        let snapshot = await workspace.currentSnapshot()
+        XCTAssertEqual(snapshot.drives.interruptionPressure, 0, accuracy: 0.000_001)
+        XCTAssertLessThan(snapshot.drives.socialInterest, 0.9)
+        XCTAssertNotNil(snapshot.intentions.first?.executedAt)
+    }
+
     func testSelectiveCheckpointRestoresDurableThoughtButClearsTransientAuthority() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("soma-mental-workspace-\(UUID().uuidString)", isDirectory: true)

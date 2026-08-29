@@ -102,6 +102,8 @@ final class SOMADiagnosticsModel: ObservableObject {
                 return .init(category: "APPLIED", title: humanizedExecutiveAction(value(for: "action") ?? "no_action"), detail: trailingValue(for: "rationale") ?? "Current L0 and social authority accepted the decision.")
             case "action_held", "executive_held", "thought_held":
                 return .init(category: "HELD", title: "Result was not applied", detail: trailingValue(for: "reason") ?? readableMetadata())
+            case "thought_superseded":
+                return .init(category: "COALESCED", title: "A newer evidence transaction replaced this thought", detail: readableMetadata())
             case "model_retry":
                 return .init(category: "MODEL", title: "Retrying a malformed or failed response", detail: trailingValue(for: "reason") ?? readableMetadata())
             case "model_failed":
@@ -193,7 +195,7 @@ final class SOMADiagnosticsModel: ObservableObject {
         thoughts
             .map { thought in
                 let presentation = thought.presentation
-                return "\(thought.timeLabel)  \(presentation.category)  \(presentation.title) · \(presentation.detail)"
+                return "\(thought.timeLabel) [\(presentation.category)] \(presentation.title) · \(presentation.detail)"
             }
             .joined(separator: "\n")
     }
@@ -458,23 +460,13 @@ struct SOMADiagnosticsView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(model.thoughts.enumerated()), id: \.element.id) { _, thought in
-                        let presentation = thought.presentation
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(thought.timeLabel)
-                                .foregroundStyle(.secondary)
-                                .frame(width: 86, alignment: .trailing)
-                            Text(presentation.category)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(color(for: thought.state))
-                                .frame(width: 118, alignment: .leading)
-                            Text("\(presentation.title) · \(presentation.detail)")
-                                .textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1)
+                        logLine(for: thought)
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
+                        .lineSpacing(0)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
                         .contentShape(Rectangle())
                         .id(thought.id)
                     }
@@ -505,6 +497,16 @@ struct SOMADiagnosticsView: View {
         }
     }
 
+    private func logLine(for thought: SOMADiagnosticsModel.Thought) -> Text {
+        let presentation = thought.presentation
+        let timestamp = Text("\(thought.timeLabel) ").foregroundColor(.secondary)
+        let category = Text("[\(presentation.category)] ")
+            .fontWeight(.semibold)
+            .foregroundColor(color(for: thought.state))
+        let message = Text("\(presentation.title) · \(presentation.detail)")
+        return timestamp + category + message
+    }
+
     private func copyDisplayedThoughtLog() {
         let text = model.displayedThoughtLog
         guard !text.isEmpty else { return }
@@ -517,7 +519,7 @@ struct SOMADiagnosticsView: View {
     private func color(for state: String) -> Color {
         switch state {
         case "thought_wake", "executive_wake": .blue
-        case "model_started", "model_retry": .orange
+        case "model_started", "model_retry", "thought_superseded": .orange
         case "foreground_thought", "action_applied": .green
         case "model_failed", "action_held", "executive_held", "thought_held",
              "discarded", "decision_rejected", "opening_suppressed": .red

@@ -1584,15 +1584,23 @@ private final class ConversationContactRuntime: @unchecked Sendable {
         return current == previous ? nil : current
     }
 
-    func authorizeSpeechOnset(at monotonicNS: UInt64) -> ConversationOpeningAuthorization? {
+    func observeVoiceActivity(
+        active: Bool,
+        at monotonicNS: UInt64
+    ) -> ConversationOpeningAuthorization? {
         lock.lock()
         defer { lock.unlock() }
         // Directed-contact history remains L1 social context. It cannot
         // authorize a new conversation on its own: the current L0 fixation
-        // must already have preempted coverage motion and verified the face.
-        // An already open conversation keeps its own inactivity lease.
+        // must already have preempted coverage motion and verified the face at
+        // the beginning of this speech episode. An already open conversation
+        // keeps its own inactivity lease.
         let directContact = l0FixationAdmission.permitsNewSession(at: monotonicNS)
-        return gate.authorizeSpeechOnset(at: monotonicNS, directContact: directContact)
+        return gate.observeVoiceActivity(
+            active: active,
+            at: monotonicNS,
+            directContact: directContact
+        )
     }
 
     func markConversationOpened(at monotonicNS: UInt64) {
@@ -2016,7 +2024,7 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
     case "foreground_thought":
         return ("foreground_thought", message)
     case "executive_wake", "executive_decision", "action_applied", "action_held",
-         "thought_held", "executive_held":
+         "thought_held", "thought_superseded", "executive_held":
         return (state, message)
     case "model_started":
         return ("model_started", message)
@@ -9915,10 +9923,25 @@ private struct SystemFaceEvidence: Sendable {
     let pitch: Double?
     let pupilOffsetX: Double?
     let pupilOffsetY: Double?
+    let signedPupilOffsetY: Double?
     let meanEyeAperture: Double?
     let alignment: FaceAlignmentEvidence
 
     var directedEyeContact: Bool { gazeState == .direct }
+
+    func withGazeState(_ gazeState: SOMACore.VisualGazeEvidence) -> Self {
+        Self(
+            rect: rect,
+            gazeState: gazeState,
+            yaw: yaw,
+            pitch: pitch,
+            pupilOffsetX: pupilOffsetX,
+            pupilOffsetY: pupilOffsetY,
+            signedPupilOffsetY: signedPupilOffsetY,
+            meanEyeAperture: meanEyeAperture,
+            alignment: alignment
+        )
+    }
 }
 
 private final class SystemFaceVerifier: @unchecked Sendable {
@@ -10024,6 +10047,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
                 pitch: gaze.pitch,
                 pupilOffsetX: gaze.pupilOffsetX,
                 pupilOffsetY: gaze.pupilOffsetY,
+                signedPupilOffsetY: gaze.signedPupilOffsetY,
                 meanEyeAperture: gaze.meanEyeAperture,
                 alignment: alignment
             )
@@ -10033,7 +10057,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
     private func refinedGaze(
         in pixelBuffer: CVPixelBuffer,
         faceRect: SOMACore.NormalizedRect
-    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence)? {
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, signedPupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence)? {
         guard let crop = faceCropCGImage(from: pixelBuffer, rect: faceRect) else { return nil }
         let request = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cgImage: crop, options: [:])
@@ -10117,13 +10141,13 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         observation: VNFaceObservation,
         landmarks: VNFaceLandmarks2D,
         rect: SOMACore.NormalizedRect
-    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence) {
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, signedPupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence) {
         let yaw = observation.yaw?.doubleValue
         let pitch = observation.pitch?.doubleValue
         guard rect.centerX >= 0.26, rect.centerX <= 0.74,
               rect.centerY >= 0.13, rect.centerY <= 0.89,
               rect.width * rect.height >= 0.008 else {
-            return (yaw, pitch, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
         }
 
         // On the Tiny 3 stream Vision supplies yaw consistently, but pitch is
@@ -10131,33 +10155,35 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         // optional feature into a permanent rejection. Direct contact still
         // requires bilateral pupil evidence below.
         guard let yaw else {
-            return (yaw, pitch, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
         }
         // Vision's yaw is coarse on this camera (roughly 0, 45, and 90
         // degrees). A pronounced head turn is reliable negative evidence;
         // vertical head pose is not available from this device's Vision
         // result and must not be guessed from it.
         if abs(yaw) > 0.65 {
-            return (yaw, pitch, nil, nil, nil, .averted)
+            return (yaw, pitch, nil, nil, nil, nil, .averted)
         }
         guard let leftEye = landmarks.leftEye,
               let rightEye = landmarks.rightEye,
               let leftPupil = landmarks.leftPupil,
               let rightPupil = landmarks.rightPupil else {
-            return (yaw, pitch, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
         }
         guard let left = pupilOffset(leftPupil, in: leftEye),
               let right = pupilOffset(rightPupil, in: rightEye) else {
-            return (yaw, pitch, nil, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, nil, .unavailable)
         }
         let leftGeometry = SOMACore.EyeLandmarkGeometry(
             pupilOffsetX: left.x,
             pupilOffsetY: left.y,
+            signedPupilOffsetY: left.signedY,
             apertureRatio: left.aperture
         )
         let rightGeometry = SOMACore.EyeLandmarkGeometry(
             pupilOffsetX: right.x,
             pupilOffsetY: right.y,
+            signedPupilOffsetY: right.signedY,
             apertureRatio: right.aperture
         )
         let state = SOMACore.LandmarkGazeClassifier.classify(
@@ -10172,6 +10198,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             pitch,
             max(left.x, right.x),
             max(left.y, right.y),
+            (left.signedY + right.signedY) / 2,
             (left.aperture + right.aperture) / 2,
             state
         )
@@ -10180,7 +10207,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
     private func pupilOffset(
         _ pupil: VNFaceLandmarkRegion2D,
         in eye: VNFaceLandmarkRegion2D
-    ) -> (x: Double, y: Double, aperture: Double)? {
+    ) -> (x: Double, y: Double, signedY: Double, aperture: Double)? {
         guard pupil.pointCount > 0, eye.pointCount >= 2 else { return nil }
         let pupilPoint = pupil.normalizedPoints[0]
         var minimumX = Double.greatestFiniteMagnitude
@@ -10197,9 +10224,11 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         let width = maximumX - minimumX
         let height = maximumY - minimumY
         guard width > 0.001, height > 0.001 else { return nil }
+        let signedY = (Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2)
         return (
             x: abs(Double(pupilPoint.x) - (minimumX + maximumX) / 2) / (width / 2),
             y: abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2),
+            signedY: signedY,
             aperture: height / width
         )
     }
@@ -10625,6 +10654,7 @@ private final class VisionWorker: @unchecked Sendable {
     private var landmarkGazeEvidence: [
         (rect: SOMACore.NormalizedRect, state: SOMACore.VisualGazeEvidence, observedNS: UInt64)
     ] = []
+    private var directGazeConsensus = SOMACore.DirectGazeConsensus()
     private var identityAlignmentEvidence: [(evidence: SystemFaceEvidence, observedNS: UInt64)] = []
     private var nextSceneSnapshotNS: UInt64 = 0
     private var visualEvidenceContinuity = VisualEvidenceContinuity()
@@ -11149,22 +11179,34 @@ private final class VisionWorker: @unchecked Sendable {
             if faceVerificationNow >= verification.captureNS,
                faceVerificationNow - verification.captureNS <= 750_000_000 {
                 verificationCaptureNS = verification.captureNS
-                newlyVerifiedFaces = verification.faces
-                faceConfirmationLease.record(verification.faces.map(\.rect), at: verification.captureNS)
-                let hasLandmarkFace = !verification.faces.isEmpty
+                let stabilizedGaze = directGazeConsensus.stabilize(verification.faces.map {
+                    SOMACore.DirectGazeConsensusSample(
+                        rect: $0.rect,
+                        evidence: $0.gazeState,
+                        capturedNS: verification.captureNS
+                    )
+                })
+                let stabilizedFaces = zip(verification.faces, stabilizedGaze).map { face, gaze in
+                    face.withGazeState(gaze)
+                }
+                newlyVerifiedFaces = stabilizedFaces
+                faceConfirmationLease.record(stabilizedFaces.map(\.rect), at: verification.captureNS)
+                let hasLandmarkFace = !stabilizedFaces.isEmpty
                 if lastSystemFaceVerificationHadFace != hasLandmarkFace
                     || faceVerificationNow >= nextSystemFaceVerificationHealthNS {
                     let captureAgeMS = Double(faceVerificationNow - verification.captureNS) / 1_000_000
-                    let directGazeCount = verification.faces.filter { $0.gazeState == .direct }.count
-                    let avertedGazeCount = verification.faces.filter { $0.gazeState == .averted }.count
-                    let unavailableGazeCount = verification.faces.filter { $0.gazeState == .unavailable }.count
-                    let gazeSample = verification.faces.first.map { evidence in
+                    let directGazeCount = stabilizedFaces.filter { $0.gazeState == .direct }.count
+                    let rawDirectGazeCount = verification.faces.filter { $0.gazeState == .direct }.count
+                    let avertedGazeCount = stabilizedFaces.filter { $0.gazeState == .averted }.count
+                    let unavailableGazeCount = stabilizedFaces.filter { $0.gazeState == .unavailable }.count
+                    let gazeSample = stabilizedFaces.first.map { evidence in
                         let yaw = evidence.yaw.map { String(format: "%.3f", $0) } ?? "na"
                         let pitch = evidence.pitch.map { String(format: "%.3f", $0) } ?? "na"
                         let pupilX = evidence.pupilOffsetX.map { String(format: "%.3f", $0) } ?? "na"
                         let pupilY = evidence.pupilOffsetY.map { String(format: "%.3f", $0) } ?? "na"
+                        let signedPupilY = evidence.signedPupilOffsetY.map { String(format: "%.3f", $0) } ?? "na"
                         let aperture = evidence.meanEyeAperture.map { String(format: "%.3f", $0) } ?? "na"
-                        return "yaw=\(yaw); pitch=\(pitch); pupil_offset_x=\(pupilX); pupil_offset_y=\(pupilY); eye_aperture=\(aperture)"
+                        return "yaw=\(yaw); pitch=\(pitch); pupil_offset_x=\(pupilX); pupil_offset_y=\(pupilY); pupil_signed_y=\(signedPupilY); eye_aperture=\(aperture)"
                     } ?? "none"
                     writer.write(RuntimeEvent(
                         event: "source.health",
@@ -11172,9 +11214,10 @@ private final class VisionWorker: @unchecked Sendable {
                         source: "system_face_verifier",
                         state: hasLandmarkFace ? "face_detected" : "no_face",
                         message: String(
-                            format: "landmark_faces=%d; gaze_direct=%d; gaze_averted=%d; gaze_unavailable=%d; capture_age_ms=%.1f; gaze_sample=%@",
-                            verification.faces.count,
+                            format: "landmark_faces=%d; gaze_direct=%d; gaze_direct_raw=%d; gaze_averted=%d; gaze_unavailable=%d; capture_age_ms=%.1f; gaze_sample=%@",
+                            stabilizedFaces.count,
                             directGazeCount,
+                            rawDirectGazeCount,
                             avertedGazeCount,
                             unavailableGazeCount,
                             captureAgeMS,
@@ -11184,10 +11227,10 @@ private final class VisionWorker: @unchecked Sendable {
                     lastSystemFaceVerificationHadFace = hasLandmarkFace
                     nextSystemFaceVerificationHealthNS = faceVerificationNow + 1_000_000_000
                 }
-                landmarkGazeEvidence = verification.faces.map {
+                landmarkGazeEvidence = stabilizedFaces.map {
                     ($0.rect, $0.gazeState, verification.captureNS)
                 }
-                identityAlignmentEvidence = verification.faces.map { ($0, verification.captureNS) }
+                identityAlignmentEvidence = stabilizedFaces.map { ($0, verification.captureNS) }
             }
         }
         // A newly completed landmark result may rescue an ANE miss, but stale
@@ -12111,8 +12154,8 @@ private func run(_ options: Options) throws {
                 // time with a pacing pause, asking the Gemma model to identify
                 // each object in an independent inference — separate from the
                 // conscious-stream cycle.
-                let presentedObject = cue.situation == .objectPresentation
-                    || cue.attentionHint == .object
+                let notableObject = cue.attentionHint == .object
+                    || (cue.situation == .objectPresentation && !cue.objectLabel.isEmpty)
                 let emptyExploration = cue.socialPresence < 0.3
                     && cue.situation != .socialBid
                 // Feed stable empty-room background to the space trigger so it
@@ -12124,7 +12167,7 @@ private func run(_ options: Options) throws {
                 }
                 let worthTalkingAbout = cue.conversationValue
                     >= somaEnvDouble("SOMA_OBJECT_CONVERSATION_THRESHOLD", default: 0.55)
-                if (presentedObject || emptyExploration), worthTalkingAbout,
+                if (notableObject || emptyExploration), worthTalkingAbout,
                    let jpeg = l1AuxiliaryBridgeBox.bridge?.latestFrameJPEG() {
                     // Capture where the camera was looking when this object was
                     // detected, so the inventory is spatially grounded. Pose is
@@ -13674,7 +13717,7 @@ private func run(_ options: Options) throws {
             complete.signal()
         },
         anonymousReviewProvider: { anonymousReviewBox.approve() },
-        pupilCenteringThreshold: somaEnvDouble("SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD", default: 1.0)
+        pupilCenteringThreshold: somaEnvDouble("SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD", default: 0.9)
     )
     let eventImportanceModel = EventImportanceModel()
     let speechInteraction: LocalSpeechInteractionCoordinator?
@@ -13753,14 +13796,14 @@ private func run(_ options: Options) throws {
                 at: completedNS
             )
             let visualAdmission = LiveConversationVisualAdmission.permitsNewSession(for: belief)
-            // VAD onset can arrive one short audio frame before the vision
-            // queue has cancelled an in-flight coverage move. Re-evaluate
-            // throughout the same active utterance so L0 can establish its
-            // verified fixation first; a historical gaze sample alone never
-            // authorizes L2.
-            let openingAuthorization = evidence.active && visualAdmission
-                ? conversationContact.authorizeSpeechOnset(at: completedNS)
-                : nil
+            // The contact gate observes every VAD state, including an onset
+            // without gaze. Once an episode starts without current direct
+            // contact, later gaze cannot upgrade that same ambient sound into
+            // a user request; a new voice onset is required.
+            let openingAuthorization = conversationContact.observeVoiceActivity(
+                active: evidence.active,
+                at: completedNS
+            )
             if evidence.changed, options.l2LiveVoice {
                 attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
             }
@@ -13798,7 +13841,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: completedNS,
                     source: "l2_live_voice",
                     state: "opening_suppressed",
-                    message: "direct_contact_not_current"
+                    message: "speech_episode_started_without_direct_contact"
                 ))
             }
             if let openingAuthorization,

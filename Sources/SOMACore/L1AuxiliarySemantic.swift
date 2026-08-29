@@ -223,7 +223,7 @@ public struct L1AuxiliarySemanticInterruptGate: Sendable {
     public mutating func recommend(_ cue: L1AuxiliarySemanticCue) -> L1AuxiliarySemanticInterrupt? {
         guard cue.wakeScore >= minimumWakeScore,
               cue.confidence >= minimumConfidence,
-              isConsistent(situation: cue.situation, reason: cue.wakeReason) else {
+              isConsistent(cue) else {
             return nil
         }
         return L1AuxiliarySemanticInterrupt(
@@ -238,13 +238,18 @@ public struct L1AuxiliarySemanticInterruptGate: Sendable {
         )
     }
 
-    private func isConsistent(situation: L1AuxiliarySituation, reason: L1AuxiliaryWakeReason) -> Bool {
-        switch (situation, reason) {
+    private func isConsistent(_ cue: L1AuxiliarySemanticCue) -> Bool {
+        switch (cue.situation, cue.wakeReason) {
         case (.socialBid, .directSocialBid),
-             (.objectPresentation, .presentedObject),
              (.sceneTransition, .unexpectedChange),
              (.uncertain, .ambiguity):
             return true
+        case (.objectPresentation, .presentedObject):
+            return cue.socialPresence >= 0.35
+                && cue.attentionHint == .person
+                && !cue.objectLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && cue.engagement >= 0.35
+                && cue.reaction == .engage
         default:
             return false
         }

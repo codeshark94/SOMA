@@ -2944,6 +2944,48 @@ final class PredictiveWorldModelTests: XCTestCase {
             situation: .socialBid,
             reason: .directSocialBid
         )))
+
+        let staticObject = L1AuxiliarySemanticCue(
+            requestID: start + 6_000_000_000,
+            captureNS: start + 6_000_000_000,
+            completedNS: start + 6_000_000_000,
+            source: "test",
+            summary: "A phone is visible on a desk.",
+            novelty: 0.8,
+            socialPresence: 0,
+            attentionHint: .object,
+            situation: .objectPresentation,
+            wakeReason: .presentedObject,
+            wakeScore: 0.9,
+            confidence: 0.9,
+            engagement: 0,
+            reaction: .orient,
+            conversationValue: 0.8,
+            objectLabel: "phone",
+            inferenceMS: 100
+        )
+        XCTAssertNil(gate.recommend(staticObject))
+
+        let presentedObject = L1AuxiliarySemanticCue(
+            requestID: start + 7_000_000_000,
+            captureNS: start + 7_000_000_000,
+            completedNS: start + 7_000_000_000,
+            source: "test",
+            summary: "A person holds a camera toward SOMA.",
+            novelty: 0.8,
+            socialPresence: 0.9,
+            attentionHint: .person,
+            situation: .objectPresentation,
+            wakeReason: .presentedObject,
+            wakeScore: 0.9,
+            confidence: 0.9,
+            engagement: 0.8,
+            reaction: .engage,
+            conversationValue: 0.8,
+            objectLabel: "camera",
+            inferenceMS: 100
+        )
+        XCTAssertNotNil(gate.recommend(presentedObject))
     }
 
     func testL1AuxiliaryTemporalSituationWakeRequiresPersistentEvidenceAndLatchesOneEpisode() {

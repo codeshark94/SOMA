@@ -7,8 +7,8 @@ final class ConsciousnessStreamTests: XCTestCase {
         var queue = L1ConsciousnessWorkQueue()
         queue.enqueue(makeThoughtRequest(wakeKind: .periodic, revision: 4))
         queue.enqueue(makeThoughtRequest(wakeKind: .periodic, revision: 5))
-        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 6))
-        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 7))
+        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 6, evidenceID: "scene:6"))
+        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 7, evidenceID: "scene:7"))
 
         let firstExecutive = makeExecutiveRequest(revision: 7)
         let secondExecutive = makeExecutiveRequest(revision: 7)
@@ -33,7 +33,24 @@ final class ConsciousnessStreamTests: XCTestCase {
         XCTAssertEqual(second.cycleID, secondExecutive.cycleID)
         XCTAssertEqual(thought.workspace.revision, 7)
         XCTAssertEqual(thought.wakeKind, .event)
+        XCTAssertEqual(thought.evidence.map(\.id), ["scene:6", "scene:7"])
+        XCTAssertTrue(thought.beliefSummary.contains("Evidence scene:6"))
+        XCTAssertTrue(thought.beliefSummary.contains("Evidence scene:7"))
         XCTAssertTrue(queue.isEmpty)
+    }
+
+    func testPendingEventCoalescingIsIdempotentAndUsesNewestAuthority() {
+        var queue = L1ConsciousnessWorkQueue()
+        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 5, evidenceID: "scene:5"))
+        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 6, evidenceID: "scene:5"))
+        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 7, evidenceID: "scene:7"))
+
+        guard case let .thought(request)? = queue.dequeue() else {
+            return XCTFail("coalesced event thought should be available")
+        }
+        XCTAssertEqual(request.workspace.revision, 7)
+        XCTAssertEqual(request.evidence.map(\.id), ["scene:5", "scene:7"])
+        XCTAssertEqual(request.observedAt, Date(timeIntervalSince1970: 27))
     }
 
     func testL1ARejectsAnyBehaviorOrSocialActionField() throws {
@@ -271,13 +288,14 @@ final class ConsciousnessStreamTests: XCTestCase {
     private func makeThoughtRequest(
         hypotheses: [MentalHypothesis] = [],
         wakeKind: L1ThoughtWakeKind = .event,
-        revision: UInt64 = 4
+        revision: UInt64 = 4,
+        evidenceID: String = "scene:1"
     ) -> L1ThoughtRequest {
         let evidence = MentalEvidenceEvent(
-            id: "scene:1",
-            observedAt: Date(timeIntervalSince1970: 20),
+            id: evidenceID,
+            observedAt: Date(timeIntervalSince1970: 20 + Double(revision)),
             kind: .sceneTransition,
-            summary: "The scene changed.",
+            summary: "Evidence \(evidenceID) changed the scene.",
             confidence: 1,
             novelty: 0.8
         )

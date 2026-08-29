@@ -48,15 +48,41 @@ require(
 )
 var contactGate = ConversationContactGate()
 require(
-    contactGate.authorizeSpeechOnset(at: start, directContact: false) == nil,
+    contactGate.observeVoiceActivity(active: true, at: start, directContact: false) == nil,
     "ambient speech authorized a new spoken turn"
 )
 require(
-    contactGate.authorizeSpeechOnset(at: start, directContact: true) == .voiceActivity,
-    "direct contact did not authorize the first spoken turn"
+    contactGate.observeVoiceActivity(
+        active: true,
+        at: start + 100_000_000,
+        directContact: true
+    ) == nil,
+    "later eye contact upgraded an already-rejected ambient sound"
+)
+_ = contactGate.observeVoiceActivity(
+    active: false,
+    at: start + 200_000_000,
+    directContact: true
 )
 require(
-    contactGate.authorizeSpeechOnset(at: start + 1_100_000_000, directContact: false) == nil,
+    contactGate.observeVoiceActivity(
+        active: true,
+        at: start + 300_000_000,
+        directContact: true
+    ) == .voiceActivity,
+    "direct contact did not authorize the first spoken turn"
+)
+_ = contactGate.observeVoiceActivity(
+    active: false,
+    at: start + 400_000_000,
+    directContact: true
+)
+require(
+    contactGate.observeVoiceActivity(
+        active: true,
+        at: start + 1_100_000_000,
+        directContact: false
+    ) == nil,
     "speech without current direct contact authorized a new spoken turn"
 )
 var l0FaceFixationAdmission = L0FaceFixationAdmission(freshnessMilliseconds: 500)
@@ -75,12 +101,30 @@ require(
     "cleared L0 fixation still admitted historical gaze"
 )
 contactGate.markConversationOpened(at: start + 2_000_000_000)
-require(
-    contactGate.authorizeSpeechOnset(at: start + 61_999_000_000, directContact: false) == .activeConversation,
-    "opened conversation did not retain its active lease"
+_ = contactGate.observeVoiceActivity(
+    active: false,
+    at: start + 2_100_000_000,
+    directContact: false
 )
 require(
-    contactGate.authorizeSpeechOnset(at: start + 62_000_000_000, directContact: true) == .voiceActivity,
+    contactGate.observeVoiceActivity(
+        active: true,
+        at: start + 61_999_000_000,
+        directContact: false
+    ) == .activeConversation,
+    "opened conversation did not retain its active lease"
+)
+_ = contactGate.observeVoiceActivity(
+    active: false,
+    at: start + 61_999_500_000,
+    directContact: false
+)
+require(
+    contactGate.observeVoiceActivity(
+        active: true,
+        at: start + 62_000_000_000,
+        directContact: true
+    ) == .voiceActivity,
     "direct contact did not remain admissible after the conversation lease closed"
 )
 var liveSessionInactivity = LiveVoiceSessionInactivityGate()

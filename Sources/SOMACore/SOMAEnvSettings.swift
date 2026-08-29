@@ -72,8 +72,8 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     /// gaze); higher = more lenient. Defaults to 450.
     public var l0EyeContactFreshnessMilliseconds: Double
     /// Scales the pupil-centering thresholds that decide directed eye contact.
-    /// 1.0 = default (0.68 X / 0.82 Y). Lower = stricter (pupil must be more
-    /// centered); higher = more lenient. Defaults to 1.0.
+    /// 1.0 uses the classifier's base limits. Lower = stricter (pupil must be
+    /// more centered); higher = more lenient. Defaults to 0.9.
     public var l0EyeContactPupilThreshold: Double
     /// Minimum confidence (0...1) for the on-device YOLO object detector to
     /// report an object. Higher = fewer false positives (e.g. phantom
@@ -116,7 +116,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l0E2BWakeIntervalMilliseconds: Double = 5_000,
         l05Enabled: Bool = true,
         l0EyeContactFreshnessMilliseconds: Double = 450,
-        l0EyeContactPupilThreshold: Double = 1.0,
+        l0EyeContactPupilThreshold: Double = 0.9,
         l0YoloConfidenceThreshold: Double = 0.5,
         memoryShortTermRetentionHours: Double = 24,
         l2ProactiveOpeningsEnabled: Bool = true,
@@ -235,7 +235,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l0E2BWakeIntervalMilliseconds = max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeIntervalMilliseconds) ?? 5_000, 1_000)
         l05Enabled = try values.decodeIfPresent(Bool.self, forKey: .l05Enabled) ?? true
         l0EyeContactFreshnessMilliseconds = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactFreshnessMilliseconds) ?? 450, 100), 2_000)
-        l0EyeContactPupilThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactPupilThreshold) ?? 1.0, 0.1), 2.0)
+        l0EyeContactPupilThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactPupilThreshold) ?? 0.9, 0.1), 2.0)
         l0YoloConfidenceThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0YoloConfidenceThreshold) ?? 0.5, 0.1), 0.95)
         memoryShortTermRetentionHours = min(max(try values.decodeIfPresent(Double.self, forKey: .memoryShortTermRetentionHours) ?? 24, 1), 24)
         l2ProactiveOpeningsEnabled = try values.decodeIfPresent(Bool.self, forKey: .l2ProactiveOpeningsEnabled) ?? true
@@ -320,7 +320,7 @@ public struct SOMAEnvStore: Sendable {
             l0E2BWakeIntervalMilliseconds: doubleValue(values["SOMA_L0_E2B_WAKE_INTERVAL_MS"], default: 5_000),
             l05Enabled: boolValue(values["SOMA_ENABLE_L05_VLM"], default: true),
             l0EyeContactFreshnessMilliseconds: doubleValue(values["SOMA_L0_EYE_CONTACT_FRESHNESS_MS"], default: 450),
-            l0EyeContactPupilThreshold: doubleValue(values["SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD"], default: 1.0),
+            l0EyeContactPupilThreshold: doubleValue(values["SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD"], default: 0.9),
             l0YoloConfidenceThreshold: doubleValue(values["SOMA_YOLO_CONFIDENCE_THRESHOLD"], default: 0.5),
             memoryShortTermRetentionHours: doubleValue(values["SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS"], default: 24),
             l2ProactiveOpeningsEnabled: boolValue(values["SOMA_L2_PROACTIVE_OPENINGS"], default: true),

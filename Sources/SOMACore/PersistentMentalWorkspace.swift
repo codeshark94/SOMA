@@ -549,6 +549,17 @@ public struct MentalDynamicsPolicy: Equatable, Sendable {
     public let contextEvidenceWeight: Double
     public let foregroundTemperature: Double
     public let foregroundInertia: Double
+    public let foregroundRepetitionHalfLifeSeconds: Double
+    public let foregroundRepetitionPenalty: Double
+    public let channelSaturationPenalty: Double
+    public let repeatedThoughtCarryover: Double
+    public let repeatedThoughtNoveltyCeiling: Double
+    public let thoughtSalienceHalfLifeSeconds: Double
+    public let curiosityDriveHalfLifeSeconds: Double
+    public let concernDriveHalfLifeSeconds: Double
+    public let boredomDriveHalfLifeSeconds: Double
+    public let socialDriveHalfLifeSeconds: Double
+    public let interruptionDriveHalfLifeSeconds: Double
     public let quietExpectedThoughtIntervalSeconds: Double
 
     public init(
@@ -564,6 +575,17 @@ public struct MentalDynamicsPolicy: Equatable, Sendable {
         contextEvidenceWeight: Double = 0.35,
         foregroundTemperature: Double = 0.32,
         foregroundInertia: Double = 0.18,
+        foregroundRepetitionHalfLifeSeconds: Double = 90,
+        foregroundRepetitionPenalty: Double = 0.45,
+        channelSaturationPenalty: Double = 0.18,
+        repeatedThoughtCarryover: Double = 0.85,
+        repeatedThoughtNoveltyCeiling: Double = 0.20,
+        thoughtSalienceHalfLifeSeconds: Double = 600,
+        curiosityDriveHalfLifeSeconds: Double = 900,
+        concernDriveHalfLifeSeconds: Double = 180,
+        boredomDriveHalfLifeSeconds: Double = 300,
+        socialDriveHalfLifeSeconds: Double = 120,
+        interruptionDriveHalfLifeSeconds: Double = 20,
         quietExpectedThoughtIntervalSeconds: Double = 150
     ) {
         self.perceptualHalfLifeSeconds = max(perceptualHalfLifeSeconds, 1)
@@ -578,6 +600,17 @@ public struct MentalDynamicsPolicy: Equatable, Sendable {
         self.contextEvidenceWeight = min(max(contextEvidenceWeight, 0), 1)
         self.foregroundTemperature = max(foregroundTemperature, 0.01)
         self.foregroundInertia = max(foregroundInertia, 0)
+        self.foregroundRepetitionHalfLifeSeconds = max(foregroundRepetitionHalfLifeSeconds, 1)
+        self.foregroundRepetitionPenalty = max(foregroundRepetitionPenalty, 0)
+        self.channelSaturationPenalty = max(channelSaturationPenalty, 0)
+        self.repeatedThoughtCarryover = min(max(repeatedThoughtCarryover, 0), 1)
+        self.repeatedThoughtNoveltyCeiling = min(max(repeatedThoughtNoveltyCeiling, 0), 1)
+        self.thoughtSalienceHalfLifeSeconds = max(thoughtSalienceHalfLifeSeconds, 1)
+        self.curiosityDriveHalfLifeSeconds = max(curiosityDriveHalfLifeSeconds, 1)
+        self.concernDriveHalfLifeSeconds = max(concernDriveHalfLifeSeconds, 1)
+        self.boredomDriveHalfLifeSeconds = max(boredomDriveHalfLifeSeconds, 1)
+        self.socialDriveHalfLifeSeconds = max(socialDriveHalfLifeSeconds, 1)
+        self.interruptionDriveHalfLifeSeconds = max(interruptionDriveHalfLifeSeconds, 1)
         self.quietExpectedThoughtIntervalSeconds = max(quietExpectedThoughtIntervalSeconds, 1)
     }
 
@@ -767,10 +800,21 @@ public actor PersistentMentalWorkspace {
         let before = state
         var hypotheses = state.hypotheses
         var changes: [String] = []
+        var drives = state.drives.applying(update.driveSignal, weight: update.confidence)
         for mutation in update.hypothesisMutations {
+            let affectedKind = mutation.hypothesisID.flatMap { id in
+                hypotheses.first(where: { $0.id == id })?.kind
+            } ?? mutation.seed?.kind
             try apply(mutation, to: &hypotheses, at: date, changes: &changes)
+            if mutation.operation == .resolve || mutation.operation == .abandon,
+               let affectedKind {
+                drives = drives.applying(
+                    satisfactionSignal(for: affectedKind),
+                    weight: mutation.strength
+                )
+                changes.append("drive_satisfied:\(affectedKind.rawValue)")
+            }
         }
-        let drives = state.drives.applying(update.driveSignal, weight: update.confidence)
         if drives != state.drives { changes.append("drives") }
 
         var candidates = state.thoughtCandidates
@@ -786,8 +830,11 @@ public actor PersistentMentalWorkspace {
                 channel: update.channel,
                 content: update.innerMonologue,
                 confidence: max(existing.confidence, update.confidence),
-                salience: max(existing.salience, update.salience),
-                novelty: update.novelty,
+                salience: max(
+                    existing.salience * policy.repeatedThoughtCarryover,
+                    update.salience * policy.repeatedThoughtCarryover
+                ),
+                novelty: min(update.novelty, policy.repeatedThoughtNoveltyCeiling),
                 parentThoughtID: update.parentThoughtID ?? existing.parentThoughtID,
                 continuity: update.continuity,
                 hypothesisIDs: mutationHypothesisIDs(update.hypothesisMutations),
@@ -823,6 +870,7 @@ public actor PersistentMentalWorkspace {
             candidates,
             incumbentID: state.foregroundThoughtID,
             drives: drives,
+            at: date,
             draw: draw ?? nextUniform()
         )
         if foregroundID != state.foregroundThoughtID {
@@ -893,7 +941,10 @@ public actor PersistentMentalWorkspace {
             restoredStale: state.restoredStale,
             context: state.context,
             hypotheses: state.hypotheses,
-            drives: state.drives,
+            drives: state.drives.applying(
+                intentionCompletionSignal(for: intention.domain),
+                weight: intention.pressure
+            ),
             thoughtCandidates: state.thoughtCandidates,
             foregroundThoughtID: state.foregroundThoughtID,
             intentions: intentions,
@@ -941,12 +992,12 @@ public actor PersistentMentalWorkspace {
 
     private func advanceDynamics(to date: Date) {
         guard date > state.updatedAt else { return }
+        let elapsed = max(0, date.timeIntervalSince(state.updatedAt))
         var hypotheses = state.hypotheses
         var changed = false
         for index in hypotheses.indices {
             let hypothesis = hypotheses[index]
             guard hypothesis.status == .active || hypothesis.status == .dormant else { continue }
-            let elapsed = max(0, date.timeIntervalSince(hypothesis.lastSupportedAt))
             let retention = pow(0.5, elapsed / policy.halfLife(for: hypothesis.kind))
             let confidence = hypothesis.confidence * retention
             let salience = hypothesis.salience * sqrt(retention)
@@ -976,6 +1027,38 @@ public actor PersistentMentalWorkspace {
             )
             changed = true
         }
+
+        let drives = MentalDriveState(
+            curiosity: state.drives.curiosity * pow(0.5, elapsed / policy.curiosityDriveHalfLifeSeconds),
+            concern: state.drives.concern * pow(0.5, elapsed / policy.concernDriveHalfLifeSeconds),
+            boredom: state.drives.boredom * pow(0.5, elapsed / policy.boredomDriveHalfLifeSeconds),
+            socialInterest: state.drives.socialInterest * pow(0.5, elapsed / policy.socialDriveHalfLifeSeconds),
+            interruptionPressure: state.drives.interruptionPressure
+                * pow(0.5, elapsed / policy.interruptionDriveHalfLifeSeconds)
+        )
+        if maximumDriveDifference(state.drives, drives) >= 0.005 { changed = true }
+
+        let thoughtRetention = pow(0.5, elapsed / policy.thoughtSalienceHalfLifeSeconds)
+        let candidates = state.thoughtCandidates.map { candidate in
+            ThoughtCandidate(
+                id: candidate.id,
+                channel: candidate.channel,
+                content: candidate.content,
+                confidence: candidate.confidence,
+                salience: candidate.salience * thoughtRetention,
+                novelty: candidate.novelty * thoughtRetention,
+                parentThoughtID: candidate.parentThoughtID,
+                continuity: candidate.continuity,
+                hypothesisIDs: candidate.hypothesisIDs,
+                createdAt: candidate.createdAt,
+                lastForegroundAt: candidate.lastForegroundAt
+            )
+        }
+        if zip(state.thoughtCandidates, candidates).contains(where: { pair in
+            abs(pair.0.salience - pair.1.salience) >= 0.005
+                || abs(pair.0.novelty - pair.1.novelty) >= 0.005
+        }) { changed = true }
+
         guard changed else { return }
         state = MentalWorkspaceSnapshot(
             schemaVersion: state.schemaVersion,
@@ -984,8 +1067,8 @@ public actor PersistentMentalWorkspace {
             restoredStale: state.restoredStale,
             context: state.context,
             hypotheses: hypotheses,
-            drives: state.drives,
-            thoughtCandidates: state.thoughtCandidates,
+            drives: drives,
+            thoughtCandidates: candidates,
             foregroundThoughtID: state.foregroundThoughtID,
             intentions: state.intentions,
             recentNovelty: state.recentNovelty * 0.8,
@@ -1141,6 +1224,7 @@ public actor PersistentMentalWorkspace {
         _ candidates: [ThoughtCandidate],
         incumbentID: UUID?,
         drives: MentalDriveState,
+        at date: Date,
         draw: Double
     ) -> UUID? {
         guard !candidates.isEmpty else { return nil }
@@ -1154,11 +1238,29 @@ public actor PersistentMentalWorkspace {
             case .perceptual, .memoryAssociation: driveRelevance = max(drives.curiosity, drives.concern)
             }
             let inertia = candidate.id == incumbentID ? policy.foregroundInertia : 0
+            let repetition: Double
+            if let lastForegroundAt = candidate.lastForegroundAt {
+                let age = max(0, date.timeIntervalSince(lastForegroundAt))
+                repetition = policy.foregroundRepetitionPenalty
+                    * pow(0.5, age / policy.foregroundRepetitionHalfLifeSeconds)
+            } else {
+                repetition = 0
+            }
+            let saturatedChannelCount = candidates.reduce(into: 0) { count, other in
+                guard other.channel == candidate.channel,
+                      let lastForegroundAt = other.lastForegroundAt else { return }
+                let age = max(0, date.timeIntervalSince(lastForegroundAt))
+                if age < policy.foregroundRepetitionHalfLifeSeconds { count += 1 }
+            }
+            let channelSaturation = policy.channelSaturationPenalty
+                * min(Double(saturatedChannelCount), 3) / 3
             return (0.42 * candidate.salience
                 + 0.28 * candidate.confidence
                 + 0.18 * candidate.novelty
                 + 0.12 * driveRelevance
-                + inertia) / policy.foregroundTemperature
+                + inertia
+                - repetition
+                - channelSaturation) / policy.foregroundTemperature
         }
         let maximum = logits.max() ?? 0
         let weights = logits.map { exp($0 - maximum) }
@@ -1192,6 +1294,40 @@ public actor PersistentMentalWorkspace {
 
     private func mutationHypothesisIDs(_ mutations: [MentalHypothesisMutation]) -> [UUID] {
         mutations.compactMap { $0.hypothesisID ?? $0.seed?.id }.uniqued()
+    }
+
+    private func satisfactionSignal(for kind: MentalHypothesisKind) -> MentalDriveSignal {
+        switch kind {
+        case .curiosity:
+            MentalDriveSignal(curiosity: -0.8, concern: -0.1)
+        case .social:
+            MentalDriveSignal(curiosity: -0.2, socialInterest: -0.4, interruptionPressure: -0.8)
+        case .perceptual, .situational:
+            MentalDriveSignal(curiosity: -0.3, concern: -0.5, interruptionPressure: -0.2)
+        case .memoryAssociation:
+            MentalDriveSignal(curiosity: -0.4, concern: -0.2)
+        }
+    }
+
+    private func intentionCompletionSignal(for domain: String) -> MentalDriveSignal {
+        switch domain.lowercased() {
+        case "social":
+            MentalDriveSignal(curiosity: -0.15, socialInterest: -0.35, interruptionPressure: -1)
+        case "inspection":
+            MentalDriveSignal(curiosity: -0.65, concern: -0.25, interruptionPressure: -0.5)
+        default:
+            MentalDriveSignal(concern: -0.35, boredom: -0.2, interruptionPressure: -0.6)
+        }
+    }
+
+    private func maximumDriveDifference(_ lhs: MentalDriveState, _ rhs: MentalDriveState) -> Double {
+        [
+            abs(lhs.curiosity - rhs.curiosity),
+            abs(lhs.concern - rhs.concern),
+            abs(lhs.boredom - rhs.boredom),
+            abs(lhs.socialInterest - rhs.socialInterest),
+            abs(lhs.interruptionPressure - rhs.interruptionPressure),
+        ].max() ?? 0
     }
 
     private func semanticMagnitude(of changes: [String]) -> Double {

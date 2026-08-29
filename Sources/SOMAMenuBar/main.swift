@@ -757,14 +757,12 @@ private struct SOMASettingsView: View {
                 HStack {
                     Text("Eye-contact pupil threshold")
                     Spacer()
-                    Picker("", selection: l0EyeContactPupilLevelBinding) {
-                        ForEach(SOMAEyeContactPupilLevel.allCases, id: \.self) { level in
-                            Text(level.label).tag(level)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 130)
+                    Stepper(
+                        "\(String(format: "%.2f", model.envSettings.l0EyeContactPupilThreshold))×",
+                        value: l0EyeContactPupilThresholdBinding,
+                        in: 0.5...2.0,
+                        step: 0.05
+                    )
                 }
                 HStack {
                     Text("Object detection confidence")
@@ -1109,10 +1107,10 @@ private struct SOMASettingsView: View {
         )
     }
 
-    private var l0EyeContactPupilLevelBinding: Binding<SOMAEyeContactPupilLevel> {
+    private var l0EyeContactPupilThresholdBinding: Binding<Double> {
         Binding(
-            get: { SOMAEyeContactPupilLevel(threshold: model.envSettings.l0EyeContactPupilThreshold) },
-            set: { model.envSettings.l0EyeContactPupilThreshold = $0.threshold }
+            get: { model.envSettings.l0EyeContactPupilThreshold },
+            set: { model.envSettings.l0EyeContactPupilThreshold = min(max($0, 0.5), 2.0) }
         )
     }
 
@@ -1178,36 +1176,6 @@ private enum SOMADefaultLanguage: String, CaseIterable {
         case .chinese: "Chinese"
         case .spanish: "Spanish"
         }
-    }
-}
-
-/// Five preset levels for the eye-contact pupil-centering threshold. Each maps
-/// to a multiplier on the default 0.68 X / 0.82 Y thresholds.
-private enum SOMAEyeContactPupilLevel: CaseIterable {
-    case strict, moderate, balanced, lenient, veryLenient
-
-    var threshold: Double {
-        switch self {
-        case .strict: 0.5
-        case .moderate: 0.75
-        case .balanced: 1.0
-        case .lenient: 1.5
-        case .veryLenient: 2.0
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .strict: "Strict"
-        case .moderate: "Moderate"
-        case .balanced: "Balanced"
-        case .lenient: "Lenient"
-        case .veryLenient: "Very lenient"
-        }
-    }
-
-    init(threshold: Double) {
-        self = Self.allCases.min(by: { abs($0.threshold - threshold) < abs($1.threshold - threshold) }) ?? .balanced
     }
 }
 

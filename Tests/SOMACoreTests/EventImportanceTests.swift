@@ -349,11 +349,12 @@ final class EventImportanceTests: XCTestCase {
             conversationInactivityMilliseconds: 60_000
         ))
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start, directContact: false),
+            gate.observeVoiceActivity(active: true, at: start, directContact: false),
             nil
         )
+        _ = gate.observeVoiceActivity(active: false, at: start + 1, directContact: false)
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start, directContact: true),
+            gate.observeVoiceActivity(active: true, at: start + 2, directContact: true),
             .voiceActivity
         )
     }
@@ -375,9 +376,57 @@ final class EventImportanceTests: XCTestCase {
         fixation.clear()
         XCTAssertFalse(fixation.permitsNewSession(at: start + 120_000_000))
         XCTAssertNil(
-            conversation.authorizeSpeechOnset(
+            conversation.observeVoiceActivity(
+                active: true,
                 at: start + 120_000_000,
                 directContact: fixation.permitsNewSession(at: start + 120_000_000)
+            )
+        )
+    }
+
+    func testAmbientVoiceEpisodeCannotBeUpgradedByLaterEyeContact() {
+        let start: UInt64 = 1_000_000_000
+        var gate = ConversationContactGate()
+
+        XCTAssertNil(
+            gate.observeVoiceActivity(active: true, at: start, directContact: false)
+        )
+        XCTAssertNil(
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 300_000_000,
+                directContact: true
+            )
+        )
+
+        _ = gate.observeVoiceActivity(
+            active: false,
+            at: start + 600_000_000,
+            directContact: true
+        )
+        XCTAssertEqual(
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 900_000_000,
+                directContact: true
+            ),
+            .voiceActivity
+        )
+    }
+
+    func testOneSpeechEpisodeEmitsAtMostOneAuthorization() {
+        let start: UInt64 = 1_000_000_000
+        var gate = ConversationContactGate()
+
+        XCTAssertEqual(
+            gate.observeVoiceActivity(active: true, at: start, directContact: true),
+            .voiceActivity
+        )
+        XCTAssertNil(
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 260_000_000,
+                directContact: true
             )
         )
     }
@@ -442,11 +491,24 @@ final class EventImportanceTests: XCTestCase {
         ))
         gate.markConversationOpened(at: start)
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 59_999_000_000, directContact: false),
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 59_999_000_000,
+                directContact: false
+            ),
             .activeConversation
         )
+        _ = gate.observeVoiceActivity(
+            active: false,
+            at: start + 59_999_500_000,
+            directContact: false
+        )
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 60_000_000_000, directContact: true),
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 60_000_000_000,
+                directContact: true
+            ),
             .voiceActivity
         )
     }
@@ -461,17 +523,39 @@ final class EventImportanceTests: XCTestCase {
         // Speech transport/VAD may contain room noise or output echo. Without
         // an explicit confirmed user turn, the lease must expire on schedule.
         XCTAssertNil(
-            gate.authorizeSpeechOnset(at: start + 60_000_000_000, directContact: false)
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 60_000_000_000,
+                directContact: false
+            )
+        )
+        _ = gate.observeVoiceActivity(
+            active: false,
+            at: start + 60_000_000_001,
+            directContact: false
         )
 
         gate.markConversationOpened(at: start)
         gate.recordConversationActivity(at: start + 59_000_000_000)
         XCTAssertEqual(
-            gate.authorizeSpeechOnset(at: start + 118_000_000_000, directContact: false),
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 118_000_000_000,
+                directContact: false
+            ),
             .activeConversation
         )
+        _ = gate.observeVoiceActivity(
+            active: false,
+            at: start + 118_500_000_000,
+            directContact: false
+        )
         XCTAssertNil(
-            gate.authorizeSpeechOnset(at: start + 119_000_000_000, directContact: false)
+            gate.observeVoiceActivity(
+                active: true,
+                at: start + 119_000_000_000,
+                directContact: false
+            )
         )
     }
 

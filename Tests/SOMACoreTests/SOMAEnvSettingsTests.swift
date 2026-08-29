@@ -31,6 +31,7 @@ final class SOMAEnvSettingsTests: XCTestCase {
         XCTAssertEqual(defaults.l1ReasoningCadenceSeconds, 150)
         XCTAssertTrue(defaults.l1CuriosityCollectionEnabled)
         XCTAssertEqual(defaults.l1CollectionIntervalHours, 24)
+        XCTAssertEqual(defaults.l0EyeContactPupilThreshold, 0.9)
     }
 
     func testEnvStoreMigratesLegacyReasoningCadence() throws {

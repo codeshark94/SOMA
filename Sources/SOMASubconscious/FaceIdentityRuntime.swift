@@ -257,8 +257,6 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     /// Face tracks for identity continuity. Accessed only on `queue`.
     private var faceTracks: [FaceTrack] = []
 
-    /// Min IoU for two rects to be considered the same face track.
-    private static let trackIoUThreshold: Double = 0.30
     /// A locked identity is held while the same face location keeps reappearing;
     /// the track is dropped only after this much genuine absence. Generous so a
     /// recognized identity is not re-evaluated (and risked as anonymous) during
@@ -361,12 +359,14 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     }
 
     private func process(_ item: WorkItem) {
+        var claimedTrackIndices = Set<Int>()
         for (index, alignment) in item.alignments.enumerated() {
             process(
                 pixelBuffer: item.pixelBuffer,
                 alignment: alignment,
                 isPrimaryFace: index == 0,
-                at: item.monotonicNS
+                at: item.monotonicNS,
+                claimedTrackIndices: &claimedTrackIndices
             )
         }
     }
@@ -375,7 +375,8 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         pixelBuffer: CVPixelBuffer,
         alignment: FaceAlignmentEvidence,
         isPrimaryFace: Bool,
-        at monotonicNS: UInt64
+        at monotonicNS: UInt64,
+        claimedTrackIndices: inout Set<Int>
     ) {
         let started = DispatchTime.now().uptimeNanoseconds
         pruneFaceTracks(at: monotonicNS)
@@ -383,12 +384,17 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         // Identity continuity: if this face location is already covered by a
         // locked track, hold its identity and skip re-matching entirely. A
         // stable face must not be re-verified every frame.
-        if let trackIndex = faceTrackIndex(matching: alignment.rect) {
+        if let trackIndex = faceTrackIndex(
+            matching: alignment.rect,
+            excluding: claimedTrackIndices
+        ) {
+            claimedTrackIndices.insert(trackIndex)
             var track = faceTracks[trackIndex]
             track.lastSeenNS = monotonicNS
             track.rect = alignment.rect
             faceTracks[trackIndex] = track
-            if case .known = track.identity {
+            switch track.identity {
+            case .known, .anonymous:
                 onDecision(
                     track.identity,
                     alignment.rect,
@@ -396,6 +402,8 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                     monotonicNS,
                     0
                 )
+            case .knownCandidate, .unknownCandidate:
+                break
             }
             return
         }
@@ -411,7 +419,11 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                     similarity: similarity,
                     confirmations: confirmations
                 )
-                lockFaceTrack(rect: alignment.rect, identity: decision, at: monotonicNS)
+                claimedTrackIndices.insert(appendFaceTrack(
+                    rect: alignment.rect,
+                    identity: decision,
+                    at: monotonicNS
+                ))
                 onDecision(
                     decision,
                     alignment.rect,
@@ -473,13 +485,19 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                         )
                         break
                     }
+                    let decision = FaceIdentityRuntimeDecision.anonymous(
+                        entityID: Self.pseudonymousEntityID(for: handle),
+                        handle: handle,
+                        similarity: similarity,
+                        observations: observations
+                    )
+                    claimedTrackIndices.insert(appendFaceTrack(
+                        rect: alignment.rect,
+                        identity: decision,
+                        at: monotonicNS
+                    ))
                     onDecision(
-                        .anonymous(
-                            entityID: Self.pseudonymousEntityID(for: handle),
-                            handle: handle,
-                            similarity: similarity,
-                            observations: observations
-                        ),
+                        decision,
                         alignment.rect,
                         isPrimaryFace,
                         monotonicNS,
@@ -507,43 +525,37 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         }
     }
 
-    /// Returns the index of the face track whose rect best overlaps the given
-    /// rect above the IoU threshold, or nil when it is a fresh face.
-    private func faceTrackIndex(matching rect: SOMACore.NormalizedRect) -> Int? {
+    /// Returns the best unclaimed spatial track for this capture. Each track
+    /// can be assigned to only one detected face in a frame.
+    private func faceTrackIndex(
+        matching rect: SOMACore.NormalizedRect,
+        excluding claimedTrackIndices: Set<Int>
+    ) -> Int? {
         var bestIndex: Int?
-        var bestIoU = Self.trackIoUThreshold
+        var bestScore = -Double.infinity
         for (index, track) in faceTracks.enumerated() {
-            let overlap = Self.iou(track.rect, rect)
-            if overlap >= bestIoU {
-                bestIoU = overlap
+            guard !claimedTrackIndices.contains(index),
+                  let score = FaceTrackAssociation.score(previous: track.rect, current: rect) else {
+                continue
+            }
+            if score > bestScore {
+                bestScore = score
                 bestIndex = index
             }
         }
         return bestIndex
     }
 
-    /// Locks a newly recognized face into a track so later frames hold the
-    /// identity. Replacing an existing track at the same location means the
-    /// object genuinely changed (a new person walked into that spot).
-    private func lockFaceTrack(
+    /// Locks a newly recognized face into a fresh track so later frames hold
+    /// the identity. Older unmatched tracks expire through genuine absence.
+    @discardableResult
+    private func appendFaceTrack(
         rect: SOMACore.NormalizedRect,
         identity: FaceIdentityRuntimeDecision,
         at monotonicNS: UInt64
-    ) {
-        if let index = faceTrackIndex(matching: rect) {
-            faceTracks[index] = FaceTrack(rect: rect, identity: identity, lastSeenNS: monotonicNS)
-        } else {
-            faceTracks.append(FaceTrack(rect: rect, identity: identity, lastSeenNS: monotonicNS))
-        }
-    }
-
-    private static func iou(_ a: SOMACore.NormalizedRect, _ b: SOMACore.NormalizedRect) -> Double {
-        let interX = max(0, min(a.x + a.width, b.x + b.width) - max(a.x, b.x))
-        let interY = max(0, min(a.y + a.height, b.y + b.height) - max(a.y, b.y))
-        let inter = interX * interY
-        let union = a.width * a.height + b.width * b.height - inter
-        guard union > 0 else { return 0 }
-        return inter / union
+    ) -> Int {
+        faceTracks.append(FaceTrack(rect: rect, identity: identity, lastSeenNS: monotonicNS))
+        return faceTracks.index(before: faceTracks.endIndex)
     }
 
     /// Profile enrichment is deliberately asynchronous to the latest-one

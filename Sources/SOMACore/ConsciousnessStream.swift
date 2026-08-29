@@ -32,7 +32,7 @@ public struct L1ConsciousnessWorkQueue: Equatable, Sendable {
     ) {
         switch request.wakeKind {
         case .event:
-            eventThought = request
+            eventThought = eventThought?.coalescing(with: request) ?? request
             if let periodicThought,
                periodicThought.workspace.revision <= request.workspace.revision {
                 self.periodicThought = nil
@@ -186,6 +186,51 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
             spokenOpeningTendency: spokenOpeningTendency,
             recalledEpisodes: recalledEpisodes,
             perceptionAgeSeconds: perceptionAgeSeconds
+        )
+    }
+
+    /// Merges pending evidence onto the newest authoritative workspace. This
+    /// method is used only before a model call starts; an in-flight response is
+    /// never rebased after generation because its reasoning may depend on a
+    /// superseded state.
+    public func coalescing(with newer: Self) -> Self {
+        precondition(wakeKind == .event && newer.wakeKind == .event)
+        var seen = Set<String>()
+        let mergedEvidence = (evidence + newer.evidence).reversed().filter { event in
+            seen.insert(event.id).inserted
+        }.reversed()
+        let boundedEvidence = Array(mergedEvidence.suffix(32))
+        let summary = boundedEvidence
+            .map(\.summary)
+            .filter { !$0.isEmpty }
+            .joined(separator: " | ")
+
+        return Self(
+            cycleID: newer.cycleID,
+            observedAt: max(observedAt, newer.observedAt),
+            wakeKind: .event,
+            workspace: newer.workspace,
+            evidence: boundedEvidence,
+            beliefSummary: summary.isEmpty ? newer.beliefSummary : summary,
+            presentEntityIDs: newer.presentEntityIDs,
+            memory: newer.memory,
+            informationNeeds: newer.informationNeeds,
+            rapport: newer.rapport,
+            preferredLanguageTag: newer.preferredLanguageTag,
+            recentConversation: newer.recentConversation,
+            contactHistory: newer.contactHistory,
+            spatialContext: newer.spatialContext,
+            dailyWorldMemory: newer.dailyWorldMemory,
+            visualResourceOffers: newer.visualResourceOffers,
+            visuals: newer.visuals,
+            socialOpportunity: newer.socialOpportunity,
+            contactPattern: newer.contactPattern,
+            behaviorContext: newer.behaviorContext,
+            curiosityContext: newer.curiosityContext,
+            personPreferences: newer.personPreferences,
+            spokenOpeningTendency: newer.spokenOpeningTendency,
+            recalledEpisodes: newer.recalledEpisodes,
+            perceptionAgeSeconds: newer.perceptionAgeSeconds
         )
     }
 }

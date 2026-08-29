@@ -22,16 +22,27 @@ public struct ConversationContactConfiguration: Equatable, Sendable {
 public struct ConversationContactGate: Sendable {
     public let configuration: ConversationContactConfiguration
     private var conversationExpiresAtNS: UInt64?
+    private var speechEpisodeActive = false
 
     public init(configuration: ConversationContactConfiguration = .init()) {
         self.configuration = configuration
     }
 
-    public mutating func authorizeSpeechOnset(
+    /// Evaluates a voice-activity episode exactly once, at its onset. Direct
+    /// visual contact that begins later cannot retroactively turn ambient
+    /// audio into a user-initiated conversation.
+    public mutating func observeVoiceActivity(
+        active: Bool,
         at monotonicNS: UInt64,
         directContact: Bool
     ) -> ConversationOpeningAuthorization? {
         expire(at: monotonicNS)
+        guard active else {
+            speechEpisodeActive = false
+            return nil
+        }
+        guard !speechEpisodeActive else { return nil }
+        speechEpisodeActive = true
         if let conversationExpiresAtNS, monotonicNS < conversationExpiresAtNS {
             return .activeConversation
         }
@@ -135,10 +146,9 @@ public struct L0FaceFixationAdmission: Sendable {
     }
 }
 
-/// Defines when a detected voice can be attributed to the person SOMA is
-/// currently addressing. Speech alone is sufficient to request a response,
-/// but a new live conversation must be visually anchored to the current
-/// verified human fixation rather than an arbitrary sound in the room.
+/// Coarse visual admission for a detected voice. The current verified face is
+/// still insufficient by itself: the contact gate separately requires direct
+/// gaze at the onset of a new speech episode.
 public enum LiveConversationVisualAdmission {
     public static func permitsNewSession(for belief: BeliefSnapshot) -> Bool {
         guard belief.targetStatus == .tracked,
