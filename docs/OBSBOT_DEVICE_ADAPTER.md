@@ -55,8 +55,8 @@ specific device can execute them.
 
 | Module | Native tracking | Direct motion | Indicator | Audio extensions |
 | --- | --- | --- | --- | --- |
-| `Tiny2LiteAdapter` | legacy human-mode transport | Tiny 2 gimbal APIs | validated firmware state IDs | unavailable unless later validated |
-| `Tiny3LiteAdapter` | selected-human portrait transport | Tiny 3 gimbal APIs | firmware status machine with persistent ready baseline and validated green/blue/yellow routes | validated capture modes, gain, and firmware sound following |
+| `Tiny2LiteAdapter` | legacy human-mode transport | Tiny 2 gimbal APIs | physically validated `54` green, `57` blue, `16` yellow; brightness-dimmed host pulse | unavailable unless later validated |
+| `Tiny3LiteAdapter` | selected-human portrait transport | Tiny 3 gimbal APIs | firmware status machine with persistent ready baseline; enable-toggled host pulse | validated capture modes, gain, and firmware sound following |
 | `UnknownAdapter` | unavailable | unavailable | unavailable | unavailable |
 
 The adapter rejects unsupported commands before a vendor call. An ACK from an
@@ -69,3 +69,8 @@ tracking work `57` for steady blue, and target-lost `16` for steady yellow.
 The native indicator session establishes `3 + 54` at startup and restores that
 baseline whenever a temporary presentation is cleared or the bridge exits.
 Direct RGB is not part of the contract.
+
+`indicator_pulse_transport` is a device capability rather than a UI policy.
+Tiny 2 Lite retains its selected firmware state while brightness is temporarily
+set to zero. Tiny 3 Lite instead uses the validated LED-enable transition.
+The bridge never substitutes one transport for another when a camera changes.

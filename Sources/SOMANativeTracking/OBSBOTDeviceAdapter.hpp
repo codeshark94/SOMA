@@ -18,6 +18,13 @@ enum class OBSBOTNativeTrackingTransport {
     selectedHumanPortrait,
 };
 
+enum class OBSBOTIndicatorPulseTransport {
+    unavailable = 0,
+    brightnessDimming = 1,
+    enableToggle = 2,
+    directDark = 3,
+};
+
 enum class OBSBOTIndicatorColor : uint8_t {
     yellow = 0,
     green = 1,
@@ -34,6 +41,7 @@ struct OBSBOTDeviceContract {
     bool firmwareDefaultIndicatorGreen;
     uint8_t directIndicatorColorMask;
     bool indicatorEnableAndBrightness;
+    OBSBOTIndicatorPulseTransport indicatorPulseTransport;
     bool selectableAudioModes;
     uint8_t supportedAudioModeMask;
     bool soundLocalization;

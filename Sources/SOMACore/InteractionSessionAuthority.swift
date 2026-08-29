@@ -20,6 +20,13 @@ public enum SOMASessionCapabilityScope: Equatable, Sendable {
     case identityRoster
     case identityManagement
     case embodimentControl
+    /// Records a privacy-bounded outcome from a tool call made by this live
+    /// session. It grants no additional read, write, or motor authority.
+    case cognitiveEvidence
+    /// Validates whether an L2 authorization basis is grounded in the current
+    /// participant turn. Autonomous goals need only a valid live session;
+    /// explicit bases additionally require fresh speech evidence owned by L0.
+    case cognitiveBasis(L2CognitiveAuthorizationBasis)
     /// Recall of SOMA's own episodic memory. It is the owner's memory, so any
     /// valid session may query it; which person a memory relates to is inferred
     /// from context rather than required up front.
@@ -34,6 +41,7 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
     case identityRosterDenied
     case identityManagementDenied
     case embodimentDenied
+    case currentParticipantTurnRequired
 
     public var errorDescription: String? {
         switch self {
@@ -44,6 +52,7 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
         case .identityRosterDenied: "Only the local administrator may read the identity roster"
         case .identityManagementDenied: "Only the local administrator may enroll or remove local identities"
         case .embodimentDenied: "Only the local administrator may control SOMA embodiment"
+        case .currentParticipantTurnRequired: "This cognitive action requires the current participant turn"
         }
     }
 }
@@ -56,20 +65,25 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
         let personEntityID: UUID
         let authority: SOMAInteractionAuthority
         let expiresAtNS: UInt64
+        var participantTurnExpiresAtNS: UInt64?
     }
 
     private let lock = NSLock()
     private var grants: [String: Grant] = [:]
     private let maximumGrants: Int
     private let defaultLifetimeNS: UInt64
+    private let participantTurnLifetimeNS: UInt64
 
     public init(
         maximumGrants: Int = 128,
-        lifetimeSeconds: TimeInterval = 15 * 60
+        lifetimeSeconds: TimeInterval = 15 * 60,
+        participantTurnLifetimeSeconds: TimeInterval = 120
     ) {
         self.maximumGrants = max(8, maximumGrants)
         let boundedSeconds = min(max(lifetimeSeconds, 30), 60 * 60)
         defaultLifetimeNS = UInt64((boundedSeconds * 1_000_000_000).rounded())
+        let boundedTurnSeconds = min(max(participantTurnLifetimeSeconds, 5), 5 * 60)
+        participantTurnLifetimeNS = UInt64((boundedTurnSeconds * 1_000_000_000).rounded())
     }
 
     public func issue(
@@ -88,9 +102,37 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
         grants[token] = Grant(
             personEntityID: personEntityID,
             authority: authority,
-            expiresAtNS: monotonicNS &+ defaultLifetimeNS
+            expiresAtNS: monotonicNS &+ defaultLifetimeNS,
+            participantTurnExpiresAtNS: nil
         )
         return token
+    }
+
+    public func observeParticipantTurn(
+        token: String?,
+        active: Bool,
+        at monotonicNS: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> Result<Void, SOMASessionCapabilityError> {
+        guard let token,
+              token.count == 36,
+              token.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || $0 == "-"
+              }) else {
+            return .failure(.required)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        removeExpiredLocked(at: monotonicNS)
+        guard var grant = grants[token] else { return .failure(.invalid) }
+        guard monotonicNS < grant.expiresAtNS else {
+            grants.removeValue(forKey: token)
+            return .failure(.expired)
+        }
+        grant.participantTurnExpiresAtNS = active
+            ? monotonicNS &+ participantTurnLifetimeNS
+            : nil
+        grants[token] = grant
+        return .success(())
     }
 
     public func authorize(
@@ -116,7 +158,14 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
             return .failure(.expired)
         }
         switch scope {
-        case .conversationControl:
+        case .conversationControl, .cognitiveEvidence:
+            return .success(())
+        case let .cognitiveBasis(basis):
+            if basis == .autonomousGoal { return .success(()) }
+            guard let turnExpiry = grant.participantTurnExpiresAtNS,
+                  monotonicNS < turnExpiry else {
+                return .failure(.currentParticipantTurnRequired)
+            }
             return .success(())
         case let .personContext(personEntityID):
             return grant.authority == .administrator || grant.personEntityID == personEntityID

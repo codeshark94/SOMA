@@ -1,5 +1,12 @@
 import Foundation
 
+public enum OBSBOTIndicatorPulseTransport: Int, Sendable {
+    case unavailable = 0
+    case brightnessDimming = 1
+    case enableToggle = 2
+    case directDark = 3
+}
+
 /// Runtime hardware contract emitted by the native OBSBOT adapter.
 ///
 /// Product-specific SDK transport stays inside the native adapter.  Swift
@@ -18,6 +25,7 @@ public struct OBSBOTDeviceContract: Equatable, Sendable {
     public let indicatorStateIDs: [SOMALEDColor: Int]
     public let directIndicatorColors: Set<SOMALEDColor>
     public let firmwareDefaultIndicatorColors: Set<SOMALEDColor>
+    public let indicatorPulseTransport: OBSBOTIndicatorPulseTransport
     public let supportedFirmwareAudioModes: Set<UInt8>
     public let nativeTrackingTransport: OBSBOTNativeTrackingTransport
 
@@ -36,6 +44,7 @@ public struct OBSBOTDeviceContract: Equatable, Sendable {
         indicatorStateIDs: [SOMALEDColor: Int] = [:],
         directIndicatorColors: Set<SOMALEDColor> = [],
         firmwareDefaultIndicatorColors: Set<SOMALEDColor> = [],
+        indicatorPulseTransport: OBSBOTIndicatorPulseTransport = .unavailable,
         supportedFirmwareAudioModes: Set<UInt8> = [],
         nativeTrackingTransport: OBSBOTNativeTrackingTransport = .unavailable
     ) {
@@ -49,6 +58,7 @@ public struct OBSBOTDeviceContract: Equatable, Sendable {
         self.indicatorStateIDs = indicatorStateIDs
         self.directIndicatorColors = directIndicatorColors
         self.firmwareDefaultIndicatorColors = firmwareDefaultIndicatorColors
+        self.indicatorPulseTransport = indicatorPulseTransport
         self.supportedFirmwareAudioModes = supportedFirmwareAudioModes
         self.nativeTrackingTransport = nativeTrackingTransport
     }
@@ -93,6 +103,23 @@ public struct OBSBOTDeviceContract: Equatable, Sendable {
         guard !supportsNativeBridge || (maximumPan > 0 && maximumPitch > 0 && wideFOV > 0) else {
             return nil
         }
+        let indicatorPulseTransport: OBSBOTIndicatorPulseTransport
+        if let rawValue = fields["indicator_pulse_transport"] {
+            guard let raw = integer(rawValue, in: 0...3),
+                  let parsed = OBSBOTIndicatorPulseTransport(rawValue: raw)
+            else { return nil }
+            indicatorPulseTransport = parsed
+        } else {
+            indicatorPulseTransport = .unavailable
+        }
+        switch indicatorPulseTransport {
+        case .brightnessDimming, .enableToggle:
+            guard indicatorBasic else { return nil }
+        case .directDark:
+            guard directRGB else { return nil }
+        case .unavailable:
+            break
+        }
         var indicatorStateIDs: [SOMALEDColor: Int] = [:]
         if yellowIndicatorStateID >= 0 { indicatorStateIDs[.yellow] = yellowIndicatorStateID }
         if greenIndicatorStateID >= 0 { indicatorStateIDs[.green] = greenIndicatorStateID }
@@ -134,6 +161,7 @@ public struct OBSBOTDeviceContract: Equatable, Sendable {
             indicatorStateIDs: indicatorStateIDs,
             directIndicatorColors: directIndicatorColors,
             firmwareDefaultIndicatorColors: firmwareDefaultIndicatorColors,
+            indicatorPulseTransport: indicatorPulseTransport,
             supportedFirmwareAudioModes: supportedFirmwareAudioModes,
             nativeTrackingTransport: nativeTrackingTransport
         )

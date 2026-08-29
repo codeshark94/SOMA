@@ -63,6 +63,204 @@ final class CognitiveEmbodimentTests: XCTestCase {
         case .success: break
         case let .failure(error): XCTFail("participant could not end their own conversation: \(error)")
         }
+        switch store.authorize(token: token, scope: .cognitiveEvidence, at: 1_000_000_001) {
+        case .success: break
+        case let .failure(error): XCTFail("session could not return its cognitive evidence: \(error)")
+        }
+    }
+
+    func testExplicitCognitiveBasisRequiresCurrentParticipantTurn() {
+        let start: UInt64 = 1_000_000_000
+        let store = SOMASessionCapabilityStore(
+            lifetimeSeconds: 60,
+            participantTurnLifetimeSeconds: 10
+        )
+        let token = store.issue(
+            personEntityID: UUID(),
+            authority: .participant,
+            at: start
+        )
+
+        if case .failure(.currentParticipantTurnRequired) = store.authorize(
+            token: token,
+            scope: .cognitiveBasis(.explicitRequest),
+            at: start + 1
+        ) {} else {
+            XCTFail("explicit request was accepted without current participant speech")
+        }
+        if case .success = store.authorize(
+            token: token,
+            scope: .cognitiveBasis(.autonomousGoal),
+            at: start + 1
+        ) {} else {
+            XCTFail("autonomous goal was denied inside a valid session")
+        }
+        if case .failure(let error) = store.observeParticipantTurn(
+            token: token,
+            active: true,
+            at: start + 2
+        ) {
+            XCTFail("participant turn could not be bound: \(error)")
+        }
+        for basis in [
+            L2CognitiveAuthorizationBasis.explicitStatement,
+            .explicitConsent,
+            .explicitRequest,
+        ] {
+            if case .failure(let error) = store.authorize(
+                token: token,
+                scope: .cognitiveBasis(basis),
+                at: start + 3
+            ) {
+                XCTFail("current turn did not authorize \(basis): \(error)")
+            }
+        }
+        _ = store.observeParticipantTurn(token: token, active: false, at: start + 4)
+        if case .failure(.currentParticipantTurnRequired) = store.authorize(
+            token: token,
+            scope: .cognitiveBasis(.explicitStatement),
+            at: start + 5
+        ) {} else {
+            XCTFail("completed turn still authorized an explicit statement")
+        }
+    }
+
+    func testCognitiveTurnBindingAndAuthorizationUseSeparateIPCCommands() throws {
+        let suffix = UUID().uuidString.prefix(8)
+        let directory = URL(fileURLWithPath: "/private/tmp/soma-cognitive-turn-ipc-\(suffix)", isDirectory: true)
+        let socketURL = directory.appendingPathComponent("shadow.sock")
+        let token = UUID().uuidString.lowercased()
+        let store = SOMASessionCapabilityStore(lifetimeSeconds: 60)
+        let issued = store.issue(personEntityID: UUID(), authority: .participant)
+        let server = EmbodimentShadowSocketServer(
+            socketURL: socketURL,
+            cognitiveTurnHandler: { supplied, active in
+                store.observeParticipantTurn(token: supplied, active: active)
+                    .mapError { $0 as Error }
+            },
+            sessionAuthorizationProvider: { supplied, scope in
+                store.authorize(token: supplied, scope: scope).mapError { $0 as Error }
+            }
+        )
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let denied = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveAuthorization,
+                cognitiveAuthorizationBasis: .explicitRequest,
+                sessionAuthorization: issued
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertFalse(denied.ok)
+        let wrong = try EmbodimentShadowSocketClient.send(
+            .init(kind: .cognitiveTurnStarted, sessionAuthorization: token),
+            socketURL: socketURL
+        )
+        XCTAssertFalse(wrong.ok)
+        let started = try EmbodimentShadowSocketClient.send(
+            .init(kind: .cognitiveTurnStarted, sessionAuthorization: issued),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(started.ok)
+        let accepted = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveAuthorization,
+                cognitiveAuthorizationBasis: .explicitRequest,
+                sessionAuthorization: issued
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(accepted.ok)
+    }
+
+    func testCognitiveActionOutcomeRequiresSessionCapabilityAndReturnsNoExtraAuthority() throws {
+        let suffix = UUID().uuidString.prefix(8)
+        let directory = URL(fileURLWithPath: "/private/tmp/soma-cognitive-action-ipc-\(suffix)", isDirectory: true)
+        let socketURL = directory.appendingPathComponent("shadow.sock")
+        let token = UUID().uuidString.lowercased()
+        let received = LockedCognitiveAction()
+        let goalID = UUID()
+        let query = CognitiveActionQuery(
+            goalEpisodeID: goalID,
+            toolName: "capture_view",
+            requestFingerprint: "semantic-capture",
+            evidenceIDs: ["turn:visual-reference"]
+        )
+        let server = EmbodimentShadowSocketServer(
+            socketURL: socketURL,
+            cognitiveActionQueryProvider: { $0 == query },
+            cognitiveActionHandler: {
+                received.set($0)
+                return true
+            },
+            sessionAuthorizationProvider: { supplied, scope in
+                guard supplied == token, scope == .cognitiveEvidence else {
+                    return .failure(EmbodimentIPCError.permissionDenied)
+                }
+                return .success(())
+            }
+        )
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let episode = CognitiveActionEpisode(
+            goalEpisodeID: goalID,
+            sourceLayer: .l2,
+            toolName: "capture_view",
+            effect: .reversibleEmbodiment,
+            purpose: "Resolve the participant's current visual reference.",
+            expectedInformationGain: 0.9,
+            evidenceIDs: ["turn:visual-reference"],
+            status: .succeeded,
+            resultFingerprint: "feedface",
+            requestFingerprint: "semantic-capture",
+            resultSummary: "Current visual evidence was acquired."
+        )
+
+        let deniedLookup = try EmbodimentShadowSocketClient.send(
+            .init(kind: .cognitiveActionQuery, cognitiveActionQuery: query),
+            socketURL: socketURL
+        )
+        XCTAssertFalse(deniedLookup.ok)
+
+        let acceptedLookup = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveActionQuery,
+                cognitiveActionQuery: query,
+                sessionAuthorization: token
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(acceptedLookup.ok)
+        XCTAssertEqual(acceptedLookup.cognitiveActionDuplicate, true)
+        XCTAssertNil(acceptedLookup.snapshot)
+
+        let denied = try EmbodimentShadowSocketClient.send(
+            .init(kind: .cognitiveActionOutcome, cognitiveAction: episode),
+            socketURL: socketURL
+        )
+        XCTAssertFalse(denied.ok)
+        XCTAssertNil(received.value)
+
+        let accepted = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveActionOutcome,
+                cognitiveAction: episode,
+                sessionAuthorization: token
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(accepted.ok)
+        XCTAssertEqual(received.value, episode)
+        XCTAssertNil(accepted.snapshot)
+        XCTAssertNil(accepted.personContext)
     }
 
     func testConversationTerminationIPCRequiresCurrentCapability() throws {
@@ -1853,6 +2051,23 @@ private final class LockedValue: @unchecked Sendable {
     }
 
     func set(_ value: Bool) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
+    }
+}
+
+private final class LockedCognitiveAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: CognitiveActionEpisode?
+
+    var value: CognitiveActionEpisode? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func set(_ value: CognitiveActionEpisode) {
         lock.lock()
         storedValue = value
         lock.unlock()

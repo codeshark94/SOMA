@@ -15,6 +15,7 @@ final class OBSBOTDeviceContractTests: XCTestCase {
         XCTAssertEqual(contract.firmwareIndicatorStateID(for: .green), 54)
         XCTAssertFalse(contract.usesFirmwareDefaultIndicator(for: .green))
         XCTAssertEqual(contract.firmwareIndicatorStateID(for: .blue), 57)
+        XCTAssertEqual(contract.indicatorPulseTransport, .enableToggle)
         XCTAssertEqual(
             SOMALEDSignalSettings(color: .yellow, pattern: .steady)
                 .deviceRendering(for: contract),
@@ -32,6 +33,21 @@ final class OBSBOTDeviceContractTests: XCTestCase {
         XCTAssertEqual(settings.deviceRendering(for: .conversation, on: contract), .init(stateID: 16, pattern: .steady))
     }
 
+    func testTiny2SemanticIndicatorStatesUsePhysicallyValidatedColors() {
+        let contract = tiny2LiteTestContract()
+        let settings = SOMALEDSettings()
+
+        XCTAssertEqual(settings.deviceRendering(for: .exploring, on: contract), .init(stateID: 54, pattern: .steady))
+        XCTAssertEqual(settings.deviceRendering(for: .humanDetected, on: contract), .init(stateID: 57, pattern: .steady))
+        XCTAssertEqual(settings.deviceRendering(for: .contactReady, on: contract), .init(stateID: 57, pattern: .firmwareAnimation))
+        XCTAssertEqual(settings.deviceRendering(for: .conversation, on: contract), .init(stateID: 16, pattern: .steady))
+    }
+
+    func testIndicatorPulseTransportIsDeclaredByEachDeviceAdapter() {
+        XCTAssertEqual(tiny2LiteTestContract().indicatorPulseTransport, .brightnessDimming)
+        XCTAssertEqual(tiny3LiteTestContract().indicatorPulseTransport, .enableToggle)
+    }
+
     func testTiny3RejectsFirmwareAudioModeThatDidNotPersistOnHardware() {
         let contract = tiny3LiteTestContract()
 
@@ -44,7 +60,7 @@ final class OBSBOTDeviceContractTests: XCTestCase {
     }
 
     func testUnknownDeviceContractRemainsPerceptionOnly() {
-        let line = "SOMA_OBSBOT_CAPABILITY contract=2 profile=unknown product_type=44 native_bridge=false motor_calibrated=false bounded_calibration_pulses=false native_human_tracking=false indicator_palette=false indicator_default_green=false indicator_direct_rgb=false indicator_direct_rgb_mask=0 indicator_basic=false selectable_audio_modes=false supported_audio_mode_mask=0 sound_localization=false requires_measured_attitude_frame=false native_tracking_transport=0 indicator_yellow_state_id=-1 indicator_green_state_id=-1 indicator_blue_state_id=-1 maximum_pan_degrees_per_second=0 maximum_pitch_degrees_per_second=0 nominal_wide_horizontal_fov_degrees=0 firmware=1.0 serial=XYZ"
+        let line = "SOMA_OBSBOT_CAPABILITY contract=2 profile=unknown product_type=44 native_bridge=false motor_calibrated=false bounded_calibration_pulses=false native_human_tracking=false indicator_palette=false indicator_default_green=false indicator_direct_rgb=false indicator_direct_rgb_mask=0 indicator_basic=false indicator_pulse_transport=0 selectable_audio_modes=false supported_audio_mode_mask=0 sound_localization=false requires_measured_attitude_frame=false native_tracking_transport=0 indicator_yellow_state_id=-1 indicator_green_state_id=-1 indicator_blue_state_id=-1 maximum_pan_degrees_per_second=0 maximum_pitch_degrees_per_second=0 nominal_wide_horizontal_fov_degrees=0 firmware=1.0 serial=XYZ"
 
         let contract = OBSBOTDeviceContract.parse(line)
 
@@ -54,7 +70,7 @@ final class OBSBOTDeviceContractTests: XCTestCase {
     }
 
     func testFirmwareDefaultAndPaletteExposeOnlyPhysicallyValidatedRoutes() throws {
-        let line = "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite product_type=19 native_bridge=true motor_calibrated=false bounded_calibration_pulses=true native_human_tracking=true indicator_palette=true indicator_default_green=false indicator_direct_rgb=false indicator_direct_rgb_mask=0 indicator_basic=true selectable_audio_modes=true supported_audio_mode_mask=55 sound_localization=true requires_measured_attitude_frame=true native_tracking_transport=2 indicator_yellow_state_id=16 indicator_green_state_id=54 indicator_blue_state_id=57 maximum_pan_degrees_per_second=90 maximum_pitch_degrees_per_second=45 nominal_wide_horizontal_fov_degrees=72 firmware=6.5.10.1 serial=ABC123"
+        let line = "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite product_type=19 native_bridge=true motor_calibrated=false bounded_calibration_pulses=true native_human_tracking=true indicator_palette=true indicator_default_green=false indicator_direct_rgb=false indicator_direct_rgb_mask=0 indicator_basic=true indicator_pulse_transport=2 selectable_audio_modes=true supported_audio_mode_mask=55 sound_localization=true requires_measured_attitude_frame=true native_tracking_transport=2 indicator_yellow_state_id=16 indicator_green_state_id=54 indicator_blue_state_id=57 maximum_pan_degrees_per_second=90 maximum_pitch_degrees_per_second=45 nominal_wide_horizontal_fov_degrees=72 firmware=6.5.10.1 serial=ABC123"
 
         let contract = try XCTUnwrap(OBSBOTDeviceContract.parse(line))
 
@@ -75,7 +91,7 @@ final class OBSBOTDeviceContractTests: XCTestCase {
     }
 
     func testContractRejectsInconsistentDirectRGBTransport() {
-        let line = "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite product_type=19 native_bridge=true motor_calibrated=false bounded_calibration_pulses=true native_human_tracking=true indicator_palette=true indicator_default_green=true indicator_direct_rgb=false indicator_direct_rgb_mask=4 indicator_basic=true selectable_audio_modes=true supported_audio_mode_mask=55 sound_localization=true requires_measured_attitude_frame=true native_tracking_transport=2 indicator_yellow_state_id=16 indicator_green_state_id=-1 indicator_blue_state_id=57 maximum_pan_degrees_per_second=90 maximum_pitch_degrees_per_second=45 nominal_wide_horizontal_fov_degrees=72 firmware=6.5.10.1 serial=ABC123"
+        let line = "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite product_type=19 native_bridge=true motor_calibrated=false bounded_calibration_pulses=true native_human_tracking=true indicator_palette=true indicator_default_green=true indicator_direct_rgb=false indicator_direct_rgb_mask=4 indicator_basic=true indicator_pulse_transport=2 selectable_audio_modes=true supported_audio_mode_mask=55 sound_localization=true requires_measured_attitude_frame=true native_tracking_transport=2 indicator_yellow_state_id=16 indicator_green_state_id=-1 indicator_blue_state_id=57 maximum_pan_degrees_per_second=90 maximum_pitch_degrees_per_second=45 nominal_wide_horizontal_fov_degrees=72 firmware=6.5.10.1 serial=ABC123"
 
         XCTAssertNil(OBSBOTDeviceContract.parse(line))
     }
@@ -85,7 +101,7 @@ final class OBSBOTDeviceContractTests: XCTestCase {
             "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite native_bridge=true"
         ))
         XCTAssertNil(OBSBOTDeviceContract.parse(
-            "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite native_bridge=true motor_calibrated=false bounded_calibration_pulses=true native_human_tracking=true indicator_palette=true indicator_default_green=true indicator_direct_rgb=false indicator_direct_rgb_mask=0 indicator_basic=true selectable_audio_modes=true supported_audio_mode_mask=55 sound_localization=true requires_measured_attitude_frame=true native_tracking_transport=2 indicator_yellow_state_id=16 indicator_green_state_id=-1 indicator_blue_state_id=57 maximum_pan_degrees_per_second=0 maximum_pitch_degrees_per_second=45 nominal_wide_horizontal_fov_degrees=72"
+            "SOMA_OBSBOT_CAPABILITY contract=2 profile=tiny_3_lite native_bridge=true motor_calibrated=false bounded_calibration_pulses=true native_human_tracking=true indicator_palette=true indicator_default_green=true indicator_direct_rgb=false indicator_direct_rgb_mask=0 indicator_basic=true indicator_pulse_transport=2 selectable_audio_modes=true supported_audio_mode_mask=55 sound_localization=true requires_measured_attitude_frame=true native_tracking_transport=2 indicator_yellow_state_id=16 indicator_green_state_id=-1 indicator_blue_state_id=57 maximum_pan_degrees_per_second=0 maximum_pitch_degrees_per_second=45 nominal_wide_horizontal_fov_degrees=72"
         ))
     }
 

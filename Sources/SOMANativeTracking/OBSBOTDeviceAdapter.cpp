@@ -15,6 +15,7 @@ public:
         static const OBSBOTDeviceContract value {
             "unknown", false, false, false, false,
             false, false, 0, false,
+            OBSBOTIndicatorPulseTransport::unavailable,
             false, 0, false, false,
             -1, -1, -1, -1, 0, 0, 0,
             OBSBOTNativeTrackingTransport::unavailable,
@@ -38,8 +39,9 @@ public:
         static const OBSBOTDeviceContract value {
             "tiny_2_lite", true, true, false, true,
             true, false, 0, true,
+            OBSBOTIndicatorPulseTransport::brightnessDimming,
             false, 0, false, false,
-            -1, 16, 57, 54, 180, 90, 67.2,
+            -1, 16, 54, 57, 180, 90, 67.2,
             OBSBOTNativeTrackingTransport::legacyHumanMode,
         };
         return value;
@@ -87,6 +89,7 @@ public:
         static const OBSBOTDeviceContract value {
             "tiny_3_lite", true, false, true, true,
             true, false, 0, true,
+            OBSBOTIndicatorPulseTransport::enableToggle,
             true, audioModes, true, true,
             3, 16, 54, 57, 90, 45, 72,
             OBSBOTNativeTrackingTransport::selectedHumanPortrait,

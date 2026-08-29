@@ -360,7 +360,7 @@ public enum L1ThoughtResponseDecoder {
     private static let allowedKeys: Set<String> = [
         "expected_revision", "evidence_ids", "inner_monologue", "channel",
         "continuity", "parent_thought_id", "confidence", "salience", "novelty",
-        "hypothesis_mutations", "drive_signal", "intention",
+        "hypothesis_mutations", "drive_signal", "intention", "intention_resolution",
         "requested_visual_resource_ids", "memory_proposals",
     ]
     private static let forbiddenKeys: Set<String> = [
@@ -416,9 +416,39 @@ public enum L1ThoughtResponseDecoder {
            !request.workspace.thoughtCandidates.contains(where: { $0.id == parent }) {
             failures.append("thought parent is unavailable")
         }
-        if let intention = update.intention,
-           !Set(intention.evidenceIDs).isSubset(of: available) {
-            failures.append("intention references unavailable evidence")
+        if let intention = update.intention {
+            if !Set(intention.evidenceIDs).isSubset(of: available) {
+                failures.append("intention references unavailable evidence")
+            }
+            if intention.completionCondition?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                failures.append("intention requires an observable completion condition")
+            }
+        }
+        if let resolution = update.intentionResolution {
+            if update.continuity != .retire {
+                failures.append("intention resolution requires retire continuity")
+            }
+            if resolution.explanation.isEmpty {
+                failures.append("intention resolution requires an explanation")
+            }
+            if resolution.evidenceIDs.isEmpty
+                || !Set(resolution.evidenceIDs).isSubset(of: available)
+                || !Set(resolution.evidenceIDs).isSubset(of: Set(update.evidenceIDs)) {
+                failures.append("intention resolution requires supplied current evidence")
+            }
+            guard let stored = request.workspace.intentions.first(where: {
+                $0.id == resolution.intentionID && $0.completedAt == nil
+            }) else {
+                failures.append("intention resolution references an unavailable goal")
+                throw ConsciousnessResponseError.validationFailed(failures)
+            }
+            let boundary = Set(stored.dispatchEvidenceIDs ?? stored.evidenceIDs)
+            if !resolution.evidenceIDs.contains(where: { !boundary.contains($0) }) {
+                failures.append("intention resolution requires evidence newer than the latest dispatch boundary")
+            }
+            if resolution.outcome == .satisfied, stored.executedAt == nil {
+                failures.append("an undispatched intention cannot be satisfied")
+            }
         }
         for proposal in update.memoryProposals where !Set(proposal.evidenceIDs).isSubset(of: available) {
             failures.append("memory proposal references unavailable evidence")

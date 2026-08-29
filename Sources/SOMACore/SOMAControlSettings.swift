@@ -1,30 +1,46 @@
 import Foundation
 
-/// The voices accepted by the account-backed realtime helper. Keeping this
-/// contract in the core target lets the launcher and the control surface agree
-/// on a value before a session is opened.
+/// Listening-oriented grouping curated for SOMA's supported realtime voices.
+public enum SOMARealtimeVoicePresentation: String, CaseIterable, Sendable {
+    case female
+    case male
+
+    public var displayName: String { rawValue.capitalized }
+}
+
+/// Voices accepted by the Codex app-server v3 realtime transport. This list is
+/// intentionally narrower than the protocol-wide `RealtimeVoice` enum: the
+/// backend rejects the additional voice IDs when a v3 WebRTC session starts.
 public enum SOMARealtimeVoice: String, CaseIterable, Codable, Sendable {
-    case alloy
     case arbor
-    case ash
-    case ballad
     case breeze
-    case cedar
-    case coral
     case cove
-    case echo
     case ember
     case juniper
     case maple
-    case marin
-    case sage
-    case shimmer
     case sol
     case spruce
     case vale
-    case verse
 
     public var displayName: String { rawValue.capitalized }
+
+    public var presentation: SOMARealtimeVoicePresentation {
+        switch self {
+        case .juniper, .maple, .vale, .sol:
+            .female
+        case .spruce, .ember, .breeze, .arbor, .cove:
+            .male
+        }
+    }
+
+    public static func voices(
+        with presentation: SOMARealtimeVoicePresentation
+    ) -> [SOMARealtimeVoice] {
+        switch presentation {
+        case .female: [.juniper, .maple, .vale, .sol]
+        case .male: [.spruce, .ember, .breeze, .arbor, .cove]
+        }
+    }
 }
 
 /// A presentation policy for the OBSBOT's built-in indicator. The device
@@ -422,11 +438,14 @@ public struct SOMAAdministratorIdentity: Codable, Equatable, Sendable {
 /// User-controlled settings consumed by the local runtime at process launch.
 /// None of the fields contain face embeddings or other raw biometric material.
 public struct SOMAControlSettings: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 8
+    public static let currentSchemaVersion = 10
 
     public var schemaVersion: Int
     public var realtimeVoiceEnabled: Bool
     public var realtimeVoice: SOMARealtimeVoice
+    /// When enabled, an already-open session receives a participant turn only
+    /// while current eye contact and audiovisual speaker evidence agree.
+    public var realtimeVoiceRequiresEyeContactForEveryTurn: Bool
     public var led: SOMALEDSettings
     /// These settings only narrow the launch-agent capabilities; they can
     /// never grant motion authority that the service was not launched with.
@@ -438,6 +457,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         schemaVersion: Int = SOMAControlSettings.currentSchemaVersion,
         realtimeVoiceEnabled: Bool = true,
         realtimeVoice: SOMARealtimeVoice = .maple,
+        realtimeVoiceRequiresEyeContactForEveryTurn: Bool = false,
         led: SOMALEDSettings = .init(),
         nativeHumanTrackingEnabled: Bool = true,
         autonomousExplorationEnabled: Bool = true,
@@ -446,6 +466,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         self.schemaVersion = schemaVersion
         self.realtimeVoiceEnabled = realtimeVoiceEnabled
         self.realtimeVoice = realtimeVoice
+        self.realtimeVoiceRequiresEyeContactForEveryTurn = realtimeVoiceRequiresEyeContactForEveryTurn
         self.led = led
         self.nativeHumanTrackingEnabled = nativeHumanTrackingEnabled
         self.autonomousExplorationEnabled = autonomousExplorationEnabled
@@ -458,6 +479,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         case schemaVersion
         case realtimeVoiceEnabled
         case realtimeVoice
+        case realtimeVoiceRequiresEyeContactForEveryTurn
         case led
         case nativeHumanTrackingEnabled
         case autonomousExplorationEnabled
@@ -472,7 +494,12 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         }
         schemaVersion = Self.currentSchemaVersion
         realtimeVoiceEnabled = try values.decodeIfPresent(Bool.self, forKey: .realtimeVoiceEnabled) ?? true
-        realtimeVoice = try values.decodeIfPresent(SOMARealtimeVoice.self, forKey: .realtimeVoice) ?? .maple
+        let persistedVoice = try values.decodeIfPresent(String.self, forKey: .realtimeVoice)
+        realtimeVoice = persistedVoice.flatMap(SOMARealtimeVoice.init(rawValue:)) ?? .maple
+        realtimeVoiceRequiresEyeContactForEveryTurn = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .realtimeVoiceRequiresEyeContactForEveryTurn
+        ) ?? false
         var decodedLED = try values.decodeIfPresent(SOMALEDSettings.self, forKey: .led) ?? .init()
         if sourceVersion < 6,
            decodedLED.signal(for: .contactReady).pattern == .steady {
@@ -509,6 +536,10 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         try values.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
         try values.encode(realtimeVoiceEnabled, forKey: .realtimeVoiceEnabled)
         try values.encode(realtimeVoice, forKey: .realtimeVoice)
+        try values.encode(
+            realtimeVoiceRequiresEyeContactForEveryTurn,
+            forKey: .realtimeVoiceRequiresEyeContactForEveryTurn
+        )
         try values.encode(led, forKey: .led)
         try values.encode(nativeHumanTrackingEnabled, forKey: .nativeHumanTrackingEnabled)
         try values.encode(autonomousExplorationEnabled, forKey: .autonomousExplorationEnabled)

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import LocalAuthentication
 import SOMACore
@@ -20,6 +21,8 @@ private enum SOMAPaths {
         .appendingPathComponent("Library/LaunchAgents/com.soma.reactive-l0.plist")
     static let menuBarPlist = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents/com.soma.menu-bar.plist")
+    static let menuBarInstanceLock = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/SOMA/menu-bar.lock")
 
     static var serviceTarget: String {
         "gui/\(getuid())/\(serviceLabel)"
@@ -29,6 +32,52 @@ private enum SOMAPaths {
         URL(fileURLWithPath: CommandLine.arguments[0])
             .deletingLastPathComponent()
             .appendingPathComponent("soma-subconscious")
+    }
+}
+
+private final class SOMAMenuBarInstanceLease {
+    static let openSettingsNotification = Notification.Name("com.soma.menu-bar.open-settings")
+
+    private let descriptor: Int32
+
+    private init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    static func acquire() -> SOMAMenuBarInstanceLease? {
+        let fileManager = FileManager.default
+        let directoryURL = SOMAPaths.menuBarInstanceLock.deletingLastPathComponent()
+        do {
+            try fileManager.createDirectory(
+                at: directoryURL,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directoryURL.path
+            )
+        } catch {
+            return nil
+        }
+
+        let descriptor = Darwin.open(
+            SOMAPaths.menuBarInstanceLock.path,
+            O_CREAT | O_RDWR | O_CLOEXEC,
+            S_IRUSR | S_IWUSR
+        )
+        guard descriptor >= 0 else { return nil }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            Darwin.close(descriptor)
+            return nil
+        }
+        _ = fchmod(descriptor, S_IRUSR | S_IWUSR)
+        return SOMAMenuBarInstanceLease(descriptor: descriptor)
+    }
+
+    deinit {
+        _ = flock(descriptor, LOCK_UN)
+        Darwin.close(descriptor)
     }
 }
 
@@ -232,13 +281,15 @@ private final class SOMAControlModel: ObservableObject {
         }
     }
 
-    func saveAndRestart() {
+    @discardableResult
+    func saveAndRestart() -> Bool {
         save()
-        guard message?.hasPrefix("Saved locally") == true else { return }
+        guard message?.hasPrefix("Saved locally") == true else { return false }
         let result = startSOMA(restart: true)
         message = result.status == 0
             ? "Saved and SOMA is restarting."
             : (result.output.isEmpty ? "Could not restart SOMA." : result.output)
+        return result.status == 0
     }
 
     func startSOMA(restart: Bool = false) -> (status: Int32, output: String) {
@@ -521,6 +572,7 @@ private enum SOMASettingsSidebarLayout {
 
 private struct SOMASettingsView: View {
     @ObservedObject var model: SOMAControlModel
+    var onSuccessfulRestart: () -> Void = {}
     var onOpenDiagnostics: () -> Void = {}
     @State private var selection: SOMASettingsSection = .experience
     @State private var revealAPIKey = false
@@ -537,7 +589,11 @@ private struct SOMASettingsView: View {
                     Spacer(minLength: 20)
                     HStack(spacing: 10) {
                         Button("Save") { model.save() }
-                        Button("Save & restart SOMA") { model.saveAndRestart() }
+                        Button("Save & restart SOMA") {
+                            if model.saveAndRestart() {
+                                onSuccessfulRestart()
+                            }
+                        }
                             .buttonStyle(.borderedProminent)
                     }
                     .controlSize(.large)
@@ -654,11 +710,26 @@ private struct SOMASettingsView: View {
             SettingsCard(title: "Realtime voice", subtitle: "The voice used for account-backed spoken responses.") {
                 Toggle("Enable spoken realtime conversations", isOn: binding(\.realtimeVoiceEnabled))
                 Picker("Voice", selection: binding(\.realtimeVoice)) {
-                    ForEach(SOMARealtimeVoice.allCases, id: \.self) { voice in
-                        Text(voice.displayName).tag(voice)
+                    ForEach(SOMARealtimeVoicePresentation.allCases, id: \.self) { presentation in
+                        Section(presentation.displayName) {
+                            ForEach(SOMARealtimeVoice.voices(with: presentation), id: \.self) { voice in
+                                Text(voice.displayName).tag(voice)
+                            }
+                        }
                     }
                 }
                 .disabled(!model.settings.realtimeVoiceEnabled)
+                Text("Only voices accepted by the installed Codex realtime transport are shown; groups are curated by listening.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle(
+                    "Require eye contact for every spoken turn",
+                    isOn: binding(\.realtimeVoiceRequiresEyeContactForEveryTurn)
+                )
+                .disabled(!model.settings.realtimeVoiceEnabled)
+                Text("When enabled, an open conversation forwards a spoken turn only when current eye contact and audiovisual evidence identify the tracked person as the speaker.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             SettingsCard(title: "LED response", subtitle: "Set global visibility and brightness for the hardware indicator.") {
                 Picker("Reaction", selection: ledModeBinding) {
@@ -1506,6 +1577,7 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
     private let opensSettingsOnLaunch: Bool
     private var settingsPanel: NSPanel?
     private var diagnosticsPanel: NSPanel?
+    private var openSettingsObserver: NSObjectProtocol?
 
     init(opensSettingsOnLaunch: Bool) {
         self.opensSettingsOnLaunch = opensSettingsOnLaunch
@@ -1513,6 +1585,13 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        openSettingsObserver = DistributedNotificationCenter.default().addObserver(
+            forName: SOMAMenuBarInstanceLease.openSettingsNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.openSettings() }
+        }
         menu.delegate = self
         menu.minimumWidth = SOMAStatusMenuLayout.width
         statusItem.menu = menu
@@ -1524,6 +1603,13 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         if opensSettingsOnLaunch {
             DispatchQueue.main.async { [weak self] in self?.openSettings() }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let openSettingsObserver {
+            DistributedNotificationCenter.default().removeObserver(openSettingsObserver)
+            self.openSettingsObserver = nil
         }
     }
 
@@ -1597,6 +1683,9 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
         panel.delegate = self
         panel.contentViewController = NSHostingController(rootView: SOMASettingsView(
             model: model,
+            onSuccessfulRestart: { [weak self] in
+                self?.settingsPanel?.close()
+            },
             onOpenDiagnostics: { [weak self] in self?.openDiagnostics() }
         ))
         panel.center()
@@ -1675,7 +1764,20 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 }
 
+private let opensSettingsOnLaunch = CommandLine.arguments.contains("--settings")
+private let instanceLease = SOMAMenuBarInstanceLease.acquire()
+if instanceLease == nil {
+    if opensSettingsOnLaunch {
+        DistributedNotificationCenter.default().postNotificationName(
+            SOMAMenuBarInstanceLease.openSettingsNotification,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+    exit(EXIT_SUCCESS)
+}
 private let application = NSApplication.shared
-private let delegate = SOMAStatusBar(opensSettingsOnLaunch: CommandLine.arguments.contains("--settings"))
+private let delegate = SOMAStatusBar(opensSettingsOnLaunch: opensSettingsOnLaunch)
 application.delegate = delegate
 application.run()

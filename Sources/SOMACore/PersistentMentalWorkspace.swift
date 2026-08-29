@@ -10,6 +10,7 @@ public enum MentalEvidenceKind: String, Codable, CaseIterable, Hashable, Sendabl
     case sceneTransition = "scene_transition"
     case memoryAssociation = "memory_association"
     case conversationOutcome = "conversation_outcome"
+    case cognitiveActionOutcome = "cognitive_action_outcome"
     case elapsedTime = "elapsed_time"
 
     public var demandsImmediateReflection: Bool {
@@ -17,7 +18,7 @@ public enum MentalEvidenceKind: String, Codable, CaseIterable, Hashable, Sendabl
         case .personArrived, .personDeparted, .directSocialBid,
              .objectPresentation, .sceneTransition, .conversationOutcome:
             true
-        case .ordinaryObservation, .memoryAssociation, .elapsedTime:
+        case .ordinaryObservation, .memoryAssociation, .cognitiveActionOutcome, .elapsedTime:
             false
         }
     }
@@ -196,6 +197,7 @@ public enum ThoughtContinuity: String, Codable, CaseIterable, Hashable, Sendable
 
 public struct ThoughtCandidate: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
+    public let episodeID: UUID?
     public let channel: ThoughtChannel
     public let content: String
     public let confidence: Double
@@ -209,6 +211,7 @@ public struct ThoughtCandidate: Codable, Equatable, Identifiable, Sendable {
 
     public init(
         id: UUID = UUID(),
+        episodeID: UUID? = nil,
         channel: ThoughtChannel,
         content: String,
         confidence: Double,
@@ -221,6 +224,7 @@ public struct ThoughtCandidate: Codable, Equatable, Identifiable, Sendable {
         lastForegroundAt: Date? = nil
     ) {
         self.id = id
+        self.episodeID = episodeID
         self.channel = channel
         self.content = String(content.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_096))
         self.confidence = Self.unit(confidence)
@@ -235,6 +239,46 @@ public struct ThoughtCandidate: Codable, Equatable, Identifiable, Sendable {
 
     private static func unit(_ value: Double) -> Double {
         value.isFinite ? min(max(value, 0), 1) : 0
+    }
+}
+
+public enum MentalThoughtEpisodeStatus: String, Codable, CaseIterable, Hashable, Sendable {
+    case active
+    case dormant
+    case retired
+}
+
+/// Persistent lineage for a thought across model turns. Candidate text may be
+/// revised or lose foreground competition without erasing the episode that
+/// links its evidence, goal, and later cognitive actions.
+public struct MentalThoughtEpisode: Codable, Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public let rootThoughtID: UUID
+    public let currentThoughtID: UUID
+    public let goalEpisodeID: UUID?
+    public let status: MentalThoughtEpisodeStatus
+    public let evidenceIDs: [String]
+    public let startedAt: Date
+    public let updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        rootThoughtID: UUID,
+        currentThoughtID: UUID,
+        goalEpisodeID: UUID? = nil,
+        status: MentalThoughtEpisodeStatus = .active,
+        evidenceIDs: [String],
+        startedAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.rootThoughtID = rootThoughtID
+        self.currentThoughtID = currentThoughtID
+        self.goalEpisodeID = goalEpisodeID
+        self.status = status
+        self.evidenceIDs = Array(evidenceIDs.uniqued().prefix(64)).map { String($0.prefix(256)) }
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
     }
 }
 
@@ -317,6 +361,7 @@ public struct MentalEvidenceEvent: Codable, Equatable, Sendable {
     public let contextPatch: MentalContextPatch?
     public let hypothesis: MentalHypothesisSeed?
     public let driveSignal: MentalDriveSignal
+    public let cognitiveAction: CognitiveActionEpisode?
 
     public init(
         id: String,
@@ -328,7 +373,8 @@ public struct MentalEvidenceEvent: Codable, Equatable, Sendable {
         novelty: Double,
         contextPatch: MentalContextPatch? = nil,
         hypothesis: MentalHypothesisSeed? = nil,
-        driveSignal: MentalDriveSignal = .init()
+        driveSignal: MentalDriveSignal = .init(),
+        cognitiveAction: CognitiveActionEpisode? = nil
     ) {
         self.id = String(id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(256))
         self.observedAt = observedAt
@@ -340,6 +386,7 @@ public struct MentalEvidenceEvent: Codable, Equatable, Sendable {
         self.contextPatch = contextPatch
         self.hypothesis = hypothesis
         self.driveSignal = driveSignal
+        self.cognitiveAction = cognitiveAction
     }
 
     private static func unit(_ value: Double) -> Double {
@@ -381,25 +428,38 @@ public struct MentalIntention: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
     public let domain: String
     public let objective: String
+    public let completionCondition: String?
     public let attentionTargetLabel: String?
     public let pressure: Double
     public let evidenceIDs: [String]
     public let createdAt: Date
     public let executedAt: Date?
+    /// Evidence already present when the latest action was dispatched. A goal
+    /// can only advance or complete from evidence outside this boundary.
+    public let dispatchEvidenceIDs: [String]?
+    public let lastDispatchedActionFingerprint: String?
+    public let completedAt: Date?
 
     public init(
         id: UUID = UUID(),
         domain: String,
         objective: String,
+        completionCondition: String? = nil,
         attentionTargetLabel: String? = nil,
         pressure: Double,
         evidenceIDs: [String],
         createdAt: Date = Date(),
-        executedAt: Date? = nil
+        executedAt: Date? = nil,
+        dispatchEvidenceIDs: [String]? = nil,
+        lastDispatchedActionFingerprint: String? = nil,
+        completedAt: Date? = nil
     ) {
         self.id = id
         self.domain = String(domain.prefix(64))
         self.objective = String(objective.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1_024))
+        self.completionCondition = completionCondition.map {
+            String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1_024))
+        }
         self.attentionTargetLabel = attentionTargetLabel.map {
             String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(96))
         }
@@ -407,6 +467,56 @@ public struct MentalIntention: Codable, Equatable, Identifiable, Sendable {
         self.evidenceIDs = Array(evidenceIDs.uniqued().prefix(32)).map { String($0.prefix(256)) }
         self.createdAt = createdAt
         self.executedAt = executedAt
+        self.dispatchEvidenceIDs = dispatchEvidenceIDs.map {
+            Array($0.uniqued().suffix(256)).map { String($0.prefix(256)) }
+        }
+        self.lastDispatchedActionFingerprint = lastDispatchedActionFingerprint.map {
+            String($0.lowercased().prefix(128))
+        }
+        self.completedAt = completedAt
+    }
+
+    public func hasPostDispatchEvidence(_ evidenceIDs: [String]) -> Bool {
+        guard completedAt == nil else { return false }
+        guard executedAt != nil else { return true }
+        let boundary = Set(dispatchEvidenceIDs ?? self.evidenceIDs)
+        return evidenceIDs.contains { !boundary.contains($0) }
+    }
+
+    public func canDispatch(
+        using evidenceIDs: [String],
+        actionFingerprint: String
+    ) -> Bool {
+        guard hasPostDispatchEvidence(evidenceIDs) else { return false }
+        guard executedAt != nil else { return true }
+        return lastDispatchedActionFingerprint != actionFingerprint.lowercased()
+    }
+}
+
+public enum MentalIntentionResolutionOutcome: String, Codable, CaseIterable, Sendable {
+    case satisfied
+    case impossible
+}
+
+/// An explicit, evidence-bound evaluation of an intention's observable
+/// completion condition. It is separate from thought continuity so retiring a
+/// sentence cannot accidentally complete a physical or social goal.
+public struct MentalIntentionResolution: Codable, Equatable, Sendable {
+    public let intentionID: UUID
+    public let outcome: MentalIntentionResolutionOutcome
+    public let evidenceIDs: [String]
+    public let explanation: String
+
+    public init(
+        intentionID: UUID,
+        outcome: MentalIntentionResolutionOutcome,
+        evidenceIDs: [String],
+        explanation: String
+    ) {
+        self.intentionID = intentionID
+        self.outcome = outcome
+        self.evidenceIDs = Array(evidenceIDs.uniqued().prefix(32)).map { String($0.prefix(256)) }
+        self.explanation = String(explanation.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1_024))
     }
 }
 
@@ -423,6 +533,7 @@ public struct L1ThoughtUpdate: Codable, Equatable, Sendable {
     public let hypothesisMutations: [MentalHypothesisMutation]
     public let driveSignal: MentalDriveSignal
     public let intention: MentalIntention?
+    public let intentionResolution: MentalIntentionResolution?
     public let requestedVisualResourceIDs: [String]
     public let memoryProposals: [L1MemoryProposal]
 
@@ -439,6 +550,7 @@ public struct L1ThoughtUpdate: Codable, Equatable, Sendable {
         hypothesisMutations: [MentalHypothesisMutation] = [],
         driveSignal: MentalDriveSignal = .init(),
         intention: MentalIntention? = nil,
+        intentionResolution: MentalIntentionResolution? = nil,
         requestedVisualResourceIDs: [String] = [],
         memoryProposals: [L1MemoryProposal] = []
     ) {
@@ -454,6 +566,7 @@ public struct L1ThoughtUpdate: Codable, Equatable, Sendable {
         self.hypothesisMutations = Array(hypothesisMutations.prefix(16))
         self.driveSignal = driveSignal
         self.intention = intention
+        self.intentionResolution = intentionResolution
         self.requestedVisualResourceIDs = Array(requestedVisualResourceIDs.uniqued().prefix(4))
             .map { String($0.prefix(256)) }
         self.memoryProposals = Array(memoryProposals.prefix(32))
@@ -475,8 +588,10 @@ public struct MentalWorkspaceSnapshot: Codable, Equatable, Sendable {
     public let hypotheses: [MentalHypothesis]
     public let drives: MentalDriveState
     public let thoughtCandidates: [ThoughtCandidate]
+    public let thoughtEpisodes: [MentalThoughtEpisode]
     public let foregroundThoughtID: UUID?
     public let intentions: [MentalIntention]
+    public let cognitiveActions: [CognitiveActionEpisode]
     public let recentNovelty: Double
     public let lastThoughtAt: Date?
     public let processedEvidenceIDs: [String]
@@ -490,8 +605,10 @@ public struct MentalWorkspaceSnapshot: Codable, Equatable, Sendable {
         hypotheses: [MentalHypothesis] = [],
         drives: MentalDriveState = .init(),
         thoughtCandidates: [ThoughtCandidate] = [],
+        thoughtEpisodes: [MentalThoughtEpisode] = [],
         foregroundThoughtID: UUID? = nil,
         intentions: [MentalIntention] = [],
+        cognitiveActions: [CognitiveActionEpisode] = [],
         recentNovelty: Double = 0,
         lastThoughtAt: Date? = nil,
         processedEvidenceIDs: [String] = []
@@ -504,8 +621,10 @@ public struct MentalWorkspaceSnapshot: Codable, Equatable, Sendable {
         self.hypotheses = Array(hypotheses.prefix(32))
         self.drives = drives
         self.thoughtCandidates = Array(thoughtCandidates.prefix(16))
+        self.thoughtEpisodes = Array(thoughtEpisodes.suffix(32))
         self.foregroundThoughtID = foregroundThoughtID
         self.intentions = Array(intentions.prefix(16))
+        self.cognitiveActions = Array(cognitiveActions.suffix(64))
         self.recentNovelty = recentNovelty.isFinite ? min(max(recentNovelty, 0), 1) : 0
         self.lastThoughtAt = lastThoughtAt
         self.processedEvidenceIDs = Array(processedEvidenceIDs.uniqued().suffix(256))
@@ -515,6 +634,65 @@ public struct MentalWorkspaceSnapshot: Codable, Equatable, Sendable {
     public var foregroundThought: ThoughtCandidate? {
         guard let foregroundThoughtID else { return nil }
         return thoughtCandidates.first { $0.id == foregroundThoughtID }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case revision
+        case updatedAt
+        case restoredStale
+        case context
+        case hypotheses
+        case drives
+        case thoughtCandidates
+        case thoughtEpisodes
+        case foregroundThoughtID
+        case intentions
+        case cognitiveActions
+        case recentNovelty
+        case lastThoughtAt
+        case processedEvidenceIDs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            schemaVersion: try values.decodeIfPresent(Int.self, forKey: .schemaVersion)
+                ?? Self.currentSchemaVersion,
+            revision: try values.decodeIfPresent(UInt64.self, forKey: .revision) ?? 0,
+            updatedAt: try values.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .distantPast,
+            restoredStale: try values.decodeIfPresent(Bool.self, forKey: .restoredStale) ?? false,
+            context: try values.decodeIfPresent(MentalContextState.self, forKey: .context) ?? .init(),
+            hypotheses: try values.decodeIfPresent([MentalHypothesis].self, forKey: .hypotheses) ?? [],
+            drives: try values.decodeIfPresent(MentalDriveState.self, forKey: .drives) ?? .init(),
+            thoughtCandidates: try values.decodeIfPresent([ThoughtCandidate].self, forKey: .thoughtCandidates) ?? [],
+            thoughtEpisodes: try values.decodeIfPresent([MentalThoughtEpisode].self, forKey: .thoughtEpisodes) ?? [],
+            foregroundThoughtID: try values.decodeIfPresent(UUID.self, forKey: .foregroundThoughtID),
+            intentions: try values.decodeIfPresent([MentalIntention].self, forKey: .intentions) ?? [],
+            cognitiveActions: try values.decodeIfPresent([CognitiveActionEpisode].self, forKey: .cognitiveActions) ?? [],
+            recentNovelty: try values.decodeIfPresent(Double.self, forKey: .recentNovelty) ?? 0,
+            lastThoughtAt: try values.decodeIfPresent(Date.self, forKey: .lastThoughtAt),
+            processedEvidenceIDs: try values.decodeIfPresent([String].self, forKey: .processedEvidenceIDs) ?? []
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(schemaVersion, forKey: .schemaVersion)
+        try values.encode(revision, forKey: .revision)
+        try values.encode(updatedAt, forKey: .updatedAt)
+        try values.encode(restoredStale, forKey: .restoredStale)
+        try values.encode(context, forKey: .context)
+        try values.encode(hypotheses, forKey: .hypotheses)
+        try values.encode(drives, forKey: .drives)
+        try values.encode(thoughtCandidates, forKey: .thoughtCandidates)
+        try values.encode(thoughtEpisodes, forKey: .thoughtEpisodes)
+        try values.encodeIfPresent(foregroundThoughtID, forKey: .foregroundThoughtID)
+        try values.encode(intentions, forKey: .intentions)
+        try values.encode(cognitiveActions, forKey: .cognitiveActions)
+        try values.encode(recentNovelty, forKey: .recentNovelty)
+        try values.encodeIfPresent(lastThoughtAt, forKey: .lastThoughtAt)
+        try values.encode(processedEvidenceIDs, forKey: .processedEvidenceIDs)
     }
 }
 
@@ -637,6 +815,8 @@ public actor PersistentMentalWorkspace {
     private var state: MentalWorkspaceSnapshot
     private let policy: MentalDynamicsPolicy
     private var randomState: UInt64
+    private var cognitiveActionReservations: [CognitiveActionQuery: Date] = [:]
+    private let cognitiveActionReservationLifetimeSeconds: TimeInterval = 60
 
     public init(
         snapshot: MentalWorkspaceSnapshot = .init(),
@@ -660,6 +840,32 @@ public actor PersistentMentalWorkspace {
         state
     }
 
+    public func containsCognitiveAction(_ query: CognitiveActionQuery) -> Bool {
+        let evidence = Set(query.evidenceIDs)
+        return state.cognitiveActions.contains {
+            $0.goalEpisodeID == query.goalEpisodeID
+                && $0.toolName == query.toolName
+                && $0.requestFingerprint == query.requestFingerprint
+                && Set($0.evidenceIDs) == evidence
+        }
+    }
+
+    /// Atomically checks durable outcomes and reserves a previously unseen
+    /// semantic request. `true` means the caller must not execute it again.
+    public func reserveCognitiveAction(
+        _ query: CognitiveActionQuery,
+        at date: Date = Date()
+    ) -> Bool {
+        cognitiveActionReservations = cognitiveActionReservations.filter {
+            date.timeIntervalSince($0.value) < cognitiveActionReservationLifetimeSeconds
+        }
+        if containsCognitiveAction(query) || cognitiveActionReservations[query] != nil {
+            return true
+        }
+        cognitiveActionReservations[query] = date
+        return false
+    }
+
     public func ingest(_ event: MentalEvidenceEvent) -> WorkspaceTransition {
         let before = state
         if state.processedEvidenceIDs.contains(event.id) {
@@ -674,12 +880,15 @@ public actor PersistentMentalWorkspace {
             )
         }
         advanceDynamics(to: event.observedAt)
+        let lifecycleTransition = state.revision != before.revision
         var changes: [String] = []
         var hypotheses = state.hypotheses
         var context = state.context
         var drives = state.drives
+        var cognitiveActions = state.cognitiveActions
         var semanticTransition = false
         var repeatedActiveHypothesis = false
+        var repeatedCognitiveAction = false
 
         if let patch = event.contextPatch {
             let patched = apply(patch, to: context, event: event)
@@ -728,6 +937,25 @@ public actor PersistentMentalWorkspace {
             }
         }
 
+        if let action = event.cognitiveAction {
+            if let requestFingerprint = action.requestFingerprint {
+                cognitiveActionReservations.removeValue(forKey: CognitiveActionQuery(
+                    goalEpisodeID: action.goalEpisodeID,
+                    toolName: action.toolName,
+                    requestFingerprint: requestFingerprint,
+                    evidenceIDs: action.evidenceIDs
+                ))
+            }
+            if cognitiveActions.contains(where: { $0.isSemanticallyEquivalent(to: action) }) {
+                repeatedCognitiveAction = true
+            } else {
+                cognitiveActions.append(action)
+                cognitiveActions = Array(cognitiveActions.suffix(64))
+                changes.append("cognitive_action_\(action.status.rawValue):\(action.id.uuidString.lowercased())")
+                semanticTransition = true
+            }
+        }
+
         let updatedDrives = drives.applying(event.driveSignal, weight: event.confidence)
         if updatedDrives != drives {
             drives = updatedDrives
@@ -742,10 +970,14 @@ public actor PersistentMentalWorkspace {
             semanticTransition = true
         }
 
-        let evidenceNovelty = repeatedActiveHypothesis ? min(event.novelty, 0.30) : event.novelty
+        let repeatedEvidence = repeatedActiveHypothesis || repeatedCognitiveAction
+        let evidenceNovelty = repeatedEvidence ? min(event.novelty, 0.30) : event.novelty
         let novelty = min(max(max(evidenceNovelty, semanticMagnitude(of: changes)), 0), 1)
-        let meaningful = semanticTransition || novelty >= 0.55
-        if meaningful, changes.isEmpty {
+        let eventMeaningful = semanticTransition || novelty >= 0.55
+        let meaningful = lifecycleTransition || eventMeaningful
+        if lifecycleTransition {
+            changes.insert("hypothesis_lifecycle_decay", at: 0)
+        } else if meaningful, changes.isEmpty {
             changes.append("novel_evidence")
         }
         let processed = Array((state.processedEvidenceIDs + [event.id]).uniqued().suffix(256))
@@ -754,15 +986,17 @@ public actor PersistentMentalWorkspace {
             // This is a semantic revision. Correlated support may refine a
             // posterior without invalidating an in-flight inference that sees
             // the same situation.
-            revision: state.revision + (meaningful ? 1 : 0),
+            revision: state.revision + (eventMeaningful ? 1 : 0),
             updatedAt: max(state.updatedAt, event.observedAt),
             restoredStale: meaningful ? false : state.restoredStale,
             context: context,
             hypotheses: boundedHypotheses(hypotheses),
             drives: drives,
             thoughtCandidates: state.thoughtCandidates,
+            thoughtEpisodes: state.thoughtEpisodes,
             foregroundThoughtID: state.foregroundThoughtID,
             intentions: state.intentions,
+            cognitiveActions: cognitiveActions,
             recentNovelty: max(state.recentNovelty * 0.8, novelty),
             lastThoughtAt: state.lastThoughtAt,
             processedEvidenceIDs: processed
@@ -796,6 +1030,15 @@ public actor PersistentMentalWorkspace {
         for evidenceID in update.evidenceIDs where !knownEvidence.contains(evidenceID) {
             throw PersistentMentalWorkspaceError.unsupportedEvidence(evidenceID)
         }
+        if let resolution = update.intentionResolution {
+            guard update.continuity == .retire,
+                  !resolution.explanation.isEmpty,
+                  !resolution.evidenceIDs.isEmpty,
+                  Set(resolution.evidenceIDs).isSubset(of: knownEvidence),
+                  Set(resolution.evidenceIDs).isSubset(of: Set(update.evidenceIDs)) else {
+                throw PersistentMentalWorkspaceError.invalidThought
+            }
+        }
 
         let before = state
         var hypotheses = state.hypotheses
@@ -818,15 +1061,31 @@ public actor PersistentMentalWorkspace {
         if drives != state.drives { changes.append("drives") }
 
         var candidates = state.thoughtCandidates
+        var episodes = state.thoughtEpisodes
         let normalized = Self.signature(update.innerMonologue)
         let candidateID: UUID
+        let inheritedEpisodeID: UUID? = {
+            if let parentThoughtID = update.parentThoughtID,
+               let parent = candidates.first(where: { $0.id == parentThoughtID }) {
+                return parent.episodeID
+            }
+            switch update.continuity {
+            case .continue, .revise, .contradict, .retire:
+                return state.foregroundThought?.episodeID
+            case .associate, .idle:
+                return nil
+            }
+        }()
+        let candidateEpisodeID: UUID
         if let existingIndex = candidates.firstIndex(where: {
             Self.signature($0.content) == normalized && $0.channel == update.channel
         }) {
             let existing = candidates[existingIndex]
             candidateID = existing.id
+            candidateEpisodeID = existing.episodeID ?? inheritedEpisodeID ?? UUID()
             candidates[existingIndex] = ThoughtCandidate(
                 id: existing.id,
+                episodeID: candidateEpisodeID,
                 channel: update.channel,
                 content: update.innerMonologue,
                 confidence: max(existing.confidence, update.confidence),
@@ -843,7 +1102,9 @@ public actor PersistentMentalWorkspace {
             )
             changes.append("thought_revised:\(existing.id.uuidString.lowercased())")
         } else {
+            candidateEpisodeID = inheritedEpisodeID ?? UUID()
             let candidate = ThoughtCandidate(
+                episodeID: candidateEpisodeID,
                 channel: update.channel,
                 content: update.innerMonologue,
                 confidence: update.confidence,
@@ -865,6 +1126,84 @@ public actor PersistentMentalWorkspace {
             intentions.append(intention)
             changes.append("intention_created:\(intention.id.uuidString.lowercased())")
         }
+        let episodeStatus: MentalThoughtEpisodeStatus
+        switch update.continuity {
+        case .retire:
+            episodeStatus = .retired
+        case .idle:
+            episodeStatus = .dormant
+        case .continue, .revise, .contradict, .associate:
+            episodeStatus = .active
+        }
+        if let index = episodes.firstIndex(where: { $0.id == candidateEpisodeID }) {
+            let existing = episodes[index]
+            episodes[index] = MentalThoughtEpisode(
+                id: existing.id,
+                rootThoughtID: existing.rootThoughtID,
+                currentThoughtID: candidateID,
+                goalEpisodeID: update.intention?.id ?? existing.goalEpisodeID,
+                status: episodeStatus,
+                evidenceIDs: existing.evidenceIDs + update.evidenceIDs,
+                startedAt: existing.startedAt,
+                updatedAt: date
+            )
+            changes.append("thought_episode_updated:\(candidateEpisodeID.uuidString.lowercased())")
+        } else {
+            episodes.append(MentalThoughtEpisode(
+                id: candidateEpisodeID,
+                rootThoughtID: candidateID,
+                currentThoughtID: candidateID,
+                goalEpisodeID: update.intention?.id,
+                status: episodeStatus,
+                evidenceIDs: update.evidenceIDs,
+                startedAt: date,
+                updatedAt: date
+            ))
+            changes.append("thought_episode_created:\(candidateEpisodeID.uuidString.lowercased())")
+        }
+        if episodeStatus == .retired {
+            let goalID = update.intention?.id
+                ?? episodes.first(where: { $0.id == candidateEpisodeID })?.goalEpisodeID
+            if let goalID,
+               let intentionIndex = intentions.firstIndex(where: {
+                   $0.id == goalID && $0.completedAt == nil
+               }) {
+                let intention = intentions[intentionIndex]
+                guard let resolution = update.intentionResolution,
+                      resolution.intentionID == goalID else {
+                    throw PersistentMentalWorkspaceError.invalidThought
+                }
+                let dispatchBoundary = Set(intention.dispatchEvidenceIDs ?? intention.evidenceIDs)
+                let postDispatchEvidence = resolution.evidenceIDs.filter {
+                    !dispatchBoundary.contains($0)
+                }
+                guard !postDispatchEvidence.isEmpty,
+                      resolution.outcome != .satisfied || intention.executedAt != nil else {
+                    throw PersistentMentalWorkspaceError.invalidThought
+                }
+                intentions[intentionIndex] = MentalIntention(
+                    id: intention.id,
+                    domain: intention.domain,
+                    objective: intention.objective,
+                    completionCondition: intention.completionCondition,
+                    attentionTargetLabel: intention.attentionTargetLabel,
+                    pressure: intention.pressure,
+                    evidenceIDs: intention.evidenceIDs + update.evidenceIDs,
+                    createdAt: intention.createdAt,
+                    executedAt: intention.executedAt,
+                    dispatchEvidenceIDs: intention.dispatchEvidenceIDs,
+                    lastDispatchedActionFingerprint: intention.lastDispatchedActionFingerprint,
+                    completedAt: date
+                )
+                drives = drives.applying(
+                    intentionCompletionSignal(for: intention.domain),
+                    weight: intention.pressure
+                )
+                if !changes.contains("drives") { changes.append("drives") }
+                changes.append("intention_completed:\(goalID.uuidString.lowercased())")
+            }
+        }
+        episodes = Array(episodes.suffix(32))
         candidates = boundedCandidates(candidates, preserving: candidateID)
         let foregroundID = selectForeground(
             candidates,
@@ -880,6 +1219,7 @@ public actor PersistentMentalWorkspace {
             guard candidate.id == foregroundID else { return candidate }
             return ThoughtCandidate(
                 id: candidate.id,
+                episodeID: candidate.episodeID,
                 channel: candidate.channel,
                 content: candidate.content,
                 confidence: candidate.confidence,
@@ -901,8 +1241,10 @@ public actor PersistentMentalWorkspace {
             hypotheses: boundedHypotheses(hypotheses),
             drives: drives,
             thoughtCandidates: candidates,
+            thoughtEpisodes: episodes,
             foregroundThoughtID: foregroundID,
             intentions: Array(intentions.suffix(16)),
+            cognitiveActions: state.cognitiveActions,
             recentNovelty: max(state.recentNovelty * 0.7, update.novelty),
             lastThoughtAt: date,
             processedEvidenceIDs: state.processedEvidenceIDs
@@ -918,8 +1260,20 @@ public actor PersistentMentalWorkspace {
         )
     }
 
-    public func markIntentionExecuted(_ id: UUID, at date: Date = Date()) -> Bool {
-        guard let index = state.intentions.firstIndex(where: { $0.id == id && $0.executedAt == nil }) else {
+    /// Records the latest action dispatch without asserting that the goal's
+    /// observable completion condition has been satisfied. A later dispatch is
+    /// allowed only after L1a has incorporated evidence outside this boundary.
+    public func markIntentionExecuted(
+        _ id: UUID,
+        using evidenceIDs: [String],
+        actionFingerprint: String,
+        at date: Date = Date()
+    ) -> Bool {
+        guard let index = state.intentions.firstIndex(where: { $0.id == id && $0.completedAt == nil }),
+              state.intentions[index].canDispatch(
+                  using: evidenceIDs,
+                  actionFingerprint: actionFingerprint
+              ) else {
             return false
         }
         var intentions = state.intentions
@@ -928,11 +1282,15 @@ public actor PersistentMentalWorkspace {
             id: intention.id,
             domain: intention.domain,
             objective: intention.objective,
+            completionCondition: intention.completionCondition,
             attentionTargetLabel: intention.attentionTargetLabel,
             pressure: intention.pressure,
             evidenceIDs: intention.evidenceIDs,
             createdAt: intention.createdAt,
-            executedAt: date
+            executedAt: date,
+            dispatchEvidenceIDs: state.processedEvidenceIDs,
+            lastDispatchedActionFingerprint: actionFingerprint,
+            completedAt: intention.completedAt
         )
         state = MentalWorkspaceSnapshot(
             schemaVersion: state.schemaVersion,
@@ -941,13 +1299,12 @@ public actor PersistentMentalWorkspace {
             restoredStale: state.restoredStale,
             context: state.context,
             hypotheses: state.hypotheses,
-            drives: state.drives.applying(
-                intentionCompletionSignal(for: intention.domain),
-                weight: intention.pressure
-            ),
+            drives: state.drives,
             thoughtCandidates: state.thoughtCandidates,
+            thoughtEpisodes: state.thoughtEpisodes,
             foregroundThoughtID: state.foregroundThoughtID,
             intentions: intentions,
+            cognitiveActions: state.cognitiveActions,
             recentNovelty: state.recentNovelty,
             lastThoughtAt: state.lastThoughtAt,
             processedEvidenceIDs: state.processedEvidenceIDs
@@ -995,6 +1352,7 @@ public actor PersistentMentalWorkspace {
         let elapsed = max(0, date.timeIntervalSince(state.updatedAt))
         var hypotheses = state.hypotheses
         var changed = false
+        var lifecycleChanged = false
         for index in hypotheses.indices {
             let hypothesis = hypotheses[index]
             guard hypothesis.status == .active || hypothesis.status == .dormant else { continue }
@@ -1025,6 +1383,7 @@ public actor PersistentMentalWorkspace {
                 evidenceIDs: hypothesis.evidenceIDs,
                 status: status
             )
+            if status != hypothesis.status { lifecycleChanged = true }
             changed = true
         }
 
@@ -1042,6 +1401,7 @@ public actor PersistentMentalWorkspace {
         let candidates = state.thoughtCandidates.map { candidate in
             ThoughtCandidate(
                 id: candidate.id,
+                episodeID: candidate.episodeID,
                 channel: candidate.channel,
                 content: candidate.content,
                 confidence: candidate.confidence,
@@ -1062,15 +1422,19 @@ public actor PersistentMentalWorkspace {
         guard changed else { return }
         state = MentalWorkspaceSnapshot(
             schemaVersion: state.schemaVersion,
-            revision: state.revision + 1,
+            // Continuous posterior decay does not invalidate an in-flight
+            // inference; a categorical lifecycle transition does.
+            revision: state.revision + (lifecycleChanged ? 1 : 0),
             updatedAt: date,
             restoredStale: state.restoredStale,
             context: state.context,
             hypotheses: hypotheses,
             drives: drives,
             thoughtCandidates: candidates,
+            thoughtEpisodes: state.thoughtEpisodes,
             foregroundThoughtID: state.foregroundThoughtID,
             intentions: state.intentions,
+            cognitiveActions: state.cognitiveActions,
             recentNovelty: state.recentNovelty * 0.8,
             lastThoughtAt: state.lastThoughtAt,
             processedEvidenceIDs: state.processedEvidenceIDs
@@ -1470,15 +1834,20 @@ public actor MentalWorkspaceCheckpointStore {
             let durableHypotheses = saved.hypotheses.filter {
                 $0.status == .active || $0.status == .dormant
             }
-            let pendingIntentions = saved.intentions.filter { $0.executedAt == nil }.map {
+            let pendingIntentions = saved.intentions.filter { $0.completedAt == nil }.map {
                 MentalIntention(
                     id: $0.id,
                     domain: $0.domain,
                     objective: $0.objective,
+                    completionCondition: $0.completionCondition,
                     attentionTargetLabel: $0.attentionTargetLabel,
                     pressure: 0,
                     evidenceIDs: $0.evidenceIDs,
-                    createdAt: $0.createdAt
+                    createdAt: $0.createdAt,
+                    executedAt: nil,
+                    dispatchEvidenceIDs: nil,
+                    lastDispatchedActionFingerprint: nil,
+                    completedAt: nil
                 )
             }
             return MentalWorkspaceSnapshot(
@@ -1498,8 +1867,10 @@ public actor MentalWorkspaceCheckpointStore {
                     interruptionPressure: 0
                 ),
                 thoughtCandidates: saved.thoughtCandidates,
+                thoughtEpisodes: saved.thoughtEpisodes,
                 foregroundThoughtID: saved.foregroundThoughtID,
                 intentions: pendingIntentions,
+                cognitiveActions: saved.cognitiveActions,
                 recentNovelty: 0,
                 lastThoughtAt: saved.lastThoughtAt,
                 processedEvidenceIDs: []

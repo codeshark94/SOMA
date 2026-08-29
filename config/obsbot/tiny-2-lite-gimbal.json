@@ -1,5 +1,6 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "deviceIdentifier": "tiny_2_lite",
   "panSign": 1,
   "pitchSign": -1,
   "maximumPanDegreesPerSecond": 180,

@@ -2025,6 +2025,7 @@ int main(int argc, char *argv[]) {
               << " indicator_direct_rgb=" << (capabilities.directIndicatorColorMask != 0 ? "true" : "false")
               << " indicator_direct_rgb_mask=" << static_cast<int>(capabilities.directIndicatorColorMask)
               << " indicator_basic=" << (capabilities.indicatorEnableAndBrightness ? "true" : "false")
+              << " indicator_pulse_transport=" << static_cast<int>(capabilities.indicatorPulseTransport)
               << " selectable_audio_modes=" << (capabilities.selectableAudioModes ? "true" : "false")
               << " supported_audio_mode_mask=" << static_cast<int>(capabilities.supportedAudioModeMask)
               << " sound_localization=" << (capabilities.soundLocalization ? "true" : "false")

@@ -1588,7 +1588,8 @@ private final class ConversationContactRuntime: @unchecked Sendable {
     func observeVoiceActivity(
         active: Bool,
         at monotonicNS: UInt64,
-        confidence: Double
+        confidence: Double,
+        audioVisualDirectContact: Bool = false
     ) -> ConversationOpeningAuthorization? {
         lock.lock()
         defer { lock.unlock() }
@@ -1598,6 +1599,7 @@ private final class ConversationContactRuntime: @unchecked Sendable {
         // the beginning of this speech episode. An already open conversation
         // keeps its own inactivity lease.
         let directContact = l0FixationAdmission.permitsNewSession(at: monotonicNS)
+            || audioVisualDirectContact
         return gate.observeVoiceActivity(
             active: active,
             at: monotonicNS,
@@ -2026,6 +2028,8 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
         return ("thought_wake", message)
     case "foreground_thought":
         return ("foreground_thought", message)
+    case "cognitive_action":
+        return ("cognitive_action", message)
     case "executive_wake", "executive_decision", "action_applied", "action_held",
          "thought_held", "thought_superseded", "executive_held":
         return (state, message)
@@ -9218,13 +9222,22 @@ private final class AudioVADFrame: @unchecked Sendable {
     let sampleRateHz: Double
     var continuous: Bool
     let captureNS: UInt64
+    let durationNS: UInt64
     let levelDB: Double
 
-    init(samples: [Float], sampleRateHz: Double, continuous: Bool, captureNS: UInt64, levelDB: Double) {
+    init(
+        samples: [Float],
+        sampleRateHz: Double,
+        continuous: Bool,
+        captureNS: UInt64,
+        durationNS: UInt64,
+        levelDB: Double
+    ) {
         self.samples = samples
         self.sampleRateHz = sampleRateHz
         self.continuous = continuous
         self.captureNS = captureNS
+        self.durationNS = durationNS
         self.levelDB = levelDB
     }
 }
@@ -9314,7 +9327,8 @@ private final class AudioVADWorker: @unchecked Sendable {
                     samples: frame.samples,
                     sampleRateHz: frame.sampleRateHz,
                     continuous: frame.continuous,
-                    at: frame.captureNS
+                    at: frame.captureNS,
+                    durationNS: frame.durationNS
                 )
                 for result in evidence {
                     stateLock.lock()
@@ -9385,6 +9399,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
     private let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     private let auditoryOnsetGate = AcousticOnsetGate()
     private let auditoryOnsetHandler: (SOMACore.AuditoryOnsetEvidence) -> Void
+    private let visualSpeakerAttribution: VisualSpeakerAttributionStore?
     private var rejectedAudioFormatReported = false
 
     init(
@@ -9397,6 +9412,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
         calibrationRecorder: TDOACalibrationRecorder?,
         speechInteraction: LocalSpeechInteractionCoordinator?,
         liveVoiceLauncher: AppServerLiveVoiceLauncher?,
+        visualSpeakerAttribution: VisualSpeakerAttributionStore? = nil,
         auditoryOnsetHandler: @escaping (SOMACore.AuditoryOnsetEvidence) -> Void
     ) {
         self.worldModel = worldModel
@@ -9408,6 +9424,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
         self.calibrationRecorder = calibrationRecorder
         self.speechInteraction = speechInteraction
         self.liveVoiceLauncher = liveVoiceLauncher
+        self.visualSpeakerAttribution = visualSpeakerAttribution
         self.auditoryOnsetHandler = auditoryOnsetHandler
     }
 
@@ -9454,7 +9471,9 @@ private final class AudioAnalyzer: @unchecked Sendable {
                 )
             ))
             auditoryOnsetHandler(SOMACore.AuditoryOnsetEvidence(
-                monotonicNS: now,
+                monotonicNS: now >= auditoryOnset.estimatedLookbackNS
+                    ? now - auditoryOnset.estimatedLookbackNS
+                    : 0,
                 levelDB: audio.levelDB,
                 thresholdDB: auditoryOnset.thresholdDB,
                 confidence: auditoryOnset.confidence,
@@ -9466,6 +9485,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
             sampleRateHz: audio.sampleRateHz,
             continuous: continuous,
             captureNS: now,
+            durationNS: audio.durationNS,
             levelDB: audio.levelDB
         )
         speechInteraction?.ingestAudio(SpeechAudioChunk(
@@ -9478,6 +9498,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
         liveVoiceLauncher?.ingestAudio(
             samples: audio.samples,
             sampleRateHz: audio.sampleRateHz,
+            captureNS: now,
             durationNS: audio.durationNS
         )
         if voiceWorker.submit(frame) { counters.supersedeAudioVADFrame() }
@@ -9519,6 +9540,11 @@ private final class AudioAnalyzer: @unchecked Sendable {
             at: now
         )
         publisher.publish(directionalBelief, reason: "audio_direction")
+        visualSpeakerAttribution?.record(
+            direction: direction.direction,
+            confidence: direction.confidence,
+            at: now
+        )
         if direction.direction != lastDirection {
             lastDirection = direction.direction
             writer.write(AudioDirectionEvent(
@@ -10009,6 +10035,7 @@ private struct SystemFaceEvidence: Sendable {
     let pupilOffsetY: Double?
     let signedPupilOffsetY: Double?
     let meanEyeAperture: Double?
+    let mouthAperture: Double?
     let alignment: FaceAlignmentEvidence
 
     var directedEyeContact: Bool { gazeState == .direct }
@@ -10024,7 +10051,292 @@ private struct SystemFaceEvidence: Sendable {
             pupilOffsetY: pupilOffsetY,
             signedPupilOffsetY: signedPupilOffsetY,
             meanEyeAperture: meanEyeAperture,
+            mouthAperture: mouthAperture,
             alignment: alignment
+        )
+    }
+}
+
+private struct VisualSpeakerFrameEvidence: Sendable {
+    let rect: SOMACore.NormalizedRect
+    let directGaze: Bool
+    let mouthAperture: Double?
+}
+
+private struct VisualSpeakerAttributionSnapshot: Sendable {
+    let evidence: AudioVisualSpeakerEvidence
+    let assessment: AudioVisualSpeakerAssessment
+}
+
+private final class RecentAcousticOnsetStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var onsets: [UInt64] = []
+    private var lastVoiceOffsetNS: UInt64?
+    private let retentionNS: UInt64 = 2_000_000_000
+
+    func record(_ evidence: SOMACore.AuditoryOnsetEvidence) {
+        lock.lock()
+        onsets.append(evidence.monotonicNS)
+        prune(at: evidence.monotonicNS)
+        lock.unlock()
+    }
+
+    func resolve(classifiedWindowStartNS: UInt64, classifiedWindowEndNS: UInt64) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        prune(at: classifiedWindowEndNS)
+        let windowDurationNS = classifiedWindowEndNS >= classifiedWindowStartNS
+            ? classifiedWindowEndNS - classifiedWindowStartNS
+            : 0
+        let previousWindowStartNS = classifiedWindowStartNS >= windowDurationNS
+            ? classifiedWindowStartNS - windowDurationNS
+            : 0
+        let lowerBound = max(previousWindowStartNS, lastVoiceOffsetNS ?? 0)
+        let acousticOnset = onsets.last {
+            $0 >= lowerBound && $0 <= classifiedWindowEndNS
+        }
+        return AudioVisualEpisodeEvidence.resolvedOnset(
+            classifiedWindowStartNS: classifiedWindowStartNS,
+            classifiedWindowEndNS: classifiedWindowEndNS,
+            acousticOnsetNS: acousticOnset,
+            earliestAllowedNS: lowerBound
+        )
+    }
+
+    func recordVoiceOffset(at monotonicNS: UInt64) {
+        lock.lock()
+        lastVoiceOffsetNS = monotonicNS
+        prune(at: monotonicNS)
+        lock.unlock()
+    }
+
+    private func prune(at monotonicNS: UInt64) {
+        onsets.removeAll {
+            monotonicNS >= $0 && monotonicNS - $0 > retentionNS
+        }
+    }
+}
+
+/// Keeps only a short scalar audiovisual window. No pixels, audio, landmark
+/// arrays, or voiceprints are retained; the window exists solely to decide
+/// whether a VAD onset plausibly belongs to the currently observed face.
+private final class VisualSpeakerAttributionStore: @unchecked Sendable {
+    private struct Sample {
+        let rect: SOMACore.NormalizedRect
+        let directGaze: Bool
+        let mouthAperture: Double?
+        let observedNS: UInt64
+    }
+
+    private struct DirectionSample {
+        let direction: AudioDirection
+        let confidence: Double
+        let observedNS: UInt64
+    }
+
+    private struct Episode {
+        let targetRect: SOMACore.NormalizedRect
+        let onsetNS: UInt64
+        let directGazeAtOnset: Bool
+        let baselineMouthAperture: Double?
+    }
+
+    private let lock = NSLock()
+    private var samples: [Sample] = []
+    private var direction: DirectionSample?
+    private var episode: Episode?
+    private let retentionNS: UInt64 = 1_200_000_000
+
+    func record(_ faces: [VisualSpeakerFrameEvidence], at monotonicNS: UInt64) {
+        lock.lock()
+        prune(at: monotonicNS)
+        samples.append(contentsOf: faces.map {
+            Sample(
+                rect: $0.rect,
+                directGaze: $0.directGaze,
+                mouthAperture: $0.mouthAperture,
+                observedNS: monotonicNS
+            )
+        })
+        lock.unlock()
+    }
+
+    func record(direction: AudioDirection, confidence: Double, at monotonicNS: UInt64) {
+        lock.lock()
+        self.direction = DirectionSample(
+            direction: direction,
+            confidence: min(max(confidence, 0), 1),
+            observedNS: monotonicNS
+        )
+        lock.unlock()
+    }
+
+    func beginEpisode(
+        targetRect: SOMACore.NormalizedRect?,
+        voiceConfidence: Double,
+        at onsetNS: UInt64
+    ) -> VisualSpeakerAttributionSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        prune(at: onsetNS)
+        guard let targetRect else {
+            episode = nil
+            let evidence = AudioVisualSpeakerEvidence(
+                faceVisible: false,
+                directGaze: false,
+                mouthMotion: nil,
+                mouthSampleCount: 0,
+                directionMatchesFace: nil,
+                voiceConfidence: voiceConfidence
+            )
+            return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+        }
+        let onsetFaceSamples = samples.filter {
+            onsetNS >= $0.observedNS
+                && onsetNS - $0.observedNS <= 700_000_000
+                && Self.matches($0.rect, targetRect)
+        }
+        let latestFaceSample = onsetFaceSamples.max { $0.observedNS < $1.observedNS }
+        let directGaze = latestFaceSample.map {
+            $0.directGaze
+                && onsetNS - $0.observedNS <= 250_000_000
+        } ?? false
+        episode = Episode(
+            targetRect: targetRect,
+            onsetNS: onsetNS,
+            directGazeAtOnset: directGaze,
+            baselineMouthAperture: latestFaceSample?.mouthAperture
+        )
+        let evidence = AudioVisualSpeakerEvidence(
+            faceVisible: latestFaceSample != nil,
+            directGaze: directGaze,
+            mouthMotion: nil,
+            mouthSampleCount: latestFaceSample?.mouthAperture == nil ? 0 : 1,
+            directionMatchesFace: nil,
+            voiceConfidence: voiceConfidence
+        )
+        return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+    }
+
+    func assessCurrentEpisode(
+        targetRect: SOMACore.NormalizedRect?,
+        voiceConfidence: Double,
+        at monotonicNS: UInt64
+    ) -> VisualSpeakerAttributionSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        prune(at: monotonicNS)
+        guard let episode,
+              let targetRect,
+              Self.matches(episode.targetRect, targetRect),
+              monotonicNS >= episode.onsetNS else {
+            let evidence = AudioVisualSpeakerEvidence(
+                faceVisible: false,
+                directGaze: false,
+                mouthMotion: nil,
+                mouthSampleCount: 0,
+                directionMatchesFace: nil,
+                voiceConfidence: voiceConfidence
+            )
+            return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+        }
+        let postOnsetSamples = samples.filter {
+            $0.observedNS > episode.onsetNS
+                && $0.observedNS <= monotonicNS
+                && Self.matches($0.rect, targetRect)
+        }
+        let postOnsetApertures = postOnsetSamples.compactMap(\.mouthAperture)
+        let apertures = [episode.baselineMouthAperture].compactMap { $0 } + postOnsetApertures
+        let mouthMotion = AudioVisualEpisodeEvidence.mouthMotion(
+            baseline: episode.baselineMouthAperture,
+            postOnsetApertures: postOnsetApertures
+        )
+        let directionMatchesFace: Bool?
+        if let direction,
+           direction.confidence >= 0.45,
+           AudioVisualEpisodeEvidence.belongsToCurrentEpisode(
+                observedNS: direction.observedNS,
+                onsetNS: episode.onsetNS,
+                nowNS: monotonicNS,
+                maximumAgeNS: 500_000_000
+           ),
+           direction.direction != .unknown {
+            let expected: AudioDirection
+            if targetRect.centerX < 0.38 {
+                expected = .left
+            } else if targetRect.centerX > 0.62 {
+                expected = .right
+            } else {
+                expected = .center
+            }
+            directionMatchesFace = direction.direction == expected
+        } else {
+            directionMatchesFace = nil
+        }
+        let evidence = AudioVisualSpeakerEvidence(
+            faceVisible: !postOnsetSamples.isEmpty,
+            directGaze: episode.directGazeAtOnset,
+            mouthMotion: mouthMotion,
+            mouthSampleCount: apertures.count,
+            directionMatchesFace: directionMatchesFace,
+            voiceConfidence: voiceConfidence
+        )
+        return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+    }
+
+    func endEpisode() {
+        lock.lock()
+        episode = nil
+        lock.unlock()
+    }
+
+    private func prune(at monotonicNS: UInt64) {
+        samples.removeAll {
+            monotonicNS >= $0.observedNS && monotonicNS - $0.observedNS > retentionNS
+        }
+        if let direction,
+           monotonicNS >= direction.observedNS,
+           monotonicNS - direction.observedNS > retentionNS {
+            self.direction = nil
+        }
+    }
+
+    private static func matches(
+        _ lhs: SOMACore.NormalizedRect,
+        _ rhs: SOMACore.NormalizedRect
+    ) -> Bool {
+        let x1 = max(lhs.x, rhs.x)
+        let y1 = max(lhs.y, rhs.y)
+        let x2 = min(lhs.x + lhs.width, rhs.x + rhs.width)
+        let y2 = min(lhs.y + lhs.height, rhs.y + rhs.height)
+        let intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        let union = lhs.width * lhs.height + rhs.width * rhs.height - intersection
+        if union > 0, intersection / union >= 0.10 { return true }
+        return hypot(lhs.centerX - rhs.centerX, lhs.centerY - rhs.centerY) <= 0.14
+    }
+}
+
+private final class LiveVoiceSpeakerEpisodeRuntime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var gate = LiveVoiceSpeakerEpisodeGate()
+
+    func observe(
+        active: Bool,
+        trackedFaceID: String?,
+        evidence: AudioVisualSpeakerEvidence,
+        assessment: AudioVisualSpeakerAssessment,
+        episodeOnsetNS: UInt64? = nil,
+        at monotonicNS: UInt64
+    ) -> LiveVoiceSpeakerEpisodeObservation {
+        lock.lock()
+        defer { lock.unlock() }
+        return gate.observe(
+            active: active,
+            trackedFaceID: trackedFaceID,
+            evidence: evidence,
+            assessment: assessment,
+            episodeOnsetNS: episodeOnsetNS,
+            at: monotonicNS
         )
     }
 }
@@ -10125,6 +10437,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
                 rect: rect
             )
             let gaze = refinedGaze(in: pixelBuffer, faceRect: rect) ?? wholeFrameGaze
+            let mouthAperture = normalizedAperture(of: landmarks.outerLips)
             return SystemFaceEvidence(
                 rect: rect,
                 gazeState: gaze.state,
@@ -10135,6 +10448,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
                 pupilOffsetY: gaze.pupilOffsetY,
                 signedPupilOffsetY: gaze.signedPupilOffsetY,
                 meanEyeAperture: gaze.meanEyeAperture,
+                mouthAperture: mouthAperture,
                 alignment: alignment
             )
         }
@@ -10209,6 +10523,24 @@ private final class SystemFaceVerifier: @unchecked Sendable {
             // Vision landmarks are bottom-left normalized; rect is top-left.
             y: rect.y + (1 - (y / divisor)) * rect.height
         )
+    }
+
+    private func normalizedAperture(of region: VNFaceLandmarkRegion2D?) -> Double? {
+        guard let region, region.pointCount >= 3 else { return nil }
+        var minimumX = Double.greatestFiniteMagnitude
+        var maximumX = -Double.greatestFiniteMagnitude
+        var minimumY = Double.greatestFiniteMagnitude
+        var maximumY = -Double.greatestFiniteMagnitude
+        for index in 0..<region.pointCount {
+            let point = region.normalizedPoints[index]
+            minimumX = min(minimumX, Double(point.x))
+            maximumX = max(maximumX, Double(point.x))
+            minimumY = min(minimumY, Double(point.y))
+            maximumY = max(maximumY, Double(point.y))
+        }
+        let width = maximumX - minimumX
+        guard width > 0.001 else { return nil }
+        return min(max((maximumY - minimumY) / width, 0), 1)
     }
 
     private func hasFacialFeatureSet(_ landmarks: VNFaceLandmarks2D) -> Bool {
@@ -10732,6 +11064,7 @@ private final class VisionWorker: @unchecked Sendable {
     private let onCameraFrame: ((CVPixelBuffer, UInt64) -> Void)?
     private let onDiagnosticFrame: ((CVPixelBuffer, [VisualObservation], UInt64) -> Void)?
     private let onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)?
+    private let onVisualSpeakerEvidence: (@Sendable ([VisualSpeakerFrameEvidence], UInt64) -> Void)?
     private let systemFaceVerificationWorker: SystemFaceVerificationWorker
     private let stateLock = NSLock()
     private var sceneField = SceneField(requiresFaceActivity: true)
@@ -10798,6 +11131,7 @@ private final class VisionWorker: @unchecked Sendable {
         onDiagnosticFrame: ((CVPixelBuffer, [VisualObservation], UInt64) -> Void)? = nil,
         onIdentityDecision: (@Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64) -> Void)? = nil,
         onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)? = nil,
+        onVisualSpeakerEvidence: (@Sendable ([VisualSpeakerFrameEvidence], UInt64) -> Void)? = nil,
         onFatalVisionFailure: (() -> Void)? = nil,
         anonymousReviewProvider: @escaping @Sendable () -> Bool = { true },
         pupilCenteringThreshold: Double = 1.0
@@ -10816,6 +11150,7 @@ private final class VisionWorker: @unchecked Sendable {
         self.onDiagnosticFrame = onDiagnosticFrame
         self.onFatalVisionFailure = onFatalVisionFailure
         self.onIdentityPresenceEvidence = onIdentityPresenceEvidence
+        self.onVisualSpeakerEvidence = onVisualSpeakerEvidence
         self.systemFaceVerificationWorker = SystemFaceVerificationWorker(
             pupilCenteringThreshold: pupilCenteringThreshold,
             // Landmark verification runs independently from the 30 Hz capture
@@ -11277,6 +11612,16 @@ private final class VisionWorker: @unchecked Sendable {
                 let stabilizedFaces = zip(verification.faces, stabilizedGaze).map { face, gaze in
                     face.withGazeState(gaze)
                 }
+                onVisualSpeakerEvidence?(
+                    stabilizedFaces.map {
+                        VisualSpeakerFrameEvidence(
+                            rect: $0.rect,
+                            directGaze: $0.gazeState == .direct,
+                            mouthAperture: $0.mouthAperture
+                        )
+                    },
+                    verification.captureNS
+                )
                 newlyVerifiedFaces = stabilizedFaces
                 faceConfirmationLease.record(stabilizedFaces.map(\.rect), at: verification.captureNS)
                 let hasLandmarkFace = !stabilizedFaces.isEmpty
@@ -12029,7 +12374,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "control_settings",
             state: "loaded",
-            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
+            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); active_turn_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
         ))
     } catch {
         controlSettings = .init()
@@ -12633,6 +12978,8 @@ private func run(_ options: Options) throws {
     // both read this so a person who speaks first in a language is answered in
     // that same language even without a stored preferred language.
     let activeLanguage = L1ActiveLanguage()
+    let visualSpeakerAttribution = VisualSpeakerAttributionStore()
+    let recentAcousticOnset = RecentAcousticOnsetStore()
     let speechInteractionBox = SpeechInteractionBox()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     let liveVoiceBox = LiveVoiceLauncherBox()
@@ -12642,6 +12989,9 @@ private func run(_ options: Options) throws {
             currentCameraImageDataURI: {
                 liveCameraFrameRelay?.currentImageDataURI(at: monotonicNanoseconds())
             },
+            embodimentSocketURL: options.embodimentShadowSocketURL,
+            requireVerifiedSpeakerForEveryTurn: controlSettings
+                .realtimeVoiceRequiresEyeContactForEveryTurn,
             persistentAppServer: persistentLiveVoiceBroker,
             persistentSessionAuthorizer: { token, scope, at in
                 liveSessionCapabilities.authorize(token: token, scope: scope, at: at)
@@ -12693,6 +13043,19 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "input_streaming",
                     message: "audio_worklet_to_webrtc"
+                ))
+            case let .inputBootstrapReplayed(durationMilliseconds, peakDBFS, maximumGainDB):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "opening_audio_replayed",
+                    message: String(
+                        format: "duration_ms=%.1f; input_peak_dbfs=%.1f; max_gain_db=%.1f",
+                        durationMilliseconds,
+                        peakDBFS,
+                        maximumGainDB
+                    )
                 ))
             case .outputPlaybackReady:
                 writer.write(RuntimeEvent(
@@ -12948,7 +13311,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -13588,6 +13951,49 @@ private func run(_ options: Options) throws {
                 }
                 return attentionGimbalBridge.calibrateIndicator(preset: preset)
             },
+            cognitiveActionQueryProvider: { query in
+                let semaphore = DispatchSemaphore(value: 0)
+                let resultBox = SynchronousResultBox<Bool>()
+                Task {
+                    resultBox.set(.success(await l1ThoughtRelay.reserveCognitiveAction(query)))
+                    semaphore.signal()
+                }
+                // Uncertain deduplication must never authorize a possibly
+                // repeated side effect.
+                guard semaphore.wait(timeout: .now() + 1) == .success else { return true }
+                if case let .success(value) = resultBox.get() { return value }
+                return true
+            },
+            cognitiveActionHandler: { episode in
+                let semaphore = DispatchSemaphore(value: 0)
+                let resultBox = SynchronousResultBox<Bool>()
+                Task {
+                    resultBox.set(.success(await l1ThoughtRelay.recordCognitiveAction(episode)))
+                    semaphore.signal()
+                }
+                guard semaphore.wait(timeout: .now() + 2) == .success else { return false }
+                writer.write(RuntimeEvent(
+                    event: "cognitive.action",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "l2_mcp",
+                    state: episode.status.rawValue,
+                    message: "goal=\(episode.goalEpisodeID.uuidString.lowercased()); tool=\(episode.toolName); effect=\(episode.effect.rawValue); information_gain=\(String(format: "%.2f", episode.expectedInformationGain))"
+                ))
+                if case let .success(value) = resultBox.get() { return value }
+                return false
+            },
+            cognitiveTurnHandler: { token, active in
+                switch liveSessionCapabilities.observeParticipantTurn(
+                    token: token,
+                    active: active,
+                    at: monotonicNanoseconds()
+                ) {
+                case .success:
+                    return .success(())
+                case let .failure(error):
+                    return .failure(error)
+                }
+            },
             runtimeShutdownHandler: {
                 let shutdownNS = monotonicNanoseconds()
                 writer.write(RuntimeEvent(
@@ -13803,6 +14209,9 @@ private func run(_ options: Options) throws {
                 }
             }
         },
+        onVisualSpeakerEvidence: { faces, monotonicNS in
+            visualSpeakerAttribution.record(faces, at: monotonicNS)
+        },
         onFatalVisionFailure: {
             complete.signal()
         },
@@ -13858,6 +14267,7 @@ private func run(_ options: Options) throws {
     // Tiny 3 front end without turning ambient room noise into a session.
     let voiceVADThreshold = somaEnvDouble("SOMA_L0_VAD_THRESHOLD", default: 0.35)
     let voiceEvidenceTelemetry = VoiceEvidenceTelemetry()
+    let liveVoiceSpeakerEpisode = LiveVoiceSpeakerEpisodeRuntime()
     let voiceWorker = try AudioVADWorker(
         activationThreshold: voiceVADThreshold,
         onEvidence: { evidence, frame, completedNS in
@@ -13891,15 +14301,58 @@ private func run(_ options: Options) throws {
                 at: frame.captureNS
             )
             let visualAdmission = LiveConversationVisualAdmission.permitsNewSession(for: belief)
-            // The contact gate observes every VAD state, including an onset
-            // without gaze. Once an episode starts without current direct
-            // contact, later gaze cannot upgrade that same ambient sound into
-            // a user request; a new voice onset is required.
-            let openingAuthorization = conversationContact.observeVoiceActivity(
+            let isVoiceOnset = evidence.active && evidence.changed
+            if !evidence.active, evidence.changed {
+                recentAcousticOnset.recordVoiceOffset(at: evidence.windowEndNS)
+            }
+            let resolvedVoiceOnsetNS = isVoiceOnset
+                ? recentAcousticOnset.resolve(
+                    classifiedWindowStartNS: evidence.windowStartNS,
+                    classifiedWindowEndNS: evidence.windowEndNS
+                )
+                : evidence.windowStartNS
+            let speakerSnapshot = isVoiceOnset
+                ? visualSpeakerAttribution.beginEpisode(
+                    targetRect: belief.target?.rect,
+                    voiceConfidence: evidence.probability,
+                    at: resolvedVoiceOnsetNS
+                )
+                : visualSpeakerAttribution.assessCurrentEpisode(
+                    targetRect: belief.target?.rect,
+                    voiceConfidence: evidence.probability,
+                    at: completedNS
+                )
+            let speakerEpisode = liveVoiceSpeakerEpisode.observe(
                 active: evidence.active,
-                at: completedNS,
-                confidence: evidence.probability
+                trackedFaceID: visualAdmission ? belief.target?.id : nil,
+                evidence: speakerSnapshot.evidence,
+                assessment: speakerSnapshot.assessment,
+                episodeOnsetNS: isVoiceOnset ? resolvedVoiceOnsetNS : nil,
+                at: completedNS
             )
+            let confirmedTrackedSpeaker = speakerEpisode.state == .confirmed
+            // Gaze is frozen by the speaker-episode gate at acoustic onset.
+            // The contact gate is invoked only after the slower lip/DOA
+            // evidence confirms that same tracked face, so an ambiguous onset
+            // is buffered rather than permanently consumed.
+            let contactAuthorization: ConversationOpeningAuthorization?
+            if !evidence.active {
+                contactAuthorization = conversationContact.observeVoiceActivity(
+                    active: false,
+                    at: completedNS,
+                    confidence: evidence.probability
+                )
+            } else if confirmedTrackedSpeaker {
+                contactAuthorization = conversationContact.observeVoiceActivity(
+                    active: true,
+                    at: completedNS,
+                    confidence: speakerEpisode.maximumVoiceConfidence,
+                    audioVisualDirectContact: speakerEpisode.directContactAtOnset
+                )
+            } else {
+                contactAuthorization = nil
+            }
+            let openingAuthorization = contactAuthorization
             if evidence.changed, options.l2LiveVoice {
                 attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
             }
@@ -13937,7 +14390,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: completedNS,
                     source: "l2_live_voice",
                     state: "opening_suppressed",
-                    message: "new_conversation_evidence_unconfirmed"
+                    message: "new_conversation_evidence_unconfirmed; tracked_face=\(visualAdmission); direct_gaze=\(speakerSnapshot.evidence.directGaze); speaker_class=\(speakerSnapshot.assessment.classification.rawValue); speaker_episode=\(speakerEpisode.state.rawValue)"
                 ))
             }
             if let openingAuthorization,
@@ -13984,9 +14437,59 @@ private func run(_ options: Options) throws {
                     message: "local_transcript_admission_unavailable"
                 ))
             }
-            if evidence.changed {
-                liveVoiceLauncher?.observeVoiceActivity(evidence.active, at: completedNS)
+            let strictConfirmedWindow = controlSettings
+                .realtimeVoiceRequiresEyeContactForEveryTurn
+                && evidence.active
+                && speakerEpisode.state == .confirmed
+            if evidence.changed
+                || speakerEpisode.didTransition
+                || openingAuthorization != nil
+                || strictConfirmedWindow {
+                let strictTurnAdmission = !controlSettings
+                    .realtimeVoiceRequiresEyeContactForEveryTurn || confirmedTrackedSpeaker
+                liveVoiceLauncher?.observeVoiceActivity(
+                    evidence.active,
+                    admitted: strictTurnAdmission && (
+                        controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn
+                            ? confirmedTrackedSpeaker
+                            : speakerSnapshot.assessment.admitsAudio
+                    ),
+                    discardBufferedEpisode: !evidence.active && (
+                        speakerEpisode.endedState == .pending
+                            || speakerEpisode.endedState == .rejected
+                    ) || (
+                        evidence.active
+                            && speakerEpisode.didTransition
+                            && speakerEpisode.state == .rejected
+                    ),
+                    onsetCaptureNS: isVoiceOnset ? resolvedVoiceOnsetNS : nil,
+                    assessedThroughCaptureNS: evidence.windowEndNS,
+                    preserveDetectorHistoryFromCaptureNS: evidence.discontinuityReset
+                        ? frame.captureNS
+                        : nil,
+                    at: completedNS
+                )
+                if evidence.active {
+                    writer.write(RuntimeEvent(
+                        event: "human.interaction",
+                        monotonicNS: completedNS,
+                        source: "audio_visual_speaker",
+                        state: speakerSnapshot.assessment.classification.rawValue,
+                        message: String(
+                            format: "probability=%.3f; episode=%@; direct_at_onset=%@; direct_gaze=%@; mouth_motion=%@; mouth_samples=%d; direction_match=%@; strict_every_turn=%@",
+                            speakerSnapshot.assessment.probability,
+                            speakerEpisode.state.rawValue,
+                            speakerEpisode.directContactAtOnset ? "true" : "false",
+                            speakerSnapshot.evidence.directGaze ? "true" : "false",
+                            speakerSnapshot.evidence.mouthMotion.map { String(format: "%.3f", $0) } ?? "na",
+                            speakerSnapshot.evidence.mouthSampleCount,
+                            speakerSnapshot.evidence.directionMatchesFace.map { $0 ? "true" : "false" } ?? "na",
+                            controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "true" : "false"
+                        )
+                    ))
+                }
             }
+            if !evidence.active { visualSpeakerAttribution.endEpisode() }
             if let speechInteraction {
                 let sessionCapability = liveSessionCapabilities.issue(
                     personEntityID: interactionParticipant.entityID,
@@ -14056,7 +14559,9 @@ private func run(_ options: Options) throws {
         calibrationRecorder: calibrationRecorder,
         speechInteraction: speechInteraction,
         liveVoiceLauncher: liveVoiceLauncher,
+        visualSpeakerAttribution: visualSpeakerAttribution,
         auditoryOnsetHandler: { [weak attentionGimbalBridge] evidence in
+            recentAcousticOnset.record(evidence)
             attentionGimbalBridge?.ingestAuditoryOnset(evidence)
         }
     )

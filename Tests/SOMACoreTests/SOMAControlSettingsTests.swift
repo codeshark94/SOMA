@@ -17,6 +17,7 @@ final class SOMAControlSettingsTests: XCTestCase {
         let expected = SOMAControlSettings(
             realtimeVoiceEnabled: true,
             realtimeVoice: .maple,
+            realtimeVoiceRequiresEyeContactForEveryTurn: true,
             led: .init(responseMode: .contextual, brightness: 3),
             nativeHumanTrackingEnabled: true,
             autonomousExplorationEnabled: false,
@@ -35,6 +36,56 @@ final class SOMAControlSettingsTests: XCTestCase {
             (try FileManager.default.attributesOfItem(atPath: directory.path)[.posixPermissions] as? NSNumber)?.intValue,
             0o700
         )
+    }
+
+    func testRealtimeVoiceEyeContactPerTurnSettingDefaultsOffForExistingSettings() throws {
+        let legacy = """
+        {
+          "schemaVersion": 8,
+          "realtimeVoiceEnabled": true,
+          "realtimeVoice": "maple"
+        }
+        """
+        let migrated = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: Data(legacy.utf8)
+        )
+        XCTAssertFalse(migrated.realtimeVoiceRequiresEyeContactForEveryTurn)
+        XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
+    }
+
+    func testRealtimeVoicePickerMatchesCodexAppServerV3Contract() {
+        XCTAssertEqual(
+            Set(SOMARealtimeVoice.allCases.map(\.rawValue)),
+            Set(["juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol", "cove"])
+        )
+        XCTAssertEqual(
+            SOMARealtimeVoice.voices(with: .female),
+            [.juniper, .maple, .vale, .sol]
+        )
+        XCTAssertEqual(
+            SOMARealtimeVoice.voices(with: .male),
+            [.spruce, .ember, .breeze, .arbor, .cove]
+        )
+    }
+
+    func testUnsupportedLegacyRealtimeVoiceMigratesWithoutCorruptingSettings() throws {
+        let legacy = """
+        {
+          "schemaVersion": 9,
+          "realtimeVoiceEnabled": true,
+          "realtimeVoice": "marin",
+          "nativeHumanTrackingEnabled": false
+        }
+        """
+        let migrated = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: Data(legacy.utf8)
+        )
+
+        XCTAssertEqual(migrated.realtimeVoice, .maple)
+        XCTAssertFalse(migrated.nativeHumanTrackingEnabled)
+        XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
     }
 
     func testLEDPolicyKeepsReactionBoundedToItsConfiguredStates() {

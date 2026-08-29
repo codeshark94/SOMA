@@ -31,12 +31,7 @@ function soma_matches_profile() {
   [[ -f "$soma_candidate" ]] || return 1
   local soma_declared
   soma_declared=$(soma_declared_profile "$soma_candidate")
-  if [[ -n "$soma_declared" ]]; then
-    [[ "$soma_declared" == "$soma_calibration_profile" ]]
-    return
-  fi
-  # Schema-1 Tiny 2 calibration predates device identifiers.
-  [[ "$soma_calibration_profile" == 'tiny_2_lite' ]]
+  [[ -n "$soma_declared" && "$soma_declared" == "$soma_calibration_profile" ]]
 }
 
 for soma_candidate in "$soma_profile_override" "${SOMA_EXTERNAL_GIMBAL_CALIBRATION:-}" "$soma_profile_default"; do

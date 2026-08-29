@@ -6,6 +6,8 @@ protocol L1ThoughtStreaming: AnyObject, Sendable {
     func depart(_ entityID: UUID)
     func invalidateMemoryContext(for entityID: UUID)
     func recordNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64)
+    func recordCognitiveAction(_ episode: CognitiveActionEpisode) async -> Bool
+    func reserveCognitiveAction(_ query: CognitiveActionQuery) async -> Bool
     func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt)
     func stop()
 }
@@ -47,6 +49,11 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         let fetchedAtNS: UInt64
     }
 
+    private struct QueuedEvidence: Sendable {
+        let event: MentalEvidenceEvent
+        let completion: (@Sendable (WorkspaceTransition, Bool) -> Void)?
+    }
+
     private let queue = DispatchQueue(label: "soma.l1.persistent-consciousness", qos: .utility)
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let workspace: PersistentMentalWorkspace
@@ -75,7 +82,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     private var cachedMemoryContexts: [UUID: CachedMemoryContext] = [:]
     private var pendingObservations: [UUID: PendingObservation] = [:]
     private var contextLookupsInFlight: Set<UUID> = []
-    private var evidenceQueue: [MentalEvidenceEvent] = []
+    private var evidenceQueue: [QueuedEvidence] = []
     private var forcedPeriodicEvidenceIDs: Set<String> = []
     private var evidenceInFlight = false
     private var contactIntegrator = L1SocialContactTemporalIntegrator()
@@ -305,6 +312,33 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         }
     }
 
+    func recordCognitiveAction(_ episode: CognitiveActionEpisode) async -> Bool {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                guard let self, !stopped else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                enqueueEvidence(MentalEvidenceEvent(
+                id: "cognitive-action:\(episode.id.uuidString.lowercased())",
+                observedAt: episode.completedAt,
+                kind: .cognitiveActionOutcome,
+                summary: episode.resultSummary,
+                subjectEntityID: presences.keys.first,
+                confidence: episode.status == .succeeded ? 1 : 0.8,
+                novelty: max(episode.expectedInformationGain, episode.status == .failed ? 0.55 : 0.35),
+                cognitiveAction: episode
+                )) { _, durable in
+                    continuation.resume(returning: durable)
+                }
+            }
+        }
+    }
+
+    func reserveCognitiveAction(_ query: CognitiveActionQuery) async -> Bool {
+        await workspace.reserveCognitiveAction(query)
+    }
+
     func stop() {
         queue.sync {
             stopped = true
@@ -418,17 +452,21 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         )
     }
 
-    private func enqueueEvidence(_ event: MentalEvidenceEvent) {
+    private func enqueueEvidence(
+        _ event: MentalEvidenceEvent,
+        completion: (@Sendable (WorkspaceTransition, Bool) -> Void)? = nil
+    ) {
         guard !event.id.isEmpty else { return }
-        if evidenceQueue.contains(where: { $0.id == event.id }) { return }
-        evidenceQueue.append(event)
+        if evidenceQueue.contains(where: { $0.event.id == event.id }) { return }
+        evidenceQueue.append(.init(event: event, completion: completion))
         drainEvidenceQueue()
     }
 
     private func drainEvidenceQueue() {
         guard !stopped, !evidenceInFlight, !evidenceQueue.isEmpty else { return }
         evidenceInFlight = true
-        let event = evidenceQueue.removeFirst()
+        let queued = evidenceQueue.removeFirst()
+        let event = queued.event
         let forcedPeriodic = forcedPeriodicEvidenceIDs.remove(event.id) != nil
         Task { [weak self] in
             guard let self else { return }
@@ -437,9 +475,6 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                 guard let self, !stopped else { return }
                 evidenceInFlight = false
                 record(transition, event: event)
-                if transition.changed {
-                    persist(transition.after)
-                }
                 if transition.delta.meaningfulTransition || forcedPeriodic {
                     submitThought(
                         for: event,
@@ -447,6 +482,30 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                         wakeKind: forcedPeriodic ? .periodic : .event
                     )
                 }
+                if transition.changed, queued.completion != nil {
+                    Task { [weak self] in
+                        guard let self else { return }
+                        let durable: Bool
+                        do {
+                            try await self.checkpointStore.save(transition.after)
+                            durable = true
+                        } catch {
+                            durable = false
+                            self.onHealth(
+                                "checkpoint_failed",
+                                "revision=\(transition.after.revision); reason=\(String(error.localizedDescription.prefix(240)))"
+                            )
+                        }
+                        self.queue.async { [weak self] in
+                            guard let self, !stopped else { return }
+                            queued.completion?(transition, durable)
+                            drainEvidenceQueue()
+                        }
+                    }
+                    return
+                }
+                if transition.changed { persist(transition.after) }
+                queued.completion?(transition, true)
                 drainEvidenceQueue()
             }
         }
@@ -560,7 +619,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     ) {
         onHealth(
             "foreground_thought",
-            "revision=\(transition.after.revision); channel=\(update.channel.rawValue); continuity=\(update.continuity.rawValue); text=\(update.innerMonologue)"
+            "revision=\(transition.after.revision); episode=\(transition.after.foregroundThought?.episodeID?.uuidString.lowercased() ?? "none"); goal=\(update.intention?.id.uuidString.lowercased() ?? "none"); channel=\(update.channel.rawValue); continuity=\(update.continuity.rawValue); text=\(update.innerMonologue)"
         )
         if !update.memoryProposals.isEmpty {
             onMemoryProposals(update.memoryProposals, request.socialOpportunity?.entityID)
@@ -568,9 +627,12 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         if !request.informationNeeds.isEmpty { onCuriosityNeeds(request.informationNeeds) }
         guard let intention = update.intention,
               intention.pressure > 0,
+              let storedIntention = transition.after.intentions.first(where: { $0.id == intention.id }),
+              storedIntention.completedAt == nil,
               let foreground = transition.after.foregroundThought else {
             return
         }
+        guard storedIntention.hasPostDispatchEvidence(update.evidenceIDs) else { return }
         let actions = availableActions(for: request, intention: intention)
         let executive = L1ExecutiveRequest(
             observedAt: Date(),
@@ -627,6 +689,25 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                         onHealth("executive_held", "reason=stale_workspace_or_conversation; expected=\(request.workspaceRevision); actual=\(snapshot.revision)")
                         return
                     }
+                    guard decision.action != .noAction else {
+                        onHealth(
+                            "action_held",
+                            "action=no_action; intention=\(decision.intentionEpisodeID.uuidString.lowercased()); reason=executive_declined_goal_remains_open; rationale=\(decision.rationale)"
+                        )
+                        return
+                    }
+                    guard let storedIntention = snapshot.intentions.first(where: {
+                        $0.id == decision.intentionEpisodeID
+                    }), storedIntention.canDispatch(
+                        using: request.evidenceIDs,
+                        actionFingerprint: decision.action.rawValue
+                    ) else {
+                        onHealth(
+                            "action_held",
+                            "action=\(decision.action.rawValue); intention=\(decision.intentionEpisodeID.uuidString.lowercased()); reason=same_action_or_no_new_evidence"
+                        )
+                        return
+                    }
                     let applied = applyExecutive(decision, request: request, at: monotonicNS)
                     onHealth(
                         applied ? "action_applied" : "action_held",
@@ -635,9 +716,29 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                     guard applied else { return }
                     Task { [weak self] in
                         guard let self else { return }
-                        if await workspace.markIntentionExecuted(decision.intentionEpisodeID, at: Date()) {
+                        if await workspace.markIntentionExecuted(
+                            decision.intentionEpisodeID,
+                            using: request.evidenceIDs,
+                            actionFingerprint: decision.action.rawValue,
+                            at: Date()
+                        ) {
                             let saved = await workspace.currentSnapshot()
                             try? await checkpointStore.save(saved)
+                            let outcome = CognitiveActionEpisode(
+                                goalEpisodeID: decision.intentionEpisodeID,
+                                sourceLayer: .l1,
+                                toolName: decision.action.rawValue,
+                                effect: decision.action == .spokenOpening || decision.action == .nonverbalInvitation
+                                    ? .conversationControl : .reversibleEmbodiment,
+                                purpose: request.intention.objective,
+                                expectedInformationGain: request.intention.pressure,
+                                evidenceIDs: request.evidenceIDs,
+                                status: .succeeded,
+                                resultFingerprint: "l1-action-accepted",
+                                requestFingerprint: "l1:\(decision.intentionEpisodeID.uuidString.lowercased()):\(decision.action.rawValue)",
+                                resultSummary: "The L1 executive action was accepted; its completion condition remains to be evaluated."
+                            )
+                            _ = await recordCognitiveAction(outcome)
                         }
                     }
                 }
@@ -652,7 +753,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     ) -> Bool {
         switch decision.action {
         case .noAction:
-            return true
+            return false
         case .resumeScanning, .seekPeople, .acknowledgePerson:
             return onAttentionAction(decision.action, decision.rationale, monotonicNS)
         case .inspectAttentionTarget:
@@ -960,6 +1061,12 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             "state_delta",
             "revision=\(transition.before.revision)->\(transition.after.revision); changed=\(changed); meaningful=\(transition.delta.meaningfulTransition); duplicate=\(transition.delta.duplicateEvidence)"
         )
+        if let action = event.cognitiveAction {
+            onHealth(
+                "cognitive_action",
+                "goal=\(action.goalEpisodeID.uuidString.lowercased()); tool=\(action.toolName); effect=\(action.effect.rawValue); status=\(action.status.rawValue); information_gain=\(String(format: "%.2f", action.expectedInformationGain))"
+            )
+        }
         recordHypothesisLifecycle(before: transition.before, after: transition.after)
     }
 

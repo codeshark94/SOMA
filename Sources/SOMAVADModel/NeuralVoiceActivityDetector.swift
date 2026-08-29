@@ -23,6 +23,27 @@ public struct NeuralVoiceActivityEvidence: Sendable {
     public let probability: Double
     public let changed: Bool
     public let inferenceMS: Double
+    public let windowStartNS: UInt64
+    public let windowEndNS: UInt64
+    public let discontinuityReset: Bool
+
+    public init(
+        active: Bool,
+        probability: Double,
+        changed: Bool,
+        inferenceMS: Double,
+        windowStartNS: UInt64,
+        windowEndNS: UInt64,
+        discontinuityReset: Bool = false
+    ) {
+        self.active = active
+        self.probability = probability
+        self.changed = changed
+        self.inferenceMS = inferenceMS
+        self.windowStartNS = windowStartNS
+        self.windowEndNS = windowEndNS
+        self.discontinuityReset = discontinuityReset
+    }
 }
 
 public final class NeuralVoiceActivityDetector: @unchecked Sendable {
@@ -37,6 +58,7 @@ public final class NeuralVoiceActivityDetector: @unchecked Sendable {
     private let hiddenState: MLMultiArray
     private let cellState: MLMultiArray
     private var pendingSamples: [Float] = []
+    private var pendingStartNS: UInt64?
     private var active = false
     private var holdUntilNS: UInt64 = 0
     private let activationThreshold: Double
@@ -63,21 +85,46 @@ public final class NeuralVoiceActivityDetector: @unchecked Sendable {
         samples: [Float],
         sampleRateHz: Double,
         continuous: Bool,
-        at monotonicNS: UInt64
+        at monotonicNS: UInt64,
+        durationNS: UInt64? = nil
     ) throws -> [NeuralVoiceActivityEvidence] {
         var evidence: [NeuralVoiceActivityEvidence] = []
+        let inferredDurationNS = UInt64(
+            max(0, (Double(samples.count) / sampleRateHz * 1_000_000_000).rounded())
+        )
+        let inputDurationNS = durationNS ?? inferredDurationNS
+        let inputStartNS = monotonicNS >= inputDurationNS
+            ? monotonicNS - inputDurationNS
+            : 0
         if !continuous {
             if active {
                 active = false
-                evidence.append(NeuralVoiceActivityEvidence(active: false, probability: 0, changed: true, inferenceMS: 0))
+                evidence.append(NeuralVoiceActivityEvidence(
+                    active: false,
+                    probability: 0,
+                    changed: true,
+                    inferenceMS: 0,
+                    windowStartNS: inputStartNS,
+                    windowEndNS: inputStartNS,
+                    discontinuityReset: true
+                ))
             }
             reset()
         }
-        pendingSamples.append(contentsOf: try downsampleTo16K(samples, sampleRateHz: sampleRateHz))
+        let downsampled = try downsampleTo16K(samples, sampleRateHz: sampleRateHz)
+        if pendingSamples.isEmpty { pendingStartNS = inputStartNS }
+        pendingSamples.append(contentsOf: downsampled)
 
         while pendingSamples.count >= Self.windowSampleCount {
             let window = Array(pendingSamples.prefix(Self.windowSampleCount))
             pendingSamples.removeFirst(Self.windowSampleCount)
+            let windowStartNS = pendingStartNS ?? inputStartNS
+            let windowDurationNS = UInt64(
+                (Double(Self.windowSampleCount) / Self.targetSampleRateHz * 1_000_000_000).rounded()
+            )
+            let (candidateEndNS, overflow) = windowStartNS.addingReportingOverflow(windowDurationNS)
+            let windowEndNS = overflow ? UInt64.max : candidateEndNS
+            pendingStartNS = windowEndNS
             let startedNS = DispatchTime.now().uptimeNanoseconds
             let probability = try predict(window)
             let inferenceMS = Double(DispatchTime.now().uptimeNanoseconds - startedNS) / 1_000_000
@@ -92,7 +139,9 @@ public final class NeuralVoiceActivityDetector: @unchecked Sendable {
                 active: active,
                 probability: probability,
                 changed: active != previous,
-                inferenceMS: inferenceMS
+                inferenceMS: inferenceMS,
+                windowStartNS: windowStartNS,
+                windowEndNS: windowEndNS
             ))
         }
         return evidence
@@ -100,6 +149,7 @@ public final class NeuralVoiceActivityDetector: @unchecked Sendable {
 
     public func reset() {
         pendingSamples.removeAll(keepingCapacity: true)
+        pendingStartNS = nil
         active = false
         holdUntilNS = 0
         zero(hiddenState)

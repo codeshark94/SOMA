@@ -376,7 +376,7 @@ final class PersistentMentalWorkspaceTests: XCTestCase {
         XCTAssertLessThan(repeated.after.thoughtCandidates[0].salience, 0.9)
     }
 
-    func testExecutingSocialIntentionDischargesInterruptionPressure() async {
+    func testDispatchingSocialIntentionDoesNotPretendItsGoalIsComplete() async {
         let intention = MentalIntention(
             domain: "social",
             objective: "Make one bounded social invitation.",
@@ -391,15 +391,374 @@ final class PersistentMentalWorkspaceTests: XCTestCase {
                 socialInterest: 0.9,
                 interruptionPressure: 1
             ),
-            intentions: [intention]
+            intentions: [intention],
+            processedEvidenceIDs: ["social:episode"]
         ))
 
-        let marked = await workspace.markIntentionExecuted(intention.id)
+        let marked = await workspace.markIntentionExecuted(
+            intention.id,
+            using: ["social:episode"],
+            actionFingerprint: "spoken_opening"
+        )
         XCTAssertTrue(marked)
         let snapshot = await workspace.currentSnapshot()
-        XCTAssertEqual(snapshot.drives.interruptionPressure, 0, accuracy: 0.000_001)
-        XCTAssertLessThan(snapshot.drives.socialInterest, 0.9)
+        XCTAssertEqual(snapshot.drives.interruptionPressure, 1, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.drives.socialInterest, 0.9, accuracy: 0.000_001)
         XCTAssertNotNil(snapshot.intentions.first?.executedAt)
+        XCTAssertNil(snapshot.intentions.first?.completedAt)
+        XCTAssertFalse(snapshot.intentions[0].canDispatch(
+            using: ["social:episode"],
+            actionFingerprint: "spoken_opening"
+        ))
+        XCTAssertFalse(snapshot.intentions[0].canDispatch(
+            using: ["action:outcome"],
+            actionFingerprint: "spoken_opening"
+        ))
+        XCTAssertTrue(snapshot.intentions[0].canDispatch(
+            using: ["action:outcome"],
+            actionFingerprint: "nonverbal_invitation"
+        ))
+    }
+
+    func testPassiveDecayDoesNotInvalidateSemanticRevision() async {
+        let start = Date(timeIntervalSince1970: 605)
+        let hypothesis = MentalHypothesis(
+            id: UUID(),
+            kind: .perceptual,
+            content: "A weak visual interpretation remains unresolved.",
+            confidence: 0.8,
+            salience: 0.7,
+            createdAt: start,
+            lastSupportedAt: start,
+            evidenceIDs: ["vision:1"],
+            status: .active
+        )
+        let workspace = PersistentMentalWorkspace(
+            snapshot: MentalWorkspaceSnapshot(
+                revision: 9,
+                updatedAt: start,
+                hypotheses: [hypothesis]
+            ),
+            policy: MentalDynamicsPolicy(perceptualHalfLifeSeconds: 10)
+        )
+
+        let decayed = await workspace.snapshot(at: start.addingTimeInterval(10))
+
+        XCTAssertEqual(decayed.revision, 9)
+        XCTAssertLessThan(decayed.hypotheses[0].confidence, hypothesis.confidence)
+    }
+
+    func testHypothesisLifecycleTransitionAdvancesRevisionOnlyAtCategoryBoundary() async {
+        let start = Date(timeIntervalSince1970: 612)
+        let workspace = PersistentMentalWorkspace(
+            snapshot: MentalWorkspaceSnapshot(
+                revision: 4,
+                updatedAt: start,
+                hypotheses: [MentalHypothesis(
+                    id: UUID(),
+                    kind: .perceptual,
+                    content: "A transient interpretation is awaiting support.",
+                    confidence: 0.8,
+                    salience: 0.7,
+                    createdAt: start,
+                    lastSupportedAt: start,
+                    evidenceIDs: ["vision:transient"],
+                    status: .active
+                )]
+            ),
+            policy: MentalDynamicsPolicy(
+                perceptualHalfLifeSeconds: 10,
+                dormantConfidence: 0.6,
+                abandonedConfidence: 0.2
+            )
+        )
+
+        let dormant = await workspace.snapshot(at: start.addingTimeInterval(5))
+        XCTAssertEqual(dormant.hypotheses[0].status, .dormant)
+        XCTAssertEqual(dormant.revision, 5)
+
+        let stillDormant = await workspace.snapshot(at: start.addingTimeInterval(6))
+        XCTAssertEqual(stillDormant.hypotheses[0].status, .dormant)
+        XCTAssertEqual(stillDormant.revision, 5)
+
+        let abandoned = await workspace.ingest(MentalEvidenceEvent(
+            id: "time:ordinary",
+            observedAt: start.addingTimeInterval(22),
+            kind: .ordinaryObservation,
+            summary: "No supporting evidence appeared.",
+            confidence: 1,
+            novelty: 0
+        ))
+        XCTAssertEqual(abandoned.after.hypotheses[0].status, .abandoned)
+        XCTAssertEqual(abandoned.after.revision, 6)
+        XCTAssertTrue(abandoned.delta.meaningfulTransition)
+        XCTAssertTrue(abandoned.delta.changedFields.contains("hypothesis_lifecycle_decay"))
+    }
+
+    func testThoughtEpisodeContinuesAcrossRevisionsAndRetiresWithItsGoal() async throws {
+        let start = Date(timeIntervalSince1970: 620)
+        let workspace = PersistentMentalWorkspace()
+        let ingested = await workspace.ingest(MentalEvidenceEvent(
+            id: "object:presented",
+            observedAt: start,
+            kind: .objectPresentation,
+            summary: "A person presented an object for closer inspection.",
+            confidence: 1,
+            novelty: 0.9
+        ))
+        let goalID = UUID()
+        let first = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: ingested.after.revision,
+            evidenceIDs: ["object:presented"],
+            innerMonologue: "I need a closer observation before deciding what this object is.",
+            channel: .curiosity,
+            continuity: .associate,
+            confidence: 0.9,
+            salience: 0.9,
+            novelty: 0.8,
+            intention: MentalIntention(
+                id: goalID,
+                domain: "inspection",
+                objective: "Acquire a grounded close view of the presented object.",
+                completionCondition: "A current close view is acquired or the object is no longer available.",
+                pressure: 0.8,
+                evidenceIDs: ["object:presented"],
+                createdAt: start
+            )
+        ), at: start, draw: 0)
+        let firstThought = try XCTUnwrap(first.after.foregroundThought)
+        let firstEpisode = try XCTUnwrap(first.after.thoughtEpisodes.first)
+        XCTAssertEqual(firstThought.episodeID, firstEpisode.id)
+        XCTAssertEqual(firstEpisode.goalEpisodeID, goalID)
+
+        let revised = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: first.after.revision,
+            evidenceIDs: ["object:presented"],
+            innerMonologue: "The inspection goal remains, but I should use the narrowest current-frame observation first.",
+            channel: .curiosity,
+            continuity: .revise,
+            parentThoughtID: firstThought.id,
+            confidence: 0.9,
+            salience: 0.8,
+            novelty: 0.4
+        ), at: start.addingTimeInterval(1), draw: 0)
+        XCTAssertEqual(revised.after.thoughtEpisodes.count, 1)
+        XCTAssertEqual(revised.after.thoughtEpisodes[0].id, firstEpisode.id)
+
+        let marked = await workspace.markIntentionExecuted(
+            goalID,
+            using: ["object:presented"],
+            actionFingerprint: "seek_people",
+            at: start.addingTimeInterval(2)
+        )
+        XCTAssertTrue(marked)
+        let dispatched = await workspace.currentSnapshot()
+        XCTAssertEqual(dispatched.thoughtEpisodes[0].status, .active)
+        XCTAssertNil(dispatched.intentions.first?.completedAt)
+
+        do {
+            _ = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+                expectedRevision: dispatched.revision,
+                evidenceIDs: ["object:presented"],
+                innerMonologue: "The request was dispatched, but I still lack completion evidence.",
+                channel: .selfCorrection,
+                continuity: .retire,
+                parentThoughtID: revised.after.foregroundThought?.id,
+                confidence: 0.8,
+                salience: 0.4,
+                novelty: 0.2,
+                intentionResolution: MentalIntentionResolution(
+                    intentionID: goalID,
+                    outcome: .satisfied,
+                    evidenceIDs: ["object:presented"],
+                    explanation: "The original presentation does not prove the later capture completed."
+                )
+            ), at: start.addingTimeInterval(2.5), draw: 0)
+            XCTFail("pre-dispatch evidence completed the goal")
+        } catch PersistentMentalWorkspaceError.invalidThought {
+        }
+
+        let completionEvidence = await workspace.ingest(MentalEvidenceEvent(
+            id: "capture:ready",
+            observedAt: start.addingTimeInterval(3),
+            kind: .cognitiveActionOutcome,
+            summary: "A current close view was acquired.",
+            confidence: 1,
+            novelty: 0.7
+        ))
+
+        let retired = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: completionEvidence.after.revision,
+            evidenceIDs: ["capture:ready"],
+            innerMonologue: "The requested view is now grounded, so this inspection goal is complete.",
+            channel: .selfCorrection,
+            continuity: .retire,
+            parentThoughtID: revised.after.foregroundThought?.id,
+            confidence: 0.95,
+            salience: 0.4,
+            novelty: 0.3,
+            intentionResolution: MentalIntentionResolution(
+                intentionID: goalID,
+                outcome: .satisfied,
+                evidenceIDs: ["capture:ready"],
+                explanation: "The current close view satisfies the observable completion condition."
+            )
+        ), at: start.addingTimeInterval(4), draw: 0)
+        let completed = retired.after
+        XCTAssertEqual(completed.thoughtEpisodes[0].status, .retired)
+        XCTAssertNotNil(completed.intentions.first?.completedAt)
+    }
+
+    func testEquivalentCognitiveActionOutcomeIsIdempotentWithinOneGoal() async {
+        let goalID = UUID()
+        let firstEpisode = CognitiveActionEpisode(
+            goalEpisodeID: goalID,
+            sourceLayer: .l2,
+            toolName: "get_person_context",
+            effect: .epistemic,
+            purpose: "Ground a relationship-aware follow-up.",
+            expectedInformationGain: 0.7,
+            evidenceIDs: ["turn:1"],
+            status: .succeeded,
+            resultFingerprint: "abc123",
+            requestFingerprint: "semantic-request",
+            resultSummary: "The participant context was refreshed."
+        )
+        let repeatedEpisode = CognitiveActionEpisode(
+            goalEpisodeID: goalID,
+            sourceLayer: .l2,
+            toolName: "get_person_context",
+            effect: .epistemic,
+            purpose: "Use canonical context before the next reply.",
+            expectedInformationGain: 0.7,
+            evidenceIDs: ["turn:1"],
+            status: .succeeded,
+            resultFingerprint: "different-volatile-result",
+            requestFingerprint: "semantic-request",
+            resultSummary: "The participant context was refreshed."
+        )
+        let workspace = PersistentMentalWorkspace()
+        let first = await workspace.ingest(MentalEvidenceEvent(
+            id: "cognitive:\(firstEpisode.id)",
+            kind: .cognitiveActionOutcome,
+            summary: firstEpisode.resultSummary,
+            confidence: 1,
+            novelty: 0.7,
+            cognitiveAction: firstEpisode
+        ))
+        let repeated = await workspace.ingest(MentalEvidenceEvent(
+            id: "cognitive:\(repeatedEpisode.id)",
+            kind: .cognitiveActionOutcome,
+            summary: repeatedEpisode.resultSummary,
+            confidence: 1,
+            novelty: 0.7,
+            cognitiveAction: repeatedEpisode
+        ))
+
+        XCTAssertEqual(first.after.cognitiveActions.count, 1)
+        XCTAssertEqual(repeated.after.cognitiveActions.count, 1)
+        XCTAssertFalse(repeated.changed)
+        XCTAssertEqual(repeated.after.revision, first.after.revision)
+        let sameRequest = await workspace.containsCognitiveAction(CognitiveActionQuery(
+            goalEpisodeID: goalID,
+            toolName: "get_person_context",
+            requestFingerprint: "semantic-request",
+            evidenceIDs: ["turn:1"]
+        ))
+        let newEvidence = await workspace.containsCognitiveAction(CognitiveActionQuery(
+            goalEpisodeID: goalID,
+            toolName: "get_person_context",
+            requestFingerprint: "semantic-request",
+            evidenceIDs: ["turn:2"]
+        ))
+        XCTAssertTrue(sameRequest)
+        XCTAssertFalse(newEvidence)
+    }
+
+    func testCognitiveActionReservationIsAtomicUntilItsOutcomeIsRecorded() async {
+        let goalID = UUID()
+        let query = CognitiveActionQuery(
+            goalEpisodeID: goalID,
+            toolName: "capture_view",
+            requestFingerprint: "capture-request",
+            evidenceIDs: ["turn:1"]
+        )
+        let workspace = PersistentMentalWorkspace()
+        let firstReservation = await workspace.reserveCognitiveAction(
+            query,
+            at: Date(timeIntervalSince1970: 700)
+        )
+        let repeatedReservation = await workspace.reserveCognitiveAction(
+            query,
+            at: Date(timeIntervalSince1970: 701)
+        )
+        XCTAssertFalse(firstReservation)
+        XCTAssertTrue(repeatedReservation)
+
+        let episode = CognitiveActionEpisode(
+            goalEpisodeID: goalID,
+            sourceLayer: .l2,
+            toolName: "capture_view",
+            effect: .reversibleEmbodiment,
+            purpose: "Ground the current visual reference.",
+            expectedInformationGain: 0.8,
+            evidenceIDs: ["turn:1"],
+            status: .succeeded,
+            resultFingerprint: "result",
+            requestFingerprint: "capture-request",
+            resultSummary: "Current visual evidence was acquired.",
+            completedAt: Date(timeIntervalSince1970: 702)
+        )
+        _ = await workspace.ingest(MentalEvidenceEvent(
+            id: "cognitive:\(episode.id.uuidString.lowercased())",
+            observedAt: episode.completedAt,
+            kind: .cognitiveActionOutcome,
+            summary: episode.resultSummary,
+            confidence: 1,
+            novelty: 0.7,
+            cognitiveAction: episode
+        ))
+        let completedReservation = await workspace.reserveCognitiveAction(
+            query,
+            at: Date(timeIntervalSince1970: 703)
+        )
+        XCTAssertTrue(completedReservation)
+    }
+
+    func testLegacyCheckpointWithoutEpisodeOrActionCollectionsStillDecodes() throws {
+        let legacyIntentionID = UUID()
+        let legacy = Data("""
+        {
+          "schemaVersion": 1,
+          "revision": 7,
+          "updatedAt": 600,
+          "restoredStale": false,
+          "hypotheses": [],
+          "thoughtCandidates": [],
+          "intentions": [{
+            "id": "\(legacyIntentionID.uuidString)",
+            "domain": "social",
+            "objective": "Continue a previously unresolved social goal.",
+            "pressure": 0.5,
+            "evidenceIDs": ["legacy:evidence"],
+            "createdAt": 600
+          }],
+          "recentNovelty": 0.4,
+          "processedEvidenceIDs": ["legacy:evidence"]
+        }
+        """.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+
+        let snapshot = try decoder.decode(MentalWorkspaceSnapshot.self, from: legacy)
+
+        XCTAssertEqual(snapshot.revision, 7)
+        XCTAssertEqual(snapshot.recentNovelty, 0.4)
+        XCTAssertEqual(snapshot.processedEvidenceIDs, ["legacy:evidence"])
+        XCTAssertTrue(snapshot.thoughtEpisodes.isEmpty)
+        XCTAssertTrue(snapshot.cognitiveActions.isEmpty)
+        XCTAssertEqual(snapshot.intentions.first?.id, legacyIntentionID)
+        XCTAssertNil(snapshot.intentions.first?.completedAt)
     }
 
     func testSelectiveCheckpointRestoresDurableThoughtButClearsTransientAuthority() async throws {

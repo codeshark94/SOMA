@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SOMACore
 
@@ -276,6 +277,24 @@ private struct InformationNeedsArguments: Codable {
     }
 }
 
+private struct CognitiveIntentArguments: Codable {
+    let goalEpisodeId: UUID
+    let purpose: String
+    let expectedInformationGain: Double
+    let evidenceIds: [String]?
+    let authorizationBasis: L2CognitiveAuthorizationBasis
+
+    var value: L2CognitiveToolIntent {
+        L2CognitiveToolIntent(
+            goalEpisodeID: goalEpisodeId,
+            purpose: purpose,
+            expectedInformationGain: expectedInformationGain,
+            evidenceIDs: evidenceIds ?? [],
+            authorizationBasis: authorizationBasis
+        )
+    }
+}
+
 private final class EmbodimentMCPServer {
     private let socketURL: URL
     private let sessionAuthorization: String?
@@ -356,13 +375,92 @@ private final class EmbodimentMCPServer {
                 write(error: -32602, message: "unknown tool: \(name)", id: id)
                 return
             }
-            let arguments = parameters["arguments"] as? [String: Any] ?? [:]
+            var arguments = parameters["arguments"] as? [String: Any] ?? [:]
+            guard let rawIntent = arguments.removeValue(forKey: "cognitive_intent") as? [String: Any] else {
+                write(result: toolFailure("\(name) requires a policy-bound cognitive_intent"), id: id)
+                return
+            }
+            let cognitiveIntent: L2CognitiveToolIntent
+            do {
+                let decoded: CognitiveIntentArguments = try decode(rawIntent)
+                cognitiveIntent = decoded.value
+                guard !cognitiveIntent.purpose.isEmpty else {
+                    write(result: toolFailure("cognitive_intent purpose is required"), id: id)
+                    return
+                }
+            } catch {
+                write(result: toolFailure(error.localizedDescription), id: id)
+                return
+            }
+            guard L2CognitiveToolPolicy.autonomy(for: name) != nil else {
+                write(result: toolFailure("tool has no cognitive authorization policy: \(name)"), id: id)
+                return
+            }
+            if !L2CognitiveToolPolicy.permits(cognitiveIntent.authorizationBasis, for: name) {
+                write(
+                    result: toolFailure("authorization_basis does not permit \(name)"),
+                    id: id
+                )
+                return
+            }
+            do {
+                try authorizeCognitiveIntent(cognitiveIntent)
+            } catch {
+                write(result: toolFailure(error.localizedDescription), id: id)
+                return
+            }
+            let requestFingerprint = semanticRequestFingerprint(toolName: name, arguments: arguments)
+            do {
+                if try cognitiveActionAlreadyRecorded(
+                    toolName: name,
+                    intent: cognitiveIntent,
+                    requestFingerprint: requestFingerprint
+                ) {
+                    write(
+                        result: toolFailure(
+                            "duplicate cognitive action rejected: the same goal, evidence, and semantic request already ran"
+                        ),
+                        id: id
+                    )
+                    return
+                }
+            } catch {
+                write(result: toolFailure("cognitive action lookup failed: \(error.localizedDescription)"), id: id)
+                return
+            }
             do {
                 let reply = try callTool(name: name, arguments: arguments)
+                guard recordCognitiveAction(
+                    toolName: name,
+                    intent: cognitiveIntent,
+                    reply: reply,
+                    requestFingerprint: requestFingerprint,
+                    sessionAuthorization: sessionAuthorization
+                ) else {
+                    write(
+                        result: toolFailure("tool executed, but its cognitive outcome could not be recorded; do not retry automatically"),
+                        id: id
+                    )
+                    return
+                }
                 write(result: toolResult(reply, for: name), id: id)
             } catch ServerFailure.invalidArguments(let message) {
+                _ = recordCognitiveFailure(
+                    toolName: name,
+                    intent: cognitiveIntent,
+                    message: message,
+                    requestFingerprint: requestFingerprint,
+                    sessionAuthorization: sessionAuthorization
+                )
                 write(result: toolFailure(message), id: id)
             } catch {
+                _ = recordCognitiveFailure(
+                    toolName: name,
+                    intent: cognitiveIntent,
+                    message: error.localizedDescription,
+                    requestFingerprint: requestFingerprint,
+                    sessionAuthorization: sessionAuthorization
+                )
                 write(result: toolFailure(error.localizedDescription), id: id)
             }
         default:
@@ -484,6 +582,22 @@ private final class EmbodimentMCPServer {
             )
         default:
             throw ServerFailure.invalidArguments("unknown tool: \(name)")
+        }
+    }
+
+    private func authorizeCognitiveIntent(_ intent: L2CognitiveToolIntent) throws {
+        let reply = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveAuthorization,
+                cognitiveAuthorizationBasis: intent.authorizationBasis,
+                sessionAuthorization: sessionAuthorization
+            ),
+            socketURL: socketURL
+        )
+        guard reply.ok else {
+            throw ServerFailure.invalidArguments(
+                reply.error ?? "cognitive authorization is unavailable"
+            )
         }
     }
 
@@ -636,6 +750,160 @@ private final class EmbodimentMCPServer {
         } catch {
             throw ServerFailure.invalidArguments("invalid tool arguments: \(bounded(error.localizedDescription))")
         }
+    }
+
+    private func recordCognitiveAction(
+        toolName: String,
+        intent: L2CognitiveToolIntent,
+        reply: EmbodimentIPCReply,
+        requestFingerprint: String?,
+        sessionAuthorization: String?
+    ) -> Bool {
+        guard let effect = L2CognitiveToolPolicy.effect(for: toolName) else { return false }
+        let data = (try? encoder.encode(reply)) ?? Data("unencodable".utf8)
+        let episode = CognitiveActionEpisode(
+            goalEpisodeID: intent.goalEpisodeID,
+            sourceLayer: .l2,
+            toolName: toolName,
+            effect: effect,
+            purpose: intent.purpose,
+            expectedInformationGain: intent.expectedInformationGain,
+            evidenceIDs: intent.evidenceIDs,
+            status: reply.ok ? .succeeded : .failed,
+            resultFingerprint: Self.sha256(data),
+            requestFingerprint: requestFingerprint,
+            resultSummary: cognitiveSummary(toolName: toolName, reply: reply)
+        )
+        guard let acknowledgement = try? EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveActionOutcome,
+                cognitiveAction: episode,
+                sessionAuthorization: sessionAuthorization
+            ),
+            socketURL: socketURL
+        ) else { return false }
+        return acknowledgement.ok
+    }
+
+    private func cognitiveActionAlreadyRecorded(
+        toolName: String,
+        intent: L2CognitiveToolIntent,
+        requestFingerprint: String
+    ) throws -> Bool {
+        let reply = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveActionQuery,
+                cognitiveActionQuery: .init(
+                    goalEpisodeID: intent.goalEpisodeID,
+                    toolName: toolName,
+                    requestFingerprint: requestFingerprint,
+                    evidenceIDs: intent.evidenceIDs
+                ),
+                sessionAuthorization: sessionAuthorization
+            ),
+            socketURL: socketURL
+        )
+        guard reply.ok else {
+            throw ServerFailure.invalidArguments(reply.error ?? "cognitive action lookup unavailable")
+        }
+        return reply.cognitiveActionDuplicate == true
+    }
+
+    private func recordCognitiveFailure(
+        toolName: String,
+        intent: L2CognitiveToolIntent,
+        message: String,
+        requestFingerprint: String?,
+        sessionAuthorization: String?
+    ) -> Bool {
+        guard let effect = L2CognitiveToolPolicy.effect(for: toolName) else { return false }
+        let boundedMessage = bounded(message)
+        let episode = CognitiveActionEpisode(
+            goalEpisodeID: intent.goalEpisodeID,
+            sourceLayer: .l2,
+            toolName: toolName,
+            effect: effect,
+            purpose: intent.purpose,
+            expectedInformationGain: intent.expectedInformationGain,
+            evidenceIDs: intent.evidenceIDs,
+            status: .failed,
+            resultFingerprint: Self.sha256(Data(boundedMessage.utf8)),
+            requestFingerprint: requestFingerprint,
+            resultSummary: "The cognitive tool action failed: \(boundedMessage)"
+        )
+        guard let acknowledgement = try? EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .cognitiveActionOutcome,
+                cognitiveAction: episode,
+                sessionAuthorization: sessionAuthorization
+            ),
+            socketURL: socketURL
+        ) else { return false }
+        return acknowledgement.ok
+    }
+
+    private func cognitiveSummary(toolName: String, reply: EmbodimentIPCReply) -> String {
+        guard reply.ok else {
+            return "The cognitive tool action failed: \(bounded(reply.error ?? "unknown failure"))"
+        }
+        switch toolName {
+        case "capture_view", "get_view_capture":
+            return reply.viewResource == nil
+                ? "The requested visual evidence was accepted but no completed view was returned."
+                : "Current visual evidence was acquired."
+        case "get_person_context":
+            return "The participant context was refreshed from canonical memory."
+        case "list_information_needs":
+            return "The curiosity queue was refreshed with \(reply.informationNeeds?.items.count ?? 0) open motives."
+        case "record_information_need_answer":
+            return "A confirmed answer was stored and its information motive was closed."
+        case "recall_episodes":
+            return "Episodic memory returned \(reply.recalledEpisodes?.count ?? 0) relevant summaries."
+        case "list_present_people", "list_identity_registry":
+            return "The identity roster returned \(reply.identityRoster?.entries.count ?? 0) bounded entries."
+        case "set_preferred_language", "clear_preferred_language", "set_contact_preference",
+             "set_person_rapport", "set_person_fact", "remove_person_fact":
+            return "Explicitly grounded participant context was persisted."
+        case "enroll_present_identity":
+            return "A consented present identity was enrolled."
+        case "end_conversation":
+            return "The active conversation was ended."
+        default:
+            if let reason = reply.decision?.reason, !reason.isEmpty {
+                return "The embodied cognitive action completed: \(bounded(reason))"
+            }
+            return "The cognitive tool action completed successfully."
+        }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func semanticRequestFingerprint(
+        toolName: String,
+        arguments: [String: Any]
+    ) -> String {
+        let payload: [String: Any] = [
+            "tool": toolName,
+            "arguments": Self.semanticArguments(arguments),
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]))
+            ?? Data("unencodable".utf8)
+        return Self.sha256(data)
+    }
+
+    private static func semanticArguments(_ value: Any) -> Any {
+        if let dictionary = value as? [String: Any] {
+            return dictionary.reduce(into: [String: Any]()) { result, entry in
+                guard entry.key != "request_id", entry.key != "reason" else { return }
+                result[entry.key] = semanticArguments(entry.value)
+            }
+        }
+        if let array = value as? [Any] {
+            return array.map(semanticArguments)
+        }
+        return value
     }
 
     private func personContextOperation(forTool name: String) -> PersonContextIPCOperation? {
@@ -1001,10 +1269,17 @@ private final class EmbodimentMCPServer {
         _ inputSchema: [String: Any],
         readOnly: Bool = false
     ) -> [String: Any] {
+        var augmentedSchema = inputSchema
+        var properties = augmentedSchema["properties"] as? [String: Any] ?? [:]
+        properties["cognitive_intent"] = cognitiveIntentSchema()
+        augmentedSchema["properties"] = properties
+        var required = augmentedSchema["required"] as? [String] ?? []
+        if !required.contains("cognitive_intent") { required.append("cognitive_intent") }
+        augmentedSchema["required"] = required
         return [
             "name": name,
             "description": description,
-            "inputSchema": inputSchema,
+            "inputSchema": augmentedSchema,
             "annotations": [
                 "readOnlyHint": readOnly,
                 "destructiveHint": false,
@@ -1037,6 +1312,23 @@ private final class EmbodimentMCPServer {
             "reason": stringSchema(maxLength: 240),
             "evidence_ids": ["type": "array", "maxItems": 16, "items": stringSchema(maxLength: 128)],
         ], required: ["source_layer", "owner_id", "priority", "lease_ms", "reason"])
+    }
+
+    private func cognitiveIntentSchema() -> [String: Any] {
+        objectSchema([
+            "goal_episode_id": uuidSchema(),
+            "purpose": stringSchema(maxLength: 512),
+            "expected_information_gain": numberSchema(minimum: 0, maximum: 1),
+            "evidence_ids": [
+                "type": "array",
+                "maxItems": 32,
+                "items": stringSchema(maxLength: 256),
+            ],
+            "authorization_basis": [
+                "type": "string",
+                "enum": L2CognitiveAuthorizationBasis.allCases.map(\.rawValue),
+            ],
+        ], required: ["goal_episode_id", "purpose", "expected_information_gain", "authorization_basis"])
     }
 
     private func registrationSchema() -> [String: Any] {

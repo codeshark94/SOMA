@@ -5,6 +5,7 @@ enum AppServerLiveVoiceEvent: Sendable {
     case launchRequested(authorization: String, personEntityID: UUID?)
     case active(threadID: String?, personEntityID: UUID?)
     case inputTransportStarted
+    case inputBootstrapReplayed(durationMilliseconds: Double, peakDBFS: Double, maximumGainDB: Double)
     case outputPlaybackReady
     case naturalTurnTakingConfirmed
     case responseInterrupted
@@ -60,6 +61,15 @@ private struct BufferedLiveAudio: Sendable {
     let sampleRate: Int
     let samplesPerChannel: Int
     let durationNS: UInt64
+    let inputPeakDBFS: Double
+    let appliedGainDB: Double
+}
+
+private struct CapturedLiveAudio: Sendable {
+    let samples: [Float]
+    let sampleRate: Int
+    let captureNS: UInt64
+    let durationNS: UInt64
 }
 
 private enum LiveVoiceSessionTerminationError: LocalizedError {
@@ -79,6 +89,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let projectDirectory: String
     private let voice: SOMARealtimeVoice
     private let currentCameraImageDataURI: (@Sendable () -> String?)?
+    private let embodimentSocketURL: URL?
     private let persistentAppServer: PersistentAppServerBroker?
     private let persistentSessionAuthorizer: (@Sendable (
         String,
@@ -86,6 +97,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         UInt64
     ) -> Result<Void, SOMASessionCapabilityError>)?
     private let cameraContextAutoInjection: Bool
+    private let requireVerifiedSpeakerForEveryTurn: Bool
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
     private var gate = LiveVoiceLaunchGate()
     private var inactivityGate = LiveVoiceSessionInactivityGate()
@@ -93,14 +105,17 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var process: Process?
     private var input: FileHandle?
     private var outputBuffer = Data()
-    private var preRoll: [BufferedLiveAudio] = []
-    private var preRollDurationNS: UInt64 = 0
+    private var speakerEpisodeAudio = LiveVoiceTimestampedEpisodeBuffer<CapturedLiveAudio>(
+        detectorHistoryNS: 2_000_000_000,
+        maximumEpisodeDurationNS: 12_000_000_000
+    )
+    private var speakerEpisodeInProgress = false
     private var initiatingTurn: [BufferedLiveAudio] = []
     private var capturingInitiatingTurn = false
-    private var audioAccumulator: [Float] = []
-    private var audioAccumulatorSampleRate = 0
+    private var inputLeveler = LiveVoiceInputLeveler()
     private var inputTransportReported = false
     private var active = false
+    private var activeTurnAudioAdmitted = false
     private var stopped = false
     private var generation: UInt64 = 0
     private var activePersonEntityID: UUID?
@@ -118,6 +133,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         projectDirectory: String? = nil,
         voice: SOMARealtimeVoice = .maple,
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
+        embodimentSocketURL: URL? = nil,
+        requireVerifiedSpeakerForEveryTurn: Bool = false,
         persistentAppServer: PersistentAppServerBroker? = nil,
         persistentSessionAuthorizer: (@Sendable (
             String,
@@ -131,6 +148,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             ?? FileManager.default.currentDirectoryPath
         self.voice = voice
         self.currentCameraImageDataURI = currentCameraImageDataURI
+        self.embodimentSocketURL = embodimentSocketURL
+        self.requireVerifiedSpeakerForEveryTurn = requireVerifiedSpeakerForEveryTurn
         self.persistentAppServer = persistentAppServer
         self.persistentSessionAuthorizer = persistentSessionAuthorizer
         cameraContextAutoInjection = somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: true)
@@ -198,25 +217,25 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
-    func ingestAudio(samples: [Float], sampleRateHz: Double, durationNS _: UInt64) {
+    func ingestAudio(
+        samples: [Float],
+        sampleRateHz: Double,
+        captureNS: UInt64,
+        durationNS: UInt64
+    ) {
         guard !samples.isEmpty,
               sampleRateHz.isFinite,
               sampleRateHz >= 8_000,
-              sampleRateHz <= 96_000 else { return }
+              sampleRateHz <= 96_000,
+              durationNS > 0 else { return }
         queue.async { [weak self] in
             guard let self, !stopped else { return }
-            let sampleRate = Int(sampleRateHz.rounded())
-            if audioAccumulatorSampleRate != 0, audioAccumulatorSampleRate != sampleRate {
-                flushAudioAccumulator()
-            }
-            audioAccumulatorSampleRate = sampleRate
-            audioAccumulator.append(contentsOf: samples)
-            let targetSamples = max(1, sampleRate * 60 / 1_000)
-            while audioAccumulator.count >= targetSamples {
-                let packet = Array(audioAccumulator.prefix(targetSamples))
-                audioAccumulator.removeFirst(targetSamples)
-                routeAudioPacket(packet, sampleRate: sampleRate)
-            }
+            routeAudioChunk(CapturedLiveAudio(
+                samples: samples,
+                sampleRate: Int(sampleRateHz.rounded()),
+                captureNS: captureNS,
+                durationNS: durationNS
+            ))
         }
     }
 
@@ -224,63 +243,148 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     /// live transport can take longer to establish than an ordinary sentence,
     /// so replaying an undifferentiated rolling buffer would either lose its
     /// beginning or submit ambient silence as the first turn.
-    func observeVoiceActivity(_ active: Bool, at _: UInt64) {
+    func observeVoiceActivity(
+        _ active: Bool,
+        admitted: Bool = true,
+        discardBufferedEpisode: Bool = false,
+        onsetCaptureNS: UInt64? = nil,
+        assessedThroughCaptureNS: UInt64? = nil,
+        preserveDetectorHistoryFromCaptureNS: UInt64? = nil,
+        at _: UInt64
+    ) {
         queue.async { [weak self] in
             guard let self, !stopped else { return }
+            // VAD drives conditioning; speaker attribution controls only
+            // transport. This preserves a quiet first utterance while the
+            // bounded audiovisual attribution window is still pending.
+            inputLeveler.observeVoiceActivity(active)
+            if active,
+               let onsetCaptureNS,
+               (!self.active || requireVerifiedSpeakerForEveryTurn) {
+                speakerEpisodeAudio.begin(
+                    at: onsetCaptureNS,
+                    splitting: Self.splitCapturedAudio
+                )
+                speakerEpisodeInProgress = true
+            }
+            if active, admitted {
+                activeTurnAudioAdmitted = true
+            } else if !active {
+                activeTurnAudioAdmitted = false
+            }
+            if discardBufferedEpisode {
+                if let preserveDetectorHistoryFromCaptureNS {
+                    speakerEpisodeAudio.end(
+                        preservingDetectorHistoryFrom: preserveDetectorHistoryFromCaptureNS
+                    )
+                } else {
+                    speakerEpisodeAudio.end()
+                }
+                speakerEpisodeInProgress = false
+                initiatingTurn.removeAll(keepingCapacity: true)
+                capturingInitiatingTurn = false
+                activeTurnAudioAdmitted = false
+            }
+            if !active, !discardBufferedEpisode {
+                if let preserveDetectorHistoryFromCaptureNS {
+                    speakerEpisodeAudio.end(
+                        preservingDetectorHistoryFrom: preserveDetectorHistoryFromCaptureNS
+                    )
+                } else {
+                    speakerEpisodeAudio.end()
+                }
+                speakerEpisodeInProgress = false
+            }
+            if self.active, requireVerifiedSpeakerForEveryTurn {
+                if active, admitted, let assessedThroughCaptureNS {
+                    let buffered = speakerEpisodeAudio
+                        .take(
+                            throughCaptureNS: assessedThroughCaptureNS,
+                            splitting: Self.splitCapturedAudio
+                        )
+                        .map(makeBufferedAudio)
+                    for chunk in buffered { send(chunk) }
+                }
+                return
+            }
             guard gate.phase == .starting else { return }
-            if active {
-                guard !capturingInitiatingTurn else { return }
-                capturingInitiatingTurn = true
-                initiatingTurn = recentPreRoll(durationNS: 480_000_000)
+            if active, admitted {
+                if requireVerifiedSpeakerForEveryTurn {
+                    guard let assessedThroughCaptureNS else { return }
+                    initiatingTurn += speakerEpisodeAudio
+                        .take(
+                            throughCaptureNS: assessedThroughCaptureNS,
+                            splitting: Self.splitCapturedAudio
+                        )
+                        .map(makeBufferedAudio)
+                } else {
+                    guard !capturingInitiatingTurn else { return }
+                    capturingInitiatingTurn = true
+                    initiatingTurn = speakerEpisodeAudio.take().map(makeBufferedAudio)
+                }
             } else {
                 capturingInitiatingTurn = false
             }
         }
     }
 
-    private func flushAudioAccumulator() {
-        guard audioAccumulatorSampleRate > 0, !audioAccumulator.isEmpty else { return }
-        let packet = audioAccumulator
-        audioAccumulator.removeAll(keepingCapacity: true)
-        routeAudioPacket(packet, sampleRate: audioAccumulatorSampleRate)
-    }
-
-    private func routeAudioPacket(_ samples: [Float], sampleRate: Int) {
-        let durationNS = UInt64(
-            (Double(samples.count) / Double(sampleRate) * 1_000_000_000).rounded()
-        )
-        let chunk = BufferedLiveAudio(
-            data: Self.pcm16Data(samples).base64EncodedString(),
-            sampleRate: sampleRate,
-            samplesPerChannel: samples.count,
-            durationNS: durationNS
-        )
-        if active {
-            send(chunk)
+    private func routeAudioChunk(_ captured: CapturedLiveAudio) {
+        if LiveVoiceAudioRoutingPolicy.forwards(
+            sessionActive: active,
+            requiresVerifiedSpeakerForEveryTurn: requireVerifiedSpeakerForEveryTurn,
+            currentTurnAdmitted: activeTurnAudioAdmitted
+        ), !requireVerifiedSpeakerForEveryTurn {
+            send(makeBufferedAudio(captured))
+        } else if capturingInitiatingTurn {
+            initiatingTurn.append(makeBufferedAudio(captured))
         } else {
-            preRoll.append(chunk)
-            preRollDurationNS &+= durationNS
-            if capturingInitiatingTurn {
-                initiatingTurn.append(chunk)
-            }
-            // This is only lead-in for the VAD-confirmed initiating turn. The
-            // full turn is held separately, so background audio cannot evict
-            // the beginning of the user's actual utterance during startup.
-            while preRollDurationNS > 1_000_000_000, preRoll.count > 1 {
-                preRollDurationNS -= preRoll.removeFirst().durationNS
-            }
+            speakerEpisodeAudio.ingest(
+                captured,
+                captureNS: captured.captureNS,
+                durationNS: captured.durationNS
+            )
         }
     }
 
-    private func recentPreRoll(durationNS: UInt64) -> [BufferedLiveAudio] {
-        var selected: [BufferedLiveAudio] = []
-        var accumulated: UInt64 = 0
-        for chunk in preRoll.reversed() {
-            selected.append(chunk)
-            accumulated &+= chunk.durationNS
-            if accumulated >= durationNS { break }
-        }
-        return selected.reversed()
+    private func makeBufferedAudio(_ captured: CapturedLiveAudio) -> BufferedLiveAudio {
+        let conditioned = inputLeveler.process(captured.samples)
+        return BufferedLiveAudio(
+            data: Self.pcm16Data(conditioned.samples).base64EncodedString(),
+            sampleRate: captured.sampleRate,
+            samplesPerChannel: captured.samples.count,
+            durationNS: captured.durationNS,
+            inputPeakDBFS: conditioned.inputPeakDBFS,
+            appliedGainDB: conditioned.appliedGainDB
+        )
+    }
+
+    private static func splitCapturedAudio(
+        _ captured: CapturedLiveAudio,
+        prefixDurationNS: UInt64
+    ) -> (prefix: CapturedLiveAudio, suffix: CapturedLiveAudio)? {
+        guard prefixDurationNS > 0,
+              prefixDurationNS < captured.durationNS,
+              captured.samples.count > 1 else { return nil }
+        let requestedFraction = Double(prefixDurationNS) / Double(captured.durationNS)
+        let prefixCount = min(
+            captured.samples.count - 1,
+            max(1, Int((Double(captured.samples.count) * requestedFraction).rounded()))
+        )
+        let suffixDurationNS = captured.durationNS - prefixDurationNS
+        return (
+            prefix: CapturedLiveAudio(
+                samples: Array(captured.samples[..<prefixCount]),
+                sampleRate: captured.sampleRate,
+                captureNS: captured.captureNS - suffixDurationNS,
+                durationNS: prefixDurationNS
+            ),
+            suffix: CapturedLiveAudio(
+                samples: Array(captured.samples[prefixCount...]),
+                sampleRate: captured.sampleRate,
+                captureNS: captured.captureNS,
+                durationNS: suffixDurationNS
+            )
+        )
     }
 
     func stop() {
@@ -297,17 +401,17 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             if let process, process.isRunning { process.terminate() }
             self.process = nil
             active = false
+            activeTurnAudioAdmitted = false
             activeThreadID = nil
             activePersonEntityID = nil
             activeSessionCapability = nil
             awaitingAssistantResponse = false
             latestUserTranscriptNS = nil
-            preRoll.removeAll(keepingCapacity: false)
-            preRollDurationNS = 0
+            speakerEpisodeAudio.end(keepingCapacity: false)
+            speakerEpisodeInProgress = false
             initiatingTurn.removeAll(keepingCapacity: false)
             capturingInitiatingTurn = false
-            audioAccumulator.removeAll(keepingCapacity: false)
-            audioAccumulatorSampleRate = 0
+            inputLeveler.reset()
             inactivityTimer?.cancel()
             inactivityTimer = nil
             inactivityGate.close()
@@ -375,6 +479,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         openingVisualContextAttached = false
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
+        inputLeveler.reset()
+        activeTurnAudioAdmitted = false
         proactiveOpeningAwaitingParticipant = proactiveOpeningText?.isEmpty == false
         proactiveOpeningDelivered = false
         let persistentEndpoint: URL?
@@ -432,8 +538,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 let personEntityID = self.activePersonEntityID
                 self.activeThreadID = nil
                 self.activePersonEntityID = nil
-                self.activeSessionCapability = nil
-                self.onEvent(.failed(
+            self.activeSessionCapability = nil
+            self.inputLeveler.reset()
+            self.onEvent(.failed(
                     threadID: threadID,
                     personEntityID: personEntityID,
                     reason: "live_voice_helper_exited_\(process.terminationStatus)"
@@ -460,7 +567,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         guard send([
             "type": "start",
             "initialContext": String(initialContext.prefix(24_000)),
-            "sessionCapability": persistentAppServer == nil ? (sessionCapability ?? "") : "",
+            "sessionCapability": sessionCapability ?? "",
+            "embodimentSocketPath": embodimentSocketURL?.path ?? "",
             "appServerURL": persistentEndpoint?.absoluteString ?? "",
             "preferredLanguageTag": preferredLanguageTag ?? "",
             "languageStartInstruction": languageStartInstruction ?? "",
@@ -496,12 +604,16 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             case "active":
                 guard !active else { continue }
                 active = true
+                if !requireVerifiedSpeakerForEveryTurn {
+                    activeTurnAudioAdmitted = true
+                }
                 activeThreadID = event.threadID
                 gate.observeActive()
                 armInactivityTimeout(at: DispatchTime.now().uptimeNanoseconds)
                 let buffered = initiatingTurn
-                preRoll.removeAll(keepingCapacity: true)
-                preRollDurationNS = 0
+                if !requireVerifiedSpeakerForEveryTurn || !speakerEpisodeInProgress {
+                    speakerEpisodeAudio.end()
+                }
                 initiatingTurn.removeAll(keepingCapacity: true)
                 capturingInitiatingTurn = false
                 // A direct first-turn visual question needs the current frame
@@ -509,6 +621,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 // already begun.
                 if !buffered.isEmpty {
                     enqueueOpeningCameraImageIfEnabled()
+                    let durationMilliseconds = Double(buffered.reduce(0) { $0 &+ $1.durationNS }) / 1_000_000
+                    let peakDBFS = buffered.map(\.inputPeakDBFS).max() ?? -.infinity
+                    let maximumGainDB = buffered.map(\.appliedGainDB).max() ?? 0
+                    onEvent(.inputBootstrapReplayed(
+                        durationMilliseconds: durationMilliseconds,
+                        peakDBFS: peakDBFS,
+                        maximumGainDB: maximumGainDB
+                    ))
                 }
                 for chunk in buffered { send(chunk) }
                 onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
@@ -607,6 +727,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 let threadID = event.threadID ?? activeThreadID
                 let personEntityID = activePersonEntityID
                 active = false
+                activeTurnAudioAdmitted = false
                 gate.observeEnded()
                 inactivityTimer?.cancel()
                 inactivityTimer = nil
@@ -618,6 +739,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 activeSessionCapability = nil
                 awaitingAssistantResponse = false
                 latestUserTranscriptNS = nil
+                inputLeveler.reset()
                 onEvent(.ended(
                     threadID: threadID,
                     personEntityID: personEntityID,
@@ -635,6 +757,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let threadID = activeThreadID
         let personEntityID = activePersonEntityID
         active = false
+        activeTurnAudioAdmitted = false
         gate.fail(at: DispatchTime.now().uptimeNanoseconds)
         inactivityTimer?.cancel()
         inactivityTimer = nil
@@ -648,6 +771,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeSessionCapability = nil
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
+        inputLeveler.reset()
         onEvent(.failed(
             threadID: threadID,
             personEntityID: personEntityID,
@@ -696,6 +820,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let threadID = activeThreadID
         let personEntityID = activePersonEntityID
         active = false
+        activeTurnAudioAdmitted = false
         gate.observeEnded()
         inactivityGate.close()
         inactivityTimer?.cancel()
@@ -709,6 +834,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeSessionCapability = nil
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
+        inputLeveler.reset()
         onEvent(.ended(
             threadID: threadID,
             personEntityID: personEntityID,
@@ -844,6 +970,7 @@ func testAppServerLiveVoiceLauncher() -> String {
             result.fail(reason)
             semaphore.signal()
         case .launchRequested, .inputTransportStarted, .outputPlaybackReady,
+             .inputBootstrapReplayed,
              .responseInterrupted, .interruptedAudioCleared, .proactiveOpeningTriggered,
              .proactiveOpeningExtraOutputSuppressed, .hearingUser,
              .visualContextAttached, .visualContextRejected,

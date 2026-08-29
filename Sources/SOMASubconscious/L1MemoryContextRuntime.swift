@@ -2681,6 +2681,22 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
         stream?.recordNonverbalInvitation(with: entityID, at: monotonicNS)
     }
 
+    func recordCognitiveAction(_ episode: CognitiveActionEpisode) async -> Bool {
+        let stream = currentStream()
+        return await stream?.recordCognitiveAction(episode) ?? false
+    }
+
+    func reserveCognitiveAction(_ query: CognitiveActionQuery) async -> Bool {
+        let stream = currentStream()
+        return await stream?.reserveCognitiveAction(query) ?? false
+    }
+
+    private func currentStream() -> (any L1ThoughtStreaming)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stream
+    }
+
     func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt) {
         lock.lock()
         let stream = self.stream

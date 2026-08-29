@@ -26,6 +26,7 @@ final class AcousticOnsetGateTests: XCTestCase {
 
         XCTAssertTrue(evidence.triggered)
         XCTAssertTrue(evidence.transient)
+        XCTAssertEqual(evidence.estimatedLookbackNS, 10_000_000)
     }
 
     func testOrdinaryAmbientVariationDoesNotTrigger() {
@@ -80,12 +81,14 @@ final class AcousticOnsetGateTests: XCTestCase {
             at: now
         ).triggered)
         now += 10_000_000
-        XCTAssertTrue(gate.ingest(
+        let evidence = gate.ingest(
             levelDB: -23,
             durationNS: 10_000_000,
             continuous: true,
             at: now
-        ).triggered)
+        )
+        XCTAssertTrue(evidence.triggered)
+        XCTAssertEqual(evidence.estimatedLookbackNS, 30_000_000)
     }
 
     func testCooldownPreventsOneSoundFromBecomingRepeatedOnsets() {

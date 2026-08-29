@@ -19,6 +19,7 @@ private struct Command: Decodable {
     let interactionAuthority: String?
     let personContextReference: String?
     let sessionCapability: String?
+    let embodimentSocketPath: String?
     let appServerURL: String?
     let cameraContextAutoInjected: Bool?
     let codexSandbox: String?
@@ -308,6 +309,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var interactionAuthority: String?
     private var personContextReference: UUID?
     private var sessionCapability: String?
+    private var embodimentSocketURL: URL?
     private var appServerURL: String?
     private var cameraContextAutoInjected = false
     private var codexSandbox = "danger-full-access"
@@ -325,8 +327,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var realtimeSessionInitialized = false
     private var activeEmitted = false
     private var inputSpeechInProgress = false
+    private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
     private var observedRealtimeEventTypes: Set<String> = []
+    private let preflightGoalEpisodeID = UUID()
 
     init(emitter: JSONLineEmitter, workingDirectory: String, voice: String) {
         self.emitter = emitter
@@ -384,6 +388,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             )
             sessionCapability = (command.sessionCapability ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            let socketPath = (command.embodimentSocketPath ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            embodimentSocketURL = socketPath.hasPrefix("/")
+                ? URL(fileURLWithPath: socketPath)
+                : nil
             appServerURL = command.appServerURL?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             cameraContextAutoInjected = command.cameraContextAutoInjected ?? false
@@ -581,7 +590,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "threadId": threadID,
                 "server": "soma_embodiment",
                 "tool": "get_embodiment_state",
-                "arguments": [:],
+                "arguments": [
+                    "cognitive_intent": preflightIntent(
+                        purpose: "Verify the current session's bounded embodiment capability."
+                    ),
+                ],
             ]
         ) { [weak self] response in
             DispatchQueue.main.async {
@@ -619,7 +632,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "threadId": threadID,
                 "server": "soma_embodiment",
                 "tool": "get_person_context",
-                "arguments": ["person_entity_id": personEntityID.uuidString.lowercased()],
+                "arguments": [
+                    "person_entity_id": personEntityID.uuidString.lowercased(),
+                    "cognitive_intent": preflightIntent(
+                        purpose: "Verify the current session's bounded person-context capability."
+                    ),
+                ],
             ]
         ) { [weak self] response in
             DispatchQueue.main.async {
@@ -660,6 +678,16 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ])
         }
         startWebRTCIfNeeded()
+    }
+
+    private func preflightIntent(purpose: String) -> [String: Any] {
+        [
+            "goal_episode_id": preflightGoalEpisodeID.uuidString.lowercased(),
+            "purpose": purpose,
+            "expected_information_gain": 0,
+            "evidence_ids": [],
+            "authorization_basis": L2CognitiveAuthorizationBasis.autonomousGoal.rawValue,
+        ]
     }
 
     private func startWebRTCIfNeeded() {
@@ -737,7 +765,15 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             conversationOriginInstruction = "This conversation was initiated by the participant. Respond to their most recent actual spoken message."
         }
         let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
-        let instruction = [baseInstruction, conversationOriginInstruction, temporalMemoryInstruction, stopConversationInstruction, languageInstruction(), proactiveOpeningInstruction()]
+        let instruction = [
+            baseInstruction,
+            L2CognitiveToolPolicy.instruction,
+            conversationOriginInstruction,
+            temporalMemoryInstruction,
+            stopConversationInstruction,
+            languageInstruction(),
+            proactiveOpeningInstruction(),
+        ]
             .compactMap { $0 }
             .joined(separator: "\n\n")
         var params: [String: Any] = [
@@ -924,14 +960,42 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         if type == "turn.completed" || type == "turn.finished" || type == "turn.done" ||
             type.contains("response.completed") || type.contains("response.done") {
+            setCognitiveTurn(active: false)
             emitter.emit("response_completed")
         }
     }
 
     private func observeInputSpeechStarted() {
         guard !inputSpeechInProgress else { return }
+        setCognitiveTurn(active: true)
         inputSpeechInProgress = true
         emitter.emit("input_speech_started")
+    }
+
+    private func setCognitiveTurn(active: Bool) {
+        guard cognitiveTurnOpen != active,
+              let embodimentSocketURL,
+              let sessionCapability,
+              !sessionCapability.isEmpty else { return }
+        let kind: EmbodimentIPCCommandKind = active ? .cognitiveTurnStarted : .cognitiveTurnEnded
+        do {
+            let reply = try EmbodimentShadowSocketClient.send(
+                .init(kind: kind, sessionAuthorization: sessionCapability),
+                socketURL: embodimentSocketURL
+            )
+            guard reply.ok else {
+                emitter.emit("cognitive_turn_binding_failed", fields: [
+                    "reason": String((reply.error ?? "authorization_failed").prefix(192)),
+                ])
+                return
+            }
+            cognitiveTurnOpen = active
+            emitter.emit(active ? "cognitive_turn_started" : "cognitive_turn_ended")
+        } catch {
+            emitter.emit("cognitive_turn_binding_failed", fields: [
+                "reason": String(error.localizedDescription.prefix(192)),
+            ])
+        }
     }
 
     private static func interruptResponseEnabled(in event: [String: Any]) -> Bool {
@@ -1022,6 +1086,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private func stop(reason: String, emitEnded: Bool = true) {
         guard !stopping else { return }
         stopping = true
+        setCognitiveTurn(active: false)
         if let threadID {
             connection.request(method: "thread/realtime/stop", params: ["threadId": threadID]) { _ in }
         }
@@ -1278,6 +1343,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     interactionAuthority: nil,
                     personContextReference: nil,
                     sessionCapability: nil,
+                    embodimentSocketPath: nil,
                     appServerURL: nil,
                     cameraContextAutoInjected: nil,
                     codexSandbox: nil,

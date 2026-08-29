@@ -64,6 +64,21 @@ public struct AcousticOnsetEvidence: Sendable {
     public let confidence: Double
     public let thresholdDB: Double
     public let transient: Bool
+    public let estimatedLookbackNS: UInt64
+
+    public init(
+        triggered: Bool,
+        confidence: Double,
+        thresholdDB: Double,
+        transient: Bool,
+        estimatedLookbackNS: UInt64 = 0
+    ) {
+        self.triggered = triggered
+        self.confidence = confidence
+        self.thresholdDB = thresholdDB
+        self.transient = transient
+        self.estimatedLookbackNS = estimatedLookbackNS
+    }
 }
 
 /// Detects a new acoustic event independently of speech classification.
@@ -185,7 +200,10 @@ public final class AcousticOnsetGate: @unchecked Sendable {
             triggered: triggered,
             confidence: clamp((levelDB - thresholdDB + 6) / 18),
             thresholdDB: thresholdDB,
-            transient: triggered && isTransient
+            transient: triggered && isTransient,
+            estimatedLookbackNS: triggered
+                ? (isTransient ? durationNS : sustainedDurationNS)
+                : 0
         )
     }
 }

@@ -2605,6 +2605,7 @@ void emitDeviceCapabilities(
                   << " indicator_direct_rgb=" << (capabilities.directIndicatorColorMask != 0 ? "true" : "false")
                   << " indicator_direct_rgb_mask=" << static_cast<int>(capabilities.directIndicatorColorMask)
                   << " indicator_basic=" << (capabilities.indicatorEnableAndBrightness ? "true" : "false")
+                  << " indicator_pulse_transport=" << static_cast<int>(capabilities.indicatorPulseTransport)
                   << " selectable_audio_modes=" << (capabilities.selectableAudioModes ? "true" : "false")
                   << " supported_audio_mode_mask=" << static_cast<int>(capabilities.supportedAudioModeMask)
                   << " sound_localization=" << (capabilities.soundLocalization ? "true" : "false")
@@ -3206,6 +3207,16 @@ const char *indicatorPatternName(IndicatorPattern pattern) {
     return "steady";
 }
 
+const char *indicatorPulseTransportName(soma::OBSBOTIndicatorPulseTransport transport) {
+    switch (transport) {
+    case soma::OBSBOTIndicatorPulseTransport::unavailable: return "unavailable";
+    case soma::OBSBOTIndicatorPulseTransport::brightnessDimming: return "brightness_dimming";
+    case soma::OBSBOTIndicatorPulseTransport::enableToggle: return "enable_toggle";
+    case soma::OBSBOTIndicatorPulseTransport::directDark: return "direct_dark";
+    }
+    return "unavailable";
+}
+
 const std::vector<IndicatorPatternPhase> &indicatorPatternPhases(IndicatorPattern pattern) {
     static const std::vector<IndicatorPatternPhase> steady = {{true, 0}};
     static const std::vector<IndicatorPatternPhase> contactPulse = {
@@ -3687,6 +3698,7 @@ public:
         if (result == RM_RET_OK) {
             requestedBrightness_ = static_cast<uint8_t>(brightness);
             brightnessChanged_ = true;
+            pulseBrightnessDimmed_ = false;
         }
         trace_.event(
             "indicator.ack",
@@ -3857,22 +3869,43 @@ public:
             int result = RM_RET_ERR;
             bool reportedEnabled = true;
             int readbackResult = RM_RET_ERR;
-            bool disabled = false;
-            if (desiredColor_) {
-                std::lock_guard<std::mutex> lock(sdkMutex);
-                result = adapter_.setIndicatorDark(device_.get());
-                disabled = result == RM_RET_OK;
-            } else {
-                // State-based products need the global enable bit for the
-                // dark phase; Tiny 3 Lite uses a direct black presentation.
+            bool darkened = false;
+            std::string darkDetail;
+            switch (capabilities_.indicatorPulseTransport) {
+            case soma::OBSBOTIndicatorPulseTransport::brightnessDimming:
+                result = callSetBrightness(0);
+                darkened = result == RM_RET_OK;
+                darkDetail = "; brightness=0";
+                break;
+            case soma::OBSBOTIndicatorPulseTransport::enableToggle:
                 result = callSetEnabled(false);
                 readbackResult = callGetEnabled(reportedEnabled);
-                disabled = result == RM_RET_OK
+                darkened = result == RM_RET_OK
                     && readbackResult == RM_RET_OK
                     && !reportedEnabled;
+                darkDetail = std::string("; enabled=false; readback=")
+                    + (readbackResult == RM_RET_OK
+                        ? (reportedEnabled ? "true" : "false")
+                        : "unavailable");
+                break;
+            case soma::OBSBOTIndicatorPulseTransport::directDark: {
+                std::lock_guard<std::mutex> lock(sdkMutex);
+                result = adapter_.setIndicatorDark(device_.get());
+                darkened = result == RM_RET_OK;
+                darkDetail = "; direct_dark=true";
+                break;
             }
-            if (disabled) {
-                if (!desiredColor_) {
+            case soma::OBSBOTIndicatorPulseTransport::unavailable:
+                darkDetail = "; pulse_transport=unavailable";
+                break;
+            }
+            if (darkened) {
+                if (capabilities_.indicatorPulseTransport
+                    == soma::OBSBOTIndicatorPulseTransport::brightnessDimming) {
+                    pulseBrightnessDimmed_ = true;
+                    brightnessChanged_ = true;
+                } else if (capabilities_.indicatorPulseTransport
+                    == soma::OBSBOTIndicatorPulseTransport::enableToggle) {
                     pulseLEDDisabled_ = true;
                     pulseChangedEnabled_ = true;
                 }
@@ -3884,14 +3917,12 @@ public:
             }
             trace_.event(
                 "indicator.ack",
-                disabled ? "soma" : "fault",
-                disabled ? "pulse_off" : "pulse_off_rejected",
-                disabled ? RM_RET_OK : RM_RET_ERR,
+                darkened ? "soma" : "fault",
+                darkened ? "pulse_off" : "pulse_off_rejected",
+                darkened ? RM_RET_OK : RM_RET_ERR,
                 presentation
-                    + (desiredColor_
-                        ? "; direct_dark=true"
-                        : std::string("; enabled=false; readback=")
-                            + (readbackResult == RM_RET_OK ? (reportedEnabled ? "true" : "false") : "unavailable"))
+                    + "; transport=" + indicatorPulseTransportName(capabilities_.indicatorPulseTransport)
+                    + darkDetail
                     + "; presentation_retained=true"
             );
             return;
@@ -3900,7 +3931,9 @@ public:
         trace_.event("indicator.command", "soma", "pulse_on", 0, presentation);
         int presentationResult = RM_RET_ERR;
         bool presentationStagedWhileDark = false;
-        if (!desiredColor_ && pulseLEDDisabled_) {
+        if (!desiredColor_ && pulseLEDDisabled_
+            && capabilities_.indicatorPulseTransport
+                == soma::OBSBOTIndicatorPulseTransport::enableToggle) {
             std::lock_guard<std::mutex> lock(sdkMutex);
             presentationResult = adapter_.setIndicatorState(
                 device_.get(), static_cast<uint8_t>(*desiredState_)
@@ -4299,6 +4332,12 @@ private:
             pulseLEDDisabled_ = false;
             pulseChangedEnabled_ = true;
         }
+        if (pulseBrightnessDimmed_) {
+            const int result = callSetBrightness(pulseBrightness());
+            if (result != RM_RET_OK) return false;
+            pulseBrightnessDimmed_ = false;
+            brightnessChanged_ = true;
+        }
         return true;
     }
 
@@ -4320,6 +4359,7 @@ private:
     size_t patternPhaseIndex_ = 0;
     bool pulseVisible_ = false;
     bool pulseLEDDisabled_ = false;
+    bool pulseBrightnessDimmed_ = false;
     bool pulseChangedEnabled_ = false;
     std::optional<Clock::time_point> nextPulseTransition_;
     std::optional<bool> baselineEnabled_;

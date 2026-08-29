@@ -5,8 +5,8 @@ final class OBSBOTDeviceProfileTests: XCTestCase {
     func testTiny2LiteCommandsComeFromTheNativeContract() {
         let contract = tiny2LiteTestContract()
         XCTAssertEqual(contract.firmwareIndicatorStateID(for: .yellow), 16)
-        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .green), 57)
-        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .blue), 54)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .green), 54)
+        XCTAssertEqual(contract.firmwareIndicatorStateID(for: .blue), 57)
         XCTAssertFalse(contract.usesFirmwareDefaultIndicator(for: .blue))
         XCTAssertEqual(contract.nativeTrackingTransport, .legacyHumanMode)
     }

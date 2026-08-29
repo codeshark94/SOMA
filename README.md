@@ -104,9 +104,26 @@ layers are connected, but they are not interchangeable.
 | --- | --- | --- | --- |
 | **L0 · subconscious** | Video/audio cadence | Captures sensor evidence, follows a verified face, keeps target continuity, estimates voice activity, maintains spatial coverage, and executes the final motor policy | The only path to SDK motion, stabilization, limits, watchdogs, and immediate stops |
 | **L0.5 · local semantic helper** | Sparse asynchronous inference and temporal evidence integration | Produces evidence deltas for L1 without blocking L0; it does not call the language model directly | No independent motor, speech, identity, memory, or wake authority |
-| **L1a · persistent thought stream** | Event-driven plus an adaptive stochastic clock | Maintains hypotheses, curiosity, intentions, self-correction, and a probabilistically selected foreground thought in one persistent mental workspace | May form an abstract intention and request bounded visual evidence; cannot speak or move hardware |
+| **L1a · persistent thought stream** | Event-driven plus an adaptive stochastic clock | Maintains hypotheses, curiosity, goal-linked thought episodes, self-correction, and a probabilistically selected foreground thought in one persistent mental workspace | May form an abstract intention and request bounded visual evidence; cannot speak or move hardware |
 | **L1b · executive judgment** | Only when an L1a intention creates action pressure | Chooses one currently available social or attention action against a frozen workspace revision | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through existing leased MCP/L0 goals |
-| **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and user-requested work | The same semantic embodiment interface as L1; never raw SDK velocity |
+| **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and goal-directed tool use when grounded information is needed | The same semantic embodiment interface as L1; never raw SDK velocity |
+
+L2 may inspect perception or memory and may request reversible attention actions
+without waiting for a literal tool command when that action advances the current
+conversational goal. This initiative is enforced by the MCP server, not only by
+the model prompt: every call carries a stable goal episode and an authorization
+basis. Participant-coupled operations also require a server-issued grant for the
+current spoken turn. Unknown tools fail closed, durable memory requires a grounded statement,
+identity enrollment requires consent, and device configuration requires an
+explicit request. Tool results return to the mental workspace as bounded
+evidence, with semantic request fingerprints preventing paraphrased duplicate
+calls without retaining raw result payloads.
+
+Issuing an action is not treated as satisfying its goal. Dispatch is recorded
+first; the linked thought and intention remain active until later evidence meets
+their observable completion condition, makes the goal impossible, or causes L1a
+to revise it. This keeps tool use inside the same perception-thought-action-
+verification loop as embodied behavior.
 
 L0.5 is intentionally a supporting process inside the L1 path, not a fourth
 mind. Its job is to make slow contextual reasoning more perceptive without
@@ -120,7 +137,7 @@ directly.
 flowchart LR
     Body["OBSBOT Tiny 2 Lite / Tiny 3 Lite\nvideo · audio · gimbal · LED"] --> L0["L0 subconscious\nreal-time perception and motor safety"]
     L0 --> Evidence["normalized evidence\nL0 · L0.5 · memory · time"]
-    Evidence --> Workspace["persistent mental workspace\nhypotheses · drives · intentions"]
+    Evidence --> Workspace["persistent mental workspace\nhypotheses · drives · thought episodes · intentions"]
     Workspace --> L1A["L1a thought update\nEnglish inner monologue"]
     L1A --> Foreground["stochastic foreground competition"]
     Foreground -->|"action pressure"| L1B["L1b executive judgment"]
@@ -130,6 +147,7 @@ flowchart LR
     L1B --> MCP["SOMA embodiment MCP\nsemantic leased goals"]
     L2 --> MCP
     MCP --> L0
+    MCP -->|"privacy-bounded outcome"| Evidence
     L0 --> Body
 ```
 
@@ -167,12 +185,21 @@ open a conversation with a concrete purpose.
 An authorized direct human contact can open an L2 Live Voice session, while L1
 can also initiate a conversation when it has a concrete purpose. L2 receives
 the private conversational objective and relevant memory context, then responds
-to the person's actual words.
+to the person's actual words. During a conversation it can proactively use the
+narrowest permitted SOMA MCP tool when doing so materially reduces uncertainty
+or advances the active goal. Perception and memory reads are autonomous;
+durable identity or person-memory changes still require a grounded statement or
+consent, and every motor request remains leased through L0.
 
 Camera imagery is not streamed into conversation as a running caption feed.
 When visual evidence is genuinely useful, L2 can decide to call
 `capture_view` through MCP and inspect that bounded, current resource itself.
 This keeps a conversation from turning into unsolicited image description.
+Each goal-directed call carries a stable cognitive goal identifier. Its raw
+result stays in the current interaction, while only a bounded outcome summary
+and result fingerprint return to the mental workspace. That closes the
+perception–thought–action loop without duplicating successful equivalent calls
+or persisting raw tool payloads.
 
 ## Memory as continuity, not a transcript dump
 
@@ -306,8 +333,14 @@ swift run soma-menu-bar
 ```
 
 The menu bar application is where a local operator configures voice, indicator
-semantics, attention policy, and explicit identity enrollment. Review the
-scripts and hardware flags before enabling physical camera control.
+semantics, attention policy, and explicit identity enrollment. A new Live Voice
+session requires current eye contact, voice activity, and affirmative
+audiovisual evidence that the tracked person is speaking. Once open, conversation remains gaze-independent
+by default; an optional setting can require current eye contact for every spoken
+turn. Quiet admitted speech is levelled with a bounded VAD-driven gain stage and
+the initiating utterance is replayed after transport startup so session latency
+does not discard the first words. Review the scripts and hardware flags before
+enabling physical camera control.
 
 <details>
 <summary><strong>Local companion installation</strong></summary>

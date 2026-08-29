@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-public enum EmbodimentIPCCommandKind: String, Codable, Sendable {
+public enum EmbodimentIPCCommandKind: String, Codable, Equatable, Sendable {
     /// Owner-local service lifecycle control. This is intentionally not an
     /// embodied request: it drains the live runtime before launchd unloads it.
     case runtimeShutdown = "runtime_shutdown"
@@ -14,6 +14,11 @@ public enum EmbodimentIPCCommandKind: String, Codable, Sendable {
     case identityRoster = "identity_roster"
     case identityEnrollment = "identity_enrollment"
     case indicatorCalibration = "indicator_calibration"
+    case cognitiveActionQuery = "cognitive_action_query"
+    case cognitiveActionOutcome = "cognitive_action_outcome"
+    case cognitiveTurnStarted = "cognitive_turn_started"
+    case cognitiveTurnEnded = "cognitive_turn_ended"
+    case cognitiveAuthorization = "cognitive_authorization"
 }
 
 /// Local-only person-context operations exposed through the same current-user
@@ -193,6 +198,9 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
     public let informationNeeds: InformationNeedsIPCRequest?
     public let identityRosterQuery: IdentityRosterQuery?
     public let identityEnrollment: IdentityEnrollmentIPCRequest?
+    public let cognitiveActionQuery: CognitiveActionQuery?
+    public let cognitiveAction: CognitiveActionEpisode?
+    public let cognitiveAuthorizationBasis: L2CognitiveAuthorizationBasis?
     /// An opaque capability issued by the owning L0 process for one live
     /// participant. It is checked locally and never persists in memory/trace.
     public let sessionAuthorization: String?
@@ -208,6 +216,9 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         informationNeeds: InformationNeedsIPCRequest? = nil,
         identityRosterQuery: IdentityRosterQuery? = nil,
         identityEnrollment: IdentityEnrollmentIPCRequest? = nil,
+        cognitiveActionQuery: CognitiveActionQuery? = nil,
+        cognitiveAction: CognitiveActionEpisode? = nil,
+        cognitiveAuthorizationBasis: L2CognitiveAuthorizationBasis? = nil,
         sessionAuthorization: String? = nil,
         indicatorPreset: SOMALEDFirmwarePreset? = nil
     ) {
@@ -218,6 +229,9 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         self.informationNeeds = informationNeeds
         self.identityRosterQuery = identityRosterQuery
         self.identityEnrollment = identityEnrollment
+        self.cognitiveActionQuery = cognitiveActionQuery
+        self.cognitiveAction = cognitiveAction
+        self.cognitiveAuthorizationBasis = cognitiveAuthorizationBasis
         self.sessionAuthorization = sessionAuthorization.map { String($0.prefix(128)) }
         self.indicatorPreset = indicatorPreset
     }
@@ -233,6 +247,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
     public let informationNeeds: InformationNeedsIPCResult?
     public let identityRoster: IdentityRosterSnapshot?
     public let identityEnrollment: IdentityEnrollmentResult?
+    public let cognitiveActionDuplicate: Bool?
     public let recalledEpisodes: [String]?
 
     public init(
@@ -245,6 +260,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         informationNeeds: InformationNeedsIPCResult? = nil,
         identityRoster: IdentityRosterSnapshot? = nil,
         identityEnrollment: IdentityEnrollmentResult? = nil,
+        cognitiveActionDuplicate: Bool? = nil,
         recalledEpisodes: [String]? = nil
     ) {
         self.ok = ok
@@ -256,6 +272,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         self.informationNeeds = informationNeeds
         self.identityRoster = identityRoster
         self.identityEnrollment = identityEnrollment
+        self.cognitiveActionDuplicate = cognitiveActionDuplicate
         self.recalledEpisodes = recalledEpisodes.map { Array($0.prefix(8)).map { String($0.prefix(1_200)) } }
     }
 }
@@ -312,6 +329,16 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     public typealias IndicatorCalibrationHandler = @Sendable (
         _ preset: SOMALEDFirmwarePreset?
     ) -> Result<Void, Error>
+    public typealias CognitiveActionHandler = @Sendable (
+        _ episode: CognitiveActionEpisode
+    ) -> Bool
+    public typealias CognitiveActionQueryProvider = @Sendable (
+        _ query: CognitiveActionQuery
+    ) -> Bool
+    public typealias CognitiveTurnHandler = @Sendable (
+        _ sessionAuthorization: String?,
+        _ active: Bool
+    ) -> Result<Void, Error>
     /// The live-session owner validates that this capability belongs to its
     /// currently active conversation before accepting termination.
     public typealias ConversationTerminationHandler = @Sendable (
@@ -334,6 +361,9 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let identityRosterProvider: IdentityRosterProvider
     private let identityEnrollmentProvider: IdentityEnrollmentProvider
     private let indicatorCalibrationHandler: IndicatorCalibrationHandler
+    private let cognitiveActionQueryProvider: CognitiveActionQueryProvider
+    private let cognitiveActionHandler: CognitiveActionHandler
+    private let cognitiveTurnHandler: CognitiveTurnHandler
     private let conversationTerminationHandler: ConversationTerminationHandler
     private let runtimeShutdownHandler: RuntimeShutdownHandler
     private let sessionAuthorizationProvider: SessionAuthorizationProvider
@@ -357,6 +387,9 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         identityRosterProvider: @escaping IdentityRosterProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         identityEnrollmentProvider: @escaping IdentityEnrollmentProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         indicatorCalibrationHandler: @escaping IndicatorCalibrationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
+        cognitiveActionQueryProvider: @escaping CognitiveActionQueryProvider = { _ in false },
+        cognitiveActionHandler: @escaping CognitiveActionHandler = { _ in false },
+        cognitiveTurnHandler: @escaping CognitiveTurnHandler = { _, _ in .failure(EmbodimentIPCError.unavailable) },
         runtimeShutdownHandler: @escaping RuntimeShutdownHandler = { .failure(EmbodimentIPCError.unavailable) },
         conversationTerminationHandler: @escaping ConversationTerminationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
         sessionAuthorizationProvider: @escaping SessionAuthorizationProvider = { _, _ in .success(()) },
@@ -372,6 +405,9 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.identityRosterProvider = identityRosterProvider
         self.identityEnrollmentProvider = identityEnrollmentProvider
         self.indicatorCalibrationHandler = indicatorCalibrationHandler
+        self.cognitiveActionQueryProvider = cognitiveActionQueryProvider
+        self.cognitiveActionHandler = cognitiveActionHandler
+        self.cognitiveTurnHandler = cognitiveTurnHandler
         self.conversationTerminationHandler = conversationTerminationHandler
         self.runtimeShutdownHandler = runtimeShutdownHandler
         self.sessionAuthorizationProvider = sessionAuthorizationProvider
@@ -462,6 +498,16 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             Self.setTimeouts(clientFD)
             let data = try Self.readLine(from: clientFD, maximumBytes: maximumMessageBytes)
             let command = try JSONDecoder().decode(EmbodimentIPCCommand.self, from: data)
+            if command.kind != .cognitiveActionOutcome, command.cognitiveAction != nil {
+                throw EmbodimentIPCError.malformedMessage
+            }
+            if command.kind != .cognitiveActionQuery, command.cognitiveActionQuery != nil {
+                throw EmbodimentIPCError.malformedMessage
+            }
+            if command.kind != .cognitiveAuthorization,
+               command.cognitiveAuthorizationBasis != nil {
+                throw EmbodimentIPCError.malformedMessage
+            }
             switch command.kind {
             case .runtimeShutdown:
                 guard command.request == nil,
@@ -667,6 +713,89 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 case let .failure(error):
                     writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
                 }
+            case .cognitiveActionQuery:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.informationNeeds == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil,
+                      command.cognitiveAction == nil,
+                      let query = command.cognitiveActionQuery,
+                      !query.toolName.isEmpty,
+                      !query.requestFingerprint.isEmpty else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .cognitiveEvidence)
+                writeReply(
+                    .init(
+                        ok: true,
+                        cognitiveActionDuplicate: cognitiveActionQueryProvider(query)
+                    ),
+                    to: clientFD
+                )
+            case .cognitiveActionOutcome:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.informationNeeds == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil,
+                      let episode = command.cognitiveAction,
+                      episode.sourceLayer == .l2,
+                      !episode.toolName.isEmpty,
+                      !episode.purpose.isEmpty,
+                      !episode.resultFingerprint.isEmpty else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .cognitiveEvidence)
+                let recorded = cognitiveActionHandler(episode)
+                writeReply(
+                    .init(
+                        ok: recorded,
+                        error: recorded ? nil : "cognitive_action_recording_failed"
+                    ),
+                    to: clientFD
+                )
+            case .cognitiveTurnStarted, .cognitiveTurnEnded:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.informationNeeds == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil,
+                      command.cognitiveActionQuery == nil,
+                      command.cognitiveAction == nil,
+                      command.cognitiveAuthorizationBasis == nil else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                switch cognitiveTurnHandler(
+                    command.sessionAuthorization,
+                    command.kind == .cognitiveTurnStarted
+                ) {
+                case .success:
+                    writeReply(.init(ok: true), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
+            case .cognitiveAuthorization:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.informationNeeds == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil,
+                      command.cognitiveActionQuery == nil,
+                      command.cognitiveAction == nil,
+                      let basis = command.cognitiveAuthorizationBasis else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .cognitiveBasis(basis))
+                writeReply(.init(ok: true), to: clientFD)
             }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
