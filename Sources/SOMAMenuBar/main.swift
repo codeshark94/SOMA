@@ -745,7 +745,7 @@ private struct SOMASettingsView: View {
                     Stepper("Confidence ≥ \(String(format: "%.2f", model.envSettings.l0E2BWakeConfidence))", value: l0E2BWakeConfidenceBinding, in: 0.1...0.95, step: 0.05)
                 }
                 HStack {
-                    Text("Local vision wake repeat")
+                    Text("Local vision semantic refresh")
                     Spacer()
                     Stepper("Every \(Int(model.envSettings.l0E2BWakeIntervalMilliseconds / 1000)) s", value: l0E2BWakeIntervalBinding, in: 2...60, step: 1)
                 }

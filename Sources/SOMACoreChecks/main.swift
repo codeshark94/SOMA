@@ -2395,12 +2395,12 @@ require(
     "credible direct social bid did not emit an L1 auxiliary wake proposal"
 )
 require(
-    l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart + 4_999_000_000, situation: .socialBid, reason: .directSocialBid)) == nil,
-    "L1 auxiliary repeated the same proposal inside its debounce interval"
+    l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart + 4_999_000_000, situation: .socialBid, reason: .directSocialBid)) != nil,
+    "credible L1 auxiliary evidence was suppressed before workspace reduction"
 )
 require(
     l1AuxiliaryInterruptGate.recommend(l1AuxiliaryCue(at: l1AuxiliaryStart + 5_000_000_000, situation: .socialBid, reason: .directSocialBid)) != nil,
-    "L1 auxiliary did not re-admit a persistent proposal after its debounce interval"
+    "credible L1 auxiliary evidence did not remain available to workspace reduction"
 )
 
 func l1AuxiliaryTemporalCue(

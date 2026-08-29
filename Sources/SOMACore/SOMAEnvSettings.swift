@@ -58,8 +58,9 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     /// Minimum local-vision (E2B) confidence (0...1) for a wake proposal to
     /// reach L1.
     public var l0E2BWakeConfidence: Double
-    /// Minimum interval (ms) between local-vision (E2B) wake proposals for the
-    /// same situation.
+    /// Maximum interval (ms) before the on-device semantic observer refreshes
+    /// an otherwise stable scene. Workspace deltas, not this sampling interval,
+    /// decide whether L1a is awakened.
     public var l0E2BWakeIntervalMilliseconds: Double
     /// Whether the local-vision (E2B) layer is launched at all. E2B is a core
     /// dependency: it supplies the auxiliary semantic cues, low-social-presence
@@ -170,6 +171,8 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
             "SOMA_L1_DEFAULT_LANGUAGE=\(l1DefaultLanguage)",
             "SOMA_L0_E2B_WAKE_SCORE=\(String(format: "%g", l0E2BWakeScore))",
             "SOMA_L0_E2B_WAKE_CONFIDENCE=\(String(format: "%g", l0E2BWakeConfidence))",
+            // Retain the deployed key for settings migration; it now controls
+            // perception refresh rather than a consciousness wake cooldown.
             "SOMA_L0_E2B_WAKE_INTERVAL_MS=\(String(format: "%g", l0E2BWakeIntervalMilliseconds))",
             "SOMA_ENABLE_L05_VLM=\(l05Enabled ? "1" : "0")",
             "SOMA_L0_EYE_CONTACT_FRESHNESS_MS=\(String(format: "%g", l0EyeContactFreshnessMilliseconds))",

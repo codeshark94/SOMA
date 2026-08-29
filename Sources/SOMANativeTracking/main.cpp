@@ -2427,12 +2427,12 @@ bool setDoaFindBack(
                 : std::string("unavailable")),
         commandID
     );
-    if (confirmed) {
-        try {
-            std::lock_guard<std::mutex> lock(stderrMutex);
-            std::cerr << "SOMA_DOA_FOLLOW enabled=" << (enabled ? "true" : "false") << "\n" << std::flush;
-        } catch (...) {}
-    }
+    try {
+        std::lock_guard<std::mutex> lock(stderrMutex);
+        std::cerr << "SOMA_DOA_FOLLOW enabled=" << (enabled ? "true" : "false")
+                  << " confirmed=" << (confirmed ? "true" : "false")
+                  << " command_id=" << commandID << "\n" << std::flush;
+    } catch (...) {}
     return confirmed;
 }
 

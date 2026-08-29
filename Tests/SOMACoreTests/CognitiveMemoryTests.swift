@@ -97,6 +97,24 @@ final class CognitiveMemoryTests: XCTestCase {
         XCTAssertEqual(corrected.revision, 2)
         let correctedHistory = try await store.history(id: initial.id)
         XCTAssertEqual(correctedHistory.map(\.revision), [1, 2])
+        do {
+            _ = try await store.correct(
+                id: initial.id,
+                expectedRevision: initial.revision,
+                replacement: taskDraft(
+                    summary: "A stale writer must not overwrite the active task",
+                    status: .active,
+                    tier: .shortTerm,
+                    expiresAt: correctedAt.addingTimeInterval(60 * 60),
+                    at: correctedAt
+                ),
+                reason: "stale concurrent correction",
+                at: correctedAt
+            )
+            XCTFail("stale correction unexpectedly succeeded")
+        } catch let error as CognitiveMemoryError {
+            XCTAssertEqual(error, .revisionConflict(initial.id))
+        }
 
         let promotedAt = start.addingTimeInterval(120)
         let promoted = try await store.promote(

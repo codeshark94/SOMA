@@ -20,8 +20,6 @@ enum AppServerLiveVoiceEvent: Sendable {
     case personContextUnavailable(reason: String)
     case embodimentMCPCall(tool: String, status: String, error: String?)
     case inputAccepted(characters: Int)
-    case acousticEchoRejected(characters: Int)
-    case localAcousticEchoSuppressed(characters: Int)
     case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
     case preparingResponse
     case responseStarted(latencyMilliseconds: Double)
@@ -40,7 +38,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let characters: Int?
     let role: String?
     let text: String?
-        let tool: String?
+    let tool: String?
     let status: String?
     let error: String?
 
@@ -113,7 +111,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var openingVisualContextAttached = false
     private var awaitingAssistantResponse = false
     private var latestUserTranscriptNS: UInt64?
-    private var transcriptEchoGuard = LiveVoiceTranscriptEchoGuard()
     private var proactiveOpeningAwaitingParticipant = false
     private var proactiveOpeningDelivered = false
 
@@ -573,17 +570,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         }
                         proactiveOpeningDelivered = true
                     }
-                    transcriptEchoGuard.recordAssistantTranscript(
-                        text,
-                        at: DispatchTime.now().uptimeNanoseconds
-                    )
-                } else if transcriptEchoGuard.rejectsUserTranscript(
-                    text,
-                    at: DispatchTime.now().uptimeNanoseconds
-                ) {
-                    onEvent(.acousticEchoRejected(characters: text.count))
-                    _ = closeActiveSession(reason: "acoustic_echo_rejected")
-                    continue
                 } else {
                     proactiveOpeningAwaitingParticipant = false
                     let now = DispatchTime.now().uptimeNanoseconds
@@ -862,8 +848,8 @@ func testAppServerLiveVoiceLauncher() -> String {
              .proactiveOpeningExtraOutputSuppressed, .hearingUser,
              .visualContextAttached, .visualContextRejected,
              .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
-             .personContextUnavailable, .embodimentMCPCall, .inputAccepted, .acousticEchoRejected,
-             .localAcousticEchoSuppressed, .transcriptFinalized, .preparingResponse, .responseStarted,
+             .personContextUnavailable, .embodimentMCPCall, .inputAccepted,
+             .transcriptFinalized, .preparingResponse, .responseStarted,
              .assistantSpeechStarted, .assistantSpeechEnded, .responding, .responseCompleted, .ended:
             break
         }

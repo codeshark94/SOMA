@@ -1991,42 +1991,6 @@ private final class PresentIdentityRoster: @unchecked Sendable {
     }
 }
 
-/// Produces a small, stable operational summary for the live panel. The full
-/// model frame remains in the runtime trace; the panel carries only the
-/// decision variables needed to understand the current cognitive state.
-private func l1DiagnosticMessage(
-    for frame: L1SituationFrame,
-    action: String? = nil,
-    mode: String
-) -> String {
-    var parts: [String] = ["mode=\(mode)"]
-    if let action {
-        parts.append("action=\(action)")
-    }
-    parts.append("uncertainty=\(String(format: "%.2f", frame.uncertainty))")
-    if let thought = frame.thoughtState {
-        parts.append("social_availability=\(String(format: "%.2f", thought.socialAvailability))")
-        parts.append("curiosity_pressure=\(String(format: "%.2f", thought.curiosityPressure))")
-        parts.append("interruption_cost=\(String(format: "%.2f", thought.interruptionCost))")
-        parts.append("relationship_uncertainty=\(String(format: "%.2f", thought.relationshipUncertainty))")
-    }
-    if let directive = frame.behaviorDirective {
-        parts.append("directive=\(directive.action.rawValue)")
-    }
-    return parts.joined(separator: " · ")
-}
-
-/// Publishes the model-authored, continuing L1 reflection separately from the
-/// compact control variables. This is an observable self-report, not an
-/// actuator instruction: L0 still receives only the validated decision and
-/// directive fields from the same frame.
-private func l1ReflectionMessage(for frame: L1SituationFrame) -> String? {
-    guard let thought = frame.thoughtState else { return nil }
-    let reflection = thought.streamOfConsciousness
-    guard !reflection.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-    return reflection
-}
-
 /// Projects L1 runtime health into the deliberately small vocabulary used by
 /// the live diagnostics panel. Runtime traces retain the original event for
 /// audit; the panel must never become a second renderer for model prose.
@@ -2040,27 +2004,26 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
     }
 
     switch state {
-    case "configured":
-        return ("configured", "status=ready")
-    case "wake":
-        let allowedCauses: Set<String> = ["recognized_person", "behavior_awareness", "auxiliary_wake", "temporal_context"]
-        let cause = value("cause").flatMap { allowedCauses.contains($0) ? $0 : nil } ?? "situational_change"
-        return ("wake", "cause=\(cause)")
-    case "deliberating":
-        return ("deliberating", "status=context_and_memory")
-    case "l1_situation_response":
-        return ("model_response_received", "status=validation")
-    case "tool_call":
-        return ("tool_call", "status=authorization_review")
-    case "tool_round":
-        return ("tool_round", "status=tool_result_review")
-    case "completed":
-        guard let uncertainty = value("uncertainty"), Double(uncertainty) != nil else {
-            return ("completed", "status=applied")
-        }
-        return ("completed", "uncertainty=\(uncertainty)")
-    case "failed":
-        return ("failed", "reason=runtime_or_validation_failure")
+    case "consciousness_configured":
+        return ("workspace_ready", "queue=executive,event,periodic · single_in_flight=true")
+    case "workspace_created", "workspace_restored":
+        return (state, message)
+    case "evidence", "state_delta", "hypothesis_created", "hypothesis_updated",
+         "hypothesis_active", "hypothesis_dormant", "hypothesis_abandoned", "hypothesis_resolved":
+        return (state, message)
+    case "thought_wake":
+        return ("thought_wake", message)
+    case "foreground_thought":
+        return ("foreground_thought", message)
+    case "executive_wake", "executive_decision", "action_applied", "action_held",
+         "thought_held", "executive_held":
+        return (state, message)
+    case "model_started":
+        return ("model_started", message)
+    case "model_response":
+        return ("model_response_received", message)
+    case "model_failed", "model_retry":
+        return (state, message)
     case "l1_memory_proposals":
         let count = value("count").flatMap(Int.init) ?? 0
         return ("l1_memory_proposals", "count=\(max(0, count))")
@@ -2068,10 +2031,6 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
         return ("visual_followup", "status=requested_context")
     case "visual_request_unavailable":
         return ("visual_request_unavailable", "status=context_unavailable")
-    case "behavior_directive":
-        let allowedActions: Set<String> = ["keep_observing", "resume_scanning", "seek_people", "acknowledge_person"]
-        let action = value("action").flatMap { allowedActions.contains($0) ? $0 : nil } ?? "none"
-        return ("behavior_directive", "action=\(action)")
     case "discarded", "decision_rejected", "opening_suppressed":
         return (state, "reason=policy_or_context_guard")
     case "memory_ready", "memory_consolidated", "conversation_memory_consolidated", "conversation_memory_recovery_finished", "memory_proposal_stored", "daily_world_memory_stored", "person_fact_stored", "person_preference_captured":
@@ -3957,6 +3916,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var activeCognitiveMotorRequestID: String?
     private var activeCognitiveMotorExpiresAtNS: UInt64?
     private var deviceSoundFollowingRequestID: String?
+    private var firmwareSoundFollowingActive: Bool?
+    private var pendingFirmwareSoundFollowing: (enabled: Bool, commandID: String)?
+    private var firmwareSoundFollowingRetryAfterNS: UInt64 = 0
     /// L0's auditory orienting lease is deliberately separate from a
     /// cognitive sound-following request. A brief new voice onset can recruit
     /// the device microphone array while no face is visible, but it may never
@@ -4294,7 +4256,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 calibration: externalCalibration
             )
             if helperReady {
-                disableFirmwareSoundFollowing(
+                reconcileFirmwareSoundFollowing(
                     at: monotonicNanoseconds(),
                     reason: "capabilities_ready"
                 )
@@ -4345,16 +4307,36 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             return
         }
         if line.hasPrefix("SOMA_DOA_FOLLOW ") {
-            let enabled = line.contains("enabled=true")
+            let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
+                let pair = part.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { return }
+                result[String(pair[0])] = pair[1]
+            }
+            let enabled = values["enabled"] == "true"
+            let confirmed = values["confirmed"].map { $0 == "true" } ?? true
+            let commandID = values["command_id"].map(String.init)
             let observedNS = monotonicNanoseconds()
-            if enabled {
+            if let pendingFirmwareSoundFollowing,
+               commandID == pendingFirmwareSoundFollowing.commandID {
+                self.pendingFirmwareSoundFollowing = nil
+            }
+            if confirmed {
+                firmwareSoundFollowingActive = enabled
+                firmwareSoundFollowingRetryAfterNS = 0
+            } else {
+                firmwareSoundFollowingActive = nil
+                firmwareSoundFollowingRetryAfterNS = observedNS + 1_000_000_000
+            }
+            if confirmed, enabled {
                 armAuditoryOrientationTrajectory(at: observedNS)
             }
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: observedNS,
                 source: "obsbot_audio_doa",
-                state: enabled ? "device_sound_following_active" : "device_sound_following_disabled",
+                state: confirmed
+                    ? (enabled ? "device_sound_following_active" : "device_sound_following_disabled")
+                    : "device_sound_following_unconfirmed",
                 message: String(line.dropFirst("SOMA_DOA_FOLLOW ".count))
             ))
             return
@@ -4392,7 +4374,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         if line == "SOMA_NATIVE_BRIDGE_READY" {
             guard !helperReady else { return }
             helperReady = true
-            disableFirmwareSoundFollowing(
+            reconcileFirmwareSoundFollowing(
                 at: monotonicNanoseconds(),
                 reason: "bridge_startup"
             )
@@ -4854,9 +4836,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         let now = belief.monotonicNS
         cancelStaleNativeStartIfNeeded(at: now)
-        if reason != "vision_miss", hasRecentObservedFace(at: now) {
+        reconcileFirmwareSoundFollowing(at: now, reason: "attention_state")
+        if reason != "vision_miss", auditoryOrientingProtectedBySocialEngagement {
             stopAuditoryOrienting(
-                state: "visual_face_observed",
+                state: "social_engagement_observed",
                 at: now,
                 resumeExploration: false
             )
@@ -5415,13 +5398,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
-    /// A salient acoustic onset without a visual person is an orienting event,
-    /// not an invitation to begin a conversation. Tiny 3 Lite's firmware updates
-    /// its DOA estimate in the rotating microphone-head frame while it moves,
-    /// so L0 delegates this closed loop instead of treating a head-relative
-    /// bearing as a fixed room coordinate. The lease is short and yields
-    /// immediately to a face, native tracking, or a higher cognitive motor
-    /// lease.
+    /// A salient acoustic onset outside established social engagement is an
+    /// orienting event, not an invitation to begin a conversation. Tiny 3
+    /// Lite's firmware updates its DOA estimate in the rotating microphone-head
+    /// frame while it moves, so L0 delegates this closed loop instead of
+    /// treating a head-relative bearing as a fixed room coordinate. The lease
+    /// is short and always yields to an explicit higher cognitive motor lease.
     func ingestAuditoryOnset(
         levelDB: Double,
         thresholdDB: Double,
@@ -5435,9 +5417,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                   self.deviceCapabilities?.supportsDeviceSoundLocalization == true,
                   self.activeCognitiveMotorRequestID == nil,
                   self.deviceSoundFollowingRequestID == nil,
-                  !self.nativeTrackingActive,
-                  !self.nativeTrackingStartPending,
-                  !self.hasRecentObservedFace(at: monotonicNS) else {
+                  !self.auditoryOrientingProtectedBySocialEngagement else {
                 return
             }
 
@@ -5456,14 +5436,22 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 self.cancelExternalStop()
                 self.sendExternalStop(state: "auditory_orienting_acquired", at: monotonicNS)
             }
-            self.send("doa_follow \(requestID) 1")
+            if self.firmwareSoundFollowingActive == true {
+                self.armAuditoryOrientationTrajectory(at: monotonicNS)
+            } else {
+                self.requestFirmwareSoundFollowing(
+                    enabled: true,
+                    at: monotonicNS,
+                    reason: "auditory_onset"
+                )
+            }
             self.writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNS,
                 source: "obsbot_audio_doa",
                 state: "auditory_orienting_requested",
                 message: String(
-                    format: "request_id=%@; source=audio_onset; level_db=%.1f; threshold_db=%.1f; visual_face=false; lease_ms=4500",
+                    format: "request_id=%@; source=audio_onset; level_db=%.1f; threshold_db=%.1f; social_engagement=false; lease_ms=4500",
                     requestID,
                     levelDB,
                     thresholdDB
@@ -5492,7 +5480,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             self.stopAuditoryOrienting(
                 state: "auditory_orienting_expired",
                 at: monotonicNanoseconds(),
-                resumeExploration: !self.hasRecentObservedFace(at: monotonicNanoseconds())
+                resumeExploration: !self.auditoryOrientingProtectedBySocialEngagement
             )
         }
     }
@@ -5510,7 +5498,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         )
         auditoryOrientingRequestID = nil
         auditoryOrientingGeneration += 1
-        disableFirmwareSoundFollowing(at: monotonicNS, reason: state)
+        reconcileFirmwareSoundFollowing(at: monotonicNS, reason: state)
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNS,
@@ -7167,7 +7155,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 cognitiveMotionMode = .suspended(reason: "firmware_sound_following")
                 stopCognitiveMotion(state: "firmware_sound_following_acquired", at: now, retainLease: true)
                 deviceSoundFollowingRequestID = requestID
-                send("doa_follow \(requestID) 1")
+                requestFirmwareSoundFollowing(
+                    enabled: true,
+                    at: now,
+                    reason: "cognitive_sound_following"
+                )
                 scheduleDeviceSoundFollowingExpiry(requestID: requestID, expiresAtNS: expiresAtNS)
             } else {
                 let activeRequestID = deviceSoundFollowingRequestID
@@ -7296,6 +7288,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 message: "request_id=\(String(requestID.prefix(96)))"
             ))
         }
+        reconcileFirmwareSoundFollowing(at: monotonicNS, reason: "cognitive_motor_acquired")
     }
 
     private func startCognitiveMotionLoop() {
@@ -7810,6 +7803,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             state: "lease_released",
             message: "request_id=\(String((releasedRequestID ?? "none").prefix(96))); reason=\(String(state.prefix(96)))"
         ))
+        reconcileFirmwareSoundFollowing(at: monotonicNS, reason: "cognitive_motor_released")
         scanScheduledForEvidenceGeneration = nil
         scheduleScanAfterContinuousVisualLoss()
     }
@@ -7832,7 +7826,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private func disableDeviceSoundFollowing(state: String, at monotonicNS: UInt64) {
         guard let activeRequestID = deviceSoundFollowingRequestID else { return }
         deviceSoundFollowingRequestID = nil
-        disableFirmwareSoundFollowing(at: monotonicNS, reason: state)
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNS,
@@ -7840,23 +7833,71 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             state: "device_sound_following_released",
             message: "request_id=\(String(activeRequestID.prefix(96))); reason=\(String(state.prefix(96)))"
         ))
+        reconcileFirmwareSoundFollowing(at: monotonicNS, reason: state)
     }
 
     private func disableFirmwareSoundFollowing(at monotonicNS: UInt64, reason: String) {
+        requestFirmwareSoundFollowing(enabled: false, at: monotonicNS, reason: reason)
+    }
+
+    private func requestFirmwareSoundFollowing(
+        enabled: Bool,
+        at monotonicNS: UInt64,
+        reason: String
+    ) {
         guard helperReady,
               process.isRunning,
               deviceCapabilities?.supportsDeviceSoundLocalization == true else {
             return
         }
-        let commandID = nextCommandID(prefix: "doa-disable")
-        send("doa_follow \(commandID) 0")
+        guard monotonicNS >= firmwareSoundFollowingRetryAfterNS else { return }
+        if pendingFirmwareSoundFollowing?.enabled == enabled { return }
+        if pendingFirmwareSoundFollowing == nil,
+           firmwareSoundFollowingActive == enabled {
+            return
+        }
+        let commandID = nextCommandID(prefix: enabled ? "doa-enable" : "doa-disable")
+        pendingFirmwareSoundFollowing = (enabled, commandID)
+        send("doa_follow \(commandID) \(enabled ? 1 : 0)")
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNS,
             source: "obsbot_audio_doa",
-            state: "firmware_sound_following_disabled",
+            state: enabled
+                ? "firmware_sound_following_enable_requested"
+                : "firmware_sound_following_disable_requested",
             message: "reason=\(String(reason.prefix(96))); command_id=\(commandID)"
         ))
+    }
+
+    /// The firmware must be listening before a short sound begins. Its sound
+    /// detector remains armed while L0 is not socially engaged, but yields as
+    /// soon as eye contact, conversation, or another cognitive motor lease
+    /// owns the gimbal.
+    private func reconcileFirmwareSoundFollowing(at monotonicNS: UInt64, reason: String) {
+        guard helperReady,
+              process.isRunning,
+              deviceCapabilities?.supportsDeviceSoundLocalization == true else {
+            return
+        }
+        let explicitSoundLease = deviceSoundFollowingRequestID != nil
+        let orienting = auditoryOrientingRequestID != nil
+        let autonomousStandby = allowsMotorControl
+            && activeCognitiveMotorRequestID == nil
+            && !auditoryOrientingProtectedBySocialEngagement
+        requestFirmwareSoundFollowing(
+            enabled: explicitSoundLease || orienting || autonomousStandby,
+            at: monotonicNS,
+            reason: reason
+        )
+    }
+
+    /// Presence and momentary eye contact do not disable hearing. Only an
+    /// active conversation suppresses autonomous acoustic reorientation; this
+    /// prevents landmark jitter from repeatedly toggling the firmware while
+    /// preserving a stable conversational gaze once a session is established.
+    private var auditoryOrientingProtectedBySocialEngagement: Bool {
+        indicatorInputs.interactionState == .conversation
     }
 
     private func sendCalibrationVelocity(
@@ -9257,7 +9298,7 @@ private final class AudioAnalyzer: @unchecked Sendable {
     private let voiceWorker: AudioVADWorker
     private let speechInteraction: LocalSpeechInteractionCoordinator?
     private let liveVoiceLauncher: AppServerLiveVoiceLauncher?
-    private let auditoryOnsetGate = VoiceActivityGate()
+    private let auditoryOnsetGate = AcousticOnsetGate()
     private let auditoryOnsetHandler: (Double, Double, UInt64) -> Void
     private var rejectedAudioFormatReported = false
 
@@ -9313,17 +9354,18 @@ private final class AudioAnalyzer: @unchecked Sendable {
             continuous: continuous,
             at: now
         )
-        if auditoryOnset.active, auditoryOnset.changed {
+        if auditoryOnset.triggered {
             writer.write(RuntimeEvent(
                 event: "audio.onset",
                 monotonicNS: now,
                 source: "audio_onset",
                 state: "detected",
                 message: String(
-                    format: "level_db=%.1f; threshold_db=%.1f; confidence=%.3f; latency_class=audio_callback",
+                    format: "level_db=%.1f; threshold_db=%.1f; confidence=%.3f; transient=%@; latency_class=audio_callback",
                     audio.levelDB,
                     auditoryOnset.thresholdDB,
-                    auditoryOnset.confidence
+                    auditoryOnset.confidence,
+                    auditoryOnset.transient ? "true" : "false"
                 )
             ))
             auditoryOnsetHandler(audio.levelDB, auditoryOnset.thresholdDB, now)
@@ -9873,6 +9915,7 @@ private struct SystemFaceEvidence: Sendable {
     let pitch: Double?
     let pupilOffsetX: Double?
     let pupilOffsetY: Double?
+    let meanEyeAperture: Double?
     let alignment: FaceAlignmentEvidence
 
     var directedEyeContact: Bool { gazeState == .direct }
@@ -9880,7 +9923,7 @@ private struct SystemFaceEvidence: Sendable {
 
 private final class SystemFaceVerifier: @unchecked Sendable {
     /// Scales the pupil-centering thresholds that decide directed eye contact.
-    /// 1.0 = default (0.68 X / 0.82 Y). Lower = stricter (pupil must be more
+    /// 1.0 = default (0.60 X / 0.50 Y). Lower = stricter (pupil must be more
     /// centered); higher = more lenient.
     private let pupilCenteringThreshold: Double
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
@@ -9981,6 +10024,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
                 pitch: gaze.pitch,
                 pupilOffsetX: gaze.pupilOffsetX,
                 pupilOffsetY: gaze.pupilOffsetY,
+                meanEyeAperture: gaze.meanEyeAperture,
                 alignment: alignment
             )
         }
@@ -9989,7 +10033,7 @@ private final class SystemFaceVerifier: @unchecked Sendable {
     private func refinedGaze(
         in pixelBuffer: CVPixelBuffer,
         faceRect: SOMACore.NormalizedRect
-    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, state: SOMACore.VisualGazeEvidence)? {
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence)? {
         guard let crop = faceCropCGImage(from: pixelBuffer, rect: faceRect) else { return nil }
         let request = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cgImage: crop, options: [:])
@@ -10073,13 +10117,13 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         observation: VNFaceObservation,
         landmarks: VNFaceLandmarks2D,
         rect: SOMACore.NormalizedRect
-    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, state: SOMACore.VisualGazeEvidence) {
+    ) -> (yaw: Double?, pitch: Double?, pupilOffsetX: Double?, pupilOffsetY: Double?, meanEyeAperture: Double?, state: SOMACore.VisualGazeEvidence) {
         let yaw = observation.yaw?.doubleValue
         let pitch = observation.pitch?.doubleValue
         guard rect.centerX >= 0.26, rect.centerX <= 0.74,
               rect.centerY >= 0.13, rect.centerY <= 0.89,
               rect.width * rect.height >= 0.008 else {
-            return (yaw, pitch, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, .unavailable)
         }
 
         // On the Tiny 3 stream Vision supplies yaw consistently, but pitch is
@@ -10087,43 +10131,56 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         // optional feature into a permanent rejection. Direct contact still
         // requires bilateral pupil evidence below.
         guard let yaw else {
-            return (yaw, pitch, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, .unavailable)
         }
         // Vision's yaw is coarse on this camera (roughly 0, 45, and 90
         // degrees). A pronounced head turn is reliable negative evidence;
         // vertical head pose is not available from this device's Vision
         // result and must not be guessed from it.
         if abs(yaw) > 0.65 {
-            return (yaw, pitch, nil, nil, .averted)
+            return (yaw, pitch, nil, nil, nil, .averted)
         }
         guard let leftEye = landmarks.leftEye,
               let rightEye = landmarks.rightEye,
               let leftPupil = landmarks.leftPupil,
               let rightPupil = landmarks.rightPupil else {
-            return (yaw, pitch, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, .unavailable)
         }
         guard let left = pupilOffset(leftPupil, in: leftEye),
               let right = pupilOffset(rightPupil, in: rightEye) else {
-            return (yaw, pitch, nil, nil, .unavailable)
+            return (yaw, pitch, nil, nil, nil, .unavailable)
         }
-        let directed = pupilIsCentered(leftPupil, in: leftEye)
-            && pupilIsCentered(rightPupil, in: rightEye)
+        let leftGeometry = SOMACore.EyeLandmarkGeometry(
+            pupilOffsetX: left.x,
+            pupilOffsetY: left.y,
+            apertureRatio: left.aperture
+        )
+        let rightGeometry = SOMACore.EyeLandmarkGeometry(
+            pupilOffsetX: right.x,
+            pupilOffsetY: right.y,
+            apertureRatio: right.aperture
+        )
+        let state = SOMACore.LandmarkGazeClassifier.classify(
+            yaw: yaw,
+            pitch: pitch,
+            leftEye: leftGeometry,
+            rightEye: rightGeometry,
+            pupilCenteringScale: pupilCenteringThreshold
+        )
         return (
             yaw,
             pitch,
             max(left.x, right.x),
             max(left.y, right.y),
-            // Bilateral pupils were measured successfully. Once that
-            // measurement is outside the direct-contact envelope it is
-            // negative gaze evidence, not a missing measurement.
-            directed ? .direct : .averted
+            (left.aperture + right.aperture) / 2,
+            state
         )
     }
 
     private func pupilOffset(
         _ pupil: VNFaceLandmarkRegion2D,
         in eye: VNFaceLandmarkRegion2D
-    ) -> (x: Double, y: Double)? {
+    ) -> (x: Double, y: Double, aperture: Double)? {
         guard pupil.pointCount > 0, eye.pointCount >= 2 else { return nil }
         let pupilPoint = pupil.normalizedPoints[0]
         var minimumX = Double.greatestFiniteMagnitude
@@ -10142,40 +10199,9 @@ private final class SystemFaceVerifier: @unchecked Sendable {
         guard width > 0.001, height > 0.001 else { return nil }
         return (
             x: abs(Double(pupilPoint.x) - (minimumX + maximumX) / 2) / (width / 2),
-            y: abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2)
+            y: abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2),
+            aperture: height / width
         )
-    }
-
-    private func pupilIsCentered(
-        _ pupil: VNFaceLandmarkRegion2D,
-        in eye: VNFaceLandmarkRegion2D
-    ) -> Bool {
-        guard pupil.pointCount > 0, eye.pointCount >= 2 else { return false }
-        let pupilPoint = pupil.normalizedPoints[0]
-        var minimumX = Double.greatestFiniteMagnitude
-        var maximumX = -Double.greatestFiniteMagnitude
-        var minimumY = Double.greatestFiniteMagnitude
-        var maximumY = -Double.greatestFiniteMagnitude
-        for index in 0..<eye.pointCount {
-            let point = eye.normalizedPoints[index]
-            minimumX = min(minimumX, Double(point.x))
-            maximumX = max(maximumX, Double(point.x))
-            minimumY = min(minimumY, Double(point.y))
-            maximumY = max(maximumY, Double(point.y))
-        }
-        let width = maximumX - minimumX
-        let height = maximumY - minimumY
-        guard width > 0.001, height > 0.001 else { return false }
-        let normalizedX = abs(Double(pupilPoint.x) - (minimumX + maximumX) / 2) / (width / 2)
-        let normalizedY = abs(Double(pupilPoint.y) - (minimumY + maximumY) / 2) / (height / 2)
-        // This is presentation-only evidence. A frontal head alone is not
-        // enough: both measured pupils must be near their eye centres before
-        // SOMA offers a ready-to-speak blink.
-        // The vertical threshold is intentionally tighter than the old 0.82
-        // proxy. It rejects a downward glance at a phone while retaining a
-        // centred pupil from a person looking through the camera.
-        return normalizedX <= 0.60 * pupilCenteringThreshold
-            && normalizedY <= 0.50 * pupilCenteringThreshold
     }
 
 }
@@ -11137,7 +11163,8 @@ private final class VisionWorker: @unchecked Sendable {
                         let pitch = evidence.pitch.map { String(format: "%.3f", $0) } ?? "na"
                         let pupilX = evidence.pupilOffsetX.map { String(format: "%.3f", $0) } ?? "na"
                         let pupilY = evidence.pupilOffsetY.map { String(format: "%.3f", $0) } ?? "na"
-                        return "yaw=\(yaw); pitch=\(pitch); pupil_offset_x=\(pupilX); pupil_offset_y=\(pupilY)"
+                        let aperture = evidence.meanEyeAperture.map { String(format: "%.3f", $0) } ?? "na"
+                        return "yaw=\(yaw); pitch=\(pitch); pupil_offset_x=\(pupilX); pupil_offset_y=\(pupilY); eye_aperture=\(aperture)"
                     } ?? "none"
                     writer.write(RuntimeEvent(
                         event: "source.health",
@@ -12064,7 +12091,7 @@ private func run(_ options: Options) throws {
             model: model,
             wakeMinimumScore: somaEnvDouble("SOMA_L0_E2B_WAKE_SCORE", default: 0.65),
             wakeMinimumConfidence: somaEnvDouble("SOMA_L0_E2B_WAKE_CONFIDENCE", default: 0.55),
-            wakeRepeatIntervalMilliseconds: UInt64(somaEnvDouble("SOMA_L0_E2B_WAKE_INTERVAL_MS", default: 5_000)),
+            semanticRefreshIntervalMilliseconds: UInt64(somaEnvDouble("SOMA_L0_E2B_WAKE_INTERVAL_MS", default: 5_000)),
             onHealth: { state, message in
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -12650,22 +12677,6 @@ private func run(_ options: Options) throws {
                     state: "input_transcript_ready",
                     message: "characters=\(min(characters, 65_535)); transcript_trace=false; local_archive=on_final"
                 ))
-            case let .acousticEchoRejected(characters):
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "acoustic_echo_rejected",
-                    message: "characters=\(min(characters, 65_535)); session_terminated=true"
-                ))
-            case let .localAcousticEchoSuppressed(characters):
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "local_acoustic_echo_suppressed",
-                    message: "characters=\(min(characters, 65_535)); transcript_not_sent=true"
-                ))
             case let .transcriptFinalized(threadID, role, text):
                 if role == .user {
                     // A finalized user transcript is the first reliable proof
@@ -12830,47 +12841,6 @@ private func run(_ options: Options) throws {
     let l1EmbodimentRelay = L1EmbodimentToolRelay()
     defer { l1EmbodimentRelay.stop() }
     let l1EmbodimentTools = L1EmbodimentToolGateway(relay: l1EmbodimentRelay)
-    let l1ToolDefinitions: [OllamaToolDefinition] = [
-        .init(function: .init(name: "get_person_context", description: "Read the stored context, rapport, and preferences for a person (needs entity_id). Use when you need to recall who this person is before deciding how to engage.", parameters: .init(properties: [
-            "entity_id": .init(type: "string", description: "The person's entity_id from present_entity_ids"),
-            "reason": .init(type: "string", description: "Why you are calling this tool")
-        ], required: ["entity_id", "reason"]))),
-        .init(function: .init(name: "add_memory_fact", description: "Store an observed fact about a person (needs entity_id and fact). Use only for a concrete, new observation worth remembering.", parameters: .init(properties: [
-            "entity_id": .init(type: "string", description: "The person's entity_id"),
-            "fact": .init(type: "string", description: "The observed fact to remember"),
-            "reason": .init(type: "string", description: "Why you are recording this fact")
-        ], required: ["entity_id", "fact", "reason"]))),
-        .init(function: .init(name: "recall_episodes", description: "Recall past conversation episodes relevant to a query (optionally scoped to one person via entity_id). Use when you need to remember what was discussed with this person before, or to ground an opening in shared history.", parameters: .init(properties: [
-            "query": .init(type: "string", description: "What you want to remember (topic, person, event)"),
-            "entity_id": .init(type: "string", description: "Optional person entity ID to scope the recall"),
-            "reason": .init(type: "string", description: "Why you are recalling past episodes")
-        ], required: ["query", "reason"]))),
-        .init(function: .init(name: "set_space_owner", description: "Declare that the person identified by entity_id is the owner of the current home space. Call when you learn (from conversation or context) who owns this place. This promotes all recognized objects that are currently bound to the home space into that person's durable taste profile.", parameters: .init(properties: [
-            "entity_id": .init(type: "string", description: "The person's entity_id (from present_entity_ids) who owns this space"),
-            "reason": .init(type: "string", description: "Why you are declaring this person as the space owner")
-        ], required: ["entity_id", "reason"]))),
-        .init(function: .init(name: "space_status", description: "Report whether the home space owner has been learned and how many recognized objects are still bound to the space awaiting owner promotion.", parameters: .init(properties: [
-            "reason": .init(type: "string", description: "Why you are checking the space status")
-        ], required: ["reason"]))),
-        .init(function: .init(name: "get_information_needs", description: "List the pending (unresolved) information the robot still wants to acquire — e.g. the person's preferred name or an enduring interest/hobby. Pass entity_id to scope to the current person, or omit to see all. Treat these as an acquisition mission in conversation.", parameters: .init(properties: [
-            "entity_id": .init(type: "string", description: "Optional person entity_id to scope the pending needs"),
-            "reason": .init(type: "string", description: "Why you are fetching pending information needs")
-        ], required: ["reason"]))),
-        .init(function: .init(name: "resolve_information_need", description: "Mark an information need as resolved once you acquire the information in conversation. Optionally supply the acquired fact to persist to the person's durable profile.", parameters: .init(properties: [
-            "motive_id": .init(type: "string", description: "The motive_id returned by get_information_needs"),
-            "acquired_fact": .init(type: "string", description: "Optional: the concrete fact you learned, e.g. their preferred name or a hobby"),
-            "reason": .init(type: "string", description: "Why you are resolving this information need")
-        ], required: ["motive_id", "reason"]))),
-        .init(function: .init(name: "web_search", description: "Search the web and return recent snippets. Use when you are genuinely curious about a topic or need current information relevant to an opening — not for facts the packet already has.", parameters: .init(properties: [
-            "query": .init(type: "string", description: "The search query"),
-            "max_results": .init(type: "string", description: "Max results (1-10, default 5)"),
-            "reason": .init(type: "string", description: "Why you are searching the web")
-        ], required: ["query", "reason"]))),
-        .init(function: .init(name: "web_fetch", description: "Fetch the main content of a single web page by URL (needs a url from web_search). Use to read deeper into a topic you already found.", parameters: .init(properties: [
-            "url": .init(type: "string", description: "The URL to fetch"),
-            "reason": .init(type: "string", description: "Why you are fetching this page")
-        ], required: ["url", "reason"])))
-    ] + l1EmbodimentTools.definitions
     let l1ToolExecutor: @Sendable (String, String) -> String = { [l1EmbodimentTools] name, arguments in
         if let result = l1EmbodimentTools.execute(name: name, arguments: arguments) {
             return result
@@ -12957,7 +12927,7 @@ private func run(_ options: Options) throws {
         ))
     }
     do {
-        let l1ThoughtStream = try L1PresenceThoughtStream(
+        let l1ThoughtStream = try PersistentConsciousnessStream(
             memoryContext: l1MemoryContext,
             runtimeContext: {
                 let nowNS = monotonicNanoseconds()
@@ -13042,32 +13012,8 @@ private func run(_ options: Options) throws {
                     )
                 }
             },
-            onSituationFrame: { request, frame, completedNS in
-                let action = frame.socialDecision?.action.rawValue ?? "no_social_action"
-                let recordedNS = monotonicNanoseconds()
-                writer.write(RuntimeEvent(
-                    event: "l1.situation",
-                    monotonicNS: recordedNS,
-                    source: "gemma4_31b_cloud",
-                    state: "frame",
-                    message: "cycle=\(request.cycleID.uuidString.lowercased()); action=\(action); uncertainty=\(String(format: "%.2f", frame.uncertainty))"
-                ))
-                liveDiagnostics.recordL1Event(
-                    state: "frame",
-                    message: l1DiagnosticMessage(for: frame, action: action, mode: "social"),
-                    at: recordedNS
-                )
-                if let reflection = l1ReflectionMessage(for: frame) {
-                    liveDiagnostics.recordL1Event(
-                        state: "reflection",
-                        message: reflection,
-                        at: recordedNS
-                    )
-                }
-            },
-            onFrame: { request, frame, presence, completedNS in
-                guard let opportunity = request.socialOpportunity,
-                      let decision = frame.socialDecision else { return }
+            onSocialDecision: { request, decision, presence, completedNS in
+                guard let opportunity = request.socialOpportunity else { return false }
                 guard !l1LiveConversationState.snapshot().conversationActive else {
                     writer.write(RuntimeEvent(
                         event: "source.health",
@@ -13076,7 +13022,7 @@ private func run(_ options: Options) throws {
                         state: "decision_suppressed",
                         message: "live_conversation_active"
                     ))
-                    return
+                    return false
                 }
                 do {
                     try L1SocialDecisionValidator().validate(
@@ -13093,9 +13039,9 @@ private func run(_ options: Options) throws {
                         state: "decision_rejected",
                         message: String(error.localizedDescription.prefix(192))
                     ))
-                    return
+                    return false
                 }
-                guard decision.action != .remainSilent else { return }
+                guard decision.action != .remainSilent else { return true }
                 guard identityPresence.hasCurrentParticipant(decision.entityID) else {
                     writer.write(RuntimeEvent(
                         event: "source.health",
@@ -13104,10 +13050,13 @@ private func run(_ options: Options) throws {
                         state: "opening_suppressed",
                         message: "participant_no_longer_present"
                     ))
-                    return
+                    return false
                 }
-                if decision.action == .spokenOpening,
-                   somaEnvBool("SOMA_L2_PROACTIVE_OPENINGS", default: true) {
+                if decision.action == .spokenOpening {
+                    guard somaEnvBool("SOMA_L2_PROACTIVE_OPENINGS", default: true),
+                          liveVoiceLauncher != nil else {
+                        return false
+                    }
                     guard let opening = L1PurposefulOpeningGate.resolve(
                         decision: decision,
                         informationNeeds: request.informationNeeds
@@ -13119,7 +13068,7 @@ private func run(_ options: Options) throws {
                             state: "opening_suppressed",
                             message: "closed_purpose_required"
                         ))
-                        return
+                        return false
                     }
                     let interactionAuthority = identityPresence.authority(for: decision.entityID)
                     let sessionCapability = liveSessionCapabilities.issue(
@@ -13147,7 +13096,7 @@ private func run(_ options: Options) throws {
                             state: "context_rejected",
                             message: "proactive_interaction_context_invalid"
                         ))
-                        return
+                        return false
                     }
                     // L1 owns social initiation and transfers directly to the
                     // conversation runtime. L0 may mirror the outcome through
@@ -13185,6 +13134,7 @@ private func run(_ options: Options) throws {
                         at: completedNS
                     )
                 }
+                return true
             },
             currentPresenceValidator: { entityID, completedNS in
                 identityPresence.hasCurrentParticipant(entityID)
@@ -13192,8 +13142,8 @@ private func run(_ options: Options) throws {
             behaviorContextProvider: { [weak attentionGimbalBridge] in
                 attentionGimbalBridge?.makeBehaviorContext(at: monotonicNanoseconds())
             },
-            onBehaviorDirective: { [weak attentionGimbalBridge] directive, origin, atNS in
-                switch directive.action {
+            onAttentionAction: { [weak attentionGimbalBridge] action, _, atNS in
+                switch action {
                 case .resumeScanning, .seekPeople:
                     // Periodic L1 awareness is advisory: a verified L0 face
                     // lock is fresher motor evidence and must not be released
@@ -13201,50 +13151,25 @@ private func run(_ options: Options) throws {
                     // Explicit L1/L2 embodiment requests use their dedicated
                     // authority path instead of this passive callback.
                     if attentionGimbalBridge?.hasVerifiedFaceLock(at: atNS) == true {
-                        let originName: String
-                        switch origin {
-                        case .awareness:
-                            originName = "awareness"
-                        case .auxiliaryWake:
-                            originName = "auxiliary_wake"
-                        }
                         writer.write(RuntimeEvent(
                             event: "source.health",
                             monotonicNS: atNS,
                             source: "l1_situation",
-                            state: "behavior_directive_deferred",
-                            message: "origin=\(originName); reason=verified_face_lock"
+                            state: "action_held",
+                            message: "action=\(action.rawValue); reason=verified_face_lock"
                         ))
-                        return
+                        return false
                     }
                     attentionGimbalBridge?.resumeCoverageScan(priority: .l1)
+                    return attentionGimbalBridge != nil
                 case .acknowledgePerson:
                     attentionGimbalBridge?.acknowledgePersonIfEligible(at: atNS)
-                case .keepObserving, .none:
-                    break
+                    return attentionGimbalBridge != nil
+                case .noAction, .nonverbalInvitation, .spokenOpening, .inspectAttentionTarget:
+                    return false
                 }
             },
-            onBehaviorThought: { frame, atNS in
-                liveDiagnostics.recordL1Event(
-                    state: "thought",
-                    message: l1DiagnosticMessage(for: frame, mode: "behavior_awareness"),
-                    at: atNS
-                )
-                if let reflection = l1ReflectionMessage(for: frame) {
-                    liveDiagnostics.recordL1Event(
-                        state: "reflection",
-                        message: reflection,
-                        at: atNS
-                    )
-                }
-            },
-            toolDefinitions: l1ToolDefinitions,
             toolExecutor: l1ToolExecutor,
-            toolVisualResourceProvider: { toolName in
-                toolName == "capture_target_view"
-                    ? l1EmbodimentTools.consumeCaptureVisual()
-                    : []
-            },
             onCuriosityNeeds: { needs in
                 l1CuriosityCollector.registerTopics(from: needs)
             },
@@ -13258,9 +13183,8 @@ private func run(_ options: Options) throws {
             }
         )
         l1ThoughtRelay.install(l1ThoughtStream)
-        // E2B's wake proposals are buffered in the relay (the interrupt closure
-        // runs before the L1 stream exists) and forwarded here once the stream is
-        // up, so the primary L1 cycle can accept or revise each proposal.
+        // The relay may buffer E2B evidence until the workspace is ready. The
+        // evidence still passes through semantic reduction before any L1a call.
         auxiliaryWakeRelay.attach { [weak l1ThoughtStream] interrupt in
             l1ThoughtStream?.wakeFromAuxiliary(interrupt)
         }
@@ -14432,7 +14356,7 @@ private func l2IdentityReference(
 }
 
 private func l1ProactiveInteractionContext(
-    request: L1SituationRequest,
+    request: L1ExecutiveRequest,
     decision: L1SocialDecision,
     purpose: L1PurposefulOpening,
     languageStartInstruction: String?,
@@ -14443,10 +14367,7 @@ private func l1ProactiveInteractionContext(
     let objective = "Conversation objective: \(purpose.objective)"
     let completion = "Conversation completion condition: \(purpose.completionCondition)"
     let situation = "L1 has opened a brief conversation. The private objective and completion condition are the only proactive reason."
-    let identityScope = request.beliefSummary.localizedCaseInsensitiveContains("pseudonymous")
-        ? "locally pseudonymous recurring person; no name or biometric material is available"
-        : "locally recognized person; do not infer an identity beyond supplied context"
-    let identity = "\(identityScope). Person context is available only through the supplied local MCP reference."
+    let identity = "Locally recognized conversation participant; do not infer an identity beyond supplied context. Person context is available only through the supplied local MCP reference."
     let rapport: String
     if let value = request.rapport {
         rapport = String(
@@ -14481,7 +14402,7 @@ private func l1ProactiveInteractionContext(
         activeTaskSummaries: [objective, completion]
             + (language.map { [$0] } ?? [])
             + (preferences.map { [$0] } ?? []),
-        memorySummaries: request.memory.map(\.summary) + request.recalledEpisodes,
+        memorySummaries: request.memorySummaries + request.recalledEpisodes,
         embodimentSummary: "L0 is maintaining visual attention while L2 leads the interaction. Do not issue camera-control instructions as part of ordinary conversation."
     )
 }

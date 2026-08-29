@@ -7,6 +7,7 @@ import SwiftUI
 /// `LiveDiagnosticsWriter` emits while the panel is open. One manifest names
 /// the image and detections from the same capture, so the panel never overlays
 /// a delayed inference on a newer image.
+@MainActor
 final class SOMADiagnosticsModel: ObservableObject {
     struct Rect: Decodable, Sendable {
         let x: Double
@@ -38,52 +39,73 @@ final class SOMADiagnosticsModel: ObservableObject {
         }
 
         let monotonicNS: UInt64
+        let recordedAtEpochMS: Int64?
         let state: String
         let message: String
         // One L1 completion emits both a compact decision and its reflection
         // at the same monotonic instant.  The time alone therefore is not a
         // valid SwiftUI list identity: duplicate IDs make LazyVStack reuse the
-        // wrong card and can leave an apparent blank gap before the following
-        // behavior proposal.
+        // wrong row and can leave an apparent blank gap before the next event.
         var id: String { "\(monotonicNS):\(state):\(message)" }
+
+        var timeLabel: String {
+            guard let recordedAtEpochMS else { return "--:--:--.---" }
+            let seconds = TimeInterval(recordedAtEpochMS) / 1_000
+            let date = Date(timeIntervalSince1970: seconds)
+            let components = Calendar.current.dateComponents(
+                [.hour, .minute, .second],
+                from: date
+            )
+            let milliseconds = Int(recordedAtEpochMS % 1_000)
+            return String(
+                format: "%02d:%02d:%02d.%03d",
+                components.hour ?? 0,
+                components.minute ?? 0,
+                components.second ?? 0,
+                milliseconds
+            )
+        }
 
         var presentation: Presentation {
             switch state {
-            case "configured":
-                return .init(category: "L1 STATUS", title: "Situation model ready", detail: "Memory and visual context are available.")
-            case "wake":
-                let cause = value(for: "cause")
-                let title: String
-                switch cause {
-                case "recognized_person": title = "Recognized person triggered deliberation"
-                case "behavior_awareness": title = "Reviewing current attention state"
-                case "auxiliary_wake": title = "Reconsidering a visual event"
-                case "temporal_context": title = "Reconsidering an evolving situation"
-                default: title = "Reviewing a new situation"
-                }
-                return .init(category: "L1 WAKE", title: title, detail: "Comparing relationship memory with the current scene.")
-            case "deliberating":
-                return .init(category: "L1 PROCESSING", title: "Interpreting situation and memory", detail: "Comparing current evidence with accumulated context.")
-            case "model_response_received":
-                return .init(category: "L1 RESPONSE", title: "Model judgment received", detail: "Checking evidence, schema, and authority.")
-            case "tool_call":
-                return .init(category: "L1 TOOL", title: "Reviewing a context request", detail: "Checking request scope and authority.")
-            case "tool_round":
-                return .init(category: "L1 TOOL", title: "Interpreting tool results", detail: "Folding new context into the next judgment.")
-            case "completed":
-                let uncertainty = value(for: "uncertainty").flatMap(Double.init)
-                let detail = uncertainty.map { "Situation uncertainty: \(Int(($0 * 100).rounded()))%" } ?? "Applied the current situation judgment."
-                return .init(category: "L1 COMPLETE", title: "Situation judgment applied", detail: detail)
-            case "failed":
-                return .init(category: "L1 FAILED", title: "Current judgment not applied", detail: "The next cycle will retry after a model or validation failure.")
-            case "frame":
-                return .init(category: "SOCIAL DECISION", title: socialDecisionTitle, detail: humanizedThought(message))
-            case "thought":
-                return .init(category: "BEHAVIOR DECISION", title: "Current attention and next action", detail: humanizedThought(message))
-            case "reflection":
-                return .init(category: "L1 REFLECTION", title: "Continuous situational thought", detail: message)
-            case "behavior_directive":
-                return .init(category: "BEHAVIOR PROPOSAL", title: humanizedDirective(value(for: "action") ?? "none"), detail: "L0 may execute only within current perception and safety conditions.")
+            case "workspace_ready":
+                return .init(category: "MENTAL WORKSPACE", title: "Persistent consciousness ready", detail: message)
+            case "workspace_created":
+                return .init(category: "MENTAL WORKSPACE", title: "Started a new mental workspace", detail: message)
+            case "workspace_restored":
+                return .init(category: "MENTAL WORKSPACE", title: "Restored durable mental state", detail: "Hypotheses, curiosity, and intentions were restored. Presence and gaze require new evidence.")
+            case "evidence":
+                return .init(category: "EVIDENCE", title: evidenceTitle, detail: trailingValue(for: "summary") ?? readableMetadata(excluding: ["summary"]))
+            case "state_delta":
+                return .init(category: "STATE DELTA", title: "Workspace revision evaluated", detail: readableMetadata())
+            case "hypothesis_created":
+                return .init(category: "HYPOTHESIS", title: "Created a grounded hypothesis", detail: trailingValue(for: "text") ?? readableMetadata())
+            case "hypothesis_updated", "hypothesis_active":
+                return .init(category: "HYPOTHESIS", title: "Updated hypothesis support", detail: trailingValue(for: "text") ?? readableMetadata())
+            case "hypothesis_dormant":
+                return .init(category: "HYPOTHESIS", title: "Hypothesis became dormant", detail: trailingValue(for: "text") ?? readableMetadata())
+            case "hypothesis_abandoned":
+                return .init(category: "SELF-CORRECTION", title: "Abandoned an unsupported hypothesis", detail: trailingValue(for: "text") ?? readableMetadata())
+            case "hypothesis_resolved":
+                return .init(category: "HYPOTHESIS", title: "Resolved a hypothesis", detail: trailingValue(for: "text") ?? readableMetadata())
+            case "thought_wake":
+                return .init(category: "L1A WAKE", title: "Reflection requested", detail: readableMetadata())
+            case "model_started":
+                return .init(category: "MODEL", title: "Gemma reasoning started", detail: readableMetadata())
+            case "foreground_thought":
+                return .init(category: "FOREGROUND THOUGHT", title: foregroundTitle, detail: trailingValue(for: "text") ?? "")
+            case "executive_wake":
+                return .init(category: "L1B WAKE", title: "Action pressure reached the executive", detail: readableMetadata())
+            case "executive_decision":
+                return .init(category: "EXECUTIVE DECISION", title: humanizedExecutiveAction(value(for: "action") ?? "no_action"), detail: trailingValue(for: "rationale") ?? readableMetadata())
+            case "action_applied":
+                return .init(category: "APPLIED", title: humanizedExecutiveAction(value(for: "action") ?? "no_action"), detail: trailingValue(for: "rationale") ?? "Current L0 and social authority accepted the decision.")
+            case "action_held", "executive_held", "thought_held":
+                return .init(category: "HELD", title: "Result was not applied", detail: trailingValue(for: "reason") ?? readableMetadata())
+            case "model_retry":
+                return .init(category: "MODEL", title: "Retrying a malformed or failed response", detail: trailingValue(for: "reason") ?? readableMetadata())
+            case "model_failed":
+                return .init(category: "MODEL FAILED", title: "Reasoning result unavailable", detail: trailingValue(for: "reason") ?? readableMetadata())
             case "l1_memory_proposals":
                 let count = value(for: "count").flatMap(Int.init) ?? 0
                 return .init(category: "MEMORY", title: "Reviewing memory candidates", detail: "Memory candidates to review: \(max(0, count))")
@@ -102,13 +124,15 @@ final class SOMADiagnosticsModel: ObservableObject {
             }
         }
 
-        private var socialDecisionTitle: String {
-            switch value(for: "action") {
-            case "spoken_opening": return "Considering a purposeful conversation opening"
-            case "nonverbal_invitation": return "Considering a nonverbal invitation"
-            case "remain_silent": return "Remaining quietly observant"
-            default: return "Updating social judgment"
-            }
+        private var evidenceTitle: String {
+            let kind = value(for: "kind")?.replacingOccurrences(of: "_", with: " ") ?? "observation"
+            return kind.prefix(1).uppercased() + kind.dropFirst()
+        }
+
+        private var foregroundTitle: String {
+            let channel = value(for: "channel")?.replacingOccurrences(of: "_", with: " ") ?? "thought"
+            let continuity = value(for: "continuity")?.replacingOccurrences(of: "_", with: " ") ?? "update"
+            return "\(channel.capitalized) · \(continuity)"
         }
 
         private func value(for key: String) -> String? {
@@ -117,6 +141,27 @@ final class SOMADiagnosticsModel: ObservableObject {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { $0.hasPrefix("\(key)=") }
                 .map { String($0.dropFirst(key.count + 1)) }
+        }
+
+        /// Model prose is always the last named field. Read the complete tail
+        /// so punctuation inside the original English text is not truncated.
+        private func trailingValue(for key: String) -> String? {
+            guard let range = message.range(of: "\(key)=") else { return nil }
+            let value = message[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : String(value)
+        }
+
+        private func humanizedExecutiveAction(_ action: String) -> String {
+            switch action {
+            case "no_action": "No external action"
+            case "nonverbal_invitation": "Offer a nonverbal invitation"
+            case "spoken_opening": "Open a purposeful conversation"
+            case "resume_scanning": "Resume active exploration"
+            case "seek_people": "Search for people"
+            case "acknowledge_person": "Acknowledge the current person"
+            case "inspect_attention_target": "Inspect the current attention target"
+            default: action.replacingOccurrences(of: "_", with: " ").capitalized
+            }
         }
 
         private func readableMetadata(excluding keys: Set<String> = []) -> String {
@@ -130,75 +175,6 @@ final class SOMADiagnosticsModel: ObservableObject {
             return items.isEmpty ? "No additional detail" : String(items.joined(separator: " · ").prefix(600))
         }
 
-        private func humanizedThought(_ text: String) -> String {
-            let parts = text
-                .split(separator: "·", omittingEmptySubsequences: true)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .compactMap(humanizedThoughtField)
-            return parts.isEmpty ? "No decision variables" : parts.joined(separator: " · ")
-        }
-
-        private func humanizedThoughtField(_ field: String) -> String? {
-            let pair = field.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            guard pair.count == 2 else { return field }
-            let key = String(pair[0])
-            let value = String(pair[1])
-            switch key {
-            case "mode":
-                return nil
-            case "action":
-                return "Decision: \(humanizedAction(value))"
-            case "directive":
-                return "Action: \(humanizedDirective(value))"
-            case "uncertainty":
-                return percentage(value, label: "Situation uncertainty")
-            case "social_availability":
-                return percentage(value, label: "Social availability")
-            case "curiosity_pressure":
-                return percentage(value, label: "Curiosity pressure")
-            case "interruption_cost":
-                return percentage(value, label: "Interruption cost")
-            case "relationship_uncertainty":
-                return percentage(value, label: "Relationship uncertainty")
-            default:
-                return field
-            }
-        }
-
-        private func percentage(_ value: String, label: String) -> String {
-            guard let scalar = Double(value) else { return "\(label): \(value)" }
-            return "\(label): \(Int((scalar * 100).rounded()))%"
-        }
-
-        private func humanizedAction(_ action: String) -> String {
-            switch action {
-            case "remain_silent": return "Remain quietly observant"
-            case "nonverbal_invitation": return "Nonverbal invitation"
-            case "spoken_opening": return "Open conversation"
-            default: return action.replacingOccurrences(of: "_", with: " ")
-            }
-        }
-
-        private func humanizedDirective(_ action: String) -> String {
-            switch action {
-            case "keep_observing": "Keep observing"
-            case "resume_scanning": "Resume scanning"
-            case "seek_people": "Seek people"
-            case "acknowledge_person": "Briefly acknowledge person"
-            default: "No new action"
-            }
-        }
-
-        private func humanizedFailure(_ text: String) -> String {
-            text
-                .replacingOccurrences(of: "reason=", with: "Reason: ")
-                .replacingOccurrences(of: "details=", with: "Details: ")
-                .replacingOccurrences(of: "invalid_response", with: "Model response schema mismatch")
-                .replacingOccurrences(of: "deadline_exceeded", with: "Response deadline exceeded")
-                .replacingOccurrences(of: "unavailable", with: "Model connection unavailable")
-                .prefix(800)
-                .description
-        }
     }
 
     private struct FileStamp: Equatable {
@@ -212,17 +188,14 @@ final class SOMADiagnosticsModel: ObservableObject {
     @Published var thoughts: [Thought] = []
     @Published var captureLagSeconds: Double = 0
 
-    /// The diagnostic panel deliberately exposes curated cognitive cards rather
-    /// than its raw runtime JSON. Copy the same presentation that is on screen
-    /// so a shared report cannot accidentally contain hidden fields.
+    /// Copy exactly the compact, human-readable stream shown in the panel.
     var displayedThoughtLog: String {
         thoughts
             .map { thought in
                 let presentation = thought.presentation
-                return [presentation.category, presentation.title, presentation.detail]
-                    .joined(separator: " · ")
+                return "\(thought.timeLabel)  \(presentation.category)  \(presentation.title) · \(presentation.detail)"
             }
-            .joined(separator: "\n\n")
+            .joined(separator: "\n")
     }
 
     private let manifestURL: URL
@@ -230,7 +203,7 @@ final class SOMADiagnosticsModel: ObservableObject {
     private let thoughtsURL: URL
     private var timer: Timer?
     /// Max log lines kept in memory for the panel.
-    private let maxThoughts = 300
+    private let maxThoughts = 3_000
     private var manifestStamp: FileStamp?
     private var thoughtsStamp: FileStamp?
 
@@ -244,7 +217,9 @@ final class SOMADiagnosticsModel: ObservableObject {
         stop()
         refresh()
         let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
-            self?.refresh()
+            Task { @MainActor in
+                self?.refresh()
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
@@ -323,38 +298,18 @@ final class SOMADiagnosticsModel: ObservableObject {
     }
 
     private func loadThoughts() -> [Thought] {
-        // Read only the tail of the file instead of the whole (potentially
-        // large) log on every refresh.
+        // The runtime owns a bounded 3,000-event ring and atomically rewrites
+        // this snapshot. Reading the complete bounded file guarantees that an
+        // unusually long monologue cannot reduce the visible event count.
         let decoder = JSONDecoder()
-        return tail(of: thoughtsURL, bytes: 128 * 1024, lines: maxThoughts)
+        guard let data = try? Data(contentsOf: thoughtsURL, options: .mappedIfSafe),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").suffix(maxThoughts)
             .compactMap { line in
-                guard let data = line.data(using: .utf8),
+                guard let data = String(line).data(using: .utf8),
                       let thought = try? decoder.decode(Thought.self, from: data) else { return nil }
                 return thought
             }
-    }
-
-    /// Returns the last `lines` complete lines from the tail of the file,
-    /// reading at most `bytes` from the end so cost stays bounded regardless
-    /// of how large the log has grown.
-    private func tail(of url: URL, bytes: Int, lines: Int) -> [String] {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        // Guard against UInt64 underflow when the file is smaller than `bytes`.
-        let readOffset = size > UInt64(bytes) ? size - UInt64(bytes) : 0
-        try? handle.seek(toOffset: readOffset)
-        guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        let raw = text.split(separator: "\n", omittingEmptySubsequences: false)
-        // Drop the first line if we started mid-line.
-        let complete: [Substring]
-        if readOffset == 0 {
-            complete = Array(raw)
-        } else {
-            complete = Array(raw.dropFirst())
-        }
-        return complete.suffix(lines).map(String.init)
     }
 }
 
@@ -501,30 +456,27 @@ struct SOMADiagnosticsView: View {
     private var thoughtLog: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(model.thoughts.enumerated()), id: \.element.id) { _, thought in
                         let presentation = thought.presentation
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack(spacing: 7) {
-                                Text(presentation.category)
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .foregroundStyle(color(for: thought.state))
-                                Text(presentation.title)
-                                    .font(.system(size: 12, weight: .medium))
-                                Spacer(minLength: 0)
-                            }
-                            Text(presentation.detail)
-                                .font(.system(size: 11))
-                                .textSelection(.enabled)
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(thought.timeLabel)
                                 .foregroundStyle(.secondary)
+                                .frame(width: 86, alignment: .trailing)
+                            Text(presentation.category)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(color(for: thought.state))
+                                .frame(width: 118, alignment: .leading)
+                            Text("\(presentation.title) · \(presentation.detail)")
+                                .textSelection(.enabled)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(color(for: thought.state).opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                        .padding(.horizontal, 4)
-                            .id(thought.id)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .contentShape(Rectangle())
+                        .id(thought.id)
                     }
                 }
             }
@@ -564,10 +516,11 @@ struct SOMADiagnosticsView: View {
 
     private func color(for state: String) -> Color {
         switch state {
-        case "wake": .blue
-        case "deliberating": .orange
-        case "completed": .green
-        case "discarded", "decision_rejected", "opening_suppressed": .red
+        case "thought_wake", "executive_wake": .blue
+        case "model_started", "model_retry": .orange
+        case "foreground_thought", "action_applied": .green
+        case "model_failed", "action_held", "executive_held", "thought_held",
+             "discarded", "decision_rejected", "opening_suppressed": .red
         default: .primary
         }
     }

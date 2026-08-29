@@ -85,62 +85,6 @@ public struct LiveVoiceSessionInactivityGate: Equatable, Sendable {
     }
 }
 
-/// Detects the narrow failure mode where SOMA's own rendered speech is picked
-/// up by the camera microphone and returned by the realtime service as a user
-/// transcript.  It deliberately compares only complete, substantial text from
-/// the immediately preceding assistant turn; ordinary short acknowledgements
-/// and a participant's independent reply remain admissible.
-public struct LiveVoiceTranscriptEchoGuard: Sendable {
-    private struct AssistantTurn: Sendable {
-        let normalizedText: String
-        let observedNS: UInt64
-    }
-
-    private let maximumAgeNS: UInt64
-    private let minimumComparableCharacters: Int
-    private var lastAssistantTurn: AssistantTurn?
-
-    public init(
-        maximumAgeMilliseconds: UInt64 = 12_000,
-        minimumComparableCharacters: Int = 8
-    ) {
-        precondition(maximumAgeMilliseconds > 0)
-        precondition(minimumComparableCharacters > 0)
-        maximumAgeNS = maximumAgeMilliseconds * 1_000_000
-        self.minimumComparableCharacters = minimumComparableCharacters
-    }
-
-    public mutating func recordAssistantTranscript(_ text: String, at monotonicNS: UInt64) {
-        let normalized = Self.normalize(text)
-        guard normalized.count >= minimumComparableCharacters else { return }
-        lastAssistantTurn = AssistantTurn(normalizedText: normalized, observedNS: monotonicNS)
-    }
-
-    public mutating func rejectsUserTranscript(_ text: String, at monotonicNS: UInt64) -> Bool {
-        guard let lastAssistantTurn,
-              monotonicNS >= lastAssistantTurn.observedNS,
-              monotonicNS - lastAssistantTurn.observedNS <= maximumAgeNS else {
-            if let lastAssistantTurn, monotonicNS >= lastAssistantTurn.observedNS {
-                self.lastAssistantTurn = nil
-            }
-            return false
-        }
-        let normalized = Self.normalize(text)
-        guard normalized.count >= minimumComparableCharacters else {
-            return false
-        }
-        guard normalized == lastAssistantTurn.normalizedText else { return false }
-        self.lastAssistantTurn = nil
-        return true
-    }
-
-    private static func normalize(_ text: String) -> String {
-        String(text.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
-            .lowercased()
-    }
-
-}
-
 /// Keeps microphone turns from being assembled out of the assistant's own
 /// rendered audio. The short trailing interval lets the microphone settle
 /// after output playback ends without turning normal silence into a user turn.

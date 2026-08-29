@@ -12,7 +12,8 @@ not imply that a language model is part of the real-time control loop.
 | Layer | Primary implementation | Responsibility | Authority |
 | --- | --- | --- | --- |
 | L0 subconscious | Local Core ML, temporal fusion, and deterministic control | Continuous perception, target continuity, VAD, spatial coverage, immediate motor control, and interaction-readiness evidence | Sole executor of hard real-time SDK commands and physical vetoes; supplies autonomous behaviour when no cognitive lease is active |
-| L1 conscious stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Active situational context, memory-conditioned interpretation, curiosity, social hypotheses, and goal-level attention | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends SDK velocity directly |
+| L1a persistent thought stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Evidence-grounded hypothesis maintenance, memory association, curiosity, self-correction, intentions, and foreground-thought competition | May request bounded visual context and form an abstract intention; cannot speak or control the gimbal |
+| L1b executive judgment | A separate call to the same `gemma4:31b-cloud` route | Decides whether one current intention should become one currently permitted social or attention action | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends SDK velocity directly |
 | L2 human interaction and executive reasoning | Codex account session with app-server GPT-Live WebRTC; explicit local fallback | Conversation, high-order reasoning, tool use, coding, and user-requested work | Opens directly from authorized L0 contact evidence, or from an L1-approved proactive opening; neither route waits on the other. It receives scoped text context, may pull image context through Codex/MCP, and uses leased embodiment goals when observation or expression is needed |
 
 The fast 31B cloud route is the primary L1 stream and may run frequently while
@@ -20,79 +21,105 @@ human or task context is active. E2B is a local visual helper within that same
 stream, not an independent L0.5 consciousness or motor owner. L1 may invoke it
 when remote image disclosure is disallowed or a provisional local sketch is
 useful. E2B results remain provisional until the primary L1 cycle accepts or
-revises them.
+revises them. E2B produces normalized workspace evidence rather than calling
+Gemma or issuing an action itself.
 
-The running `gemma4:31b-cloud` adapter uses Ollama's local `/api/generate`
-transport to reach the selected cloud route. It accepts one in-flight cycle and
-one replaceable pending cycle, has an eight-second situation deadline, and
-receives only the minimum context projection allowed for that cycle. Raw
+The running `gemma4:31b-cloud` adapter uses Ollama's local `/api/chat`
+transport to reach the selected cloud route. One priority queue permits exactly
+one in-flight request: L1b executive work precedes meaningful event-based L1a
+work, which precedes periodic L1a reflection. The newest event and periodic
+snapshots coalesce rather than forming a backlog. Raw
 biometric templates, unrestricted memory rows, and continuous camera media
 remain local by default.
 
-An ordinary L1 cycle carries no pixels. It starts from scalar scene, spatial,
-memory, task, and social evidence. The runtime may offer an expiring visual
-resource, but L1 must explicitly request it and receives at most one immediate
-follow-up image; it cannot request another image from that follow-up. The
-rolling spherical atlas remains local by default. Its current low-resolution
-render can be offered for a place-level discrepancy or route-planning question,
-but it is never routine conversational context.
+An L1a event cycle starts from scalar scene, spatial, memory, task, and social
+evidence and may attach one short-lived current camera frame. Additional visual
+resources must be explicitly requested and are limited to one immediate
+follow-up. The rolling spherical atlas remains local by default. Its current
+low-resolution render can be offered for a place-level discrepancy or
+route-planning question, but it is never routine conversational context.
 
 ```mermaid
 flowchart LR
     Sensors["Camera and microphone"] --> L0["L0 perception and motor control"]
-    L0 --> Router["Event-importance router"]
-    Router --> L1["L1 31B conscious stream"]
-    Router -->|"authorized direct contact"| Speech["Codex app-server GPT-Live WebRTC"]
-    L1 --> Helper["Local E2B visual helper"]
-    Helper --> L1
-    Memory["Short, medium, and long-term memory"] <--> L1
-    L1 -->|"accepted curiosity"| Speech
+    L0 --> Evidence["Normalized evidence"]
+    Helper["Local E2B visual helper"] --> Evidence
+    Evidence --> Workspace["Persistent mental workspace"]
+    Memory["Short, medium, and long-term memory"] <--> Workspace
+    Workspace --> L1A["L1a thought update"]
+    L1A --> Competition["Probabilistic foreground competition"]
+    Competition -->|"intention pressure"| L1B["L1b executive judgment"]
+    L0 -->|"authorized eye contact + speech"| Speech["Codex app-server GPT-Live WebRTC"]
+    L1B -->|"purposeful spoken opening"| Speech
     Speech -->|"live conversation"| Codex["L2 Codex interaction and task worker"]
     Codex -->|"live spoken response"| Speech
-    L1 --> MCP["SOMA embodiment MCP"]
+    L1B --> MCP["SOMA embodiment MCP"]
     Codex --> MCP
     MCP --> Arbiter["L0 owner arbiter and intent executor"]
     Arbiter --> Gimbal["Gimbal and supported LED controls"]
     L0 --> Atlas["Spherical scene atlas"]
     Atlas <--> Memory
-    Atlas --> L1
+    Atlas --> Workspace
 ```
 
-## L1 situational stream
+## Persistent mental workspace and the L1 stream
 
-L1 runs event-driven situation cycles rather than continuously regenerating a
-description of every frame. A cycle combines:
+All L0, L0.5, memory, conversation, and elapsed-time inputs first become an
+idempotent `MentalEvidenceEvent`. One actor-owned workspace reduces those
+events into canonical context, drives, hypotheses, thought candidates, and
+intentions. Novelty is the semantic difference between workspace revisions,
+not a raw pixel-difference score. Repeated views of the same device or posture
+support an existing hypothesis without repeatedly calling Gemma.
+
+A workspace snapshot combines:
 
 - the latest L0 belief and interaction-readiness evidence;
 - scalar spatial-atlas coverage, revisits, and scene-entity context, with one
   explicitly requested expiring visual resource only when it is necessary;
 - stable scene entities and their spatial bearings;
 - retrieved person, space, task, and recent episode context;
-- unresolved questions and the previous L1 situation state; and
+- unresolved questions and the full bounded thought lineage; and
 - provenance, confidence, freshness, and privacy labels for every retrieved
   fact.
 
-The output is a strict `SituationFrame`, not free-form control text:
+Hypotheses follow `active → dormant → abandoned/resolved`. Support and
+contradiction update confidence in log-odds space; unsupported confidence and
+salience decay by hypothesis-specific half-life. Relationship uncertainty is
+derived once from retained relationship/contact context and projected into the
+workspace. Neither L1a nor L1b may replace it with an independent estimate.
+
+L1a returns a strict `L1ThoughtUpdate`, not control text:
 
 ```text
-SituationFrame
-  cycle_id, observed_at, model_route, evidence_ids
-  place_hypotheses[], present_entities[], identity_hypotheses[]
-  social_context, active_tasks[], changes[], contradictions[]
-  uncertainty, information_gaps[], curiosity_proposals[]
-  memory_write_proposals[], attention_intents[]
-  interaction_recommendation, natural_language_summary
+L1ThoughtUpdate
+  expected_revision, evidence_ids
+  hypothesis_mutations[], drive_signal
+  inner_monologue, channel, continuity, parent_thought_id
+  confidence, salience, novelty
+  optional abstract intention
+  visual requests and memory proposals
 ```
 
+L1a cannot emit a social action, behavior directive, opening, or motor command.
+Its thought candidates compete through a softmax over salience, confidence,
+novelty, drive relevance, and attentional inertia. Tests inject a seed; the
+installed runtime uses system entropy. `SOMA_L1_REASONING_CADENCE_SECONDS` is
+the quiet-state expected interval of an adaptive stochastic clock, not a fixed
+poll. Meaningful transitions wake L1a immediately; otherwise unresolved
+hypotheses, curiosity, contradiction, novelty, boredom, and elapsed time shape
+the monologue hazard. Periodic thoughts must advance, revise, associate,
+self-correct, retire, or explicitly idle rather than redescribe a static scene.
+
+Only a non-null L1a intention creates an `ExecutiveWakeRequest`. L1b receives a
+frozen workspace revision, the selected foreground thought, related hypotheses,
+the intention episode, and the currently available action set. It returns a
+strict `L1ExecutiveDecision`. Completion rechecks revision, current person,
+conversation state, and L0 authority. Each intention episode can be applied
+once without a wall-clock action cooldown.
+
 Human presence and a recognized identity create a social-deliberation
-opportunity, not a speech trigger. The same configured L1 reasoning cadence
-governs this deliberation and baseline awareness. Local visual input may also
-interrupt that baseline: a credible discrete event can wake L1 immediately,
-while the local helper separately integrates social availability, scene
-relevance, and unresolved change over a short interval before issuing one
-latched temporal-context request. Every such L1 cycle may conclude
-`remain_silent`, `nonverbal_invitation`, or `spoken_opening`; only an explicit,
-grounded L1 decision can take the latter two paths. A locally validated social
+opportunity, not a speech trigger. Only a grounded L1b decision can choose a
+nonverbal invitation or purposeful spoken opening. A locally validated social
 admission can open a voice conversation; the bounded response window after
 SOMA initiates a greeting pulse remains available. Once an L2 handoff opens a
 conversation, follow-up turns use the active conversation lease. An L2
@@ -100,17 +127,16 @@ interaction therefore needs one of two causes:
 
 1. an authorized local social admission, or SOMA's own still-active greeting
    invitation; or
-2. a grounded L1 social decision that passes relevance, confidence, temporal
+2. a grounded L1b executive decision that passes relevance, confidence, temporal
    contact-history, interruption-cost, and social-appropriateness policy. A useful open question
-   may supply its content, but curiosity is not mandatory: L1 may conclude that
-   a plain greeting is appropriate, or that silence is preferable.
+   supplies its closed purpose. Without one, L1b may choose a nonverbal
+   invitation or no action, but it cannot manufacture a generic spoken greeting.
 
 Because the selected 31B route is remote, L1 is not treated as a scarce local
-compute task. While a human, active task, unresolved change, or accepted
-curiosity remains present, the scheduler may keep a frequent bounded situation
-stream instead of waiting for a rare alarm event. Quiet familiar scenes back
-off. Measured provider latency, request budget, privacy projection, and
-latest-value cancellation still bound cadence; L0 never waits for it.
+compute task. Quiet familiar scenes naturally back off through the stochastic
+hazard, while accumulating uncertainty or curiosity shortens the expected
+interval. Latest-value coalescing and a single in-flight transport prevent a
+slow provider from building an inference backlog; L0 never waits for it.
 
 Curiosity is represented as a bounded information gap with supporting memory
 and evidence. It is not an unconstrained instruction to ask questions. Repeated
@@ -140,16 +166,20 @@ it is never a questionnaire trigger.
 ### Current social thought path
 
 A stable local person identity—an enrolled face profile or an encrypted
-pseudonymous repeat-visitor cluster—is an event source for the running L1
-adapter. It must first remain stable through the local identity scheduler; it
-then opens at most one 31B deliberation per person every 12 seconds while the
-person remains current. Gemma emits a strict JSON `L1SituationFrame`, which is
-checked against the current cycle's evidence and social opportunity. Its bounded
-rolling thought state carries social availability, curiosity pressure,
-interruption cost, relationship uncertainty, active grounded motives, and a
-short working hypothesis into the next cycle; current evidence always takes
-precedence. A late frame is discarded if the person is no longer current.
-`remain_silent` has no side effect. A nonverbal invitation uses a bounded L0
+pseudonymous repeat-visitor cluster—creates a `person_arrived` evidence
+transition in the same workspace used by behavior, scene, object, memory, and
+time evidence. Stable repeated recognition refreshes L0 presence but does not
+create another L1 call. When the local identity scheduler establishes a social
+opportunity, that semantic change is recorded separately; it is still not
+permission to speak.
+
+L1a may form a grounded social intention after reading the canonical contact
+history, information motives, rapport, current visual context, and foreground
+thought. L1b then chooses from only the actions exposed by the current
+opportunity and L0 state. A late result is held if its workspace revision is no
+longer current, the person has departed, or a Live conversation is active.
+`no_action` has no external side effect and settles only that intention episode.
+A nonverbal invitation uses a bounded L0
 greeting overlay: a small down-and-return bow that releases its lease as soon
 as it completes, rather than a side-to-side sweep or a timeout-held pose. The
 face-lock state survives the overlay and resumes fixation immediately after the
@@ -162,10 +192,10 @@ observable facts only: an unanswered session is not relabelled as a rejection,
 and any later social interpretation remains an explicit L1 consolidation task.
 Writing one of these events invalidates the affected person's L1 memory
 projection only after the encrypted record succeeds. A Live session also
-publishes a process-local availability state: it suppresses new L1 social
-opportunities and discards a late L1 social decision until that session ends.
+publishes a process-local availability transition into the workspace and
+suppresses a late L1b social decision until that session ends.
 A spoken opening transfers directly
-from L1 to the account-backed Live session only when it is a question bound to
+from L1b to the account-backed Live session only when it is a question bound to
 one current information motive; the same packet carries the motive's explicit
 completion condition. The motive is private L2 orientation, not an opening
 script: L2 begins with one question and advances the exchange responsively,
@@ -173,6 +203,13 @@ without narrating its plan or stacking its questions. A bare greeting, generic
 offer of help, or unbound question cannot open Live voice. The L0 greeting expression is an asynchronous
 social mirror, never a serial speech gate. L0 remains free to reject all
 physical motion.
+
+The workspace is checkpointed as one encrypted, atomically replaced file only
+after meaningful revisions. Restart restores unresolved hypotheses, curiosity,
+pending intentions with zero action pressure, thought lineage, and foreground
+history. Present people, eye contact, speaking, conversation state, social
+availability, and recent novelty are stale-reset and cannot authorize an
+action until fresh L0 evidence arrives.
 
 ## Memory layer
 
@@ -746,7 +783,7 @@ Official implementation references:
 | C1 E2B L1 visual helper | Worker implemented; opt-in for visual audit | Direct-MLX bounded worker is advisory, consumes substantial unified memory, and has no independent layer or motor lease |
 | C2 Memory contracts and store | Core, encrypted runtime store, L1 read projection, and finalized Live-turn ingestion implemented; consolidation remains pending | Versioned schemas, exact encrypted local L2 turns, L1 consolidation links, provenance/consent validator, encrypted short/medium/long store, correction, deletion, policy-filtered remote projection, and replay checks |
 | C3 Event-importance router | Core implemented; deployment labels and shadow integration pending | Versioned route probabilities, direct L2 interaction dispatch plus parallel L1 context, interaction/safety policy masks, 32-row bootstrap contract, calibration and false/missed-wake report; real labelled corpus still required |
-| C4 31B L1 conscious stream | Event-driven local-person situation runtime and policy-filtered memory retrieval implemented; consolidation remains pending | One Gemma 31B stream, structured `SituationFrame`, bounded current-presence check, explicit silence/nonverbal/speech decisions, allowed memory summaries, rapport, and information motives naturalized at decision time, then asynchronous memory consolidation |
+| C4 31B L1 conscious stream | Persistent workspace, separate L1a/L1b calls, adaptive stochastic reflection, selective restore, and installed cutover implemented; long soak and physical scenario matrix remain | Idempotent semantic evidence reduction, hypothesis lifecycle and confidence decay, canonical relationship uncertainty, seeded foreground competition, executive-first single-flight queue, revision-bound decisions, intention-episode idempotence, encrypted bounded checkpoint, and stale transient-state reset |
 | C5 Local embodiment MCP | Shadow transport implemented and deployed | MCP lifecycle plus thirteen schema-described tools; stdio to owner-only Unix socket; live L0 scene/atlas/state reply and scalar audit trace; no actuator writes |
 | C6 Leased embodiment actions | Implemented and physically validated | Target ownership, registration-before-tracking, priority preemption, independently scheduled expiry, owner release, explicit-scene permanence, probabilistic descriptor ambiguity, orient/grounded-track/policy-explore/active-view/social-expression execution, transient image return, labelled target reacquisition, and native stop/watchdog pass |
 | C7 Panoramic spatial memory | Learned fixed-base place memory and active mapping implemented; robustness evaluation pending | Capture-aligned spherical projection, bounded image registration, best-observation pixels, versioned Feature Print revisits, bounded cross-session persistence, information-gain reachable view planning, MCP map projection, static/dynamic separation and familiar-space evaluation |
@@ -755,9 +792,11 @@ Official implementation references:
 | C10 End-to-end social evaluation | Planned | Labelled explicit-contact, curiosity, dialogue, task, opt-out, memory-correction, and embodiment scenarios |
 
 The physical intent adapter and its end-to-end target/view gates are complete.
-The next integration gate is C4 consolidation: the primary 31B L1 stream must
-turn raw L2 transcript turns into validated memory proposals and use the C6 MCP
-surface for active observation. Place
+The next C4 acceptance gate is a 30-minute recorded-scene replay plus a two-hour
+installed-runtime soak, followed by the physical person, gaze, departure,
+object-presentation, quiet-scene, and restart matrix. Transcript consolidation
+must continue turning raw L2 turns into validated memory proposals, while L1b
+uses the C6 MCP surface for active observation. Place
 re-identification remains deliberately ambiguity-aware and needs a
 labelled viewpoint, lighting, and change-evaluation corpus before its
 familiarity can influence anything beyond no-target exploration. C3 still needs

@@ -103,26 +103,31 @@ layers are connected, but they are not interchangeable.
 | Layer | Time scale | What it does | What it may control |
 | --- | --- | --- | --- |
 | **L0 · subconscious** | Video/audio cadence | Captures sensor evidence, follows a verified face, keeps target continuity, estimates voice activity, maintains spatial coverage, and executes the final motor policy | The only path to SDK motion, stabilization, limits, watchdogs, and immediate stops |
-| **L0.5 · local semantic helper** | Sparse asynchronous inference and temporal evidence integration | Supplies optional semantic cues and context-change wake proposals to L1 without blocking L0 | No independent motor, speech, identity, or memory authority |
-| **L1 · situation stream** | Event-driven, broad context | Interprets a situation using memory, rapport, spatial context, unresolved questions, and permitted world context; forms curiosity and social hypotheses | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through leased MCP goals |
+| **L0.5 · local semantic helper** | Sparse asynchronous inference and temporal evidence integration | Produces evidence deltas for L1 without blocking L0; it does not call the language model directly | No independent motor, speech, identity, memory, or wake authority |
+| **L1a · persistent thought stream** | Event-driven plus an adaptive stochastic clock | Maintains hypotheses, curiosity, intentions, self-correction, and a probabilistically selected foreground thought in one persistent mental workspace | May form an abstract intention and request bounded visual evidence; cannot speak or move hardware |
+| **L1b · executive judgment** | Only when an L1a intention creates action pressure | Chooses one currently available social or attention action against a frozen workspace revision | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through existing leased MCP/L0 goals |
 | **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and user-requested work | The same semantic embodiment interface as L1; never raw SDK velocity |
 
 L0.5 is intentionally a supporting process inside the L1 path, not a fourth
 mind. Its job is to make slow contextual reasoning more perceptive without
-weakening the real-time loop. It can emit an immediate, evidence-bounded wake
-for a clear event, or accumulate a short time-series of social availability,
-scene relevance, and unresolved change before asking L1 to reconsider the
-situation once. Neither path controls movement or conversation directly.
+weakening the real-time loop. Every cue is reduced into the same workspace as
+face, gaze, voice, memory, conversation, and elapsed-time evidence. Only a
+meaningful workspace transition may wake L1a; repeated equivalent cues merely
+support an existing hypothesis. Neither path controls movement or conversation
+directly.
 
 ```mermaid
 flowchart LR
-    Body["OBSBOT Tiny 2 Lite\nvideo · audio · gimbal · LED"] --> L0["L0 subconscious\nreal-time perception and motor safety"]
-    L0 --> Router["event importance\nand current state"]
-    Router -->|"situational evidence"| L1["L1 situation stream\nmemory · curiosity · context"]
-    Router -->|"authorized direct contact"| L2["L2 Live Voice\nconversation and reasoning"]
-    L1 <--> Memory["local memory\nshort · medium · long"]
-    L1 <--> Atlas["spherical place memory\nand scene field"]
-    L1 --> MCP["SOMA embodiment MCP\nsemantic leased goals"]
+    Body["OBSBOT Tiny 2 Lite / Tiny 3 Lite\nvideo · audio · gimbal · LED"] --> L0["L0 subconscious\nreal-time perception and motor safety"]
+    L0 --> Evidence["normalized evidence\nL0 · L0.5 · memory · time"]
+    Evidence --> Workspace["persistent mental workspace\nhypotheses · drives · intentions"]
+    Workspace --> L1A["L1a thought update\nEnglish inner monologue"]
+    L1A --> Foreground["stochastic foreground competition"]
+    Foreground -->|"action pressure"| L1B["L1b executive judgment"]
+    L0 -->|"authorized eye contact + speech"| L2["L2 Live Voice\nconversation and reasoning"]
+    Workspace <--> Memory["local memory\nshort · medium · long"]
+    Workspace <--> Atlas["spherical place memory\nand scene field"]
+    L1B --> MCP["SOMA embodiment MCP\nsemantic leased goals"]
     L2 --> MCP
     MCP --> L0
     L0 --> Body

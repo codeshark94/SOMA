@@ -73,7 +73,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private let onHealth: @Sendable (String, String) -> Void
     private let onCue: @Sendable (L1AuxiliarySemanticCue) -> Void
     private let onInterrupt: @Sendable (L1AuxiliarySemanticInterrupt) -> Void
-    private var admission = L1AuxiliarySemanticAdmissionGate()
+    private var admission: L1AuxiliarySemanticAdmissionGate
     private var interruptGate: L1AuxiliarySemanticInterruptGate
     private var temporalSituationGate = L1AuxiliaryTemporalSituationGate()
     private var pending: Pending?
@@ -111,7 +111,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         model: String,
         wakeMinimumScore: Double = 0.65,
         wakeMinimumConfidence: Double = 0.55,
-        wakeRepeatIntervalMilliseconds: UInt64 = 5_000,
+        semanticRefreshIntervalMilliseconds: UInt64 = 5_000,
         onHealth: @escaping @Sendable (String, String) -> Void,
         onCue: @escaping @Sendable (L1AuxiliarySemanticCue) -> Void,
         onInterrupt: @escaping @Sendable (L1AuxiliarySemanticInterrupt) -> Void
@@ -121,8 +121,10 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         self.onInterrupt = onInterrupt
         interruptGate = L1AuxiliarySemanticInterruptGate(
             minimumWakeScore: wakeMinimumScore,
-            minimumConfidence: wakeMinimumConfidence,
-            repeatIntervalMilliseconds: wakeRepeatIntervalMilliseconds
+            minimumConfidence: wakeMinimumConfidence
+        )
+        admission = L1AuxiliarySemanticAdmissionGate(
+            refreshIntervalMilliseconds: semanticRefreshIntervalMilliseconds
         )
         let inputPipe = Pipe()
         let outputPipe = Pipe()

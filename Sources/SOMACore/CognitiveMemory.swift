@@ -1394,6 +1394,7 @@ public actor CognitiveMemoryStore {
     @discardableResult
     public func correct(
         id: UUID,
+        expectedRevision: UInt64? = nil,
         replacement: CognitiveMemoryDraft,
         reason: String,
         at date: Date = Date()
@@ -1401,6 +1402,9 @@ public actor CognitiveMemoryStore {
         try ensureOpen()
         try validateReason(reason)
         guard let previous = current[id] else { throw CognitiveMemoryError.recordNotFound(id) }
+        if let expectedRevision, previous.revision != expectedRevision {
+            throw CognitiveMemoryError.revisionConflict(id)
+        }
         guard replacement.payload.kind == previous.payload.kind else { throw CognitiveMemoryError.kindChangeNotAllowed }
         guard replacement.tier == previous.tier else { throw CognitiveMemoryError.tierChangeRequiresPromotion }
         guard date >= previous.updatedAt else { throw CognitiveMemoryError.nonMonotonicUpdate(id) }

@@ -2904,7 +2904,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         )
     }
 
-    func testL1AuxiliarySemanticInterruptRequiresConsistentCredibleEvidenceAndDebounces() {
+    func testL1AuxiliarySemanticInterruptProducesEvidenceWithoutOwningWakeCadence() {
         func cue(
             at monotonicNS: UInt64,
             situation: L1AuxiliarySituation,
@@ -2934,7 +2934,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertNil(gate.recommend(cue(at: start, situation: .ambient, reason: .none)))
         XCTAssertNil(gate.recommend(cue(at: start, situation: .socialBid, reason: .presentedObject)))
         XCTAssertNotNil(gate.recommend(cue(at: start, situation: .socialBid, reason: .directSocialBid)))
-        XCTAssertNil(gate.recommend(cue(
+        XCTAssertNotNil(gate.recommend(cue(
             at: start + 4_999_000_000,
             situation: .socialBid,
             reason: .directSocialBid

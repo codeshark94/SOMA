@@ -68,6 +68,7 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
 
     struct Thought: Encodable, Sendable {
         let monotonicNS: UInt64
+        let recordedAtEpochMS: Int64
         let state: String
         let message: String
     }
@@ -83,7 +84,7 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     private let frameIntervalNS: UInt64 = 100_000_000
     private let maxFrameDimension = 640.0
     private let retainedDiagnosticFramePairs = 10
-    private let maxThoughts = 400
+    private let maxThoughts = 3_000
     private let faceOverlayHoldNS: UInt64 = 200_000_000
     private let encoder = JSONEncoder()
 
@@ -98,6 +99,10 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
     /// at ~10Hz while the panel is open, so opening the panel shows the full
     /// buffered history even if no new L1 event fires afterwards.
     private var thoughtsDirty = false
+    /// Coalesces bursts of evidence/state-delta events into one bounded file
+    /// snapshot instead of serializing and atomically rewriting the whole ring
+    /// once per event.
+    private var thoughtFlushScheduled = false
 
     init(rootURL: URL) {
         self.flagURL = rootURL.appendingPathComponent("live-diagnostics.enabled")
@@ -253,16 +258,19 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         // of starting from an empty log. Only the file write is gated on the
         // flag (the panel being open).
         lock.lock()
-        thoughts.append(Thought(monotonicNS: monotonicNS, state: state, message: message))
+        thoughts.append(Thought(
+            monotonicNS: monotonicNS,
+            recordedAtEpochMS: Int64(Date().timeIntervalSince1970 * 1_000),
+            state: String(state.prefix(96)),
+            message: String(message.prefix(12_000))
+        ))
         if thoughts.count > maxThoughts {
             thoughts.removeFirst(thoughts.count - maxThoughts)
         }
         thoughtsDirty = true
-        let lines = thoughts.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
         let active = isActive
         lock.unlock()
-        guard active else { return }
-        queue.async { [weak self] in self?.writeThoughts(lines) }
+        if active { scheduleThoughtFlush() }
     }
 
     // MARK: - Frame encoding
@@ -330,7 +338,7 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
             return
         }
         pruneDiagnosticFrames()
-        flushThoughtsIfNeeded()
+        scheduleThoughtFlush()
     }
 
     // MARK: - JSON snapshots
@@ -340,19 +348,39 @@ final class LiveDiagnosticsWriter: @unchecked Sendable {
         try? lines.joined(separator: "\n").write(to: thoughtsURL, atomically: true, encoding: .utf8)
     }
 
+    private func scheduleThoughtFlush() {
+        lock.lock()
+        guard thoughtsDirty, !thoughtFlushScheduled, isActive else {
+            lock.unlock()
+            return
+        }
+        thoughtFlushScheduled = true
+        lock.unlock()
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.flushThoughtsIfNeeded()
+        }
+    }
+
     private func flushThoughtsIfNeeded() {
         lock.lock()
-        let dirtyThoughts: [String]?
-        if thoughtsDirty {
-            dirtyThoughts = thoughts.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
-            thoughtsDirty = false
-        } else {
-            dirtyThoughts = nil
+        thoughtFlushScheduled = false
+        guard thoughtsDirty, isActive else {
+            lock.unlock()
+            return
         }
+        let snapshot = thoughts
+        thoughtsDirty = false
         lock.unlock()
-        if let dirtyThoughts {
-            writeThoughts(dirtyThoughts)
-        }
+
+        let lines = snapshot
+            .compactMap { try? encoder.encode($0) }
+            .compactMap { String(data: $0, encoding: .utf8) }
+        writeThoughts(lines)
+
+        // Events may have arrived while this snapshot was encoded and written.
+        // Preserve them in the next coalesced flush without queueing one write
+        // for every intermediate event.
+        scheduleThoughtFlush()
     }
 
     private func visionSnapshot(

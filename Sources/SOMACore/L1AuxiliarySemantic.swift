@@ -211,18 +211,13 @@ public struct L1AuxiliarySemanticInterrupt: Codable, Equatable, Sendable {
 public struct L1AuxiliarySemanticInterruptGate: Sendable {
     private let minimumWakeScore: Double
     private let minimumConfidence: Double
-    private let repeatIntervalNS: UInt64
-    private var lastSignature: String?
-    private var lastEmittedNS: UInt64?
 
     public init(
         minimumWakeScore: Double = 0.65,
-        minimumConfidence: Double = 0.55,
-        repeatIntervalMilliseconds: UInt64 = 5_000
+        minimumConfidence: Double = 0.55
     ) {
         self.minimumWakeScore = min(max(minimumWakeScore, 0), 1)
         self.minimumConfidence = min(max(minimumConfidence, 0), 1)
-        repeatIntervalNS = repeatIntervalMilliseconds * 1_000_000
     }
 
     public mutating func recommend(_ cue: L1AuxiliarySemanticCue) -> L1AuxiliarySemanticInterrupt? {
@@ -231,15 +226,6 @@ public struct L1AuxiliarySemanticInterruptGate: Sendable {
               isConsistent(situation: cue.situation, reason: cue.wakeReason) else {
             return nil
         }
-        let signature = "\(cue.situation.rawValue)|\(cue.wakeReason.rawValue)"
-        if signature == lastSignature,
-           let lastEmittedNS,
-           cue.completedNS >= lastEmittedNS,
-           cue.completedNS - lastEmittedNS < repeatIntervalNS {
-            return nil
-        }
-        lastSignature = signature
-        lastEmittedNS = cue.completedNS
         return L1AuxiliarySemanticInterrupt(
             requestID: cue.requestID,
             captureNS: cue.captureNS,

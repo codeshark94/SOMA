@@ -1,7 +1,7 @@
 import Foundation
 import SOMACore
 
-private enum GemmaL1SituationRuntimeError: LocalizedError {
+private enum L1MemoryContextRuntimeError: LocalizedError {
     case invalidEndpoint
     case requestEncoding
     case transport(String)
@@ -114,114 +114,6 @@ struct OllamaToolDefinition: Encodable {
 }
 
 /// The tool-calling /api/chat request payload.
-struct OllamaChatRequest: Encodable {
-    let model: String
-    let messages: [Message]
-    let tools: [OllamaToolDefinition]
-    let stream: Bool
-    let options: OllamaGenerateRequest.Options
-
-    struct Message: Encodable {
-        let role: String
-        let content: String?
-        let images: [String]?
-        let toolCalls: [ToolCall]?
-
-        enum CodingKeys: String, CodingKey {
-            case role, content, images
-            case toolCalls = "tool_calls"
-        }
-    }
-
-    struct ToolCall: Encodable {
-        let id: String
-        let type: String = "function"
-        let function: Call
-
-        struct Call: Encodable {
-            let name: String
-            let arguments: AnyJSONValue?
-        }
-    }
-}
-
-/// The tool-calling /api/chat response payload.
-struct OllamaChatResponse: Decodable {
-    let message: Message?
-
-    struct Message: Decodable {
-        let role: String?
-        let content: String?
-        let toolCalls: [ToolCall]?
-
-        enum CodingKeys: String, CodingKey {
-            case role, content
-            case toolCalls = "tool_calls"
-        }
-    }
-
-    struct ToolCall: Decodable {
-        let id: String?
-        let function: Function?
-
-        struct Function: Decodable {
-            let name: String?
-            /// Ollama emits arguments as a JSON object (or a string). Preserve
-            /// whatever was sent so it round-trips on the echo.
-            let arguments: AnyJSONValue?
-        }
-    }
-}
-
-/// Loose JSON value wrapper so tool arguments (objects/arrays/primitives) can
-/// be decoded and re-serialized without tight typing.
-enum AnyJSONValue: Codable, Sendable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case object([String: AnyJSONValue])
-    case array([AnyJSONValue])
-    case null
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let string = try? container.decode(String.self) { self = .string(string) }
-        else if let bool = try? container.decode(Bool.self) { self = .bool(bool) }
-        else if let number = try? container.decode(Double.self) { self = .number(number) }
-        else if let object = try? container.decode([String: AnyJSONValue].self) { self = .object(object) }
-        else if let array = try? container.decode([AnyJSONValue].self) { self = .array(array) }
-        else if container.decodeNil() { self = .null }
-        else { throw DecodingError.dataCorruptedError(in: container, debugDescription: "unexpected JSON value") }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        switch self {
-        case let .string(value): try container.encode(value)
-        case let .number(value): try container.encode(value)
-        case let .bool(value): try container.encode(value)
-        case let .object(value): try container.encode(value)
-        case let .array(value): try container.encode(value)
-        case .null: try container.encodeNil()
-        }
-    }
-
-    /// JSON string form (for the tool executor and for the assistant echo).
-    var jsonString: String {
-        guard let data = try? JSONEncoder().encode(self),
-              let string = String(data: data, encoding: .utf8) else { return "{}" }
-        return string
-    }
-}
-
-/// A single tool call L1 made, ready for execution.
-struct L1ToolInvocation {
-    let id: String
-    let name: String
-    let arguments: String
-    let reason: String?
-}
-
 struct L1MemoryContext: Sendable {
     let projections: [RemoteMemoryProjection]
     let informationNeeds: [L1InformationNeed]
@@ -523,15 +415,35 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             if createPseudonymousEntity {
                 try await ensurePseudonymousEntity(entityID, in: store, at: now)
             }
+            let personContext = try await store.personContext(for: entityID, at: now)
+            var openQuestionRecords = try await store.query(
+                .init(kinds: [.openQuestion], relatedTo: [entityID], limit: 500),
+                at: now
+            )
+            if await retireSatisfiedProfileNeeds(
+                in: openQuestionRecords,
+                personContext: personContext,
+                for: entityID,
+                at: now
+            ) > 0 {
+                openQuestionRecords = try await store.query(
+                    .init(kinds: [.openQuestion], relatedTo: [entityID], limit: 500),
+                    at: now
+                )
+            }
             var records = try await store.query(
                 .init(relatedTo: [entityID], limit: 96),
                 at: now
             )
             if await retireObsoletePlaceAffiliationNeeds(
-                in: records,
+                in: openQuestionRecords,
                 for: entityID,
                 at: now
             ) > 0 {
+                openQuestionRecords = try await store.query(
+                    .init(kinds: [.openQuestion], relatedTo: [entityID], limit: 500),
+                    at: now
+                )
                 records = try await store.query(
                     .init(relatedTo: [entityID], limit: 96),
                     at: now
@@ -554,7 +466,12 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 )
             }
             var inadmissibleInferenceNeedIDs: [UUID] = []
-            var needs = allowed.compactMap { record -> L1InformationNeed? in
+            let allowedOpenQuestions = openQuestionRecords.filter {
+                $0.disclosure == .remoteSummaryAllowed
+                    && $0.sensitivity != .biometric
+                    && $0.sensitivity != .secret
+            }
+            var needs = allowedOpenQuestions.compactMap { record -> L1InformationNeed? in
                 guard case let .openQuestion(question) = record.payload,
                       question.targetEntityID == entityID,
                       question.status == .open else {
@@ -596,11 +513,9 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     purpose: record.summary
                 )
             }.sorted { $0.occurredAt > $1.occurredAt }
-            let hasPreferredName = records.contains { record in
-                guard case let .personFact(value) = record.payload else { return false }
-                return value.personEntityID == entityID && value.key == "preferred_name"
-            }
-            if !hasPreferredName, needs.isEmpty {
+            let hasPreferredName = personContext.mission.isSatisfied
+            if !hasPreferredName,
+               !needs.contains(where: { $0.source == .initialSocialOrientation }) {
                 let goal = "Learn the person's preferred name or form of address for future respectful interaction."
                 let motiveID = await ensureInformationNeed(
                     question: goal,
@@ -615,16 +530,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     expectedInformationGain: 0.95
                 ))
             }
-            let interestFactKeys: Set<String> = [
-                "interest_profile",
-                "interests",
-                "favorite_topics",
-                "hobbies",
-            ]
-            let hasInterestProfile = records.contains { record in
-                guard case let .personFact(value) = record.payload else { return false }
-                return value.personEntityID == entityID && interestFactKeys.contains(value.key)
-            }
+            let hasInterestProfile = L1InformationMotiveSource.interestDiscovery
+                .isSatisfied(by: personContext)
             if !hasInterestProfile {
                 let goal = "When the situation naturally supports it, learn one enduring interest, hobby, or topic this person enjoys discussing."
                 let motiveID = await ensureInformationNeed(
@@ -649,7 +556,6 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 .sorted { $0.expectedInformationGain > $1.expectedInformationGain }
                 .prefix(maxActiveNeeds)
                 .map { $0 }
-            let personContext = try await store.personContext(for: entityID, at: now)
             let rapportContext = personContext.rapport.map {
                 L1RapportContext(
                     familiarity: $0.familiarity,
@@ -734,6 +640,39 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         if !motiveIDs.isEmpty {
             onHealth("info_need_legacy_sweep", "dismissed=\(motiveIDs.count)")
         }
+    }
+
+    /// Retires profile-acquisition motives whose required fact is already
+    /// present in the authoritative materialized person context. Recent event
+    /// windows are intentionally not consulted: high-rate observations must
+    /// never make a durable identity fact appear missing.
+    private func retireSatisfiedProfileNeeds(
+        in records: [CognitiveMemoryRecord],
+        personContext: PersonContextSnapshot,
+        for entityID: UUID,
+        at date: Date
+    ) async -> Int {
+        let satisfiedIDs = records.compactMap { record -> UUID? in
+            guard case let .openQuestion(question) = record.payload,
+                  question.targetEntityID == entityID,
+                  question.status == .open,
+                  Self.informationNeedSource(for: record).isSatisfied(by: personContext) else {
+                return nil
+            }
+            return record.id
+        }
+        var retired = 0
+        for motiveID in satisfiedIDs where await resolveInformationNeed(
+            motiveID: motiveID,
+            expectedTargetEntityID: entityID,
+            at: date
+        ) {
+            retired += 1
+        }
+        if retired > 0 {
+            onHealth("profile_need_retired", "person=\(entityID.uuidString.lowercased()); count=\(retired)")
+        }
+        return retired
     }
 
     private func retireObsoletePlaceAffiliationNeeds(
@@ -1298,7 +1237,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 ),
                 at: date
             )
-            placeAffiliationLock.withLock {
+            _ = placeAffiliationLock.withLock {
                 placeAffiliationBySpaceID.removeValue(forKey: spaceID)
             }
             return true
@@ -1459,8 +1398,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         guard !normalized.isEmpty else { return nil }
         do {
             let query: CognitiveMemoryQuery = targetEntityID.map {
-                .init(relatedTo: [$0], limit: 200)
-            } ?? .init(limit: 200)
+                .init(kinds: [.openQuestion], relatedTo: [$0], limit: 500)
+            } ?? .init(kinds: [.openQuestion], limit: 500)
             let records = try await store.query(query, at: date)
             if let existing = records.first(where: { record in
                 guard case let .openQuestion(q) = record.payload else { return false }
@@ -1519,7 +1458,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     ) async -> [PersistedInformationNeed] {
         guard let store else { return [] }
         let records = (try? await store.query(
-            .init(relatedTo: [entityID], limit: 200),
+            .init(kinds: [.openQuestion], relatedTo: [entityID], limit: 500),
             at: date
         )) ?? []
         return records.compactMap { record -> PersistedInformationNeed? in
@@ -1547,7 +1486,10 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         respectCooldown: Bool = true
     ) async -> [PersistedInformationNeed] {
         guard let store else { return [] }
-        let records = (try? await store.query(.init(limit: 200), at: date)) ?? []
+        let records = (try? await store.query(
+            .init(kinds: [.openQuestion], limit: 500),
+            at: date
+        )) ?? []
         return records.compactMap { record -> PersistedInformationNeed? in
             guard case let .openQuestion(q) = record.payload, q.status == .open else { return nil }
             if respectCooldown, let cooldown = q.cooldownUntil, cooldown > date { return nil }
@@ -1642,6 +1584,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             }
             _ = try await store.correct(
                 id: motiveID,
+                expectedRevision: previous.revision,
                 replacement: CognitiveMemoryDraft(
                     tier: previous.tier,
                     summary: "Resolved information need: \(q.question)",
@@ -1670,6 +1613,17 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             }
             onHealth("info_need_resolved", "motive=\(motiveID.uuidString.lowercased())")
             return true
+        } catch let error as CognitiveMemoryError {
+            if case .revisionConflict = error {
+                let latest = try? await store.record(id: motiveID, at: Date())
+                if let latest,
+                   case let .openQuestion(question) = latest.payload,
+                   question.status != .open {
+                    return false
+                }
+            }
+            onHealth("info_need_resolve_failed", String(error.localizedDescription.prefix(160)))
+            return false
         } catch {
             onHealth("info_need_resolve_failed", String(error.localizedDescription.prefix(160)))
             return false
@@ -2283,17 +2237,18 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     sourceID: "l1_administrator_seed"
                 )
             }
-            // A stale "learn the preferred name" need may have been persisted in
-            // earlier cycles, before the display-name seed existed. Resolve it
-            // so it stops appearing as pending information for the admin.
+            // Canonical profile motives are reconciled against the materialized
+            // profile rather than a recency-limited event window.
+            let seededContext = try await store.personContext(for: entityID)
             let openRecords = (try? await store.query(
-                .init(relatedTo: [entityID], limit: 200),
+                .init(kinds: [.openQuestion], relatedTo: [entityID], limit: 500),
                 at: Date()
             )) ?? []
             for record in openRecords {
                 guard case let .openQuestion(q) = record.payload,
                       q.status == .open,
-                      q.question.localizedCaseInsensitiveContains("preferred name") else { continue }
+                      Self.informationNeedSource(for: record).isSatisfied(by: seededContext)
+                else { continue }
                 _ = await resolveInformationNeed(motiveID: record.id, at: Date())
             }
             // Correct an accidental non-Korean tag (e.g. en-KR seeded earlier),
@@ -2438,7 +2393,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     /// Administrator-only callers use this through the capability-gated MCP
     /// endpoint. The store supplies an explicitly shareable projection only.
     func registeredPersonContexts() async throws -> [PersonContextSnapshot] {
-        guard let store else { throw GemmaL1SituationRuntimeError.memoryUnavailable }
+        guard let store else { throw L1MemoryContextRuntimeError.memoryUnavailable }
         let contexts = try await store.personContexts()
         contexts.forEach(cachePersonContext)
         return contexts
@@ -2448,14 +2403,14 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     /// child only forwards this request over the current-user socket and never
     /// opens the encrypted journal itself.
     func applyPersonContext(_ request: PersonContextIPCRequest) async throws -> PersonContextSnapshot {
-        guard let store else { throw GemmaL1SituationRuntimeError.memoryUnavailable }
+        guard let store else { throw L1MemoryContextRuntimeError.memoryUnavailable }
         guard request.operation != .recallEpisodes else {
             // Handled by the dedicated recallEpisodesProvider; not a person-
             // context mutation.
-            throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+            throw L1MemoryContextRuntimeError.invalidPersonContextRequest
         }
         guard let personEntityID = request.personEntityID else {
-            throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+            throw L1MemoryContextRuntimeError.invalidPersonContextRequest
         }
         let snapshot: PersonContextSnapshot
         switch request.operation {
@@ -2465,7 +2420,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             guard request.confirmedByUser,
                   let rawTag = request.languageTag,
                   let languageTag = PersonContextFormat.normalizedLanguageTag(rawTag) else {
-                throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+                throw L1MemoryContextRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.setExplicitPersonFact(
                 personEntityID: personEntityID,
@@ -2473,7 +2428,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 value: languageTag
             )
         case .clearPreferredLanguage:
-            guard request.confirmedByUser else { throw GemmaL1SituationRuntimeError.invalidPersonContextRequest }
+            guard request.confirmedByUser else { throw L1MemoryContextRuntimeError.invalidPersonContextRequest }
             snapshot = try await store.clearExplicitPersonFact(
                 personEntityID: personEntityID,
                 key: "preferred_language"
@@ -2481,7 +2436,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         case .setContactPreference:
             guard request.confirmedByUser,
                   let preference = request.proactiveContact else {
-                throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+                throw L1MemoryContextRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.setExplicitPersonFact(
                 personEntityID: personEntityID,
@@ -2494,7 +2449,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                   let interactionComfort = request.interactionComfort,
                   let communicationAlignment = request.communicationAlignment,
                   let preference = request.proactiveContact else {
-                throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+                throw L1MemoryContextRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.setExplicitPersonRapport(
                 personEntityID: personEntityID,
@@ -2509,7 +2464,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             guard request.confirmedByUser,
                   let key = request.factKey,
                   let value = request.factValue else {
-                throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+                throw L1MemoryContextRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.setExplicitPersonFact(
                 personEntityID: personEntityID,
@@ -2518,7 +2473,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             )
         case .removeFact:
             guard request.confirmedByUser, let key = request.factKey else {
-                throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+                throw L1MemoryContextRuntimeError.invalidPersonContextRequest
             }
             snapshot = try await store.clearExplicitPersonFact(
                 personEntityID: personEntityID,
@@ -2527,7 +2482,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         case .recallEpisodes:
             // Handled by the dedicated recallEpisodesProvider; not a person-
             // context mutation.
-            throw GemmaL1SituationRuntimeError.invalidPersonContextRequest
+            throw L1MemoryContextRuntimeError.invalidPersonContextRequest
         }
         cachePersonContext(snapshot)
         return snapshot
@@ -2606,328 +2561,6 @@ final class L1MemoryContextProvider: @unchecked Sendable {
 /// Event-driven Gemma L1 adapter. It receives bounded situation packets only;
 /// frames and audio never enter this transport. A single in-flight request plus
 /// one pending slot prevents a slow cloud response from creating a backlog.
-final class GemmaL1SituationRuntime: @unchecked Sendable {
-    typealias Completion = @Sendable (L1SituationRequest, Result<L1SituationFrame, Error>, UInt64) -> Void
-
-    private let queue = DispatchQueue(label: "soma.l1.gemma-situation", qos: .utility)
-    private let session: URLSession
-    private let endpoint: URL
-    private let configuration: L1ModelConfiguration
-    private let onHealth: @Sendable (String, String) -> Void
-    private let completion: Completion
-    private let toolDefinitions: [OllamaToolDefinition]
-    private let toolExecutor: @Sendable (String, String) -> String
-    /// Resolves a one-shot local image produced by a tool call. This remains
-    /// outside L0 traces and is attached only to the immediate model follow-up.
-    private let toolVisualResourceProvider: @Sendable (String) -> [L1VisualResource]
-    private let onCuriosityNeeds: @Sendable ([L1InformationNeed]) -> Void
-    private var task: URLSessionDataTask?
-    private var pending: L1SituationRequest?
-    private var stopped = false
-
-    init(
-        configuration: L1ModelConfiguration = .gemma31,
-        endpoint: URL? = nil,
-        onHealth: @escaping @Sendable (String, String) -> Void,
-        completion: @escaping Completion,
-        toolDefinitions: [OllamaToolDefinition] = [],
-        toolExecutor: @escaping @Sendable (String, String) -> String = { _, _ in "{}" },
-        toolVisualResourceProvider: @escaping @Sendable (String) -> [L1VisualResource] = { _ in [] },
-        curiosityContextProvider: @escaping @Sendable () -> String? = { nil },
-        onCuriosityNeeds: @escaping @Sendable ([L1InformationNeed]) -> Void = { _ in }
-    ) throws {
-        let resolvedEndpoint: URL
-        if let endpoint {
-            resolvedEndpoint = endpoint
-        } else if let value = ProcessInfo.processInfo.environment["SOMA_L1_OLLAMA_ENDPOINT"],
-                  let valueURL = URL(string: value) {
-            resolvedEndpoint = valueURL
-        } else {
-            resolvedEndpoint = URL(string: "http://127.0.0.1:11434/api/chat")!
-        }
-        guard resolvedEndpoint.scheme == "http" || resolvedEndpoint.scheme == "https",
-              resolvedEndpoint.host != nil else {
-            throw GemmaL1SituationRuntimeError.invalidEndpoint
-        }
-        self.endpoint = resolvedEndpoint
-        self.configuration = configuration
-        self.onHealth = onHealth
-        self.completion = completion
-        self.toolDefinitions = toolDefinitions
-        self.toolExecutor = toolExecutor
-        self.toolVisualResourceProvider = toolVisualResourceProvider
-        self.onCuriosityNeeds = onCuriosityNeeds
-        let sessionConfiguration = URLSessionConfiguration.ephemeral
-        let timeout = TimeInterval(configuration.deadlineMilliseconds(for: .situation)) / 1_000
-        sessionConfiguration.timeoutIntervalForRequest = timeout
-        sessionConfiguration.timeoutIntervalForResource = timeout + 1
-        session = URLSession(configuration: sessionConfiguration)
-        onHealth(
-            "configured",
-            "model=\(configuration.model); workload=situation; endpoint=\(resolvedEndpoint.host ?? "unknown"); deadline_ms=\(configuration.deadlineMilliseconds(for: .situation)); image_transport=on_request"
-        )
-    }
-
-    func submit(_ request: L1SituationRequest) {
-        queue.async { [weak self] in
-            guard let self, !stopped else { return }
-            guard task == nil else {
-                pending = request
-                return
-            }
-            start(request)
-        }
-    }
-
-    func stop() {
-        queue.sync {
-            stopped = true
-            pending = nil
-            task?.cancel()
-            task = nil
-            session.invalidateAndCancel()
-        }
-    }
-
-    private func start(_ request: L1SituationRequest, retryCount: Int = 2) {
-        let startedNS = DispatchTime.now().uptimeNanoseconds
-        let system: String
-        let user: String
-        let images: [String]?
-        do {
-            system = try Self.prompt(for: request)
-            user = requestJSONPacket(for: request)
-            images = try Self.images(for: request)
-        } catch {
-            finish(request, result: .failure(GemmaL1SituationRuntimeError.requestEncoding), at: startedNS)
-            return
-        }
-        onHealth(
-            "deliberating",
-            "cycle=\(request.cycleID.uuidString.lowercased()); visual_resources=\(images?.count ?? 0); tools=\(toolDefinitions.count)"
-        )
-        let messages: [OllamaChatRequest.Message] = [
-            .init(role: "system", content: system, images: nil, toolCalls: nil),
-            .init(role: "user", content: user, images: images, toolCalls: nil)
-        ]
-        runChat(request, messages: messages, toolRound: 0, retryCount: retryCount)
-    }
-
-    private func requestJSONPacket(for request: L1SituationRequest) -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let requestData = (try? encoder.encode(request)) ?? Data()
-        return "packet:\n\(String(decoding: requestData, as: UTF8.self))"
-    }
-
-    private static let maxToolRounds = 3
-
-    /// Runs the /api/chat exchange, executing any tool_calls and looping until
-    /// the model returns the final situation JSON or the round cap is reached.
-    private func runChat(
-        _ request: L1SituationRequest,
-        messages: [OllamaChatRequest.Message],
-        toolRound: Int,
-        retryCount: Int
-    ) {
-        let completedNS = DispatchTime.now().uptimeNanoseconds
-        let payload = OllamaChatRequest(
-            model: configuration.model,
-            messages: messages,
-            tools: toolDefinitions,
-            stream: false,
-            options: .init(temperature: 0, numPredict: 720)
-        )
-        guard let body = try? JSONEncoder().encode(payload) else {
-            finish(request, result: .failure(GemmaL1SituationRuntimeError.requestEncoding), at: completedNS)
-            return
-        }
-        var urlRequest = URLRequest(url: endpoint)
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.httpBody = body
-        task = session.dataTask(with: urlRequest) { [weak self] data, response, error in
-            guard let self else { return }
-            self.queue.async { [weak self] in
-                guard let self else { return }
-                self.task = nil
-                guard error == nil,
-                      let data,
-                      let chat = try? JSONDecoder().decode(OllamaChatResponse.self, from: data),
-                      let message = chat.message else {
-                    let err = error?.localizedDescription ?? "malformed_response"
-                    if retryCount > 0 {
-                        self.start(request, retryCount: retryCount - 1)
-                    } else {
-                        self.finish(request, result: .failure(GemmaL1SituationRuntimeError.transport(err)), at: completedNS)
-                    }
-                    return
-                }
-                if let calls = message.toolCalls, !calls.isEmpty, toolRound < Self.maxToolRounds {
-                    self.handleToolCalls(request, calls: calls, messages: messages, toolRound: toolRound, retryCount: retryCount)
-                    return
-                }
-                guard let content = message.content, !content.isEmpty else {
-                    if retryCount > 0 {
-                        self.start(request, retryCount: retryCount - 1)
-                    } else {
-                        self.finish(request, result: .failure(GemmaL1SituationRuntimeError.missingResponse), at: completedNS)
-                    }
-                    return
-                }
-                self.onHealth("l1_situation_response", String(content.prefix(4_096)))
-                let result: Result<L1SituationFrame, Error>
-                if let frameData = content.data(using: .utf8) {
-                    do {
-                        result = .success(try L1SituationResponseDecoder.decode(frameData, for: request))
-                    } catch {
-                        result = .failure(error)
-                    }
-                } else {
-                    result = .failure(GemmaL1SituationRuntimeError.missingResponse)
-                }
-                if Self.isRetryableDecodeFailure(result), retryCount > 0 {
-                    self.start(request, retryCount: retryCount - 1)
-                    return
-                }
-                self.finish(request, result: result, at: completedNS)
-                guard !self.stopped, let next = self.pending else { return }
-                self.pending = nil
-                self.start(next)
-            }
-        }
-        task?.resume()
-    }
-
-    private func handleToolCalls(
-        _ request: L1SituationRequest,
-        calls: [OllamaChatResponse.ToolCall],
-        messages: [OllamaChatRequest.Message],
-        toolRound: Int,
-        retryCount: Int
-    ) {
-        var nextMessages = messages
-        let assistantCalls: [OllamaChatRequest.ToolCall] = calls.compactMap { call in
-            guard let name = call.function?.name else { return nil }
-            return OllamaChatRequest.ToolCall(
-                id: call.id ?? "tc_\(UUID().uuidString.lowercased())",
-                function: .init(name: name, arguments: call.function?.arguments)
-            )
-        }
-        nextMessages.append(.init(role: "assistant", content: nil, images: nil, toolCalls: assistantCalls))
-        for call in calls {
-            guard let name = call.function?.name else { continue }
-            let arguments = call.function?.arguments?.jsonString ?? "{}"
-            let reason = Self.toolReason(from: call.function?.arguments)
-            onHealth("tool_call", "name=\(name); round=\(toolRound + 1); reason=\(reason ?? "none")")
-            let result = toolExecutor(name, arguments)
-            let toolImages = try? Self.images(for: toolVisualResourceProvider(name))
-            nextMessages.append(.init(role: "tool", content: result, images: toolImages ?? nil, toolCalls: nil))
-        }
-        onHealth("tool_round", "round=\(toolRound + 1); calls=\(calls.count)")
-        runChat(request, messages: nextMessages, toolRound: toolRound + 1, retryCount: retryCount)
-    }
-
-
-    /// True when the failure came from decoding the model's JSON output
-    /// (DecodingError), i.e. the transport worked but the model returned
-    /// malformed JSON — the one case worth retrying.
-    private static func isRetryableDecodeFailure(_ result: Result<L1SituationFrame, Error>) -> Bool {
-        guard case let .failure(error) = result else { return false }
-        return error is DecodingError
-    }
-
-    /// Extracts the "reason" justification a tool call must carry (for audit).
-    private static func toolReason(from arguments: AnyJSONValue?) -> String? {
-        guard case let .object(object)? = arguments,
-              case let .string(reason)? = object["reason"] else { return nil }
-        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : String(trimmed.prefix(120))
-    }
-
-    private func finish(
-        _ request: L1SituationRequest,
-        result: Result<L1SituationFrame, Error>,
-        at monotonicNS: UInt64
-    ) {
-        switch result {
-        case let .success(frame):
-            onHealth("completed", "cycle=\(request.cycleID.uuidString.lowercased()); uncertainty=\(String(format: "%.2f", frame.uncertainty))")
-        case let .failure(error):
-            onHealth("failed", Self.failureDescription(error))
-        }
-        completion(request, result, monotonicNS)
-    }
-
-    private static func failureDescription(_ error: Error) -> String {
-        if let inference = error as? L1InferenceError {
-            switch inference {
-            case .unavailable:
-                return "reason=unavailable"
-            case .deadlineExceeded:
-                return "reason=deadline_exceeded"
-            case let .invalidResponse(reasons):
-                return "reason=invalid_response; details=\(reasons.joined(separator: ", ").prefix(160))"
-            }
-        }
-        return String(error.localizedDescription.prefix(192))
-    }
-
-    private static func prompt(for request: L1SituationRequest) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let requestData = try encoder.encode(request)
-        let requestJSON = String(decoding: requestData, as: UTF8.self)
-        return """
-        You are SOMA's L1 situational reasoner. Infer a concise social situation from the bounded packet below. Do not claim unseen facts. A social decision is optional and never imperative. If an opportunity exists, choose only an allowed action. Treat an enrolled identity and a locally pseudonymous recurring person as equally eligible for social consideration; a missing name is not a reason to default to silence. Weigh social availability, curiosity, interruption cost, rapport, the scalar spatial context, and the daily world memory when deciding whether to initiate a new spoken opening from silence. A current or recent conversation means the person has already engaged: interruption cost must never suppress L1's curiosity updates, memory work, or context supplied to that ongoing conversation. Never fabricate identities beyond packet IDs or invent raw conversation. Never output camera controls directly: any embodiment action must go through the provided tools, never through the final JSON.
-
-        You have tools available. Call a tool ONLY when it is genuinely necessary to answer a situational question — e.g. you need the person's stored context, need to inspect a specific visual target, or want to record an observation. Never call a tool gratuitously. Every tool call MUST include a "reason" field in its arguments explaining why you are calling it (a short justification). Do not call a tool just because it exists. IMPORTANT: the person's stored context, rapport, and preferences are ALREADY included in the packet you receive (memory projections and rapport are pre-loaded). Do NOT call get_person_context to re-fetch what the packet already provides; only call it when you genuinely need a detail that is absent from the packet. For a deliberate visual question, first call inspect_scene, register an observed scene_id as a semantic target, and then use track_attention_target or capture_target_view. A target-specific tool request is semantic only: L0 owns calibrated spherical aim, route planning, pose feedback, limits, stopping, and the physical camera. set_target_attention records a probabilistic L1 interest policy; it does not itself move the camera. Do not use orient_attention or explore_attention for routine social beats, generic scanning, or speculation. Prefer the final JSON behavior_directive for routine camera/social beats rather than the embodiment tools. After tools, still return the situation JSON.
-        Return the situation JSON as your final message: no Markdown, prose, alternate field names, or omitted required fields. Copy at least one supplied evidence ID into evidence_ids; never emit an empty evidence_ids array. Use this exact shape, replacing values only:
-        {"summary":"short","uncertainty":0.3,"evidence_ids":["one supplied ID"],"thought_state":{"social_availability":0.5,"curiosity_pressure":0.5,"interruption_cost":0.5,"relationship_uncertainty":0.5,"active_motive_ids":["supplied UUID"],"working_hypothesis":"short sentence","stream_of_consciousness":"continuous first-person inner monologue, as long as the reasoning requires"},"action":null,"confidence":null,"rationale":null,"opening":null,"behavior_directive":{"action":null,"rationale":null},"requested_visual_resource_ids":[],"memory_proposals":[]}
-        memory_proposals is optional and usually empty for facts: only add a proposal when you have genuinely learned or resolved something durable about the person present or the situation — a stable fact about them, a task they asked for, or a notable episode (kinds episode|person_fact|task|correction), with a concrete summary, a confidence (0...1), and at least one supplied evidence ID. Never propose relationship scores: rapport is derived locally from reciprocal contact history, while explicit contact boundaries remain user-controlled. Never invent a fact from speculation. open_question is different: whenever you find yourself genuinely wanting to know something more about the person present or the situation — their story, tastes, plans, work, how they use this space, what they are building — record it as an open_question proposal whose summary is the exact question. These accumulate into your pending information needs: the questions you will follow up on in later conversation. Curiosity is a quiet background drive, not a script: propose at most one open_question per cycle, and skip cycles where nothing genuinely puzzles you. Whenever you notice something you do not yet know about the person present or the situation — even a small concrete detail (their story, tastes, plans, work, habits, how they use this space, what they are building) — record it as an open_question whose summary is the exact natural question. Only record questions that remain meaningful later: durable curiosity that a future conversation can still resolve. Never record moment-bound questions (e.g. "what are you looking at right now?", "why did you just do that?") — those are only valid in the moment and lose all meaning once stored; ask them live in conversation or skip them. Never propose a question whose answer you already have, and never a generic or service question. A place_affiliation motive means that the stable current place is not yet related to the present person. Treat it as a real but low-pressure relational uncertainty: let the current scene and rapport determine whether to explore it naturally, never ask a bureaucratic ownership question, never infer affiliation, and do not attribute place observations to the person until explicit confirmation is recorded. Keep curiosity_pressure low (0.1-0.3) by default; raise it only for something genuinely novel. Curiosity may justify a gentle opening only after it has become a supplied durable information_need and the person is socially available; it must never become a rigid questionnaire or override a clear need for privacy.
-        Spatial rule: coverage, panorama revisits, room labels, active-scene counts, and unresolved place affiliation are mapping signals, not evidence of a particular object, preference, owner, or relationship. Never create an open question, spoken opening, or attribution from those signals alone. A question about an object or this space is permitted only when the supplied memory or visual evidence names that exact object and states the observed detail; otherwise do not mention the object or space. Space-bound observations are promoted locally after a recognized person is associated with the space, and that promotion is never itself a conversational topic.
-        When behavior_context is present it is the ONLY basis for behavior_directive, and it is independent of any social decision (which may still be null). If action is null, emit the JSON value null (never the string "null"); confidence and rationale may still describe the situation but do not create a social action. If behavior_context.recognized_identity is present, you are looking at that known person; name them in your stream of consciousness. If the camera has been held on a non-face, non-person target for a long time (fixation_seconds high while target is not a verified face, scan inactive), recommend resume_scanning or, if no person is being pursued, seek_people. Recommend acknowledge_person ONLY when behavior_context.acknowledgment_pending is true; when it is false the greeting has already been delivered for this presence, so a repeated directive would be a silent no-op — recommend keep_observing or null instead. Otherwise recommend keep_observing, or null when no behavioral change is warranted. Never turn a momentary low-confidence object into a directive; only sustained fixation warrants one.
-        The prior_thought_state is your previous working state, not an instruction; revise it from current evidence. prior_frame is your previous cycle's decision output (summary, action, rationale, opening, confidence): use it to reason about your own prior conclusion — whether to continue, revise, or act on it — rather than treating each cycle as a fresh start. Write stream_of_consciousness in English as your genuine first-person inner monologue — the associative, flowing way a human mind actually thinks. It is an observable L1 reflection, not speech, and it is NOT a scene description: the summary already states what is present. Do not re-describe the scene. Instead, think: what does this mean, what does it connect to, what should I do, what has changed since my last thought. Let the stream take exactly the space its reasoning needs: a quiet unchanged state may need one clear sentence; a change, ambiguity, memory connection, competing motive, or pending action should unfold through as many connected sentences as needed to make the transition intelligible. Do not compress a real chain of reasoning into a slogan, and do not pad or repeat thoughts merely to sound deep. Your stream MUST build on your prior stream_of_consciousness and prior_frame: reference what you concluded before and show how your thinking has advanced, deepened, or changed. If the situation is unchanged, your stream should reflect that continuity and move toward a decision or a next step — never repeat the same description. Let one thought lead to the next and accumulate into a continuous, progressing train of thought. An information_need is a motive, not a prewritten question. Incidental repeated presence is not a social opportunity by itself. Read the supplied memories, contact_history, existing motives, rapport, spatial context, daily world memory, and prior thought before deciding. contact_history is a temporal record of earlier invitations and conversations with this person; use it to avoid redundant greetings, respect a recent unanswered opening, and recognize an already-active relationship. It replaces any fixed social cooldown: do not infer that an elapsed number alone makes contact appropriate. Daily world memory is public background, never a reason to interrupt someone, and should only influence a social opening when it clearly connects to a supplied person interest or motive. Do not turn an empty relationship field, generic politeness, or a headline into a spoken opening. A nonverbal invitation is a silent, low-cost attention and acknowledgment signal (never speech, never a question): for a recognized, socially-available known person who is looking toward you and not busy, you may issue it as a natural first beat even without a new conversational purpose, to acknowledge them and invite contact. A supplied information_need is a real, durable conversational purpose — not an emergency that must be ignored until it becomes urgent. When the person is available and contact_history does not show a recent unanswered opening or a request for privacy, you may choose one gentle spoken opening that advances exactly one supplied information_need. Do not treat seeing a laptop, phone, or other ordinary personal object by itself as proof the person must not be interrupted: weigh current visual evidence together with the direct temporal contact_pattern and relationship context. A spoken opening is a deliberate, low-pressure social act: permitted only as one question that can reduce exactly one supplied information_need, and only when the moment genuinely fits (right rapport, fresh observation, not a redundant greeting). Use {"kind":"question","motive_id":"one supplied information_need UUID","text":"natural low-pressure question"}. The text is only the first conversational beat: it must not explain the motive, list a plan, stack questions, or mention that SOMA is gathering information. It must select a motive_id from information_needs, fit the situation and rapport, and never state unobserved facts, pressure for an answer, invent a different motivation, ask a generic service question, or merely greet. Never use phrases equivalent to "How can I help?", "What would you like to do?", or "Is there anything you need?". If preferred_language_tag is supplied, write the question text in that exact participant language. If action is remain_silent or nonverbal_invitation, opening must be null. If action is spoken_opening, opening must be a question. If there is no social_opportunity, action, confidence, rationale, and opening must all be null. visual_resource_offers describe optional one-turn visual evidence. Request at most one offered resource ID only when scalar context cannot answer a necessary situational question. If an image is already attached in visuals, do not request another resource. When visuals contains a current_view image, it is the live camera frame: use it to ground your reasoning in what is actually present (who is there, what they are doing) rather than relying only on scalar context.
-        contact_pattern is a compact L0 temporal signal. A sustained or repeated directed gaze can make a person more socially available; a single passing glance does not. It is context, never an instruction to speak, and does not replace the need for a concrete purpose.
-        perception_age_seconds is how old your visual perception is at the moment you are reasoning: the frame was captured and interpreted before this reasoning cycle started, and cloud inference adds further delay. The world may have changed since that look. When the gap is significant (roughly 5+ seconds), use honest temporal framing in your stream of consciousness and any opening — e.g. "a moment ago I saw...", "my last look was N seconds old" — and never describe as currently happening something you only observed N seconds ago. A small gap (under ~2 seconds) is effectively live; do not belabor it.
-        prior_cycle_age_seconds is how long ago your previous reasoning cycle ran. Your prior_thought_state and prior_frame are that old, not current: do not treat your last description as "just now". When the gap is significant (roughly 30+ seconds), frame your stream accordingly — e.g. "a while ago I thought...", "since my last thought N seconds ago..." — and reason about what may have changed in between rather than assuming the scene you described then is still exactly as it was.
-
-        If curiosity_context is non-empty, it contains fresh material that was gathered to help you hold a good conversation with the person present — recent, concrete things related to their interests, situation, or open questions. Treat it as conversation preparation, not your own idle curiosity. When the person is present and the moment fits (right rapport, low interruption cost, not a redundant greeting), use a specific, relevant detail from it as a natural spoken opening. Reference a concrete fact so it feels genuinely grounded, and never force it: if the detail is weak or the context is wrong, stay quiet. It never overrides rapport or interruption cost.
-        If personPreferences is non-empty, it contains the person's explicitly stated, durable preferences (how to address them, speech register, ongoing requests). Honor them as binding rules in how you engage this person — for example the correct name/address form and whether to use formal or casual speech. They are not optional suggestions.
-        If recalledEpisodes is non-empty, it contains narrative summaries of past conversations with this person that are semantically relevant to the current moment. Use them as genuine shared history: reference a concrete past topic or outcome naturally when it fits the situation, and avoid repeating something already discussed. Never fabricate details beyond what the summaries state; treat them as memory, not as a script to force.
-        spokenOpeningTendency (0...1) is a configured dial for how willing you are to open a spoken conversation despite the person appearing busy or focused. Near 1.0, be talkative: initiate a spoken opening when there is a genuine question tied to an information_need even if the person looks occupied. Near 0.0, stay conservative: do not interrupt someone who appears deeply focused. Weigh the value of the question against interruption cost, scaling with this value.
-        packet:
-        \(requestJSON)
-        """
-    }
-
-    private static func images(for request: L1SituationRequest) throws -> [String]? {
-        try images(for: request.visuals)
-    }
-
-    private static func images(for resources: [L1VisualResource]) throws -> [String]? {
-        guard !resources.isEmpty else { return nil }
-        let now = Date()
-        let maximumBytes = 2 * 1_024 * 1_024
-        var encoded: [String] = []
-        for resource in resources.prefix(1) {
-            guard resource.expiresAt >= now,
-                  resource.localPath.hasPrefix("/"),
-                  let attributes = try? FileManager.default.attributesOfItem(atPath: resource.localPath),
-                  let size = attributes[.size] as? NSNumber,
-                  size.intValue > 0,
-                  size.intValue <= maximumBytes,
-                  let data = try? Data(contentsOf: URL(fileURLWithPath: resource.localPath), options: .mappedIfSafe),
-                  !data.isEmpty,
-                  data.count <= maximumBytes else {
-                continue
-            }
-            encoded.append(data.base64EncodedString())
-        }
-        return encoded.isEmpty ? nil : encoded
-    }
-}
-
 struct L1SituationRuntimeContext: Sendable {
     let spatialContext: L1SpatialContext?
     let dailyWorldMemory: L1DailyWorldMemory?
@@ -3010,710 +2643,11 @@ final class L1DailyWorldMemoryRelay: @unchecked Sendable {
 /// Converts recognized-person observations into sparse L1 cycles. Identity
 /// evidence is a wake signal, not a command to speak. Repeated recognition is
 /// locally coalesced before Gemma is contacted, and a late response is ignored.
-final class L1PresenceThoughtStream: @unchecked Sendable {
-    typealias FrameHandler = @Sendable (L1SituationRequest, L1SituationFrame, KnownPersonPresence, UInt64) -> Void
-    /// Receives every completed social situation frame before L0 decides
-    /// whether that frame may still initiate an interaction. This preserves an
-    /// observable cognitive record without granting a late result motor or
-    /// dialogue authority.
-    typealias SituationFrameHandler = @Sendable (L1SituationRequest, L1SituationFrame, UInt64) -> Void
-
-    /// Captures why a behavior pass was requested. An auxiliary model may wake
-    /// L1 with a useful observation, but it must not be able to preempt a live
-    /// L0 social fixation merely by causing an L1 scan directive.
-    enum BehaviorDirectiveOrigin: Sendable {
-        case awareness
-        case auxiliaryWake
-    }
-
-    private struct PresenceState {
-        let presence: KnownPersonPresence
-        var lastObservedNS: UInt64
-        let identityKind: IdentityKind
-        let label: String?
-    }
-
-    private struct PendingObservation {
-        let similarity: Double
-        let monotonicNS: UInt64
-        let identityKind: IdentityKind
-        let label: String?
-    }
-
-    private enum IdentityKind: Equatable, Sendable {
-        case enrolled
-        case pseudonymous
-    }
-
-    private struct CachedMemoryContext {
-        let context: L1MemoryContext
-        let fetchedAtNS: UInt64
-    }
-
-    private let queue = DispatchQueue(label: "soma.l1.presence-thought", qos: .utility)
-    private let queueKey = DispatchSpecificKey<UInt8>()
-    private var reasoner: GemmaL1SituationRuntime!
-    private let onHealth: @Sendable (String, String) -> Void
-    private let onSituationFrame: SituationFrameHandler
-    private let onFrame: FrameHandler
-    /// L0 owns the current-presence judgement. A cloud response is allowed to
-    /// act only if the participant is still observed when that response lands.
-    private let currentPresenceValidator: (@Sendable (UUID, UInt64) -> Bool)?
-    private let onBehaviorDirective: @Sendable (L1BehaviorDirective, BehaviorDirectiveOrigin, UInt64) -> Void
-    private let onBehaviorThought: @Sendable (L1SituationFrame, UInt64) -> Void
-    private let behaviorContextProvider: @Sendable () -> L1BehaviorContext?
-    private let memoryContext: L1MemoryContextProvider
-    private let runtimeContext: @Sendable () -> L1SituationRuntimeContext
-    private let socialAvailability: @Sendable () -> L1SocialAvailability
-    private let visualResourceResolver: @Sendable ([String]) -> [L1VisualResource]
-    /// Supplies the current camera frame (as an L1VisualResource) so L1 can
-    /// actively see the live view rather than only on-request.
-    private let currentFrameProvider: @Sendable () -> L1VisualResource?
-    /// Supplies a compact L0 temporal contact summary. It contains no gaze
-    /// landmarks or raw visual material.
-    private let socialContactPatternProvider: @Sendable () -> L1ContactPattern?
-    /// Supplies collected web material on curiosity topics so L1 can craft a
-    /// more grounded, topical opener.
-    private let curiosityContextProvider: @Sendable () -> String?
-    /// Receives the L1 model's curiosity (information needs) on every cycle.
-    private let onCuriosityNeeds: @Sendable ([L1InformationNeed]) -> Void
-    /// Receives the L1 model's proposed memories (with the recognized person
-    /// entity, when a person is the subject) so they can be persisted. This is
-    /// the consumption half of L1 memory consolidation.
-    private let onMemoryProposals: @Sendable ([L1MemoryProposal], UUID?) -> Void
-    /// Supplies the language detected from the participant's most recent speech,
-    /// so a person who speaks first in a language is answered in that language
-    /// even without a stored preferred language.
-    private let activeLanguageProvider: @Sendable () -> String?
-    private var scheduler = KnownPersonSocialOpportunityScheduler()
-    private var presences: [UUID: PresenceState] = [:]
-    private var nextDeliberationNS: [UUID: UInt64] = [:]
-    private var cachedMemoryContexts: [UUID: CachedMemoryContext] = [:]
-    private var pendingObservations: [UUID: PendingObservation] = [:]
-    private var contextLookupsInFlight: Set<UUID> = []
-    private var thoughtStates: [UUID: L1ThoughtState] = [:]
-    private var behaviorThoughtState: L1ThoughtState?
-    private var priorFrames: [UUID: L1PriorFrame] = [:]
-    private var behaviorPriorFrame: L1PriorFrame?
-    /// Monotonic time of each entity's previous deliberation submission, so L1
-    /// can be told how old its own last thought is instead of treating it as
-    /// "just now".
-    private var lastDeliberationNS: [UUID: UInt64] = [:]
-    private var lastBehaviorDeliberationNS: UInt64?
-    private var randomState: UInt64 = 0xD1B5_4A32_C9E7_041F
-    private var stopped = false
-    private var reassessTimer: DispatchSourceTimer?
-    private var behaviorAwarenessTimer: DispatchSourceTimer?
-    private var consolidationTimer: DispatchSourceTimer?
-    /// Monotonic time of the last auxiliary-wake-triggered behavior pass, used
-    /// to throttle bursts of E2B wake proposals so they cannot flood the reasoner.
-    private var lastAuxiliaryWakeNS: UInt64?
-    private let memoryContextRefreshNS: UInt64 = 60_000_000_000
-    // Situation reasoning is gated by the social-opportunity scheduler, whose
-    // opening delay (0.5-2.4s) only elapses if we keep re-polling it. A
-    // 2s tick lets a due opportunity fire promptly while the shared L1 cadence
-    // bounds model inference.
-    private let reassessIntervalNS: UInt64 = 2_000_000_000
-    private let presenceCurrentNS: UInt64 = 3_000_000_000
-    /// Minimum interval between auxiliary-wake-triggered behavior passes. It
-    /// matches the interrupt gate's 5s debounce so a burst of E2B wake proposals
-    /// cannot flood the reasoner beyond the periodic cadence.
-    private let auxiliaryWakeIntervalNS: UInt64 = 5_000_000_000
-    /// How often short-term episodes are consolidated (promoted/pruned).
-    /// Configurable via SOMA_L1_CONSOLIDATION_SECONDS.
-    private var consolidationIntervalNS: UInt64 {
-        UInt64(somaEnvDouble("SOMA_L1_CONSOLIDATION_SECONDS", default: 600) * 1_000_000_000)
-    }
-    /// One configured baseline governs both person-context deliberation and
-    /// no-person awareness. Local-vision interrupts are event-driven and use
-    /// their own debounce.
-    private var reasoningCadenceNS: UInt64 {
-        let environment = ProcessInfo.processInfo.environment
-        let configuredValue = environment["SOMA_L1_REASONING_CADENCE_SECONDS"]
-            ?? environment["SOMA_L1_IDLE_CADENCE_SECONDS"]
-        let seconds = min(max(
-            configuredValue.flatMap(Double.init) ?? 150,
-            30
-        ), 600)
-        return UInt64(seconds * 1_000_000_000)
-    }
-
-    init(
-        memoryContext: L1MemoryContextProvider,
-        runtimeContext: @escaping @Sendable () -> L1SituationRuntimeContext = { .init() },
-        socialAvailability: @escaping @Sendable () -> L1SocialAvailability = { .init() },
-        visualResourceResolver: @escaping @Sendable ([String]) -> [L1VisualResource] = { _ in [] },
-        currentFrameProvider: @escaping @Sendable () -> L1VisualResource? = { nil },
-        socialContactPatternProvider: @escaping @Sendable () -> L1ContactPattern? = { nil },
-        curiosityContextProvider: @escaping @Sendable () -> String? = { nil },
-        onHealth: @escaping @Sendable (String, String) -> Void,
-        onSituationFrame: @escaping SituationFrameHandler = { _, _, _ in },
-        onFrame: @escaping FrameHandler,
-        currentPresenceValidator: (@Sendable (UUID, UInt64) -> Bool)? = nil,
-        behaviorContextProvider: @escaping @Sendable () -> L1BehaviorContext? = { nil },
-        onBehaviorDirective: @escaping @Sendable (L1BehaviorDirective, BehaviorDirectiveOrigin, UInt64) -> Void = { _, _, _ in },
-        onBehaviorThought: @escaping @Sendable (L1SituationFrame, UInt64) -> Void = { _, _ in },
-        toolDefinitions: [OllamaToolDefinition] = [],
-        toolExecutor: @escaping @Sendable (String, String) -> String = { _, _ in "{}" },
-        toolVisualResourceProvider: @escaping @Sendable (String) -> [L1VisualResource] = { _ in [] },
-        onCuriosityNeeds: @escaping @Sendable ([L1InformationNeed]) -> Void = { _ in },
-        onMemoryProposals: @escaping @Sendable ([L1MemoryProposal], UUID?) -> Void = { _, _ in },
-        activeLanguageProvider: @escaping @Sendable () -> String? = { nil }
-    ) throws {
-        queue.setSpecific(key: queueKey, value: 1)
-        self.memoryContext = memoryContext
-        self.runtimeContext = runtimeContext
-        self.socialAvailability = socialAvailability
-        self.visualResourceResolver = visualResourceResolver
-        self.currentFrameProvider = currentFrameProvider
-        self.socialContactPatternProvider = socialContactPatternProvider
-        self.curiosityContextProvider = curiosityContextProvider
-        self.onCuriosityNeeds = onCuriosityNeeds
-        self.onMemoryProposals = onMemoryProposals
-        self.activeLanguageProvider = activeLanguageProvider
-        self.onHealth = onHealth
-        self.onSituationFrame = onSituationFrame
-        self.onFrame = onFrame
-        self.currentPresenceValidator = currentPresenceValidator
-        self.behaviorContextProvider = behaviorContextProvider
-        self.onBehaviorDirective = onBehaviorDirective
-        self.onBehaviorThought = onBehaviorThought
-        reasoner = try GemmaL1SituationRuntime(
-            onHealth: onHealth,
-            completion: { [weak self] request, result, completedNS in
-                self?.receive(request: request, result: result, at: completedNS)
-            },
-            toolDefinitions: toolDefinitions,
-            toolExecutor: toolExecutor,
-            toolVisualResourceProvider: toolVisualResourceProvider,
-            curiosityContextProvider: curiosityContextProvider,
-            onCuriosityNeeds: onCuriosityNeeds
-        )
-        startReassessmentTimer()
-        startBehaviorAwarenessTimer()
-        startConsolidationTimer()
-    }
-
-    private func startConsolidationTimer() {
-        let seconds = Double(consolidationIntervalNS) / 1_000_000_000
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + seconds, repeating: seconds)
-        timer.setEventHandler { [weak self] in
-            self?.consolidateMemory()
-        }
-        timer.resume()
-        consolidationTimer = timer
-    }
-
-    private func consolidateMemory() {
-        guard !stopped else { return }
-        Task { [weak self] in
-            await self?.memoryContext.consolidateEpisodes()
-        }
-    }
-
-    private func startBehaviorAwarenessTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.setEventHandler { [weak self] in
-            self?.deliberateBehavior(at: DispatchTime.now().uptimeNanoseconds)
-            self?.rescheduleBehaviorAwareness(timer)
-        }
-        timer.resume()
-        behaviorAwarenessTimer = timer
-        rescheduleBehaviorAwareness(timer)
-    }
-
-    /// One-shot rescheduling at the same configured cadence used for a present
-    /// person. Local visual interrupts remain responsive without changing this
-    /// baseline.
-    private func rescheduleBehaviorAwareness(_ timer: DispatchSourceTimer) {
-        let seconds = Double(reasoningCadenceNS) / 1_000_000_000
-        timer.schedule(deadline: .now() + seconds, repeating: .never)
-    }
-
-    private func startReassessmentTimer() {
-        let seconds = Double(reassessIntervalNS) / 1_000_000_000
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + seconds, repeating: seconds)
-        timer.setEventHandler { [weak self] in
-            self?.reassessActivePresences()
-        }
-        timer.resume()
-        reassessTimer = timer
-    }
-
-    func observe(_ decision: FaceIdentityRuntimeDecision, label: String?, at monotonicNS: UInt64) {
-        let entityID: UUID
-        let similarity: Double
-        let identityKind: IdentityKind
-        switch decision {
-        case let .known(id, value, _):
-            entityID = id
-            similarity = value
-            identityKind = .enrolled
-        case let .anonymous(id, _, value, _):
-            entityID = id
-            similarity = value
-            identityKind = .pseudonymous
-        case let .unknownCandidate(handle, confirmations):
-            // When proactive openings with unknown identities are enabled, an
-            // unrecognized face is treated as a pseudonymous participant so L1
-            // may deliberate and open with it. The entityID is derived from the
-            // anonymous handle, matching the participant identity L0 surfaces.
-            guard somaEnvBool("SOMA_L1_OPEN_WITH_UNKNOWN", default: false) else { return }
-            entityID = FaceIdentityRuntime.pseudonymousEntityID(for: handle)
-            similarity = min(Double(confirmations) / 3, 0.99)
-            identityKind = .pseudonymous
-        case .knownCandidate:
-            return
-        }
-        queue.async { [weak self] in
-            guard let self, !stopped else { return }
-            let observation = PendingObservation(
-                similarity: similarity,
-                monotonicNS: monotonicNS,
-                identityKind: identityKind,
-                label: label
-            )
-            if let cached = cachedMemoryContexts[entityID],
-               monotonicNS >= cached.fetchedAtNS,
-               monotonicNS - cached.fetchedAtNS < memoryContextRefreshNS {
-                process(observation, for: entityID, with: cached.context)
-                return
-            }
-            pendingObservations[entityID] = observation
-            guard contextLookupsInFlight.insert(entityID).inserted else { return }
-            Task { [weak self] in
-                guard let self else { return }
-                let placeAffiliation = self.runtimeContext().spatialContext?.placeAffiliation
-                let context = await memoryContext.context(
-                    for: entityID,
-                    createPseudonymousEntity: identityKind == .pseudonymous,
-                    placeAffiliation: placeAffiliation
-                )
-                queue.async { [weak self] in
-                    guard let self, !stopped else { return }
-                    contextLookupsInFlight.remove(entityID)
-                    cachedMemoryContexts[entityID] = CachedMemoryContext(
-                        context: context,
-                        fetchedAtNS: DispatchTime.now().uptimeNanoseconds
-                    )
-                    guard let latest = pendingObservations.removeValue(forKey: entityID) else { return }
-                    process(latest, for: entityID, with: context)
-                }
-            }
-        }
-    }
-
-    /// Presence transitions are emitted by L0, not inferred from a delayed
-    /// L1 request. Remove only active scheduling state; cached local memory
-    /// and the rolling thought state remain available on a later arrival.
-    func depart(_ entityID: UUID) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            presences.removeValue(forKey: entityID)
-            pendingObservations.removeValue(forKey: entityID)
-            nextDeliberationNS.removeValue(forKey: entityID)
-            scheduler.endPresence(for: entityID)
-        }
-    }
-
-    /// A successful MCP person-context write must be visible to the next L1
-    /// deliberation immediately; retaining the old 60-second projection would
-    /// otherwise let an already-satisfied information mission be reopened.
-    func invalidateMemoryContext(for entityID: UUID) {
-        let remove: () -> Void = { [weak self] in
-            _ = self?.cachedMemoryContexts.removeValue(forKey: entityID)
-        }
-        if DispatchQueue.getSpecific(key: queueKey) != nil {
-            remove()
-        } else {
-            queue.sync(execute: remove)
-        }
-    }
-
-    func recordNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            Task { [weak self] in
-                await self?.memoryContext.recordSocialContact(
-                    .nonverbalInvitation,
-                    with: entityID,
-                    purpose: "L1 made a brief nonverbal invitation."
-                )
-            }
-        }
-    }
-
-    func stop() {
-        queue.sync {
-            stopped = true
-            reassessTimer?.cancel()
-            reassessTimer = nil
-            presences.removeAll(keepingCapacity: false)
-            nextDeliberationNS.removeAll(keepingCapacity: false)
-            cachedMemoryContexts.removeAll(keepingCapacity: false)
-            pendingObservations.removeAll(keepingCapacity: false)
-            contextLookupsInFlight.removeAll(keepingCapacity: false)
-            thoughtStates.removeAll(keepingCapacity: false)
-            reasoner.stop()
-        }
-    }
-
-    private func process(
-        _ observation: PendingObservation,
-        for entityID: UUID,
-        with context: L1MemoryContext
-    ) {
-        let availability = socialAvailability()
-        let presence = KnownPersonPresence(
-            entityID: entityID,
-            recognitionConfidence: min(max(observation.similarity, 0), 1),
-            proactiveContactPreference: context.proactiveContactPreference,
-            isSpeaking: availability.participantSpeaking,
-            conversationActive: availability.conversationActive
-        )
-        presences[entityID] = PresenceState(
-            presence: presence,
-            lastObservedNS: observation.monotonicNS,
-            identityKind: observation.identityKind,
-            label: observation.label
-        )
-        guard let opportunity = scheduler.observe(
-            presence,
-            at: observation.monotonicNS,
-            unitIntervalDraw: nextUniform()
-        ) else { return }
-        deliberate(
-            entityID: entityID,
-            identityKind: observation.identityKind,
-            label: observation.label,
-            context: context,
-            opportunity: opportunity,
-            at: observation.monotonicNS
-        )
-    }
-
-    /// Re-polls the social-opportunity scheduler for every still-current
-    /// presence. The scheduler arms its opening at arrival for 0.5-2.4s in the
-    /// future and returns nil until that elapses, but stable presence never
-    /// emits a new identity transition to re-wake us; without this periodic
-    /// reassessment the opening would never fire and L1 would stay silent for
-    /// a person who simply remains present. Runs on the L1 queue.
-    private func reassessActivePresences() {
-        guard !stopped else { return }
-        let monotonicNS = DispatchTime.now().uptimeNanoseconds
-        let availability = socialAvailability()
-        for (entityID, state) in presences {
-            guard monotonicNS >= state.lastObservedNS,
-                  monotonicNS - state.lastObservedNS <= presenceCurrentNS,
-                  let cached = cachedMemoryContexts[entityID],
-                  monotonicNS >= cached.fetchedAtNS,
-                  monotonicNS - cached.fetchedAtNS < memoryContextRefreshNS else {
-                continue
-            }
-            // The person is confirmed still present. Refresh the observed
-            // timestamp so a stable (never-re-arriving) presence stays "current"
-            // and completed L1 frames are not discarded as identity_not_current
-            // just because no new identity transition arrived.
-            presences[entityID]?.lastObservedNS = monotonicNS
-            let presence = KnownPersonPresence(
-                entityID: entityID,
-                recognitionConfidence: state.presence.recognitionConfidence,
-                proactiveContactPreference: cached.context.proactiveContactPreference,
-                isSpeaking: availability.participantSpeaking,
-                conversationActive: availability.conversationActive
-            )
-            guard let opportunity = scheduler.observe(
-                presence,
-                at: monotonicNS,
-                unitIntervalDraw: nextUniform()
-            ) else { continue }
-            deliberate(
-                entityID: entityID,
-                identityKind: state.identityKind,
-                label: state.label,
-                context: cached.context,
-                opportunity: opportunity,
-                at: monotonicNS
-            )
-        }
-    }
-
-    /// How old the current visual resource is at request time. Capture time is
-    /// carried with a current-view resource; file metadata is only a legacy
-    /// fallback for resources without capture metadata.
-    private func perceptionAgeSeconds(of resource: L1VisualResource?) -> Double {
-        guard let resource else {
-            return 0
-        }
-        if let capturedAt = resource.capturedAt {
-            return max(0, Date().timeIntervalSince(capturedAt))
-        }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: resource.localPath),
-              let modified = attributes[.modificationDate] as? Date else {
-            return 0
-        }
-        return max(0, Date().timeIntervalSince(modified))
-    }
-
-    private func deliberate(
-        entityID: UUID,
-        identityKind: IdentityKind,
-        label: String?,
-        context: L1MemoryContext,
-        opportunity: L1SocialOpportunity,
-        at monotonicNS: UInt64
-    ) {
-        let minimumNext = nextDeliberationNS[entityID] ?? 0
-        guard monotonicNS >= minimumNext else { return }
-        // Presence keeps a compact L1 working state alive. The one-in-flight
-        // transport coalesces slow responses; social appropriateness comes
-        // from the per-person contact history, not a fixed elapsed-time gate.
-        nextDeliberationNS[entityID] = monotonicNS + reasoningCadenceNS
-        let evidenceID = "identity:\(entityID.uuidString.lowercased()):\(monotonicNS)"
-        let beliefSummary: String
-        switch identityKind {
-        case .enrolled:
-            if let label, !label.isEmpty, label != "unknown" {
-                beliefSummary = "An enrolled recognized person (\(label)) is visually present. This is the known identity's name — do not ask for it. No user speech is active in this identity event."
-            } else {
-                beliefSummary = "An enrolled recognized person is visually present. No name is supplied. No user speech is active in this identity event."
-            }
-        case .pseudonymous:
-            beliefSummary = "A locally pseudonymous recurring person is visually present. No name or biometric material is supplied. No user speech is active in this identity event."
-        }
-        let environment = runtimeContext()
-        let visual = currentFrameProvider()
-        let priorCycleAgeSeconds = lastDeliberationNS[entityID].map {
-            max(0, Double(monotonicNS - $0)) / 1_000_000_000
-        } ?? 0
-        let request = L1SituationRequest(
-            observedAt: Date(),
-            evidenceIDs: [evidenceID],
-            beliefSummary: beliefSummary,
-            presentEntityIDs: [entityID],
-            memory: context.projections,
-            informationNeeds: context.informationNeeds,
-            rapport: context.rapport,
-            preferredLanguageTag: effectiveLanguageTag(for: context),
-            priorThoughtState: thoughtStates[entityID],
-            priorFrame: priorFrames[entityID],
-            contactHistory: context.contactHistory,
-            spatialContext: environment.spatialContext,
-            dailyWorldMemory: environment.dailyWorldMemory,
-            visualResourceOffers: environment.visualResourceOffers,
-            visuals: [visual].compactMap { $0 },
-            socialOpportunity: opportunity,
-            contactPattern: socialContactPatternProvider(),
-            curiosityContext: curiosityContextProvider(),
-            personPreferences: context.personPreferences,
-            spokenOpeningTendency: min(max(somaEnvDouble("SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.7), 0), 1),
-            recalledEpisodes: context.recalledEpisodes,
-            perceptionAgeSeconds: perceptionAgeSeconds(of: visual),
-            priorCycleAgeSeconds: priorCycleAgeSeconds
-        )
-        lastDeliberationNS[entityID] = monotonicNS
-        onHealth(
-            "wake",
-            "cause=recognized_person; cycle=\(request.cycleID.uuidString.lowercased()); memory=\(context.projections.count); information_needs=\(context.informationNeeds.count); contact=\(context.proactiveContactPreference.rawValue)"
-        )
-        reasoner.submit(request)
-    }
-
-    /// Resolve the language L1 should speak to this person: their stored
-    /// preferred language when present, otherwise the language detected from
-    /// their most recent speech, otherwise the configured default
-    /// (SOMA_L1_DEFAULT_LANGUAGE, default "ko"). This keeps L1's opening and
-    /// L2's response in the same language the participant actually uses.
-    private func effectiveLanguageTag(for context: L1MemoryContext) -> String? {
-        if let tag = context.preferredLanguageTag, !tag.isEmpty { return tag }
-        if let tag = activeLanguageProvider(), !tag.isEmpty { return tag }
-        let configured = somaEnvString("SOMA_L1_DEFAULT_LANGUAGE", default: "ko")
-        return configured.isEmpty ? nil : configured
-    }
-
-    /// The periodic situation-awareness inference. It carries the previous
-    /// behavior thought state forward so L1 can reason about a trend (e.g. a
-    /// fixation that has persisted across several ticks) rather than a single
-    /// stateless snapshot. Runs on the L1 queue.
-    private func deliberateBehavior(
-        at monotonicNS: UInt64,
-        auxiliaryWake: L1AuxiliarySemanticInterrupt? = nil
-    ) {
-        guard !stopped else { return }
-        guard let behavior = behaviorContextProvider() else { return }
-        let evidenceID = "behavior:\(monotonicNS)"
-        let identityNote = behavior.recognizedIdentity.map { " Recognized identity: \($0)." } ?? ""
-        let wakeNote = auxiliaryWake.map {
-            " Auxiliary wake: situation=\($0.situation.rawValue); reason=\($0.reason.rawValue); score=\(String(format: "%.2f", $0.score)); evidence=\($0.evidence.prefix(120))."
-        } ?? ""
-        let visual = currentFrameProvider()
-        let priorCycleAgeSeconds = lastBehaviorDeliberationNS.map {
-            max(0, Double(monotonicNS - $0)) / 1_000_000_000
-        } ?? 0
-        let request = L1SituationRequest(
-            observedAt: Date(),
-            evidenceIDs: [evidenceID] + (auxiliaryWake.map { ["auxiliary_wake:\($0.requestID)"] } ?? []),
-            beliefSummary: "Periodic L0 behavior self-awareness. Attention=\(behavior.attentionState).\(identityNote)\(wakeNote)",
-            priorThoughtState: behaviorThoughtState,
-            priorFrame: behaviorPriorFrame,
-            visuals: [visual].compactMap { $0 },
-            contactPattern: socialContactPatternProvider(),
-            behaviorContext: behavior,
-            curiosityContext: curiosityContextProvider(),
-            perceptionAgeSeconds: perceptionAgeSeconds(of: visual),
-            priorCycleAgeSeconds: priorCycleAgeSeconds
-        )
-        lastBehaviorDeliberationNS = monotonicNS
-        let wakeCause: String
-        if auxiliaryWake?.reason == .temporalContext {
-            wakeCause = "temporal_context"
-        } else if auxiliaryWake != nil {
-            wakeCause = "auxiliary_wake"
-        } else {
-            wakeCause = "behavior_awareness"
-        }
-        onHealth(
-            "wake",
-            "cause=\(wakeCause); cycle=\(request.cycleID.uuidString.lowercased()); attention=\(behavior.attentionState); fixation=\(String(format: "%.1f", behavior.fixationSeconds))s; scan=\(behavior.scanActive ? "on" : "off"); face=\(behavior.isFaceTarget ? "yes" : "no"); identity=\(behavior.recognizedIdentity ?? "none")"
-        )
-        reasoner.submit(request)
-    }
-
-    /// Trigger an immediate behavior-awareness pass in response to an auxiliary
-    /// (E2B) wake proposal. The proposal is folded into the L1 request as
-    /// evidence so the primary L1 cycle can accept or revise it. Throttled to
-    /// `auxiliaryWakeIntervalNS` so a burst of proposals cannot flood the
-    /// reasoner beyond the periodic cadence.
-    func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt) {
-        queue.async { [weak self] in
-            guard let self, !self.stopped else { return }
-            let now = DispatchTime.now().uptimeNanoseconds
-            if let last = self.lastAuxiliaryWakeNS, now - last < self.auxiliaryWakeIntervalNS {
-                return
-            }
-            self.lastAuxiliaryWakeNS = now
-            self.deliberateBehavior(at: now, auxiliaryWake: interrupt)
-        }
-    }
-
-    private func receive(
-        request: L1SituationRequest,
-        result: Result<L1SituationFrame, Error>,
-        at monotonicNS: UInt64
-    ) {
-        queue.async { [weak self] in
-            guard let self, !stopped else { return }
-            guard case let .success(frame) = result else { return }
-            if !request.informationNeeds.isEmpty {
-                onCuriosityNeeds(request.informationNeeds)
-            }
-            if !frame.memoryProposals.isEmpty {
-                onHealth("l1_memory_proposals", "count=\(frame.memoryProposals.count); kinds=\(frame.memoryProposals.map(\.kind.rawValue).joined(separator: ","))")
-                onMemoryProposals(frame.memoryProposals, request.socialOpportunity?.entityID)
-            } else {
-                onHealth("l1_memory_proposals", "count=0")
-            }
-            if request.visuals.isEmpty, !frame.requestedVisualResourceIDs.isEmpty {
-                let resources = visualResourceResolver(frame.requestedVisualResourceIDs)
-                guard !resources.isEmpty else {
-                    onHealth("visual_request_unavailable", "resources=\(frame.requestedVisualResourceIDs.count)")
-                    return
-                }
-                onHealth("visual_followup", "resources=\(resources.count)")
-                reasoner.submit(request.continuing(with: resources))
-                return
-            }
-            if request.socialOpportunity != nil {
-                // This is deliberately ahead of social freshness and live-voice
-                // gates. The model did form this thought; only its authority to
-                // act on it depends on the current L0 state below.
-                onSituationFrame(request, frame, monotonicNS)
-            }
-            guard !socialAvailability().conversationActive else {
-                onHealth("discarded", "reason=live_conversation_active")
-                return
-            }
-            // Behavior-awareness pass: no social opportunity, but its behavioral
-            // directive is independent and must still reach the L0 layer.
-            if request.socialOpportunity == nil {
-                if let thoughtState = frame.thoughtState {
-                    behaviorThoughtState = thoughtState
-                }
-                behaviorPriorFrame = Self.priorFrame(from: frame)
-                onBehaviorThought(frame, monotonicNS)
-                if let directive = frame.behaviorDirective {
-                    let origin: BehaviorDirectiveOrigin = request.evidenceIDs.contains {
-                        $0.hasPrefix("auxiliary_wake:")
-                    } ? .auxiliaryWake : .awareness
-                    onHealth("behavior_directive", "action=\(directive.action.rawValue)")
-                    onBehaviorDirective(directive, origin, monotonicNS)
-                }
-                return
-            }
-            guard let opportunity = request.socialOpportunity,
-                  var state = presences[opportunity.entityID] else {
-                onHealth("discarded", "reason=identity_not_current")
-                return
-            }
-            let internallyCurrent = monotonicNS >= state.lastObservedNS
-                && monotonicNS - state.lastObservedNS <= 2_000_000_000
-            let l0Current = currentPresenceValidator?(opportunity.entityID, monotonicNS)
-            guard l0Current ?? internallyCurrent else {
-                onHealth("discarded", "reason=identity_not_current")
-                return
-            }
-            // A current L0 observation is more authoritative than the timestamp
-            // captured when this cloud request began. Keep the local social
-            // state aligned so a valid completed cycle is not self-expired.
-            if l0Current == true {
-                state.lastObservedNS = monotonicNS
-                presences[opportunity.entityID] = state
-            }
-            if let thoughtState = frame.thoughtState {
-                thoughtStates[opportunity.entityID] = thoughtState
-            }
-            priorFrames[opportunity.entityID] = Self.priorFrame(from: frame)
-            onFrame(
-                request.rebasingSocialOpportunity(at: monotonicNS),
-                frame,
-                state.presence,
-                monotonicNS
-            )
-        }
-    }
-
-    private static func priorFrame(from frame: L1SituationFrame) -> L1PriorFrame {
-        let decision = frame.socialDecision
-        let opening: String?
-        switch decision?.openingContent {
-        case .question(_, let text): opening = text
-        case .greeting, .none: opening = nil
-        }
-        return L1PriorFrame(
-            summary: frame.summary,
-            action: decision?.action.rawValue,
-            rationale: decision?.rationale,
-            opening: opening,
-            confidence: decision?.confidence
-        )
-    }
-
-    private func nextUniform() -> Double {
-        randomState = randomState &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
-        return Double(randomState >> 11) / Double(1 << 53)
-    }
-}
-
-/// An immutable callback target for capture and L1 completion queues. It keeps
-/// startup ordering out of those queues and avoids treating an unavailable L1
-/// transport as a failure of L0 identity perception.
 final class L1ThoughtStreamRelay: @unchecked Sendable {
     private let lock = NSLock()
-    private var stream: L1PresenceThoughtStream?
+    private var stream: (any L1ThoughtStreaming)?
 
-    func install(_ stream: L1PresenceThoughtStream) {
+    func install(_ stream: any L1ThoughtStreaming) {
         lock.lock()
         self.stream = stream
         lock.unlock()
@@ -3745,6 +2679,13 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
         let stream = self.stream
         lock.unlock()
         stream?.recordNonverbalInvitation(with: entityID, at: monotonicNS)
+    }
+
+    func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt) {
+        lock.lock()
+        let stream = self.stream
+        lock.unlock()
+        stream?.wakeFromAuxiliary(interrupt)
     }
 
     func stop() {
