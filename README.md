@@ -291,11 +291,14 @@ For a clean Mac, obtain `libdev_v2.1.0_8.zip` through the
 `~/Downloads`, and run the idempotent setup command:
 
 ```sh
-scripts/setup-soma.zsh
+scripts/setup-soma.zsh --enable-motion
 ```
 
 Use `--sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip` when the archive is
 elsewhere, and `--with-l05` to provision the optional local semantic helper.
+`--enable-motion` activates the bundled Tiny 2 Lite and Tiny 3 Lite gimbal
+profiles; without it, an existing motion setting is preserved and a fresh
+installation remains perception-only.
 The command reuses the lower-level bootstrap, doctor, test, signing, and
 LaunchAgent installation boundaries rather than duplicating them.
 
@@ -351,7 +354,7 @@ enabling physical camera control.
 <br>
 
 ```sh
-scripts/setup-soma.zsh
+scripts/setup-soma.zsh --enable-motion
 ```
 
 The setup command finds the supported SDK in `~/Downloads`, installs locked

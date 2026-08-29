@@ -81,4 +81,24 @@ final class OBSBOTDeviceProfileTests: XCTestCase {
             panPoseDelta: -3.0
         ))
     }
+
+    func testTiny3ProfileCalibrationUsesRuntimeHomeReference() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let calibrationURL = repositoryRoot
+            .appendingPathComponent("config/obsbot/tiny-3-lite-gimbal.json")
+        let calibration = try JSONDecoder().decode(
+            ExternalGimbalCalibration.self,
+            from: Data(contentsOf: calibrationURL)
+        )
+
+        XCTAssertTrue(calibration.isValid)
+        XCTAssertTrue(calibration.matches(deviceIdentifier: "tiny_3_lite"))
+        XCTAssertTrue(calibration.hasMeasuredAttitudeAxes)
+        XCTAssertFalse(calibration.hasMeasuredAttitudeFrame)
+        XCTAssertNil(calibration.homePanDegrees)
+        XCTAssertNil(calibration.homePitchDegrees)
+    }
 }

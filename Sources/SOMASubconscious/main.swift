@@ -4016,7 +4016,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         if deviceCapabilities.supportsCalibratedMotorControl { return true }
         return externalCalibration?.matches(deviceIdentifier: deviceContract?.profileID ?? deviceProfile.rawValue) == true
             && (!deviceCapabilities.requiresMeasuredAttitudeFrame
-                || externalCalibration?.hasMeasuredAttitudeFrame == true)
+                || externalCalibration?.hasMeasuredAttitudeAxes == true)
     }
 
     private var externalPoseProjection: GimbalPoseProjection {
@@ -4098,7 +4098,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         ]
         if calibrationMode {
             processArguments.append("--allow-device-calibration")
-        } else if externalCalibration?.hasMeasuredAttitudeFrame == true {
+        } else if externalCalibration?.hasMeasuredAttitudeAxes == true {
             processArguments.append("--allow-profile-calibrated-motion")
         }
         if let traceRotationPolicy {
@@ -12675,8 +12675,8 @@ private func run(_ options: Options) throws {
                     throw RuntimeError.invalidArgument("External gimbal calibration belongs to \(calibrationDevice), not \(contract.profileID)")
                 }
                 if contract.capabilities.requiresMeasuredAttitudeFrame,
-                   !calibration.hasMeasuredPoseProjection {
-                    throw RuntimeError.invalidArgument("\(contract.profileID) requires a calibration with measured SDK-attitude axis signs")
+                   !calibration.hasMeasuredAttitudeAxes {
+                    throw RuntimeError.invalidArgument("\(contract.profileID) requires measured image, SDK-attitude, and velocity axis signs")
                 }
             }
             externalGimbalCalibration = calibration
@@ -12992,6 +12992,9 @@ private func run(_ options: Options) throws {
             embodimentSocketURL: options.embodimentShadowSocketURL,
             requireVerifiedSpeakerForEveryTurn: controlSettings
                 .realtimeVoiceRequiresEyeContactForEveryTurn,
+            inactivityTimeoutMilliseconds: UInt64(
+                controlSettings.realtimeVoiceSilenceTimeoutSeconds
+            ) * 1_000,
             persistentAppServer: persistentLiveVoiceBroker,
             persistentSessionAuthorizer: { token, scope, at in
                 liveSessionCapabilities.authorize(token: token, scope: scope, at: at)
@@ -13311,7 +13314,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=60; visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil

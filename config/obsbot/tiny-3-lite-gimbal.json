@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "deviceIdentifier": "tiny_3_lite",
+  "panSign": -1,
+  "pitchSign": 1,
+  "maximumPanDegreesPerSecond": 90,
+  "maximumPitchDegreesPerSecond": 45,
+  "posePanImageSign": 1,
+  "posePitchImageSign": -1,
+  "velocityPanPoseSign": 1,
+  "velocityPitchPoseSign": 1
+}

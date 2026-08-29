@@ -34,6 +34,14 @@ function soma_warn() {
   (( soma_warnings += 1 ))
 }
 
+function soma_valid_profile_gimbal_calibration() {
+  local soma_profile=$1
+  local soma_path="$soma_root/config/obsbot/${soma_profile//_/-}-gimbal.json"
+  [[ -f "$soma_path" ]] || return 1
+  [[ "$(/usr/bin/plutil -extract schemaVersion raw -o - "$soma_path" 2>/dev/null)" == 2 \
+      && "$(/usr/bin/plutil -extract deviceIdentifier raw -o - "$soma_path" 2>/dev/null)" == "$soma_profile" ]]
+}
+
 function soma_check_minimum_version() {
   local soma_name="$1"
   local soma_actual="$2"
@@ -203,8 +211,11 @@ if [[ "$soma_mode" == "--runtime" ]]; then
     if [[ -n "${SOMA_EXTERNAL_GIMBAL_CALIBRATION:-}" \
           && -f "$SOMA_EXTERNAL_GIMBAL_CALIBRATION" ]]; then
       soma_ok 'explicit external gimbal calibration for enabled motion'
+    elif soma_valid_profile_gimbal_calibration tiny_2_lite \
+        && soma_valid_profile_gimbal_calibration tiny_3_lite; then
+      soma_ok 'bundled device-profile gimbal calibrations for enabled motion'
     else
-      soma_fail 'SOMA_ENABLE_MOTION=1 requires an explicit existing SOMA_EXTERNAL_GIMBAL_CALIBRATION'
+      soma_fail 'SOMA_ENABLE_MOTION=1 requires an explicit or bundled device-profile gimbal calibration'
     fi
   else
     soma_ok 'physical motion disabled by configuration'

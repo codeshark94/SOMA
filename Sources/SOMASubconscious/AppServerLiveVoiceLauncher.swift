@@ -135,6 +135,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         embodimentSocketURL: URL? = nil,
         requireVerifiedSpeakerForEveryTurn: Bool = false,
+        inactivityTimeoutMilliseconds: UInt64 = 60_000,
         persistentAppServer: PersistentAppServerBroker? = nil,
         persistentSessionAuthorizer: (@Sendable (
             String,
@@ -150,6 +151,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.currentCameraImageDataURI = currentCameraImageDataURI
         self.embodimentSocketURL = embodimentSocketURL
         self.requireVerifiedSpeakerForEveryTurn = requireVerifiedSpeakerForEveryTurn
+        inactivityGate = LiveVoiceSessionInactivityGate(
+            timeoutMilliseconds: inactivityTimeoutMilliseconds
+        )
         self.persistentAppServer = persistentAppServer
         self.persistentSessionAuthorizer = persistentSessionAuthorizer
         cameraContextAutoInjection = somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: true)

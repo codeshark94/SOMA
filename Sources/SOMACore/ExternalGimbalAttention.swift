@@ -140,10 +140,18 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
         posePanImageSign != nil && posePitchImageSign != nil
     }
 
-    public var hasMeasuredAttitudeFrame: Bool {
+    /// Profile-stable axis relationships measured from physical pulses. The
+    /// session-specific attitude origin is established from live SDK feedback
+    /// when the native bridge starts and therefore is not part of a portable
+    /// device-profile calibration.
+    public var hasMeasuredAttitudeAxes: Bool {
         hasMeasuredPoseProjection
             && velocityPanPoseSign != nil
             && velocityPitchPoseSign != nil
+    }
+
+    public var hasMeasuredAttitudeFrame: Bool {
+        hasMeasuredAttitudeAxes
             && homePanDegrees != nil
             && homePitchDegrees != nil
     }

@@ -18,6 +18,7 @@ final class SOMAControlSettingsTests: XCTestCase {
             realtimeVoiceEnabled: true,
             realtimeVoice: .maple,
             realtimeVoiceRequiresEyeContactForEveryTurn: true,
+            realtimeVoiceSilenceTimeoutSeconds: 90,
             led: .init(responseMode: .contextual, brightness: 3),
             nativeHumanTrackingEnabled: true,
             autonomousExplorationEnabled: false,
@@ -51,7 +52,24 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: Data(legacy.utf8)
         )
         XCTAssertFalse(migrated.realtimeVoiceRequiresEyeContactForEveryTurn)
+        XCTAssertEqual(migrated.realtimeVoiceSilenceTimeoutSeconds, 60)
         XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
+    }
+
+    func testRealtimeVoiceSilenceTimeoutIsPersistedAndBounded() throws {
+        var settings = SOMAControlSettings(realtimeVoiceSilenceTimeoutSeconds: 120)
+        let restored = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: JSONEncoder().encode(settings)
+        )
+        XCTAssertEqual(restored.realtimeVoiceSilenceTimeoutSeconds, 120)
+
+        settings.realtimeVoiceSilenceTimeoutSeconds = 10_000
+        let bounded = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: JSONEncoder().encode(settings)
+        )
+        XCTAssertEqual(bounded.realtimeVoiceSilenceTimeoutSeconds, 600)
     }
 
     func testRealtimeVoicePickerMatchesCodexAppServerV3Contract() {

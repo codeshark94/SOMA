@@ -6,12 +6,24 @@ soma_root=${soma_script_dir:h}
 soma_lock="$soma_root/config/soma-dependencies.env"
 soma_sdk_archive=''
 soma_with_l05=0
+soma_enable_motion=0
 soma_plan_only=0
 soma_tool_path='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
 soma_sdk_request_url='https://www.obsbot.com/sdk'
+soma_env_stage=''
+
+function soma_cleanup() {
+  if [[ -n "$soma_env_stage" \
+        && -f "$soma_env_stage" \
+        && "${soma_env_stage:h}" == "$HOME/Library/Application Support/SOMA" \
+        && "${soma_env_stage:t}" == .env.* ]]; then
+    /bin/rm -f -- "$soma_env_stage"
+  fi
+}
+trap soma_cleanup EXIT
 
 function soma_usage() {
-  print -r -- 'Usage: scripts/setup-soma.zsh [--sdk-archive /path/libdev_v2.1.0_8.zip] [--with-l05] [--plan]'
+  print -r -- 'Usage: scripts/setup-soma.zsh [--sdk-archive /path/libdev_v2.1.0_8.zip] [--with-l05] [--enable-motion] [--plan]'
 }
 
 while (( $# > 0 )); do
@@ -23,6 +35,10 @@ while (( $# > 0 )); do
       ;;
     --with-l05)
       soma_with_l05=1
+      shift
+      ;;
+    --enable-motion)
+      soma_enable_motion=1
       shift
       ;;
     --plan)
@@ -104,6 +120,7 @@ if (( soma_plan_only )); then
     print -r -- "  SDK: required from $soma_sdk_request_url"
   fi
   print -r -- "  L0.5 environment: $([[ $soma_with_l05 == 1 ]] && print install || print preserve)"
+  print -r -- "  physical motion: $([[ $soma_enable_motion == 1 ]] && print enable || print preserve)"
   print -r -- "  Homebrew dependencies: $([[ $soma_skip_brew == 1 ]] && print already-present || print install)"
   print -r -- "  L1 model: $SOMA_DEFAULT_L1_MODEL"
   print -r -- "  signing identity: $SOMA_CODESIGN_IDENTITY_NAME"
@@ -113,6 +130,24 @@ fi
 
 print -r -- '[1/6] Preparing locked dependencies'
 "$soma_root/scripts/bootstrap-soma.zsh" "${soma_bootstrap_arguments[@]}"
+
+if (( soma_enable_motion )); then
+  soma_env_file="$HOME/Library/Application Support/SOMA/.env"
+  soma_env_stage=$(mktemp "${soma_env_file:h}/.env.XXXXXX")
+  /usr/bin/awk -v key='SOMA_ENABLE_MOTION' -v value='1' '
+    BEGIN { written = 0 }
+    index($0, key "=") == 1 {
+      if (!written) print key "=" value
+      written = 1
+      next
+    }
+    { print }
+    END { if (!written) print key "=" value }
+  ' "$soma_env_file" > "$soma_env_stage"
+  chmod 600 "$soma_env_stage"
+  /bin/mv -f "$soma_env_stage" "$soma_env_file"
+  soma_env_stage=''
+fi
 
 if ! /usr/bin/codesign --dryrun --force --sign "$SOMA_CODESIGN_IDENTITY_NAME" \
     --timestamp=none "$soma_sdk_library" >/dev/null 2>&1; then

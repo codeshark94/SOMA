@@ -681,6 +681,16 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertTrue(gate.shouldClose(at: renewedDeadline!))
     }
 
+    func testLiveVoiceSessionUsesConfiguredSilenceTimeout() {
+        let start: UInt64 = 1_000_000_000
+        var gate = LiveVoiceSessionInactivityGate(timeoutMilliseconds: 120_000)
+        let deadline = gate.activate(at: start)
+
+        XCTAssertEqual(deadline, start + 120_000_000_000)
+        XCTAssertFalse(gate.shouldClose(at: deadline - 1))
+        XCTAssertTrue(gate.shouldClose(at: deadline))
+    }
+
     func testLiveVoiceInputLevelerBoostsOnlyVADAdmittedQuietSpeech() {
         var leveler = LiveVoiceInputLeveler()
         let quietSpeech = (0..<960).map { index in

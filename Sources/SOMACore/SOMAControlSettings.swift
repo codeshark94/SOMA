@@ -438,7 +438,9 @@ public struct SOMAAdministratorIdentity: Codable, Equatable, Sendable {
 /// User-controlled settings consumed by the local runtime at process launch.
 /// None of the fields contain face embeddings or other raw biometric material.
 public struct SOMAControlSettings: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 10
+    public static let currentSchemaVersion = 11
+    public static let defaultRealtimeVoiceSilenceTimeoutSeconds = 60
+    public static let realtimeVoiceSilenceTimeoutRange = 15...600
 
     public var schemaVersion: Int
     public var realtimeVoiceEnabled: Bool
@@ -446,6 +448,9 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
     /// When enabled, an already-open session receives a participant turn only
     /// while current eye contact and audiovisual speaker evidence agree.
     public var realtimeVoiceRequiresEyeContactForEveryTurn: Bool
+    /// User silence closes the account-backed realtime session so an idle
+    /// microphone never holds conversation resources indefinitely.
+    public var realtimeVoiceSilenceTimeoutSeconds: Int
     public var led: SOMALEDSettings
     /// These settings only narrow the launch-agent capabilities; they can
     /// never grant motion authority that the service was not launched with.
@@ -458,6 +463,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoiceEnabled: Bool = true,
         realtimeVoice: SOMARealtimeVoice = .maple,
         realtimeVoiceRequiresEyeContactForEveryTurn: Bool = false,
+        realtimeVoiceSilenceTimeoutSeconds: Int = SOMAControlSettings.defaultRealtimeVoiceSilenceTimeoutSeconds,
         led: SOMALEDSettings = .init(),
         nativeHumanTrackingEnabled: Bool = true,
         autonomousExplorationEnabled: Bool = true,
@@ -467,6 +473,10 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         self.realtimeVoiceEnabled = realtimeVoiceEnabled
         self.realtimeVoice = realtimeVoice
         self.realtimeVoiceRequiresEyeContactForEveryTurn = realtimeVoiceRequiresEyeContactForEveryTurn
+        self.realtimeVoiceSilenceTimeoutSeconds = min(
+            max(realtimeVoiceSilenceTimeoutSeconds, Self.realtimeVoiceSilenceTimeoutRange.lowerBound),
+            Self.realtimeVoiceSilenceTimeoutRange.upperBound
+        )
         self.led = led
         self.nativeHumanTrackingEnabled = nativeHumanTrackingEnabled
         self.autonomousExplorationEnabled = autonomousExplorationEnabled
@@ -480,6 +490,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         case realtimeVoiceEnabled
         case realtimeVoice
         case realtimeVoiceRequiresEyeContactForEveryTurn
+        case realtimeVoiceSilenceTimeoutSeconds
         case led
         case nativeHumanTrackingEnabled
         case autonomousExplorationEnabled
@@ -500,6 +511,14 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             Bool.self,
             forKey: .realtimeVoiceRequiresEyeContactForEveryTurn
         ) ?? false
+        let decodedSilenceTimeout = try values.decodeIfPresent(
+            Int.self,
+            forKey: .realtimeVoiceSilenceTimeoutSeconds
+        ) ?? Self.defaultRealtimeVoiceSilenceTimeoutSeconds
+        realtimeVoiceSilenceTimeoutSeconds = min(
+            max(decodedSilenceTimeout, Self.realtimeVoiceSilenceTimeoutRange.lowerBound),
+            Self.realtimeVoiceSilenceTimeoutRange.upperBound
+        )
         var decodedLED = try values.decodeIfPresent(SOMALEDSettings.self, forKey: .led) ?? .init()
         if sourceVersion < 6,
            decodedLED.signal(for: .contactReady).pattern == .steady {
@@ -539,6 +558,10 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         try values.encode(
             realtimeVoiceRequiresEyeContactForEveryTurn,
             forKey: .realtimeVoiceRequiresEyeContactForEveryTurn
+        )
+        try values.encode(
+            realtimeVoiceSilenceTimeoutSeconds,
+            forKey: .realtimeVoiceSilenceTimeoutSeconds
         )
         try values.encode(led, forKey: .led)
         try values.encode(nativeHumanTrackingEnabled, forKey: .nativeHumanTrackingEnabled)

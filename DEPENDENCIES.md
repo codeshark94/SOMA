@@ -47,7 +47,7 @@ xcode-select --install
 git clone https://github.com/codeshark94/SOMA.git
 cd SOMA
 
-scripts/setup-soma.zsh
+scripts/setup-soma.zsh --enable-motion
 ```
 
 The setup command is safe to rerun. It discovers the exact supported SDK
@@ -55,7 +55,10 @@ archive, invokes the existing locked bootstrap, starts Ollama and provisions
 the L1 model when absent, runs the tests and runtime doctor, installs the signed
 app, and verifies that the process remains active. Use `--plan` for a read-only
 preview, `--sdk-archive` for a different archive location, or `--with-l05` for
-the optional local semantic helper.
+the optional local semantic helper. `--enable-motion` enables the checked-in
+device-profile calibration registry; the runtime then selects the matching
+Tiny 2 Lite or Tiny 3 Lite profile after SDK device detection and establishes
+the session-specific attitude origin from live gimbal feedback.
 
 The SDK is not published in this public repository or its release assets. The
 vendor-supplied archive contains no public redistribution grant and the official

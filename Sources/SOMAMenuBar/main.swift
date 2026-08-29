@@ -730,6 +730,20 @@ private struct SOMASettingsView: View {
                 Text("When enabled, an open conversation forwards a spoken turn only when current eye contact and audiovisual evidence identify the tracked person as the speaker.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                HStack {
+                    Text("End after user silence")
+                    Spacer()
+                    Stepper(
+                        "\(model.settings.realtimeVoiceSilenceTimeoutSeconds) s",
+                        value: realtimeVoiceSilenceTimeoutBinding,
+                        in: SOMAControlSettings.realtimeVoiceSilenceTimeoutRange,
+                        step: 15
+                    )
+                }
+                .disabled(!model.settings.realtimeVoiceEnabled)
+                Text("Only confirmed participant activity renews this timer; SOMA speaking does not. Save & Restart applies the new duration.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             SettingsCard(title: "LED response", subtitle: "Set global visibility and brightness for the hardware indicator.") {
                 Picker("Reaction", selection: ledModeBinding) {
@@ -1020,6 +1034,18 @@ private struct SOMASettingsView: View {
 
     private var ledModeBinding: Binding<SOMALEDResponseMode> {
         Binding(get: { model.settings.led.responseMode }, set: { model.settings.led.responseMode = $0 })
+    }
+
+    private var realtimeVoiceSilenceTimeoutBinding: Binding<Int> {
+        Binding(
+            get: { model.settings.realtimeVoiceSilenceTimeoutSeconds },
+            set: {
+                model.settings.realtimeVoiceSilenceTimeoutSeconds = min(
+                    max($0, SOMAControlSettings.realtimeVoiceSilenceTimeoutRange.lowerBound),
+                    SOMAControlSettings.realtimeVoiceSilenceTimeoutRange.upperBound
+                )
+            }
+        )
     }
 
     private var ledBrightnessBinding: Binding<Double> {
