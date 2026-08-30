@@ -537,7 +537,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         for event: MentalEvidenceEvent,
         snapshot: MentalWorkspaceSnapshot,
         wakeKind: L1ThoughtWakeKind,
-        suppliedVisuals: [L1VisualResource]? = nil
+        suppliedVisuals: [L1VisualResource]? = nil,
+        authorityRebaseAttempt: Int = 0
     ) {
         let entityID = event.subjectEntityID ?? snapshot.context.presentEntityIDs.first
         let memory = entityID.flatMap { cachedMemoryContexts[$0]?.context }
@@ -573,7 +574,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             personPreferences: memory?.personPreferences,
             spokenOpeningTendency: min(max(somaEnvDouble("SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.7), 0), 1),
             recalledEpisodes: memory?.recalledEpisodes ?? [],
-            perceptionAgeSeconds: perceptionAgeSeconds(of: attachedVisuals.first)
+            perceptionAgeSeconds: perceptionAgeSeconds(of: attachedVisuals.first),
+            authorityRebaseAttempt: authorityRebaseAttempt
         )
         onHealth(
             "thought_wake",
@@ -592,6 +594,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             guard case let .success(update) = result else {
                 if case let .failure(error) = result {
                     onHealth("thought_held", "reason=\(String(error.localizedDescription.prefix(240)))")
+                    rebaseThoughtIfNeeded(request, error: error)
                 }
                 return
             }
@@ -636,6 +639,31 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         }
     }
 
+    private func rebaseThoughtIfNeeded(_ request: L1ThoughtRequest, error: Error) {
+        guard request.authorityRebaseAttempt == 0,
+              let responseError = error as? ConsciousnessResponseError,
+              responseError.requiresAuthorityRebase,
+              let event = request.evidence.last else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await workspace.currentSnapshot()
+            queue.async { [weak self] in
+                guard let self, !stopped else { return }
+                onHealth(
+                    "thought_authority_rebased",
+                    "from_revision=\(request.workspace.revision); to_revision=\(snapshot.revision); reason=\(String(error.localizedDescription.prefix(160)))"
+                )
+                submitThought(
+                    for: event,
+                    snapshot: snapshot,
+                    wakeKind: request.wakeKind,
+                    suppliedVisuals: request.visuals,
+                    authorityRebaseAttempt: 1
+                )
+            }
+        }
+    }
+
     /// A model turn can become stale while high-rate evidence advances the
     /// workspace. Ordinary observations may be dropped because their scalar
     /// evidence is already durable, but an active-sensing image exists only in
@@ -643,6 +671,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     /// until L1a has evaluated it.
     private func rebaseVisualThoughtIfNeeded(_ request: L1ThoughtRequest) {
         guard !stopped,
+              request.authorityRebaseAttempt == 0,
               !request.visuals.isEmpty,
               let event = request.evidence.last else { return }
         Task { [weak self] in
@@ -658,7 +687,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                     for: event,
                     snapshot: snapshot,
                     wakeKind: .event,
-                    suppliedVisuals: request.visuals
+                    suppliedVisuals: request.visuals,
+                    authorityRebaseAttempt: 1
                 )
             }
         }

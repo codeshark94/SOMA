@@ -511,7 +511,7 @@ shadow-only, while the authorized persistent launcher reports `mode=active`.
 The current executable is `soma-embodiment`. It implements the MCP lifecycle
 and tool calls over newline-delimited stdio, then forwards one bounded request
 per connection to the L0 socket. The deployed surface contains
-`get_robot_body_state`, `list_scene_entities`, `get_spatial_map`,
+`get_robot_body_state`, `get_activity_overview`, `list_scene_entities`, `get_spatial_map`,
 `get_view_capture`,
 `register_semantic_target`, `remove_semantic_target`,
 `set_attention_policy`, `track_target`, `orient_to`,
@@ -527,6 +527,14 @@ The wire contract follows the MCP 2025-11-25
 [stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports),
 and [tool](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 specifications; stdout contains JSON-RPC messages only.
+
+Read-only epistemic tools expose only their semantic arguments. After the live
+session capability is authenticated, the trusted MCP gateway supplies the
+internal cognitive-intent envelope and records the bounded outcome. Mutating,
+motor, memory-write, conversation-control, and external-work tools still
+require a model-authored intent with the appropriate authorization basis.
+Current-state reads bypass semantic result deduplication because the underlying
+state may change while the query wording remains identical.
 
 ### Person-context tools
 
@@ -737,13 +745,18 @@ Host operating-system state, shell/process work, files, repositories, coding,
 services, APIs, and research belong to the external domain when the
 administrator explicitly requests the outcome. `get_robot_body_state` is
 reserved for the robot body's L0 lease, attention target, and policy; it cannot
-stand in for host-computer inspection. A successful submission ends the tool
+stand in for host-computer inspection. An ambiguous administrator request for
+SOMA's current activity uses `get_activity_overview`, which combines robot-body
+state with result-free delegated-task summaries; detailed task results remain
+behind the explicit report workflow. A successful submission ends the tool
 turn immediately, leaves Live Voice listening, and never polls the worker from
 the spoken response path. L2 then gives one short spoken acceptance without
 reading the durable task ID. `turn/completed` is the protocol boundary: when it
 contains a completed `delegate_hermes_task` call but no assistant audio was
 observed for that turn, the controller injects one localized
-`SOMA_HERMES_DELEGATION_ACCEPTED` event. Turn identity makes this fallback
+`SOMA_HERMES_DELEGATION_ACCEPTED` event. Individual `item/completed` events are
+also normalized immediately so a tool-level `ok: false` is not mistaken for a
+protocol-level completed call. Turn identity makes the acknowledgement fallback
 idempotent, while any acknowledgement already spoken suppresses it.
 
 Submission, continuation, cancellation, and every task read require an active

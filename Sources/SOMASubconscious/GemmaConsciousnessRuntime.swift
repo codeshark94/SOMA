@@ -170,7 +170,13 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
             case let .thought(request):
                 systemPrompt = Self.thoughtPrompt
                 packet = try Self.packet(request)
-                binding = "expected_revision=\(request.workspace.revision); cycle_id=\(request.cycleID.uuidString.lowercased())"
+                let evidence = request.availableEvidenceIDs.sorted().joined(separator: ",")
+                let hypotheses = request.workspace.hypotheses.map { $0.id.uuidString.lowercased() }.joined(separator: ",")
+                let intentions = request.workspace.intentions
+                    .filter { $0.completedAt == nil }
+                    .map { $0.id.uuidString.lowercased() }
+                    .joined(separator: ",")
+                binding = "expected_revision=\(request.workspace.revision); cycle_id=\(request.cycleID.uuidString.lowercased()); available_evidence_ids=[\(evidence)]; available_hypothesis_ids=[\(hypotheses)]; active_intention_ids=[\(intentions)]"
                 images = try Self.images(for: request.visuals)
             case let .executive(request):
                 systemPrompt = Self.executivePrompt
@@ -255,10 +261,18 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
     }
 
     private func handleFailure(_ work: L1ConsciousnessWorkItem, error: Error, retryCount: Int) {
-        if retryCount > 0 {
+        let identicalRetryPermitted = (error as? ConsciousnessResponseError)?
+            .permitsIdenticalRequestRetry ?? true
+        if retryCount > 0, identicalRetryPermitted {
             onHealth("model_retry", "role=\(work.label); reason=\(String(error.localizedDescription.prefix(240)))")
             start(work, retryCount: retryCount - 1)
         } else {
+            if retryCount > 0 {
+                onHealth(
+                    "model_retry_suppressed",
+                    "role=\(work.label); reason=semantic_authority_failure; detail=\(String(error.localizedDescription.prefix(240)))"
+                )
+            }
             completeFailure(work, error: error)
         }
     }

@@ -67,6 +67,18 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertEqual(L2CognitiveToolPolicy.autonomy(for: "resolve_hermes_report_offer"), .explicitRequest)
         XCTAssertTrue(L2CognitiveToolPolicy.permits(.explicitRequest, for: "resolve_hermes_report_offer"))
         XCTAssertFalse(L2CognitiveToolPolicy.permits(.autonomousGoal, for: "resolve_hermes_report_offer"))
+
+        XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_robot_body_state"))
+        XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_activity_overview"))
+        XCTAssertTrue(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "delegate_hermes_task"))
+        XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "get_robot_body_state"))
+        XCTAssertTrue(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "set_person_fact"))
+
+        let gateway = L2CognitiveToolPolicy.gatewayEpistemicIntent(for: "get_activity_overview")
+        XCTAssertEqual(gateway?.authorizationBasis, .autonomousGoal)
+        XCTAssertEqual(gateway?.evidenceIDs, [])
+        XCTAssertFalse(gateway?.purpose.isEmpty ?? true)
+        XCTAssertNil(L2CognitiveToolPolicy.gatewayEpistemicIntent(for: "delegate_hermes_task"))
     }
 
     func testTaskRoutingSeparatesHostWorkFromRobotEmbodiment() {
@@ -77,12 +89,54 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertTrue(enabled.contains("acknowledge aloud"))
         XCTAssertTrue(enabled.contains("Do not read the task UUID aloud"))
         XCTAssertTrue(enabled.contains("Do not substitute get_robot_body_state"))
+        XCTAssertTrue(enabled.contains("use get_activity_overview"))
         XCTAssertTrue(L2TaskRoutingPolicy.embodimentStateToolDescription.contains("not the host Mac"))
         XCTAssertTrue(L2TaskRoutingPolicy.hermesDelegationToolDescription.contains("while the voice conversation remains responsive"))
 
         let disabled = L2TaskRoutingPolicy.instruction(hermesEnabled: false)
         XCTAssertTrue(disabled.contains("delegation is disabled"))
         XCTAssertFalse(disabled.contains("call delegate_hermes_task exactly once"))
+    }
+
+    func testActivityOverviewProjectionCannotDiscloseWorkerResult() throws {
+        let task = HermesAgentTask(
+            goalEpisodeID: UUID(),
+            title: "Inspect runtime",
+            objective: "Read sensitive host details",
+            workingDirectory: "/tmp",
+            status: .completed,
+            result: "private worker result",
+            completedAt: Date()
+        )
+        let activity = HermesAgentTaskActivity(task: task)
+        let encoded = try String(decoding: JSONEncoder().encode(activity), as: UTF8.self)
+
+        XCTAssertEqual(activity.id, task.id)
+        XCTAssertEqual(activity.status, .completed)
+        XCTAssertTrue(activity.awaitingReport)
+        XCTAssertFalse(encoded.contains(task.objective))
+        XCTAssertFalse(encoded.contains("private worker result"))
+    }
+
+    func testMCPDiagnosticsPreserveStructuredToolFailure() {
+        let diagnostic = MCPToolCompletionDiagnostic.parse([
+            "id": "item-1",
+            "type": "mcpToolCall",
+            "server": "soma_embodiment",
+            "tool": "get_robot_body_state",
+            "status": "completed",
+            "result": [
+                "structuredContent": [
+                    "ok": false,
+                    "error": "invalid tool arguments: unexpected field",
+                ],
+            ],
+        ])
+
+        XCTAssertEqual(diagnostic?.protocolStatus, "completed")
+        XCTAssertEqual(diagnostic?.effectiveStatus, "failed")
+        XCTAssertEqual(diagnostic?.error, "invalid tool arguments: unexpected field")
+        XCTAssertFalse(diagnostic?.succeeded ?? true)
     }
 
     func testDelegationAcknowledgementIsLocalizedAndInjectedOnlyForSilentSuccess() {

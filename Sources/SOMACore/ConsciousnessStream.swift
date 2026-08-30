@@ -100,6 +100,7 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
     public let spokenOpeningTendency: Double
     public let recalledEpisodes: [String]
     public let perceptionAgeSeconds: Double
+    public let authorityRebaseAttempt: Int
 
     public init(
         cycleID: UUID = UUID(),
@@ -126,7 +127,8 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
         personPreferences: String? = nil,
         spokenOpeningTendency: Double = 0.7,
         recalledEpisodes: [String] = [],
-        perceptionAgeSeconds: Double = 0
+        perceptionAgeSeconds: Double = 0,
+        authorityRebaseAttempt: Int = 0
     ) {
         self.cycleID = cycleID
         self.observedAt = observedAt
@@ -153,6 +155,7 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
         self.spokenOpeningTendency = min(max(spokenOpeningTendency, 0), 1)
         self.recalledEpisodes = Array(recalledEpisodes.prefix(8)).map { String($0.prefix(1_200)) }
         self.perceptionAgeSeconds = max(perceptionAgeSeconds, 0)
+        self.authorityRebaseAttempt = min(max(authorityRebaseAttempt, 0), 1)
     }
 
     public var availableEvidenceIDs: Set<String> {
@@ -185,7 +188,8 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
             personPreferences: personPreferences,
             spokenOpeningTendency: spokenOpeningTendency,
             recalledEpisodes: recalledEpisodes,
-            perceptionAgeSeconds: perceptionAgeSeconds
+            perceptionAgeSeconds: perceptionAgeSeconds,
+            authorityRebaseAttempt: authorityRebaseAttempt
         )
     }
 
@@ -234,7 +238,8 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
             personPreferences: newer.personPreferences,
             spokenOpeningTendency: newer.spokenOpeningTendency,
             recalledEpisodes: newer.recalledEpisodes,
-            perceptionAgeSeconds: newer.perceptionAgeSeconds
+            perceptionAgeSeconds: newer.perceptionAgeSeconds,
+            authorityRebaseAttempt: newer.authorityRebaseAttempt
         )
     }
 }
@@ -355,6 +360,34 @@ extension ConsciousnessResponseError: LocalizedError {
             "L1a response contained forbidden field: \(field)."
         case let .validationFailed(failures):
             "Consciousness response validation failed: \(failures.joined(separator: "; "))."
+        }
+    }
+}
+
+public extension ConsciousnessResponseError {
+    /// Schema or grounding failures must be regenerated from fresh authority,
+    /// not replayed against the identical immutable request. Malformed wire
+    /// output may be retried once because no semantic answer was decoded.
+    var permitsIdenticalRequestRetry: Bool {
+        switch self {
+        case .malformedJSON:
+            true
+        case .forbiddenThoughtField, .validationFailed:
+            false
+        }
+    }
+
+    /// These failures indicate that the model reasoned over identifiers that
+    /// are no longer part of the authoritative workspace. The controller may
+    /// regenerate one request against the newest snapshot.
+    var requiresAuthorityRebase: Bool {
+        guard case let .validationFailed(failures) = self else { return false }
+        return failures.contains { failure in
+            failure.contains("unavailable evidence")
+                || failure.contains("unavailable goal")
+                || failure.contains("workspace revision mismatch")
+                || failure.contains("unknown hypothesis")
+                || failure.contains("thought parent is unavailable")
         }
     }
 }

@@ -181,6 +181,50 @@ final class ConsciousnessStreamTests: XCTestCase {
         XCTAssertThrowsError(try L1ThoughtResponseDecoder.decode(data, for: request))
     }
 
+    func testSemanticAuthorityFailureRebasesInsteadOfRetryingIdenticalRequest() {
+        let unavailable = ConsciousnessResponseError.validationFailed([
+            "thought references unavailable evidence",
+        ])
+        XCTAssertFalse(unavailable.permitsIdenticalRequestRetry)
+        XCTAssertTrue(unavailable.requiresAuthorityRebase)
+
+        let unknownField = ConsciousnessResponseError.validationFailed([
+            "unknown thought field: invented",
+        ])
+        XCTAssertFalse(unknownField.permitsIdenticalRequestRetry)
+        XCTAssertFalse(unknownField.requiresAuthorityRebase)
+
+        XCTAssertTrue(ConsciousnessResponseError.malformedJSON.permitsIdenticalRequestRetry)
+        XCTAssertFalse(ConsciousnessResponseError.malformedJSON.requiresAuthorityRebase)
+        XCTAssertFalse(
+            ConsciousnessResponseError.forbiddenThoughtField("action")
+                .permitsIdenticalRequestRetry
+        )
+    }
+
+    func testThoughtAuthorityRebaseIsBoundedAndSurvivesVisualContinuation() {
+        let original = makeThoughtRequest()
+        let rebased = L1ThoughtRequest(
+            observedAt: original.observedAt,
+            wakeKind: original.wakeKind,
+            workspace: original.workspace,
+            evidence: original.evidence,
+            beliefSummary: original.beliefSummary,
+            authorityRebaseAttempt: 1
+        )
+        let continued = rebased.continuing(with: [
+            L1VisualResource(
+                resourceID: "current_frame",
+                projection: .currentView,
+                localPath: "/private/tmp/current.jpg",
+                expiresAt: Date(timeIntervalSince1970: 120)
+            ),
+        ])
+
+        XCTAssertEqual(rebased.authorityRebaseAttempt, 1)
+        XCTAssertEqual(continued.authorityRebaseAttempt, 1)
+    }
+
     func testL1BIsBoundToOneRevisionIntentionAndAllowedAction() throws {
         let intention = MentalIntention(
             id: UUID(),

@@ -336,6 +336,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var assistantOutputActive = false
     private var assistantSpeechObservedInCurrentTurn = false
     private var handledHermesDelegationTurnIDs: Set<String> = []
+    private var reportedEmbodimentMCPItemIDs: Set<String> = []
     private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
     private var observedRealtimeEventTypes: Set<String> = []
@@ -956,6 +957,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             if role == "user" { inputSpeechInProgress = false }
         case "thread/realtime/closed":
             stop(reason: params["reason"] as? String ?? "realtime_closed")
+        case "item/completed":
+            if let item = params["item"] as? [String: Any] {
+                _ = inspectEmbodimentMCPItem(item, emitDiagnostic: true)
+            }
         case "turn/completed":
             handleCompletedTurn(params)
         default:
@@ -970,23 +975,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         assistantSpeechObservedInCurrentTurn = false
         var successfulHermesDelegation = false
         for item in items where item["type"] as? String == "mcpToolCall" {
-            guard item["server"] as? String == "soma_embodiment",
-                  let tool = item["tool"] as? String,
-                  let status = item["status"] as? String else { continue }
-            let error = ((item["error"] as? [String: Any])?["message"] as? String) ?? ""
-            emitter.emit("embodiment_mcp_call", fields: [
-                "tool": String(tool.prefix(96)),
-                "status": String(status.prefix(48)),
-                "error": String(error.prefix(192)),
-            ])
-            let structuredOK = ((item["result"] as? [String: Any])?["structuredContent"]
-                as? [String: Any])?["ok"] as? Bool
-            if tool == "delegate_hermes_task",
-               status == "completed",
-               error.isEmpty,
-               structuredOK != false {
-                successfulHermesDelegation = true
-            }
+            successfulHermesDelegation = inspectEmbodimentMCPItem(
+                item,
+                emitDiagnostic: true
+            ) || successfulHermesDelegation
         }
         guard successfulHermesDelegation,
               let turnID = turn["id"] as? String,
@@ -1009,6 +1001,37 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         triggerHermesDelegationAcknowledgement(turnID: turnID)
+    }
+
+    /// App Server emits tool completion before the enclosing turn completes.
+    /// Logging the item immediately preserves the actual MCP failure instead
+    /// of relying on the assistant's later natural-language interpretation.
+    private func inspectEmbodimentMCPItem(
+        _ item: [String: Any],
+        emitDiagnostic: Bool
+    ) -> Bool {
+        guard let diagnostic = MCPToolCompletionDiagnostic.parse(item) else { return false }
+        let itemID = diagnostic.itemID
+        let shouldEmit: Bool
+        if let itemID, !itemID.isEmpty {
+            shouldEmit = reportedEmbodimentMCPItemIDs.insert(itemID).inserted
+            if reportedEmbodimentMCPItemIDs.count > 128 {
+                reportedEmbodimentMCPItemIDs.removeAll(keepingCapacity: true)
+                reportedEmbodimentMCPItemIDs.insert(itemID)
+            }
+        } else {
+            shouldEmit = true
+        }
+        if emitDiagnostic, shouldEmit {
+            emitter.emit("embodiment_mcp_call", fields: [
+                "tool": diagnostic.tool,
+                "status": diagnostic.effectiveStatus,
+                "protocol_status": diagnostic.protocolStatus,
+                "error": diagnostic.error,
+                "item_id": String((itemID ?? "").prefix(128)),
+            ])
+        }
+        return diagnostic.tool == "delegate_hermes_task" && diagnostic.succeeded
     }
 
     private func handleRealtimeDataChannel(_ payload: String) {

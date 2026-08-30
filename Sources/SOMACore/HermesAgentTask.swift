@@ -174,6 +174,26 @@ public struct HermesAgentTaskIPCResult: Codable, Equatable, Sendable {
     }
 }
 
+/// A result-free projection suitable for a general activity overview. Worker
+/// output remains behind the explicit report workflow.
+public struct HermesAgentTaskActivity: Codable, Equatable, Sendable {
+    public let id: UUID
+    public let title: String
+    public let status: HermesAgentTaskStatus
+    public let updatedAt: Date
+    public let completedAt: Date?
+    public let awaitingReport: Bool
+
+    public init(task: HermesAgentTask) {
+        id = task.id
+        title = task.title
+        status = task.status
+        updatedAt = task.updatedAt
+        completedAt = task.completedAt
+        awaitingReport = task.status == .completed && task.reportedAt == nil
+    }
+}
+
 public enum HermesReportOfferPrompt {
     public static func question(languageTag: String?) -> String {
         let language = (languageTag ?? "").lowercased().split(separator: "-").first.map(String.init) ?? ""

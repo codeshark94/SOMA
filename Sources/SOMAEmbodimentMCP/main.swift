@@ -321,6 +321,7 @@ private final class EmbodimentMCPServer {
     private var initialized = false
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
+    private let gatewayReadGoalEpisodeID = UUID()
     private let supportedProtocolVersion = "2025-11-25"
     private let maximumLineBytes = 1_048_576
 
@@ -395,22 +396,34 @@ private final class EmbodimentMCPServer {
                 write(error: -32602, message: "unknown tool: \(name)", id: id)
                 return
             }
-            var arguments = parameters["arguments"] as? [String: Any] ?? [:]
-            guard let rawIntent = arguments.removeValue(forKey: "cognitive_intent") as? [String: Any] else {
-                write(result: toolFailure("\(name) requires a policy-bound cognitive_intent"), id: id)
-                return
-            }
             let cognitiveIntent: L2CognitiveToolIntent
-            do {
-                let decoded: CognitiveIntentArguments = try decode(rawIntent)
-                cognitiveIntent = decoded.value
-                guard !cognitiveIntent.purpose.isEmpty else {
-                    write(result: toolFailure("cognitive_intent purpose is required"), id: id)
+            var arguments = parameters["arguments"] as? [String: Any] ?? [:]
+            if L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: name) {
+                guard let rawIntent = arguments.removeValue(forKey: "cognitive_intent") as? [String: Any] else {
+                    write(result: toolFailure("\(name) requires a policy-bound cognitive_intent"), id: id)
                     return
                 }
-            } catch {
-                write(result: toolFailure(error.localizedDescription), id: id)
-                return
+                do {
+                    let decoded: CognitiveIntentArguments = try decode(rawIntent)
+                    cognitiveIntent = decoded.value
+                    guard !cognitiveIntent.purpose.isEmpty else {
+                        write(result: toolFailure("cognitive_intent purpose is required"), id: id)
+                        return
+                    }
+                } catch {
+                    write(result: toolFailure(error.localizedDescription), id: id)
+                    return
+                }
+            } else {
+                arguments.removeValue(forKey: "cognitive_intent")
+                guard let gatewayIntent = L2CognitiveToolPolicy.gatewayEpistemicIntent(
+                    for: name,
+                    goalEpisodeID: gatewayReadGoalEpisodeID
+                ) else {
+                    write(result: toolFailure("tool has no epistemic authorization policy: \(name)"), id: id)
+                    return
+                }
+                cognitiveIntent = gatewayIntent
             }
             guard L2CognitiveToolPolicy.autonomy(for: name) != nil else {
                 write(result: toolFailure("tool has no cognitive authorization policy: \(name)"), id: id)
@@ -516,6 +529,30 @@ private final class EmbodimentMCPServer {
             return try EmbodimentShadowSocketClient.send(
                 .init(kind: .snapshot, sessionAuthorization: sessionAuthorization),
                 socketURL: socketURL
+            )
+        case "get_activity_overview":
+            guard toolArguments.isEmpty else {
+                throw ServerFailure.invalidArguments("get_activity_overview takes no arguments")
+            }
+            let bodyReply = try EmbodimentShadowSocketClient.send(
+                .init(kind: .snapshot, sessionAuthorization: sessionAuthorization),
+                socketURL: socketURL
+            )
+            guard bodyReply.ok, let snapshot = bodyReply.snapshot else { return bodyReply }
+            let taskReply = try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .hermesAgentTask,
+                    hermesAgentTask: .init(operation: .list),
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+            guard taskReply.ok else { return taskReply }
+            let activities = (taskReply.hermesAgentTask?.tasks ?? []).map(HermesAgentTaskActivity.init)
+            return EmbodimentIPCReply(
+                ok: true,
+                snapshot: snapshot,
+                activityOverview: .init(robotBody: snapshot, delegatedTasks: activities)
             )
         case "get_view_capture":
             let value: ViewResultArguments = try decode(toolArguments)
@@ -1034,6 +1071,10 @@ private final class EmbodimentMCPServer {
         switch toolName {
         case "get_robot_body_state", "list_scene_entities", "get_spatial_map":
             if let snapshot = reply.snapshot { projected["snapshot"] = try? jsonObject(snapshot) }
+        case "get_activity_overview":
+            if let overview = reply.activityOverview {
+                projected["activity_overview"] = try? jsonObject(overview)
+            }
         case "get_view_capture":
             if let resource = reply.viewResource { projected["view_resource"] = try? jsonObject(resource) }
         case "list_present_people", "list_identity_registry":
@@ -1138,6 +1179,7 @@ private final class EmbodimentMCPServer {
         return [
             "end_conversation",
             "get_robot_body_state",
+            "get_activity_overview",
             "list_scene_entities",
             "get_spatial_map",
             "get_view_capture",
@@ -1202,6 +1244,7 @@ private final class EmbodimentMCPServer {
     private func embodimentStateTools() -> [[String: Any]] {
         [
             tool("get_robot_body_state", L2TaskRoutingPolicy.embodimentStateToolDescription, objectSchema([:], required: []), readOnly: true),
+            tool("get_activity_overview", L2TaskRoutingPolicy.activityOverviewToolDescription, objectSchema([:], required: []), readOnly: true),
             tool("list_scene_entities", "Read the bounded scalar projection of L0's persistent scene entities and semantic bindings for this interaction.", objectSchema([:], required: []), readOnly: true),
             tool("get_spatial_map", "Read L0's bounded spherical coverage atlas, rolling panorama status, remembered scene bearings, and shared gimbal reachability envelope.", objectSchema([:], required: []), readOnly: true),
             tool("get_view_capture", "Read one short-lived capture result by request ID.", objectSchema([
@@ -1411,12 +1454,14 @@ private final class EmbodimentMCPServer {
         readOnly: Bool = false
     ) -> [String: Any] {
         var augmentedSchema = inputSchema
-        var properties = augmentedSchema["properties"] as? [String: Any] ?? [:]
-        properties["cognitive_intent"] = cognitiveIntentSchema()
-        augmentedSchema["properties"] = properties
-        var required = augmentedSchema["required"] as? [String] ?? []
-        if !required.contains("cognitive_intent") { required.append("cognitive_intent") }
-        augmentedSchema["required"] = required
+        if L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: name) {
+            var properties = augmentedSchema["properties"] as? [String: Any] ?? [:]
+            properties["cognitive_intent"] = cognitiveIntentSchema()
+            augmentedSchema["properties"] = properties
+            var required = augmentedSchema["required"] as? [String] ?? []
+            if !required.contains("cognitive_intent") { required.append("cognitive_intent") }
+            augmentedSchema["required"] = required
+        }
         return [
             "name": name,
             "description": description,

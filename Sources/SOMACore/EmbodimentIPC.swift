@@ -254,6 +254,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
     public let cognitiveActionDuplicate: Bool?
     public let recalledEpisodes: [String]?
     public let hermesAgentTask: HermesAgentTaskIPCResult?
+    public let activityOverview: SOMAActivityOverview?
 
     public init(
         ok: Bool,
@@ -267,7 +268,8 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         identityEnrollment: IdentityEnrollmentResult? = nil,
         cognitiveActionDuplicate: Bool? = nil,
         recalledEpisodes: [String]? = nil,
-        hermesAgentTask: HermesAgentTaskIPCResult? = nil
+        hermesAgentTask: HermesAgentTaskIPCResult? = nil,
+        activityOverview: SOMAActivityOverview? = nil
     ) {
         self.ok = ok
         self.error = error.map { String($0.prefix(240)) }
@@ -281,6 +283,23 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         self.cognitiveActionDuplicate = cognitiveActionDuplicate
         self.recalledEpisodes = recalledEpisodes.map { Array($0.prefix(8)).map { String($0.prefix(1_200)) } }
         self.hermesAgentTask = hermesAgentTask
+        self.activityOverview = activityOverview
+    }
+}
+
+public struct SOMAActivityOverview: Codable, Equatable, Sendable {
+    public let generatedAt: Date
+    public let robotBody: EmbodimentShadowSnapshot
+    public let delegatedTasks: [HermesAgentTaskActivity]
+
+    public init(
+        generatedAt: Date = Date(),
+        robotBody: EmbodimentShadowSnapshot,
+        delegatedTasks: [HermesAgentTaskActivity]
+    ) {
+        self.generatedAt = generatedAt
+        self.robotBody = robotBody
+        self.delegatedTasks = Array(delegatedTasks.prefix(25))
     }
 }
 
