@@ -91,7 +91,7 @@ final class SOMADiagnosticsModel: ObservableObject {
             case "thought_wake":
                 return .init(category: "L1A WAKE", title: "Reflection requested", detail: readableMetadata())
             case "model_started":
-                return .init(category: "MODEL", title: "Gemma reasoning started", detail: readableMetadata())
+                return .init(category: "MODEL", title: "L1 reasoning started", detail: readableMetadata())
             case "foreground_thought":
                 return .init(category: "FOREGROUND THOUGHT", title: foregroundTitle, detail: trailingValue(for: "text") ?? "")
             case "executive_wake":
