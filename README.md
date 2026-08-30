@@ -133,24 +133,6 @@ meaningful workspace transition may wake L1a; repeated equivalent cues merely
 support an existing hypothesis. Neither path controls movement or conversation
 directly.
 
-```mermaid
-flowchart LR
-    Body["OBSBOT Tiny 2 Lite / Tiny 3 Lite\nvideo · audio · gimbal · LED"] --> L0["L0 subconscious\nreal-time perception and motor safety"]
-    L0 --> Evidence["normalized evidence\nL0 · L0.5 · memory · time"]
-    Evidence --> Workspace["persistent mental workspace\nhypotheses · drives · thought episodes · intentions"]
-    Workspace --> L1A["L1a thought update\nEnglish inner monologue"]
-    L1A --> Foreground["stochastic foreground competition"]
-    Foreground -->|"action pressure"| L1B["L1b executive judgment"]
-    L0 -->|"authorized eye contact + speech"| L2["L2 Live Voice\nconversation and reasoning"]
-    Workspace <--> Memory["local memory\nshort · medium · long"]
-    Workspace <--> Atlas["spherical place memory\nand scene field"]
-    L1B --> MCP["SOMA embodiment MCP\nsemantic leased goals"]
-    L2 --> MCP
-    MCP --> L0
-    MCP -->|"privacy-bounded outcome"| Evidence
-    L0 --> Body
-```
-
 This loop lets a high-level model influence *why* SOMA looks somewhere, which
 object matters, how long attention should persist, or whether a gesture would
 be appropriate—while L0 remains responsible for *how* the hardware gets there
