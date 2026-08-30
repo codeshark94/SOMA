@@ -159,11 +159,6 @@ private struct CameraFieldOfViewArguments: Codable {
     let goal: CameraFieldOfViewGoal
 }
 
-private struct DeviceSoundFollowingArguments: Codable {
-    let control: ControlArguments
-    let goal: DeviceSoundFollowingGoal
-}
-
 private struct ExpressionArguments: Codable {
     let control: ControlArguments
     let expression: SocialGimbalExpression
@@ -555,7 +550,7 @@ private final class EmbodimentMCPServer {
             )
         case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
              "track_target", "orient_to", "set_exploration_policy", "capture_view",
-             "set_camera_optical_zoom", "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance", "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure", "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning", "set_native_human_tracking_policy", "set_camera_field_of_view", "set_device_sound_following", "express_gimbal", "release_embodiment":
+             "set_camera_optical_zoom", "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance", "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure", "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning", "set_native_human_tracking_policy", "set_camera_field_of_view", "express_gimbal", "release_embodiment":
             let request = try embodimentRequest(for: name, arguments: toolArguments)
             let initial = try EmbodimentShadowSocketClient.send(
                 .init(
@@ -663,9 +658,6 @@ private final class EmbodimentMCPServer {
         case "set_camera_field_of_view":
             let value: CameraFieldOfViewArguments = try decode(arguments)
             return value.control.request(operation: .setCameraFieldOfView(value.goal))
-        case "set_device_sound_following":
-            let value: DeviceSoundFollowingArguments = try decode(arguments)
-            return value.control.request(operation: .setDeviceSoundFollowing(value.goal))
         case "express_gimbal":
             let value: ExpressionArguments = try decode(arguments)
             return value.control.request(operation: .express(value.expression))
@@ -1055,7 +1047,6 @@ private final class EmbodimentMCPServer {
             "set_camera_image_tuning",
             "set_native_human_tracking_policy",
             "set_camera_field_of_view",
-            "set_device_sound_following",
             "express_gimbal",
             "release_embodiment",
             "get_person_context",
@@ -1248,10 +1239,6 @@ private final class EmbodimentMCPServer {
             tool("set_camera_field_of_view", "Set the camera's calibrated 86, 78, or 65 degree optical field of view for a concrete observation. L0 verifies firmware state and updates spherical projection before later visual evidence is interpreted.", objectSchema([
                 "control": controlSchema(),
                 "goal": cameraFieldOfViewGoalSchema(),
-            ], required: ["control", "goal"])),
-            tool("set_device_sound_following", "Temporarily delegate gimbal orientation to the Tiny 3 device's sound-source follower. This claims a motor lease, is disabled on expiry or visual preemption, and intentionally does not claim a raw sound bearing that firmware does not expose.", objectSchema([
-                "control": controlSchema(),
-                "goal": deviceSoundFollowingGoalSchema(),
             ], required: ["control", "goal"])),
             tool("express_gimbal", "Lease a bounded semantic social gimbal expression through L0.", objectSchema([
                 "control": controlSchema(),
@@ -1511,12 +1498,6 @@ private final class EmbodimentMCPServer {
         objectSchema([
             "degrees": ["type": "integer", "enum": [65, 78, 86]],
         ], required: ["degrees"])
-    }
-
-    private func deviceSoundFollowingGoalSchema() -> [String: Any] {
-        objectSchema([
-            "enabled": ["type": "boolean"],
-        ], required: ["enabled"])
     }
 
     private func bearingSchema() -> [String: Any] {

@@ -106,13 +106,23 @@ fi
 
 soma_selected_native_helper="$soma_native_helper"
 soma_control_backend=open_uvc_xu
-soma_device_probe_output=$("$soma_device_probe" --contract 2>>"$soma_launcher_log" || true)
-print -r -- "$soma_device_probe_output" >>"$soma_launcher_log"
-soma_device_contract=$(print -r -- "$soma_device_probe_output" | /usr/bin/sed -n 's/^SOMA_OBSBOT_CAPABILITY //p' | /usr/bin/tail -n 1)
+soma_device_probe_output=''
+soma_device_contract=''
+soma_device_probe_max_attempts=12
+for ((soma_device_probe_attempt = 1; soma_device_probe_attempt <= soma_device_probe_max_attempts; soma_device_probe_attempt++)); do
+  soma_device_probe_output=$("$soma_device_probe" --contract 2>&1 || true)
+  print -r -- "$soma_device_probe_output"
+  soma_device_contract=$(print -r -- "$soma_device_probe_output" | /usr/bin/sed -n 's/^SOMA_OBSBOT_CAPABILITY //p' | /usr/bin/tail -n 1)
+  [[ -n "$soma_device_contract" ]] && break
+  if (( soma_device_probe_attempt < soma_device_probe_max_attempts )); then
+    print -r -- "OBSBOT capability probe attempt $soma_device_probe_attempt/$soma_device_probe_max_attempts did not acquire the USB control endpoint; retrying."
+    sleep 0.5
+  fi
+done
 soma_device_profile=$(print -r -- "$soma_device_contract" | /usr/bin/sed -n 's/.* profile=\([^ ]*\).*/\1/p')
 : "${soma_device_profile:=unknown}"
 if [[ -z "$soma_device_contract" ]]; then
-  print -u2 -r -- 'Unable to obtain an OBSBOT capability contract; starting perception without physical actuation.'
+  print -u2 -r -- "Unable to obtain an OBSBOT capability contract after $soma_device_probe_max_attempts attempts; starting perception without physical actuation."
 fi
 export SOMA_OBSBOT_CAPABILITY_CONTRACT="$soma_device_contract"
 print -r -- "SOMA device profile: $soma_device_profile"

@@ -48,9 +48,8 @@ should do everything:
   voice, or a lost target cannot wait for a long reasoning cycle.
 - **Interpretation needs continuity.** A familiar person, a room, a prior
   conversation, and an unfinished question only make sense across time.
-- **Interaction needs embodiment.** Where the camera looks, how it pauses, a
-  small acknowledgement motion, and an indicator light are part of the social
-  signal—not decorative output.
+- **Interaction needs embodiment.** Where the camera looks, how it pauses, and
+  an indicator light are part of the social signal—not decorative output.
 - **Deliberation must remain accountable.** Higher-level models may decide what
   deserves attention, but a local physical boundary still owns the final motor
   command, joint envelope, watchdog, and stale-evidence veto.
@@ -87,7 +86,7 @@ does not silently borrow another camera's motor or LED assumptions.
 | Device profile | Available without new calibration | Intentionally withheld |
 | --- | --- | --- |
 | `tiny_2_lite` | Video, USB audio, calibrated gimbal control, firmware indicator palette | — |
-| `tiny_3_lite` | Video, USB audio, selectable microphone modes, profile-calibrated L0 gimbal control, native human tracking, firmware status LED, and Live Voice | Tiny 2 motor calibration, host-readable sound bearing, and camera-tuning controls not yet migrated to the open bridge |
+| `tiny_3_lite` | Video, USB audio, selectable microphone modes, profile-calibrated L0 gimbal control, native human tracking, firmware status LED, and Live Voice | Tiny 2 motor calibration, unverified firmware sound following, host-readable sound bearing, and camera-tuning controls not yet migrated to the open bridge |
 
 This is a physical boundary, not a feature downgrade: calibration signs,
 motion envelopes, sound-localization semantics, and LED state IDs are
@@ -241,7 +240,7 @@ and resolves competing requests before anything reaches the USB control plane.
 SOMA treats motion and light as part of interaction design:
 
 - **Fixation** says “I am attending here.”
-- **A short acknowledgement or thinking glance** can communicate intent without
+- **A bounded thinking glance** can communicate attentional intent without
   taking over a conversation.
 - **Exploration** is driven by coverage, novelty, place uncertainty, and
   remembered bearings—not a fixed left-right sweep.
@@ -288,14 +287,20 @@ SOMA's Swift package has no remote SwiftPM dependencies. A full runtime uses:
 - Ollama with the configured L1 model
 - A compatible signed-in Codex installation when L2 Live Voice is enabled
 
-On a clean Apple Silicon Mac, clone the repository and run the idempotent setup
-command:
+On a clean Apple Silicon Mac with Xcode and Homebrew, clone the repository and
+run the idempotent full setup command:
 
 ```sh
-scripts/setup-soma.zsh --enable-motion
+scripts/setup-soma.zsh --full
 ```
 
-Use `--with-l05` to provision the optional local semantic helper.
+`--full` provisions the optional L0.5 semantic helper and ArcFace identity
+model, enables the supported gimbal profiles, creates a machine-local persistent
+code-signing identity when needed, verifies the complete runtime, installs the
+apps, and starts SOMA. The same flow is available by double-clicking
+[`Install SOMA.command`](Install%20SOMA.command).
+Use `--with-l05`, `--with-face-identity`, and `--enable-motion` to select
+individual capabilities instead.
 `--enable-motion` activates the bundled Tiny 2 Lite and Tiny 3 Lite gimbal
 profiles; without it, an existing motion setting is preserved and a fresh
 installation remains perception-only.
@@ -358,11 +363,12 @@ enabling physical camera control.
 <br>
 
 ```sh
-scripts/setup-soma.zsh --enable-motion
+scripts/setup-soma.zsh --full
 ```
 
-The setup command installs locked dependencies, provisions the L1 model, runs
-the full verification suite, then
+The full setup command installs locked dependencies, downloads the pinned L0.5
+checkpoint, builds the pinned ArcFace model, provisions the L1 model, runs the
+full verification suite, then
 rebuilds the Swift and native helpers, signs a local app bundle,
 writes `com.soma.menu-bar` and `com.soma.reactive-l0` LaunchAgents, and starts or
 restarts them. macOS may then request Camera, Microphone, Speech Recognition,

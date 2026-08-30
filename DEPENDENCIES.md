@@ -37,22 +37,24 @@ dylib's deployment target so it cannot approve an unloadable local build.
 
 ## Clean-Mac installation
 
-Install Xcode command-line tools and Homebrew first, create the local signing
-identity described below, then run:
+Install full Xcode 26.6 build 17F113 and Homebrew first, then run:
 
 ```sh
 xcode-select --install
 git clone https://github.com/codeshark94/SOMA.git
 cd SOMA
 
-scripts/setup-soma.zsh --enable-motion
+scripts/setup-soma.zsh --full
 ```
 
 The setup command is safe to rerun. It invokes the locked bootstrap, starts
 Ollama and provisions
 the L1 model when absent, runs the tests and runtime doctor, installs the signed
-app, and verifies that the process remains active. Use `--plan` for a read-only
-preview or `--with-l05` for the optional local semantic helper.
+app, and verifies that the process remains active. `--full` also provisions
+the pinned L0.5 model and ArcFace identity model and enables motion. Use
+`--plan` for a read-only preview or select only `--with-l05`,
+`--with-face-identity`, and `--enable-motion` as needed. Double-click
+`Install SOMA.command` to run the same full profile from Finder.
 `--enable-motion` enables the checked-in
 device-profile calibration registry; the runtime then selects the matching
 Tiny 2 Lite or Tiny 3 Lite profile after open USB detection and establishes
@@ -78,16 +80,15 @@ Git. L2 Live Voice additionally requires the Codex app, a signed-in account,
 and the `realtime_conversation` App Server capability. Set
 `SOMA_ENABLE_L2_LIVE_VOICE=0` when that component is intentionally absent.
 
-Before the first local app installation, create a machine-local code-signing
-certificate in Keychain Access using Certificate Assistant > Create a
-Certificate. Set its name to `SOMA Local Persistent Code Signing`, its identity
-type to Self Signed Root, and its certificate type to Code Signing. The private
-key stays in that Mac's login keychain. Open the resulting certificate, expand
-Trust, and set **Code Signing** to **Always Trust**; then verify that
-`security find-identity -v -p codesigning` reports the identity as valid. The
-doctor and installer require this usable persistent identity and never fall
-back to ad-hoc signing, so macOS TCC permissions remain attached to a stable
-installed application identity across rebuilds.
+Before the first local app installation,
+`scripts/ensure-soma-signing-identity.zsh` creates a ten-year machine-local
+self-signed code-signing root in the current user's default keychain when the
+named identity is absent. Its temporary export password and files are destroyed
+after import, and the private key never leaves that Mac. The doctor and
+installer require the resulting usable persistent identity and never fall back
+to ad-hoc signing, so macOS TCC permissions remain attached to a stable
+installed application identity across rebuilds. Keychain may request explicit
+user approval while importing or trusting the identity.
 
 For debugging an individual setup stage, the lower-level commands remain
 available:
@@ -124,10 +125,14 @@ This locked MLX 0.32 environment requires macOS 26 or newer; the published
 Apple Silicon wheels themselves carry that deployment target. Only the Swift
 package without the current Homebrew runtime retains the macOS 13 minimum.
 
-Then obtain `mlx-community/gemma-4-e2b-it-4bit` revision
-`238767527555cb75a05732a84dff5d6ba0dd6809` after accepting its terms, place it
-at `~/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit`, and enable
-`SOMA_ENABLE_L05_VLM=1`. The locked `model.safetensors` SHA-256 is
+The full setup and `--with-l05` route download
+`mlx-community/gemma-4-e2b-it-4bit` revision
+`238767527555cb75a05732a84dff5d6ba0dd6809` into an isolated staging directory,
+verify every runtime file, atomically install it at
+`~/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit`, and enable
+`SOMA_ENABLE_L05_VLM=1`. If the repository requires authentication, accept
+its terms and run `hf auth login` before rerunning setup. The locked
+`model.safetensors` SHA-256 is
 `038e39a37a7667373d2c3991375446b10c96ae1d717a68674870343db376b76e`;
 `config/l05-model.sha256` verifies the complete runtime checkpoint manifest,
 including tokenizer, processor, generation, and chat-template files.
@@ -135,7 +140,7 @@ including tokenizer, processor, generation, and chat-template files.
 ## Optional face identity
 
 ArcFace weights are not redistributable as a general product dependency. For
-the research-only identity path, run:
+the research-only identity path, use `--with-face-identity`, `--full`, or run:
 
 ```sh
 brew install python@3.12

@@ -441,11 +441,6 @@ public struct L1BehaviorContext: Codable, Equatable, Sendable {
     /// behavior-awareness pass knows who it is looking at, not just that it is
     /// looking at a face.
     public let recognizedIdentity: String?
-    /// Whether a greeting acknowledgment is still pending for the perceived
-    /// person. L1 should recommend acknowledge_person only while this is true;
-    /// once delivered (false) a repeated directive would be a silent no-op.
-    public let acknowledgmentPending: Bool?
-
     public init(
         attentionState: String,
         targetLabel: String?,
@@ -455,8 +450,7 @@ public struct L1BehaviorContext: Codable, Equatable, Sendable {
         scanActive: Bool,
         idleSeconds: Double,
         recentStates: [String],
-        recognizedIdentity: String? = nil,
-        acknowledgmentPending: Bool? = nil
+        recognizedIdentity: String? = nil
     ) {
         self.attentionState = attentionState
         self.targetLabel = targetLabel.map { String($0.prefix(96)) }
@@ -467,7 +461,6 @@ public struct L1BehaviorContext: Codable, Equatable, Sendable {
         self.idleSeconds = idleSeconds.isFinite ? max(idleSeconds, 0) : 0
         self.recentStates = Array(recentStates.prefix(16))
         self.recognizedIdentity = recognizedIdentity.map { String($0.prefix(96)) }
-        self.acknowledgmentPending = acknowledgmentPending
     }
 }
 

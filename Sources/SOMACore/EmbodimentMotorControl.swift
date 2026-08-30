@@ -93,11 +93,6 @@ public enum EmbodimentMotorIntent: Equatable, Sendable {
         requestID: String,
         degrees: Int
     )
-    case deviceSoundFollowing(
-        requestID: String,
-        enabled: Bool,
-        expiresAtNS: UInt64?
-    )
     case explore(
         requestID: String,
         policy: ExplorationPolicyGoal,
@@ -224,18 +219,6 @@ public struct EmbodimentMotorCoordinator: Sendable {
         if case let .setCameraFieldOfView(goal) = request.operation,
            decision.status == .accepted {
             return .cameraFieldOfView(requestID: request.requestID, degrees: goal.degrees)
-        }
-
-        if case let .setDeviceSoundFollowing(goal) = request.operation,
-           !goal.enabled,
-           decision.status == .accepted {
-            activeRequest = nil
-            lastFingerprint = nil
-            return .deviceSoundFollowing(
-                requestID: request.requestID,
-                enabled: false,
-                expiresAtNS: nil
-            )
         }
 
         if case .release = request.operation {
@@ -380,12 +363,6 @@ public struct EmbodimentMotorCoordinator: Sendable {
                 reason: "sensor_control_not_motor_lease",
                 expiresAtNS: request.lease.expiresAtNS
             )
-        case let .setDeviceSoundFollowing(goal):
-            intent = .deviceSoundFollowing(
-                requestID: request.requestID,
-                enabled: goal.enabled,
-                expiresAtNS: goal.enabled ? request.lease.expiresAtNS : nil
-            )
         case .registerTarget, .removeTarget, .setAttentionPolicy, .release:
             return nil
         }
@@ -499,8 +476,6 @@ public struct EmbodimentMotorCoordinator: Sendable {
             return "native_human_tracking_policy|\(requestID)|\(speed.rawValue)|\(motionTracking)|\(foreTarget)|\(adaptiveComposition)|\(adaptivePanGain)|\(adaptivePitchGain)|\(panGainValue)|\(pitchGainValue)"
         case let .cameraFieldOfView(requestID, degrees):
             return "camera_field_of_view|\(requestID)|\(degrees)"
-        case let .deviceSoundFollowing(requestID, enabled, expiresAtNS):
-            return "device_sound_following|\(requestID)|\(enabled)|\(expiresAtNS.map(String.init) ?? "none")"
         case let .explore(requestID, policy, expiresAtNS):
             return "explore|\(requestID)|\(policy.mode.rawValue)|\(expiresAtNS)"
         case let .express(requestID, expression, expiresAtNS):

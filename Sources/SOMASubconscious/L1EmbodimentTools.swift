@@ -196,10 +196,6 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
                 "degrees": numberProperty("One of 86, 78, or 65"),
                 "reason": property("Specific visual-observation purpose")
             ], required: ["degrees", "reason"]),
-            tool("set_device_sound_following", "Temporarily delegate head orientation to the Tiny 3 device's sound-source follower when no grounded visual target should own the gimbal. This takes a motor lease and is automatically disabled when the lease ends or a visual goal preempts it; it does not report a raw sound bearing.", [
-                "enabled": booleanProperty("true to start the temporary sound-following lease, false to stop it"),
-                "reason": property("Specific attention reason")
-            ], required: ["enabled", "reason"]),
             tool("orient_attention", "Lease a calibrated L0 orientation toward one spherical direction. L0 owns route planning, feedback, joint limits, and stopping.", [
                 "azimuth_degrees": numberProperty("Gimbal-home-relative azimuth from -180 to 180"),
                 "elevation_degrees": numberProperty("Gimbal-home-relative elevation from -90 to 90"),
@@ -481,15 +477,6 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
                 reason: reason,
                 durationMilliseconds: duration(args, fallback: 5_000),
                 operation: .setCameraFieldOfView(.init(degrees: Int(degrees)))
-            )
-        case "set_device_sound_following":
-            guard let enabled = boolean(args, "enabled") else {
-                return Self.json(["ok": false, "error": "device_sound_following_enabled_must_be_boolean"])
-            }
-            return submit(
-                reason: reason,
-                durationMilliseconds: duration(args, fallback: enabled ? 10_000 : 1_000),
-                operation: .setDeviceSoundFollowing(.init(enabled: enabled))
             )
         case "orient_attention":
             guard let bearing = bearing(args),
@@ -791,7 +778,7 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
     private static let toolNames: Set<String> = [
         "inspect_scene", "register_attention_target", "set_target_attention",
         "track_attention_target", "capture_target_view", "orient_attention",
-        "explore_attention", "set_camera_optical_zoom", "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance", "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure", "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning", "set_native_human_tracking_policy", "set_camera_field_of_view", "set_device_sound_following", "release_attention",
+        "explore_attention", "set_camera_optical_zoom", "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance", "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure", "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning", "set_native_human_tracking_policy", "set_camera_field_of_view", "release_attention",
     ]
 
     private func tool(

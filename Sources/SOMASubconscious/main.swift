@@ -2572,21 +2572,6 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             framingWidth = nil
             framingHeight = nil
             expiresAtNS = nil
-        case let .deviceSoundFollowing(requestID, enabled, expiresAtNS):
-            self.requestID = requestID
-            action = "device_sound_following"
-            reason = enabled ? "enabled" : "disabled"
-            targetReference = nil
-            sceneID = nil
-            targetAzimuthDegrees = nil
-            targetElevationDegrees = nil
-            fieldOfViewDegrees = nil
-            observedThisFrame = nil
-            framingCenterX = nil
-            framingCenterY = nil
-            framingWidth = nil
-            framingHeight = nil
-            self.expiresAtNS = expiresAtNS
         case let .explore(requestID, policy, expiresAtNS):
             self.requestID = requestID
             action = "explore"
@@ -3507,9 +3492,9 @@ private final class GimbalPoseStore: @unchecked Sendable {
         return feedback
     }
 
-    /// The most recent pose regardless of age. Used by bounded expressions so a
-    /// stale attitude sample (e.g. during a firmware tracking transaction) does
-    /// not stall a bow/nod that should complete on a fixed timer.
+    /// The most recent pose regardless of age. Used by bounded gaze expressions
+    /// so a stale attitude sample during a firmware tracking transaction does
+    /// not stall an overlay that should complete on a fixed timer.
     func lastKnown() -> GimbalPose? {
         lock.lock()
         defer { lock.unlock() }
@@ -3896,18 +3881,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// Supplies the currently recognized identity label (e.g. the administrator's
     /// name) so the behavior-awareness pass knows who it is looking at.
     var recognizedIdentityProvider: (() -> String?)?
-    /// Supplies the currently perceived person's opaque entity ID so the
-    /// acknowledgment queue can match a pending greeting to the person SOMA is
-    /// actually looking at.
-    var recognizedPersonEntityIDProvider: (() -> UUID?)?
-    /// Acknowledgment queue: person entity IDs awaiting a greeting bow, keyed by
-    /// enqueue time. A person is enqueued on arrival and the bow fires only once
-    /// SOMA is perceiving them, so a greeting is never thrown at an empty view.
-    private var pendingAcknowledgmentEntityIDs: [String: UInt64] = [:]
-    /// People whose greeting has already been delivered. Cleared on departure so
-    /// a re-arriving person is greeted again; within one presence it is judged
-    /// from context that the greeting was received and never re-fired.
-    private var deliveredAcknowledgmentEntityIDs: Set<String> = Set()
     private var actionableVisualContinuity = VisualEvidenceContinuity()
     private var socialTrackingContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 1_200)
     /// While native AI owns the live visual loop the device itself is tracking
@@ -3965,14 +3938,12 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var explorationEligibleAfterNS: UInt64 = 0
     private var activeCognitiveMotorRequestID: String?
     private var activeCognitiveMotorExpiresAtNS: UInt64?
-    private var deviceSoundFollowingRequestID: String?
     private var firmwareSoundFollowingActive: Bool?
     private var pendingFirmwareSoundFollowing: (enabled: Bool, commandID: String)?
     private var firmwareSoundFollowingRetryAfterNS: UInt64 = 0
-    /// L0's auditory orienting lease is deliberately separate from a
-    /// cognitive sound-following request. A brief new voice onset can recruit
-    /// the device microphone array while no face is visible, but it may never
-    /// preempt L1/L2 motor ownership or outlive fresh visual evidence.
+    /// A brief new voice onset can recruit a verified device microphone array
+    /// while no face is visible, but it may never preempt L1/L2 motor
+    /// ownership or outlive fresh visual evidence.
     private var auditoryOrientingAdmission = SOMACore.AuditoryOrientingAdmission()
     private var auditoryOrientingLease = SOMACore.AuditoryOrientingLease()
     private let auditoryMotionQualificationDelayNS: UInt64 = 900_000_000
@@ -3991,7 +3962,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// must not acquire the gimbal while another attention loop owns it.
     private var coverageScanBlockedByMotorLease: Bool {
         activeCognitiveMotorRequestID != nil
-            || deviceSoundFollowingRequestID != nil
             || auditoryOrientingLease.isActive
             || nativeTrackingActive
             || nativeTrackingStartPending
@@ -4149,13 +4119,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         process.standardInput = inputPipe
         process.standardOutput = FileHandle.nullDevice
         process.standardError = readyPipe
+        let runtimePID = ProcessInfo.processInfo.processIdentifier
         process.terminationHandler = { [writer, exited = self.exited] completed in
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
                 source: "attention_gimbal_bridge",
                 state: completed.terminationStatus == 0 ? "stopped" : "fault",
-                message: "termination_status=\(completed.terminationStatus)"
+                message: "runtime_pid=\(runtimePID); termination_status=\(completed.terminationStatus)"
             ))
             exited.signal()
         }
@@ -4173,7 +4144,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNanoseconds(),
             source: "attention_gimbal_bridge",
             state: "started",
-            message: "local_scalar_pipe_only; exploration_posterior=entropy_seeded"
+            message: "runtime_pid=\(runtimePID); local_scalar_pipe_only; exploration_posterior=entropy_seeded"
         ))
     }
 
@@ -4445,7 +4416,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 monotonicNS: monotonicNanoseconds(),
                 source: "attention_gimbal_bridge",
                 state: "ready",
-                message: "native_endpoint_discovered"
+                message: "runtime_pid=\(ProcessInfo.processInfo.processIdentifier); native_endpoint_discovered"
             ))
             if allowsMotorControl && (cameraGeometryCalibrationMode || panoramaStripScanMode) {
                 startSmoothExploration()
@@ -4746,69 +4717,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         queue.async { [weak self] in self?.applyEmbodimentIntent(intent) }
     }
 
-    /// Enqueue a greeting for a person who has just been recognized/arrived.
-    /// The bow is not fired here: it waits until SOMA is actually perceiving
-    /// that person, so a greeting is never aimed at an empty view. L1's
-    /// behavior cycle recommends `acknowledge_person` to present it; a fallback
-    /// timer (SOMA_L0_ACK_FALLBACK_SECONDS, default 15, 0 disables) retries
-    /// that presentation only after current verified eye contact exists.
-    /// Both paths drain the same pending entry, so they can never double-fire.
-    func enqueueAcknowledgment(for entityID: UUID, at monotonicNS: UInt64) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            let key = entityID.uuidString
-            guard !self.deliveredAcknowledgmentEntityIDs.contains(key) else { return }
-            self.pendingAcknowledgmentEntityIDs[key] = monotonicNS
-            let fallbackSeconds = somaEnvDouble("SOMA_L0_ACK_FALLBACK_SECONDS", default: 15)
-            guard fallbackSeconds > 0 else { return }
-            self.queue.asyncAfter(deadline: .now() + .seconds(Int(fallbackSeconds))) { [weak self] in
-                guard let self else { return }
-                let now = monotonicNanoseconds()
-                self.deliverAcknowledgmentIfEligible(for: key, at: now)
-            }
-        }
-    }
-
-    /// Re-arm a person on departure so a re-arriving person is greeted again.
-    func clearAcknowledgment(for entityID: UUID) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            let key = entityID.uuidString
-            self.pendingAcknowledgmentEntityIDs.removeValue(forKey: key)
-            self.deliveredAcknowledgmentEntityIDs.remove(key)
-        }
-    }
-
-    /// L1 behavior `acknowledge_person` entry point. Instead of firing a
-    /// greeting on a fixed cooldown, it drains the acknowledgment queue: if the
-    /// person SOMA is currently fixating with eye contact has a pending
-    /// greeting, present it and mark it delivered so it is never re-fired
-    /// within one presence.
-    func acknowledgePersonIfEligible(at monotonicNS: UInt64) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            guard let perceived = self.recognizedPersonEntityIDProvider?() else { return }
-            let key = perceived.uuidString
-            self.deliverAcknowledgmentIfEligible(for: key, at: monotonicNanoseconds())
-        }
-    }
-
-    private func deliverAcknowledgmentIfEligible(for entityKey: String, at monotonicNS: UInt64) {
-        guard pendingAcknowledgmentEntityIDs[entityKey] != nil,
-              recognizedPersonEntityIDProvider?()?.uuidString == entityKey,
-              faceLock.permitsMotor(at: monotonicNS),
-              eyeContactIndicatorLease.isActive(at: monotonicNS) else {
-            return
-        }
-        pendingAcknowledgmentEntityIDs.removeValue(forKey: entityKey)
-        deliveredAcknowledgmentEntityIDs.insert(entityKey)
-        applyEmbodimentIntent(.express(
-            requestID: "l1-ack-\(monotonicNS)",
-            expression: .acknowledge,
-            expiresAtNS: monotonicNS + 1_500_000_000
-        ))
-    }
-
     func stop() {
         let shouldStop: Bool = queue.sync {
             if case .stopped = state { return false }
@@ -4833,7 +4741,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 at: stopNS,
                 resumeExploration: false
             )
-            disableDeviceSoundFollowing(state: "runtime_stopping", at: stopNS)
             // Sound following is a firmware state, not a host-side velocity
             // command. Clear it even when no local lease survived a previous
             // process so the next launch begins from an unowned motor state.
@@ -5309,15 +5216,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     func makeBehaviorContext(at nowNS: UInt64) -> L1BehaviorContext {
         let fixationSeconds = behaviorChangedAtNS == 0 ? 0 : Double(nowNS - behaviorChangedAtNS) / 1_000_000_000
-        // Only report an acknowledgment as pending while it is still
-        // undelivered, so L1 stops recommending acknowledge_person once the
-        // greeting bow has already been fired for this presence.
-        let pendingAcknowledgment: Bool?
-        if let perceived = recognizedPersonEntityIDProvider?() {
-            pendingAcknowledgment = pendingAcknowledgmentEntityIDs[perceived.uuidString] != nil
-        } else {
-            pendingAcknowledgment = nil
-        }
         return L1BehaviorContext(
             attentionState: behaviorAttentionState,
             targetLabel: behaviorTargetLabel,
@@ -5327,8 +5225,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             scanActive: scanRunning,
             idleSeconds: fixationSeconds,
             recentStates: recentAttentionStates,
-            recognizedIdentity: recognizedIdentityProvider?(),
-            acknowledgmentPending: pendingAcknowledgment
+            recognizedIdentity: recognizedIdentityProvider?()
         )
     }
 
@@ -5536,7 +5433,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               process.isRunning,
               deviceCapabilities?.supportsDeviceSoundLocalization == true,
               activeCognitiveMotorRequestID == nil,
-              deviceSoundFollowingRequestID == nil,
               !auditoryMotorOrientationBlocked(at: monotonicNS) else {
             return
         }
@@ -5624,8 +5520,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             message: "request_id=\(requestID); visual_face=\(hasRecentObservedFace(at: monotonicNS)); exploration_resume=\(resumeExploration)"
         ))
         if resumeExploration,
-           activeCognitiveMotorRequestID == nil,
-           deviceSoundFollowingRequestID == nil {
+           activeCognitiveMotorRequestID == nil {
             scheduleScanAfterContinuousVisualLoss(minimumDelayMilliseconds: 150)
         }
     }
@@ -7297,43 +7192,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 state: "field_of_view_requested",
                 message: "request_id=\(String(requestID.prefix(96))); field_of_view_degrees=\(degrees)"
             ))
-        case let .deviceSoundFollowing(requestID, enabled, expiresAtNS):
-            guard helperReady else {
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: now,
-                    source: "obsbot_audio_doa",
-                    state: "helper_unavailable",
-                    message: "request_id=\(String(requestID.prefix(96))); enabled=\(enabled)"
-                ))
-                return
-            }
-            if enabled {
-                guard let expiresAtNS else { return }
-                claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
-                cognitiveMotionMode = .suspended(reason: "firmware_sound_following")
-                stopCognitiveMotion(state: "firmware_sound_following_acquired", at: now, retainLease: true)
-                deviceSoundFollowingRequestID = requestID
-                requestFirmwareSoundFollowing(
-                    enabled: true,
-                    at: now,
-                    reason: "cognitive_sound_following"
-                )
-                scheduleDeviceSoundFollowingExpiry(requestID: requestID, expiresAtNS: expiresAtNS)
-            } else {
-                let activeRequestID = deviceSoundFollowingRequestID
-                disableDeviceSoundFollowing(state: "explicit_disable", at: now)
-                if activeCognitiveMotorRequestID == activeRequestID {
-                    releaseCognitiveMotor(state: "firmware_sound_following_disabled", at: now)
-                }
-            }
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: now,
-                source: "obsbot_audio_doa",
-                state: enabled ? "device_sound_following_requested" : "device_sound_following_disable_requested",
-                message: "request_id=\(String(requestID.prefix(96))); enabled=\(enabled)"
-            ))
         case let .explore(requestID, policy, expiresAtNS):
             claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
             cognitiveMotionMode = .exploration(policy: policy)
@@ -7342,21 +7200,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             cognitiveMotionHolding = false
             startCognitiveMotionLoop()
         case let .express(requestID, expression, expiresAtNS):
-            // An arrival acknowledgment is a low-amplitude social overlay,
-            // not permission to take the gimbal away from the face currently
-            // being followed. The active eye-contact presentation supplies the
-            // acknowledgment while L0 retains the social motor lease.
-            if expression == .acknowledge,
-               nativeTrackingOwnsMotor || faceLock.permitsMotor(at: now) {
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: now,
-                    source: "embodiment_motor",
-                    state: "acknowledgment_preserved_l0_tracking",
-                    message: "request_id=\(String(requestID.prefix(96))); native_lease=\(nativeTrackingOwnsMotor)"
-                ))
-                return
-            }
             claimCognitiveMotor(requestID: requestID, expiresAtNS: expiresAtNS, at: now)
             cognitiveMotionMode = .expression(
                 kind: expression,
@@ -7414,9 +7257,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 at: monotonicNS,
                 resumeExploration: false
             )
-        }
-        if changesOwner, deviceSoundFollowingRequestID != nil {
-            disableDeviceSoundFollowing(state: "cognitive_motor_preempted", at: monotonicNS)
         }
         activeCognitiveMotorRequestID = requestID
         activeCognitiveMotorExpiresAtNS = expiresAtNS
@@ -7487,10 +7327,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             scheduleCognitiveMotionTick(generation: generation, afterMilliseconds: 100)
             return
         }
-        // Bounded expressions (bow/nod/greeting) complete on a fixed timer, so
-        // they may use the last known pose even if the attitude sample is stale
-        // (e.g. during a firmware tracking transaction). Other modes need a fresh
-        // pose to avoid driving on outdated geometry.
+        // Bounded gaze expressions complete on a fixed timer, so they may use
+        // the last known pose even if the attitude sample is stale (e.g. during
+        // a firmware tracking transaction). Other modes need a fresh pose to
+        // avoid driving on outdated geometry.
         let pose: GimbalPose?
         if case .expression = cognitiveMotionMode {
             pose = poseStore.lastKnown()
@@ -7834,13 +7674,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         )
         let distance = hypot(target.azimuthDegrees - pose.panDegrees, target.elevationDegrees - pose.pitchDegrees)
         let startedNS = waypointStartedNS ?? monotonicNS
-        let minimumWaypointNS: UInt64 = kind == .greeting ? 70_000_000 : 120_000_000
-        let arrivalToleranceDegrees = kind == .greeting ? 0.75 : 1.8
+        let minimumWaypointNS: UInt64 = 120_000_000
+        let arrivalToleranceDegrees = 1.8
         // Advance on arrival OR on a time fallback. Some gimbal transports do not
         // reflect commanded movement in the attitude feedback, so the pose
         // distance never converges; without this fallback the expression would
         // hold until the lease expires and never report completion.
-        let waypointTimeoutNS: UInt64 = kind == .greeting ? 250_000_000 : 400_000_000
+        let waypointTimeoutNS: UInt64 = 400_000_000
         if distance <= arrivalToleranceDegrees {
             // Waypoint reached. Advance once the minimum dwell time has elapsed;
             // otherwise hold (keep the loop running) WITHOUT re-driving the
@@ -7874,9 +7714,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         )
         driveCognitiveWaypoint(
             target,
-            toleranceDegrees: kind == .greeting ? 0.75 : 1.2,
-            motionStyle: kind == .greeting ? .playful : .attentive,
-            accelerationMultiplier: kind == .greeting ? 4 : 1,
+            toleranceDegrees: 1.2,
+            motionStyle: .attentive,
+            accelerationMultiplier: 1,
             state: "cognitive_expression_\(kind.rawValue)",
             calibration: calibration,
             pose: pose,
@@ -7890,23 +7730,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     ) -> [(pitch: Double, pan: Double)] {
         let inward = currentPan > 0 ? -1.0 : 1.0
         switch expression {
-        case .acknowledge:
-            // Positive pitch = down (pitchCommand == error with pitchSign -1 and
-            // pitchImageSign -1). A bow must lower the head, so use +8: large
-            // enough to be clearly visible as a greeting, small enough to keep
-            // the person in frame.
-            return [(pitch: 8, pan: 0), (pitch: 0, pan: 0)]
-        case .nod:
-            // Down, up, return.
-            return [(pitch: 7, pan: 0), (pitch: -3, pan: 0), (pitch: 0, pan: 0)]
         case .attentiveReframe:
             return [(pitch: 2, pan: 7 * inward), (pitch: 0, pan: 0)]
         case .thinkingGlance:
             return [(pitch: 4, pan: 10 * inward), (pitch: 0, pan: 0)]
-        case .greeting:
-            // Explicit greetings are a brief bow and return, never a
-            // side-to-side sweep that can dislodge the social target.
-            return [(pitch: 4, pan: 0), (pitch: 0, pan: 0)]
         }
     }
 
@@ -7944,9 +7771,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private func releaseCognitiveMotor(state: String, at monotonicNS: UInt64) {
         guard activeCognitiveMotorRequestID != nil else { return }
         let releasedRequestID = activeCognitiveMotorRequestID
-        if deviceSoundFollowingRequestID == releasedRequestID {
-            disableDeviceSoundFollowing(state: state, at: monotonicNS)
-        }
         if let releasedRequestID {
             embodimentViewCaptureStore?.cancel(
                 requestID: releasedRequestID,
@@ -7965,34 +7789,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         reconcileFirmwareSoundFollowing(at: monotonicNS, reason: "cognitive_motor_released")
         scanScheduledForEvidenceGeneration = nil
         scheduleScanAfterContinuousVisualLoss()
-    }
-
-    private func scheduleDeviceSoundFollowingExpiry(requestID: String, expiresAtNS: UInt64) {
-        let now = monotonicNanoseconds()
-        let delayNS = expiresAtNS > now ? expiresAtNS - now : 0
-        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(min(delayNS, UInt64(Int.max))))) { [weak self] in
-            guard let self,
-                  self.deviceSoundFollowingRequestID == requestID,
-                  self.activeCognitiveMotorRequestID == requestID,
-                  self.activeCognitiveMotorExpiresAtNS.map({ $0 <= monotonicNanoseconds() }) == true else {
-                return
-            }
-            let expiredAt = monotonicNanoseconds()
-            self.releaseCognitiveMotor(state: "firmware_sound_following_expired", at: expiredAt)
-        }
-    }
-
-    private func disableDeviceSoundFollowing(state: String, at monotonicNS: UInt64) {
-        guard let activeRequestID = deviceSoundFollowingRequestID else { return }
-        deviceSoundFollowingRequestID = nil
-        writer.write(RuntimeEvent(
-            event: "source.health",
-            monotonicNS: monotonicNS,
-            source: "obsbot_audio_doa",
-            state: "device_sound_following_released",
-            message: "request_id=\(String(activeRequestID.prefix(96))); reason=\(String(state.prefix(96)))"
-        ))
-        reconcileFirmwareSoundFollowing(at: monotonicNS, reason: state)
     }
 
     private func disableFirmwareSoundFollowing(at monotonicNS: UInt64, reason: String) {
@@ -8039,10 +7835,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               deviceCapabilities?.supportsDeviceSoundLocalization == true else {
             return
         }
-        let explicitSoundLease = deviceSoundFollowingRequestID != nil
         let orienting = auditoryOrientingLease.isActive
         requestFirmwareSoundFollowing(
-            enabled: explicitSoundLease || orienting,
+            enabled: orienting,
             at: monotonicNS,
             reason: reason
         )
@@ -8312,7 +8107,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         case .l0:
             // Reflexive L0 scan is the lowest authority: it yields to a
             // recently observed face, an active L0 face lock, and an in-flight
-            // L1 cognitive expression (bow/nod/greeting).
+            // L1 gaze expression.
             guard (exclusiveScan || !hasRecentObservedFace(at: now)),
                   (exclusiveScan || activeSpatialFaceReacquisition == nil),
                   (exclusiveScan || !faceLock.permitsMotor(at: now)),
@@ -13095,9 +12890,6 @@ private func run(_ options: Options) throws {
         attentionGimbalBridge?.recognizedIdentityProvider = {
             latestPrimaryIdentity.snapshot()?.label
         }
-        attentionGimbalBridge?.recognizedPersonEntityIDProvider = {
-            identityPresence.recognizedPersonEntityID()
-        }
         auxiliaryHumanVerdictRelay.attach { cue in
             attentionGimbalBridge?.ingestSemanticHumanVerdict(cue)
         }
@@ -13826,17 +13618,6 @@ private func run(_ options: Options) throws {
                         )
                     }
                 }
-                let requestID = "l1-social-\(decision.opportunityID.uuidString.lowercased())"
-                // A greeting is a short physical overlay, not a long-lived
-                // attention claim. Completion releases this lease sooner; the
-                // deadline only guarantees recovery if an attitude sample is
-                // unavailable while the gesture starts.
-                let expiration = completedNS + 600_000_000
-                attentionGimbalBridge?.ingestEmbodimentIntent(.express(
-                    requestID: requestID,
-                    expression: .greeting,
-                    expiresAtNS: expiration
-                ))
                 if decision.action != .spokenOpening {
                     // The durable event becomes L1 context for later social
                     // judgment; L0 does not impose a relationship cooldown.
@@ -13872,9 +13653,6 @@ private func run(_ options: Options) throws {
                         return false
                     }
                     attentionGimbalBridge?.resumeCoverageScan(priority: .l1)
-                    return attentionGimbalBridge != nil
-                case .acknowledgePerson:
-                    attentionGimbalBridge?.acknowledgePersonIfEligible(at: atNS)
                     return attentionGimbalBridge != nil
                 case .noAction, .nonverbalInvitation, .spokenOpening, .inspectAttentionTarget:
                     return false
@@ -14373,7 +14151,6 @@ private func run(_ options: Options) throws {
             for update in identityPresence.observe(decision, at: monotonicNS) {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .arrived(identity) = update.transition {
-                    attentionGimbalBridge?.enqueueAcknowledgment(for: identity.entityID, at: monotonicNS)
                     // Pre-warm the person's durable memory context so reactive
                     // speech can surface recalled facts (e.g. recognized-object
                     // taste profile) even before the first L1 wake cycle.
@@ -14399,7 +14176,6 @@ private func run(_ options: Options) throws {
                 }
                 if case let .departed(identity) = update.transition {
                     l1ThoughtRelay.depart(identity.entityID)
-                    attentionGimbalBridge?.clearAcknowledgment(for: identity.entityID)
                 }
                 if update.participant?.authority == .administrator {
                     writer.write(RuntimeEvent(
@@ -14421,7 +14197,6 @@ private func run(_ options: Options) throws {
                 writer.write(identityPresenceRuntimeEvent(for: update.transition, at: monotonicNS))
                 if case let .departed(identity) = update.transition {
                     l1ThoughtRelay.depart(identity.entityID)
-                    attentionGimbalBridge?.clearAcknowledgment(for: identity.entityID)
                 }
             }
         },

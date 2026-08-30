@@ -170,7 +170,7 @@ public enum L2CognitiveToolPolicy {
             .explicitRequest
         case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
              "track_target", "orient_to", "set_exploration_policy", "capture_view",
-             "set_camera_optical_zoom", "set_device_sound_following", "express_gimbal",
+             "set_camera_optical_zoom", "express_gimbal",
              "release_embodiment":
             .goalBoundEmbodiment
         case "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance",

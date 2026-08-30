@@ -28,7 +28,7 @@ request is not treated as physical validation.
 | Audio | microphone input gain `0...100` | none | open setter/readback contract is not yet complete | withheld rather than reporting false success |
 | Audio | VQE: none, talk, vlog | none | current state `none` is readable; `talk` setter returned success but the immediate state query failed, then `none` restored | withheld: a success return without durable readback is not a usable SOMA control |
 | Audio | rear capture mode | none | setter returned success but camera status remained spatial stereo | withheld on firmware `6.5.10.1` |
-| Audio | firmware sound following | L0, L1 tool, embodiment MCP | enable/disable setter and a bounded L0 lease; firmware contains a multichannel audio/DOA queue and an internal gimbal find-by-DOA path | active configuration; state readback and physical sound-turn validation pending |
+| Audio | firmware sound following | diagnostic transport only | the enable/disable request is accepted, but repeated bounded trials produced no measured gimbal response | withheld; not advertised to L0, L1, or L2 until physical sound-turn validation succeeds |
 | Audio | firmware sound-follow distance | none | only `doa_range=1` persisted; values 2 and 3 silently remained 0 | withheld until its physical semantics are established |
 | Audio | audio distance field | none | `cameraSetAudioDistanceU` state round-trip verified for values 0, 1, and 2; 3, 4, and 15 silently reported 0 | withheld until the firmware's three distance settings and acoustic effect are established |
 | Audio | raw sound bearing | none | firmware does not expose a host-readable direction | calibration required |

@@ -160,7 +160,6 @@ final class SOMADiagnosticsModel: ObservableObject {
             case "spoken_opening": "Open a purposeful conversation"
             case "resume_scanning": "Resume active exploration"
             case "seek_people": "Search for people"
-            case "acknowledge_person": "Acknowledge the current person"
             case "inspect_attention_target": "Inspect the current attention target"
             default: action.replacingOccurrences(of: "_", with: " ").capitalized
             }

@@ -4,6 +4,25 @@ import XCTest
 @testable import SOMACore
 
 final class CognitiveEmbodimentTests: XCTestCase {
+    func testGimbalExpressionsExcludeGreetingAndNodMotions() throws {
+        XCTAssertEqual(
+            SocialGimbalExpression.allCases.map(\.rawValue),
+            ["attentive_reframe", "thinking_glance"]
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                SocialGimbalExpression.self,
+                from: Data("\"nod\"".utf8)
+            )
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                SocialGimbalExpression.self,
+                from: Data("\"greeting\"".utf8)
+            )
+        )
+    }
+
     func testRuntimeShutdownIPCIsLocalAndPayloadFree() throws {
         let suffix = UUID().uuidString.prefix(8)
         let directory = URL(fileURLWithPath: "/private/tmp/soma-runtime-stop-ipc-\(suffix)", isDirectory: true)
@@ -1835,53 +1854,6 @@ final class CognitiveEmbodimentTests: XCTestCase {
             operation: .setCameraFieldOfView(.init(degrees: 70))
         )
         XCTAssertThrowsError(try invalidFieldOfView.validate())
-    }
-
-    func testDeviceSoundFollowingClaimsTheMotorAndItsOwnerCanReleaseIt() throws {
-        let now: UInt64 = 75_000_000_000
-        let arbiter = ShadowEmbodimentArbiter(physicalActuationEnabled: true)
-        var coordinator = EmbodimentMotorCoordinator()
-        let start = shadowRequest(
-            id: "sound-following-start",
-            layer: .l1,
-            owner: "l1:situation",
-            priority: 60,
-            now: now,
-            durationMilliseconds: 10_000,
-            operation: .setDeviceSoundFollowing(.init(enabled: true))
-        )
-
-        XCTAssertNoThrow(try start.validate())
-        let startDecision = arbiter.submit(start, at: now)
-        XCTAssertEqual(startDecision.status, .accepted)
-        XCTAssertEqual(startDecision.snapshot.activeRequestID, start.requestID)
-        XCTAssertEqual(
-            coordinator.apply(request: start, decision: startDecision, at: now),
-            .deviceSoundFollowing(
-                requestID: start.requestID,
-                enabled: true,
-                expiresAtNS: start.lease.expiresAtNS
-            )
-        )
-        XCTAssertEqual(coordinator.activeRequestID, start.requestID)
-
-        let stop = shadowRequest(
-            id: "sound-following-stop",
-            layer: .l1,
-            owner: "l1:situation",
-            priority: 60,
-            now: now + 1,
-            durationMilliseconds: 1_000,
-            operation: .setDeviceSoundFollowing(.init(enabled: false))
-        )
-        let stopDecision = arbiter.submit(stop, at: now + 1)
-        XCTAssertEqual(stopDecision.status, .accepted)
-        XCTAssertNil(stopDecision.snapshot.activeRequestID)
-        XCTAssertEqual(
-            coordinator.apply(request: stop, decision: stopDecision, at: now + 1),
-            .deviceSoundFollowing(requestID: stop.requestID, enabled: false, expiresAtNS: nil)
-        )
-        XCTAssertNil(coordinator.activeRequestID)
     }
 
     func testCaptureResultIPCReturnsOnlyTheRequestedTTLResource() throws {

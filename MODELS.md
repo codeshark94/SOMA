@@ -101,11 +101,12 @@ to one 260 ms input window.
 - Reproduction: `scripts/install-soma-face-identity-model.zsh` verifies the
   archive, locks Python 3.12, the complete conversion environment, and Xcode
   build 17F113, converts it with `scripts/convert_arcface_coreml.py`, verifies
-  the deterministic model, weights, and metadata, then loads the compiled
-  package with Core ML before installing it with owner-only permissions. The
-  compiler-generated `coremldata.bin` containers vary between equivalent
-  compilations, so they are checked for presence and successful loading rather
-  than byte identity.
+  the deterministic model and weights plus the stable metadata schema, then
+  loads the compiled package with Core ML before installing it with owner-only
+  permissions. The compiler-generated `metadata.json` conversion date and
+  `coremldata.bin` containers vary between equivalent compilations, so those
+  artifacts are checked semantically and by successful loading rather than by
+  byte identity.
 
 The runtime aligns independently verified eye and nose landmarks to ArcFace's
 canonical template, then requests `.cpuAndNeuralEngine`. A deterministic probe
@@ -141,6 +142,10 @@ to Gemma, traces, or remote services.
 - License: Gemma terms, as declared by the conversion model card. The operator
   is responsible for accepting and complying with those terms for the local
   downloaded checkpoint.
+
+`scripts/install-soma-l05-model.zsh` downloads only that immutable revision,
+verifies every runtime file against `config/l05-model.sha256`, and atomically
+activates the checkpoint. The repository does not redistribute the model.
 
 This is L1's optional local visual helper. A same-image three-request
 probe measured 1.47 s cold and 1.39 s warm-median inference with a 4.20 GB

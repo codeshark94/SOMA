@@ -295,11 +295,8 @@ public struct ExplorationPolicyGoal: Codable, Equatable, Sendable {
 }
 
 public enum SocialGimbalExpression: String, Codable, CaseIterable, Sendable {
-    case acknowledge
-    case nod
     case attentiveReframe = "attentive_reframe"
     case thinkingGlance = "thinking_glance"
-    case greeting
 }
 
 public struct CaptureViewGoal: Codable, Equatable, Sendable {
@@ -579,17 +576,6 @@ public struct CameraFieldOfViewGoal: Codable, Equatable, Sendable {
     }
 }
 
-/// Lets a cognitive layer temporarily delegate gimbal orientation to the
-/// device's verified sound-source follower.  It is a motor lease because the
-/// firmware moves the physical head without emitting a bearing to the host.
-public struct DeviceSoundFollowingGoal: Codable, Equatable, Sendable {
-    public let enabled: Bool
-
-    public init(enabled: Bool) {
-        self.enabled = enabled
-    }
-}
-
 public enum EmbodimentViewCaptureState: String, Codable, Sendable {
     case pendingAlignment = "pending_alignment"
     case awaitingFrame = "awaiting_frame"
@@ -673,7 +659,6 @@ public enum CognitiveEmbodimentOperation: Equatable, Sendable {
     case setCameraImageTuning(CameraImageTuningGoal)
     case setNativeHumanTrackingPolicy(NativeHumanTrackingPolicyGoal)
     case setCameraFieldOfView(CameraFieldOfViewGoal)
-    case setDeviceSoundFollowing(DeviceSoundFollowingGoal)
     case express(SocialGimbalExpression)
     case release
 }
@@ -700,7 +685,6 @@ extension CognitiveEmbodimentOperation: Codable {
         case setCameraImageTuning = "set_camera_image_tuning"
         case setNativeHumanTrackingPolicy = "set_native_human_tracking_policy"
         case setCameraFieldOfView = "set_camera_field_of_view"
-        case setDeviceSoundFollowing = "set_device_sound_following"
         case express
         case release
     }
@@ -746,8 +730,6 @@ extension CognitiveEmbodimentOperation: Codable {
             self = .setNativeHumanTrackingPolicy(try values.decode(NativeHumanTrackingPolicyGoal.self, forKey: .payload))
         case .setCameraFieldOfView:
             self = .setCameraFieldOfView(try values.decode(CameraFieldOfViewGoal.self, forKey: .payload))
-        case .setDeviceSoundFollowing:
-            self = .setDeviceSoundFollowing(try values.decode(DeviceSoundFollowingGoal.self, forKey: .payload))
         case .express:
             self = .express(try values.decode(SocialGimbalExpression.self, forKey: .payload))
         case .release:
@@ -814,9 +796,6 @@ extension CognitiveEmbodimentOperation: Codable {
             try values.encode(payload, forKey: .payload)
         case let .setCameraFieldOfView(payload):
             try values.encode(Kind.setCameraFieldOfView, forKey: .type)
-            try values.encode(payload, forKey: .payload)
-        case let .setDeviceSoundFollowing(payload):
-            try values.encode(Kind.setDeviceSoundFollowing, forKey: .type)
             try values.encode(payload, forKey: .payload)
         case let .express(payload):
             try values.encode(Kind.express, forKey: .type)
@@ -1048,8 +1027,6 @@ public struct CognitiveEmbodimentRequest: Codable, Equatable, Sendable {
             guard [65, 78, 86].contains(goal.degrees) else {
                 throw CognitiveEmbodimentError.invalidRequest
             }
-        case .setDeviceSoundFollowing:
-            break
         case .express, .release:
             break
         }
@@ -1084,7 +1061,6 @@ public enum CognitiveEmbodimentOperationKind: String, Codable, CaseIterable, Sen
     case setCameraImageTuning = "set_camera_image_tuning"
     case setNativeHumanTrackingPolicy = "set_native_human_tracking_policy"
     case setCameraFieldOfView = "set_camera_field_of_view"
-    case setDeviceSoundFollowing = "set_device_sound_following"
     case express
     case release
 }
@@ -1111,7 +1087,6 @@ public extension CognitiveEmbodimentOperation {
         case .setCameraImageTuning: .setCameraImageTuning
         case .setNativeHumanTrackingPolicy: .setNativeHumanTrackingPolicy
         case .setCameraFieldOfView: .setCameraFieldOfView
-        case .setDeviceSoundFollowing: .setDeviceSoundFollowing
         case .express: .express
         case .release: .release
         }
@@ -1123,8 +1098,6 @@ public extension CognitiveEmbodimentOperation {
             return true
         case let .captureView(goal):
             return !goal.requestsCurrentFrame
-        case let .setDeviceSoundFollowing(goal):
-            return goal.enabled
         case .registerTarget, .removeTarget, .setAttentionPolicy, .setOpticalZoom, .setAudioCaptureMode, .setAudioInputGain, .setCameraWhiteBalance, .setCameraExposureLock, .setCameraFocus, .setCameraAbsoluteExposure, .setCameraFacePriority, .setCameraAntiFlicker, .setCameraImageTuning, .setNativeHumanTrackingPolicy, .setCameraFieldOfView, .release:
             return false
         }
@@ -1482,29 +1455,6 @@ public final class ShadowEmbodimentArbiter: @unchecked Sendable {
                 reason: physicalActuationEnabled
                     ? "camera_field_of_view_ready_l0_adapter"
                     : "camera_field_of_view_ready_shadow_no_actuation",
-                preemptedRequestID: nil,
-                at: monotonicNS
-            )
-        case let .setDeviceSoundFollowing(goal) where goal.enabled:
-            return claimMotor(request, at: monotonicNS)
-        case .setDeviceSoundFollowing:
-            let activeOwner = activeMotorGoal?.lease.ownerID
-            guard activeOwner == nil || activeOwner == request.lease.ownerID else {
-                return decision(
-                    request: request,
-                    status: .rejected,
-                    reason: "sound_following_disable_not_owner",
-                    preemptedRequestID: nil,
-                    at: monotonicNS
-                )
-            }
-            activeMotorGoal = nil
-            return decision(
-                request: request,
-                status: .accepted,
-                reason: physicalActuationEnabled
-                    ? "device_sound_following_disabled_l0_adapter"
-                    : "device_sound_following_disabled_shadow_no_actuation",
                 preemptedRequestID: nil,
                 at: monotonicNS
             )

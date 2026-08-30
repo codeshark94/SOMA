@@ -241,7 +241,6 @@ public enum L1ExecutiveAction: String, Codable, CaseIterable, Hashable, Sendable
     case spokenOpening = "spoken_opening"
     case resumeScanning = "resume_scanning"
     case seekPeople = "seek_people"
-    case acknowledgePerson = "acknowledge_person"
     case inspectAttentionTarget = "inspect_attention_target"
 }
 

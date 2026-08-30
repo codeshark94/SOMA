@@ -18,7 +18,18 @@ if [[ ! -f "$soma_lock" ]]; then
   exit 1
 fi
 source "$soma_lock"
+source "$soma_root/scripts/lib/soma-model-contracts.zsh"
 autoload -Uz is-at-least
+
+soma_install_scripts=(
+  "$soma_root/scripts/setup-soma.zsh"
+  "$soma_root/scripts/bootstrap-soma.zsh"
+  "$soma_root/scripts/install-soma-l05-model.zsh"
+  "$soma_root/scripts/install-soma-face-identity-model.zsh"
+  "$soma_root/scripts/ensure-soma-signing-identity.zsh"
+  "$soma_root/scripts/install-soma-subconscious-app.zsh"
+  "$soma_root/Install SOMA.command"
+)
 
 function soma_ok() {
   print -r -- "ok   $1"
@@ -52,6 +63,23 @@ function soma_check_minimum_version() {
     soma_fail "$soma_name ${soma_actual:-unknown}; requires >= $soma_minimum"
   fi
 }
+
+soma_install_contract_valid=1
+for soma_install_script in "${soma_install_scripts[@]}"; do
+  if [[ ! -x "$soma_install_script" ]] || ! /bin/zsh -n "$soma_install_script"; then
+    soma_install_contract_valid=0
+  fi
+done
+soma_full_plan=$(/bin/zsh "$soma_root/scripts/setup-soma.zsh" --full --plan 2>/dev/null || true)
+if (( soma_install_contract_valid == 1 )) \
+    && [[ "$soma_full_plan" == *'installation profile: full'* \
+          && "$soma_full_plan" == *'L0.5 environment and pinned model: install'* \
+          && "$soma_full_plan" == *'ArcFace identity model: install'* \
+          && "$soma_full_plan" == *'physical motion: enable'* ]]; then
+  soma_ok 'idempotent full-install orchestration contract'
+else
+  soma_fail 'full-install scripts are missing, non-executable, invalid, or incomplete'
+fi
 
 if [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]]; then
   soma_ok 'Apple Silicon macOS'
@@ -297,14 +325,13 @@ if [[ "$soma_mode" == "--runtime" ]]; then
         && -f "$soma_arcface_root/metadata.json" ]]; then
     soma_arcface_model_hash=$(shasum -a 256 "$soma_arcface_root/model.mil" | awk '{print $1}')
     soma_arcface_weights_hash=$(shasum -a 256 "$soma_arcface_root/weights/weight.bin" | awk '{print $1}')
-    soma_arcface_metadata_hash=$(shasum -a 256 "$soma_arcface_root/metadata.json" | awk '{print $1}')
     if [[ "$soma_arcface_model_hash" == "$SOMA_ARCFACE_MODEL_SHA256" \
-          && "$soma_arcface_weights_hash" == "$SOMA_ARCFACE_WEIGHTS_SHA256" \
-          && "$soma_arcface_metadata_hash" == "$SOMA_ARCFACE_METADATA_SHA256" ]]; then
+          && "$soma_arcface_weights_hash" == "$SOMA_ARCFACE_WEIGHTS_SHA256" ]] \
+        && soma_arcface_metadata_contract_is_valid "$soma_arcface_root/metadata.json" current; then
       soma_ok 'optional ArcFace identity model'
     elif [[ "$soma_arcface_model_hash" == "$SOMA_ARCFACE_LEGACY_MODEL_SHA256" \
-            && "$soma_arcface_weights_hash" == "$SOMA_ARCFACE_LEGACY_WEIGHTS_SHA256" \
-            && "$soma_arcface_metadata_hash" == "$SOMA_ARCFACE_LEGACY_METADATA_SHA256" ]]; then
+            && "$soma_arcface_weights_hash" == "$SOMA_ARCFACE_LEGACY_WEIGHTS_SHA256" ]] \
+        && soma_arcface_metadata_contract_is_valid "$soma_arcface_root/metadata.json" legacy; then
       soma_warn 'optional ArcFace identity model uses the previous verified conversion; rerun its installer to converge'
     else
       soma_fail 'installed ArcFace identity model differs from MODELS.md'

@@ -60,7 +60,7 @@ grants gimbal authority.
 | recenter | measured-pose closed loop | firmware recenter command with measured settle verification |
 | indicator | states `54`, `57`, `16`; brightness-dimmed pulse | persistent state `3` plus states `54`, `57`, `16`; enable-toggled pulse |
 | audio modes | not exposed | omni, stereo, front, bidirectional, music |
-| firmware sound following | unavailable | supported |
+| firmware sound following | unavailable | experimental transport only; not advertised to production cognition |
 
 Direct arbitrary RGB is not part of either contract. Cognitive code requests a
 semantic presentation; only the native profile maps it to a firmware state.

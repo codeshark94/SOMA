@@ -460,16 +460,18 @@ has no Ollama fallback. `scripts/soma_l1_auxiliary_ollama_probe.py` is a benchma
 tool for an explicitly named comparison model; it is not imported or launched
 by `soma-subconscious`.
 
-The installed reference environment is:
+Provision the locked reference environment and immutable checkpoint with the
+same scripts used by the full installer:
 
 ```sh
-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 -m venv \
-  "$HOME/Library/Application Support/SOMA/venvs/l05"
-"$HOME/Library/Application Support/SOMA/venvs/l05/bin/python" -m pip install mlx-vlm
-"$HOME/Library/Application Support/SOMA/venvs/l05/bin/hf" download \
-  mlx-community/gemma-4-e2b-it-4bit \
-  --local-dir "$HOME/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit"
+scripts/bootstrap-soma.zsh --with-l05
+scripts/install-soma-l05-model.zsh
 ```
+
+The bootstrap verifies the complete Python lock. The model installer downloads
+the revision recorded in `config/soma-dependencies.env`, verifies every runtime
+file against `config/l05-model.sha256`, and activates it atomically. There is no
+supported unpinned setup path.
 
 Probe it without changing the running camera service:
 

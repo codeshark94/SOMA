@@ -599,8 +599,8 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                                 result, "gain=" + tokens[2] + "; profile=" + profileID, commandID);
                 } else if (verb == "doa_follow" && tokens.size() == 3) {
                     const int result = transport.setSoundFollowing(tokens[2] == "1");
-                    trace.event("audio.doa", result == 0 ? "firmware" : "fault",
-                                result == 0 ? "sound_source_tracking_submitted" : "sound_source_tracking_rejected",
+                    trace.event("audio.doa", result == 0 ? "experimental" : "fault",
+                                result == 0 ? "experimental_sound_following_transport_submitted" : "sound_source_tracking_rejected",
                                 result, "enabled=" + tokens[2] + "; profile=" + profileID
                                     + "; transport=open_uvc_xu", commandID);
                 } else if (verb == "indicator_enabled" && tokens.size() == 3) {

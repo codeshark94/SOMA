@@ -21,7 +21,7 @@ final class OBSBOTDeviceProfileTests: XCTestCase {
         XCTAssertFalse(capabilities.supportsDirectIndicatorRGB)
         XCTAssertTrue(capabilities.supportsIndicatorEnableAndBrightness)
         XCTAssertTrue(capabilities.supportsSelectableAudioModes)
-        XCTAssertTrue(capabilities.supportsDeviceSoundLocalization)
+        XCTAssertFalse(capabilities.supportsDeviceSoundLocalization)
         XCTAssertTrue(capabilities.requiresMeasuredAttitudeFrame)
         XCTAssertEqual(capabilities.maximumPanDegreesPerSecond, 90)
         XCTAssertEqual(capabilities.maximumPitchDegreesPerSecond, 45)

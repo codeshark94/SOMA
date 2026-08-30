@@ -1,4 +1,5 @@
 #include "OpenOBSBOTProtocol.hpp"
+#include "OpenOBSBOTContract.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -33,6 +34,13 @@ int main() {
     assert(vendorID == 0x3564);
     assert(productID(OBSBOTOpenDeviceProfile::tiny2Lite) == 0xFEF9);
     assert(productID(OBSBOTOpenDeviceProfile::tiny3Lite) == 0xFF04);
+    const std::string tiny3Contract = soma::openOBSBOTContractLine({
+        OBSBOTOpenDeviceProfile::tiny3Lite,
+        productID(OBSBOTOpenDeviceProfile::tiny3Lite),
+        "test",
+    });
+    assert(tiny3Contract.find("sound_localization=false") != std::string::npos);
+    assert(tiny3Contract.find("sound_localization=true") == std::string::npos);
     assert(isRestPose(-70.0));
     assert(isRestPose(84.0));
     assert(!isRestPose(2.5));

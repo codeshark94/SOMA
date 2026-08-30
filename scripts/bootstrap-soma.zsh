@@ -96,34 +96,50 @@ if (( soma_with_l05 )); then
   soma_venv="$soma_l05_parent/l05"
   mkdir -p "$soma_l05_parent"
   chmod 700 "$soma_l05_parent"
-  soma_l05_stage=$(mktemp -d "$soma_l05_parent/.l05-stage.XXXXXX")
-  "$soma_python" -m venv "$soma_l05_stage"
-  "$soma_l05_stage/bin/python" -m pip install "pip==$SOMA_L05_PIP_VERSION"
-  "$soma_l05_stage/bin/python" -m pip install -r "$soma_root/requirements-l05.lock.txt"
-  "$soma_l05_stage/bin/python" -m pip check
   soma_l05_expected=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$soma_root/requirements-l05.lock.txt" | LC_ALL=C sort -f)
-  soma_l05_actual=$("$soma_l05_stage/bin/python" -m pip freeze --exclude-editable | LC_ALL=C sort -f)
-  [[ "$soma_l05_actual" == "$soma_l05_expected" ]] \
-    || { print -u2 -r -- 'staged L0.5 environment differs from requirements-l05.lock.txt'; exit 2; }
+  soma_existing_l05_valid=0
+  if [[ -x "$soma_venv/bin/python" ]]; then
+    soma_existing_python_version=$("$soma_venv/bin/python" --version 2>&1)
+    soma_existing_pip_version=$("$soma_venv/bin/python" -m pip --version 2>/dev/null | sed -nE 's/^pip ([0-9]+(\.[0-9]+){1,2}).*/\1/p')
+    soma_existing_l05_actual=$("$soma_venv/bin/python" -m pip freeze --exclude-editable 2>/dev/null | LC_ALL=C sort -f)
+    if [[ "$soma_existing_python_version" == "Python $SOMA_L05_PYTHON_VERSION"* \
+          && "$soma_existing_pip_version" == "$SOMA_L05_PIP_VERSION" \
+          && "$soma_existing_l05_actual" == "$soma_l05_expected" ]]; then
+      soma_existing_l05_valid=1
+    fi
+  fi
 
-  soma_l05_backup="$soma_l05_parent/.l05-backup.$$"
-  [[ ! -e "$soma_l05_backup" ]] || { print -u2 -r -- "unexpected L0.5 backup path: $soma_l05_backup"; exit 2; }
-  if [[ -e "$soma_venv" ]]; then
-    /bin/mv "$soma_venv" "$soma_l05_backup"
-  fi
-  if /bin/mv "$soma_l05_stage" "$soma_venv"; then
-    soma_l05_stage=''
-    if [[ -d "$soma_l05_backup" && "${soma_l05_backup:h}" == "$soma_l05_parent" ]]; then
-      /bin/rm -rf -- "$soma_l05_backup"
-    fi
+  if (( soma_existing_l05_valid == 1 )); then
+    print -r -- "L0.5 Python environment is already verified at $soma_venv"
   else
-    if [[ -d "$soma_l05_backup" && ! -e "$soma_venv" ]]; then
-      /bin/mv "$soma_l05_backup" "$soma_venv"
+    soma_l05_stage=$(mktemp -d "$soma_l05_parent/.l05-stage.XXXXXX")
+    "$soma_python" -m venv "$soma_l05_stage"
+    "$soma_l05_stage/bin/python" -m pip install "pip==$SOMA_L05_PIP_VERSION"
+    "$soma_l05_stage/bin/python" -m pip install -r "$soma_root/requirements-l05.lock.txt"
+    "$soma_l05_stage/bin/python" -m pip check
+    soma_l05_actual=$("$soma_l05_stage/bin/python" -m pip freeze --exclude-editable | LC_ALL=C sort -f)
+    [[ "$soma_l05_actual" == "$soma_l05_expected" ]] \
+      || { print -u2 -r -- 'staged L0.5 environment differs from requirements-l05.lock.txt'; exit 2; }
+
+    soma_l05_backup="$soma_l05_parent/.l05-backup.$$"
+    [[ ! -e "$soma_l05_backup" ]] || { print -u2 -r -- "unexpected L0.5 backup path: $soma_l05_backup"; exit 2; }
+    if [[ -e "$soma_venv" ]]; then
+      /bin/mv "$soma_venv" "$soma_l05_backup"
     fi
-    print -u2 -r -- 'could not activate the staged L0.5 environment'
-    exit 2
+    if /bin/mv "$soma_l05_stage" "$soma_venv"; then
+      soma_l05_stage=''
+      if [[ -d "$soma_l05_backup" && "${soma_l05_backup:h}" == "$soma_l05_parent" ]]; then
+        /bin/rm -rf -- "$soma_l05_backup"
+      fi
+    else
+      if [[ -d "$soma_l05_backup" && ! -e "$soma_venv" ]]; then
+        /bin/mv "$soma_l05_backup" "$soma_venv"
+      fi
+      print -u2 -r -- 'could not activate the staged L0.5 environment'
+      exit 2
+    fi
+    print -r -- "Installed the L0.5 Python environment at $soma_venv"
   fi
-  print -r -- "Installed the L0.5 Python environment at $soma_venv"
 fi
 
 "$soma_root/scripts/soma-doctor.zsh" --build

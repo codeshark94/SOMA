@@ -754,7 +754,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         switch decision.action {
         case .noAction:
             return false
-        case .resumeScanning, .seekPeople, .acknowledgePerson:
+        case .resumeScanning, .seekPeople:
             return onAttentionAction(decision.action, decision.rationale, monotonicNS)
         case .inspectAttentionTarget:
             return executeInspectionIntention(request.intention)
@@ -807,7 +807,6 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         if let behavior = request.behaviorContext {
             if !behavior.scanActive { result.append(.resumeScanning) }
             if behavior.recognizedIdentity == nil { result.append(.seekPeople) }
-            if behavior.acknowledgmentPending == true { result.append(.acknowledgePerson) }
         }
         if let target = intention.attentionTargetLabel,
            request.behaviorContext?.targetLabel?.caseInsensitiveCompare(target) == .orderedSame {
@@ -1014,7 +1013,6 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             behavior.isFaceTarget ? "face" : "not_face",
             behavior.scanActive ? "scan" : "held",
             behavior.recognizedIdentity ?? "anonymous",
-            behavior.acknowledgmentPending == true ? "ack_pending" : "ack_clear",
         ].joined(separator: "|")
         guard signature != lastBehaviorSignature else { return }
         lastBehaviorSignature = signature

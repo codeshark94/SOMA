@@ -49,7 +49,7 @@ inline std::string openOBSBOTContractLine(const OpenOBSBOTDeviceIdentity &identi
             " indicator_pulse_transport=2"
             " selectable_audio_modes=true"
             " supported_audio_mode_mask=55"
-            " sound_localization=true"
+            " sound_localization=false"
             " requires_measured_attitude_frame=true"
             " indicator_base_state_id=3"
             " indicator_yellow_state_id=16"
