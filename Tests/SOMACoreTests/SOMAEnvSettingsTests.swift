@@ -31,7 +31,108 @@ final class SOMAEnvSettingsTests: XCTestCase {
         XCTAssertEqual(defaults.l1ReasoningCadenceSeconds, 150)
         XCTAssertTrue(defaults.l1CuriosityCollectionEnabled)
         XCTAssertEqual(defaults.l1CollectionIntervalHours, 24)
+        XCTAssertEqual(
+            defaults.l0EyeContactFreshnessMilliseconds,
+            SOMAEnvSettings.defaultEyeContactFreshnessMilliseconds
+        )
         XCTAssertEqual(defaults.l0EyeContactPupilThreshold, 0.9)
+    }
+
+    func testZeroSpokenOpeningTendencyRoundTripsWithoutBecomingDefault() throws {
+        let dir = NSTemporaryDirectory() + "envstore-zero-tendency-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let url = URL(fileURLWithPath: dir).appendingPathComponent(".env")
+        var settings = SOMAEnvSettings()
+        settings.l1SpokenOpeningTendency = 0
+
+        let store = SOMAEnvStore(fileURL: url)
+        try store.save(settings)
+
+        XCTAssertEqual(try store.load().l1SpokenOpeningTendency, 0)
+    }
+
+    func testInvalidOllamaConfigurationIsRejectedBeforePersistence() throws {
+        let dir = NSTemporaryDirectory() + "envstore-invalid-ollama-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let url = URL(fileURLWithPath: dir).appendingPathComponent(".env")
+        let store = SOMAEnvStore(fileURL: url)
+
+        var invalidHost = SOMAEnvSettings()
+        invalidHost.ollamaHost = "http://"
+        XCTAssertThrowsError(try store.save(invalidHost)) { error in
+            guard case SOMAEnvStoreError.invalidValue = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        var invalidModel = SOMAEnvSettings()
+        invalidModel.l1Model = ""
+        XCTAssertThrowsError(try store.save(invalidModel)) { error in
+            guard case SOMAEnvStoreError.invalidValue = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        var invalidPort = SOMAEnvSettings()
+        invalidPort.ollamaHost = "http://127.0.0.1:99999"
+        XCTAssertThrowsError(try store.save(invalidPort)) { error in
+            guard case SOMAEnvStoreError.invalidValue = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        var shellUnsafeHost = SOMAEnvSettings()
+        shellUnsafeHost.ollamaHost = "http://host$(id):11434"
+        XCTAssertThrowsError(try store.save(shellUnsafeHost)) { error in
+            guard case SOMAEnvStoreError.invalidValue = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testOllamaHostIsCanonicalizedBeforeWritingShellEnvironment() throws {
+        let dir = NSTemporaryDirectory() + "envstore-canonical-ollama-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let url = URL(fileURLWithPath: dir).appendingPathComponent(".env")
+        var settings = SOMAEnvSettings()
+        settings.ollamaHost = "  http://127.0.0.1:11434/  "
+
+        let store = SOMAEnvStore(fileURL: url)
+        try store.save(settings)
+
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(raw.contains("OLLAMA_HOST=http://127.0.0.1:11434\n"))
+        XCTAssertEqual(try store.load().ollamaHost, SOMAEnvSettings.defaultOllamaHost)
+    }
+
+    func testMalformedOrOutOfRangeManagedValuesAreRejectedOnLoad() throws {
+        let dir = NSTemporaryDirectory() + "envstore-invalid-managed-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let url = URL(fileURLWithPath: dir).appendingPathComponent(".env")
+        let store = SOMAEnvStore(fileURL: url)
+
+        for content in [
+            "SOMA_L0_TRACKING_ENABLED=perhaps\n",
+            "SOMA_L1_REASONING_CADENCE_SECONDS=5\n",
+            "SOMA_L0_EYE_CONTACT_FRESHNESS_MS=not-a-number\n",
+            "SOMA_L2_CODEX_SANDBOX=unrestricted\n",
+        ] {
+            try content.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            XCTAssertThrowsError(try store.load(), "accepted invalid managed value: \(content)") { error in
+                guard case SOMAEnvStoreError.invalidValue = error else {
+                    return XCTFail("unexpected error: \(error)")
+                }
+            }
+        }
     }
 
     func testEnvStoreMigratesLegacyReasoningCadence() throws {

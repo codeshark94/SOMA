@@ -17,6 +17,8 @@ enum AppServerLiveVoiceEvent: Sendable {
     case visualContextRejected(reason: String)
     case embodimentMCPReady
     case embodimentMCPUnavailable(reason: String)
+    case hermesTaskResultAccepted(taskID: UUID)
+    case hermesTaskResultRejected(taskID: UUID?, reason: String)
     case personContextReady
     case personContextUnavailable(reason: String)
     case embodimentMCPCall(tool: String, status: String, error: String?)
@@ -42,6 +44,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let tool: String?
     let status: String?
     let error: String?
+    let taskID: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -53,6 +56,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case tool
         case status
         case error
+        case taskID = "task_id"
     }
 }
 
@@ -98,6 +102,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     ) -> Result<Void, SOMASessionCapabilityError>)?
     private let cameraContextAutoInjection: Bool
     private let requireVerifiedSpeakerForEveryTurn: Bool
+    private let pendingHermesTasks: @Sendable () -> [HermesAgentTask]
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
     private var gate = LiveVoiceLaunchGate()
     private var inactivityGate = LiveVoiceSessionInactivityGate()
@@ -130,6 +135,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var initialTurnValidation: LiveVoiceInitialTurnValidation
     private var proactiveOpeningAwaitingParticipant = false
     private var proactiveOpeningDelivered = false
+    private var hermesResultAwaitingConfirmation = Set<UUID>()
 
     init(
         projectDirectory: String? = nil,
@@ -137,6 +143,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         embodimentSocketURL: URL? = nil,
         requireVerifiedSpeakerForEveryTurn: Bool = false,
+        pendingHermesTasks: @escaping @Sendable () -> [HermesAgentTask] = { [] },
         inactivityTimeoutMilliseconds: UInt64 = 60_000,
         initialParticipantTranscriptTimeoutMilliseconds: UInt64 = 3_500,
         persistentAppServer: PersistentAppServerBroker? = nil,
@@ -154,6 +161,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.currentCameraImageDataURI = currentCameraImageDataURI
         self.embodimentSocketURL = embodimentSocketURL
         self.requireVerifiedSpeakerForEveryTurn = requireVerifiedSpeakerForEveryTurn
+        self.pendingHermesTasks = pendingHermesTasks
         inactivityGate = LiveVoiceSessionInactivityGate(
             timeoutMilliseconds: inactivityTimeoutMilliseconds
         )
@@ -471,6 +479,37 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
+    /// Delivers a completed background result into an already active L2
+    /// conversation. It never opens a conversation on its own; otherwise the
+    /// durable task remains pending for retrieval in a later session.
+    func deliverHermesTaskResult(_ task: HermesAgentTask) -> Bool {
+        queue.sync {
+            sendHermesTaskResult(task)
+        }
+    }
+
+    private func sendHermesTaskResult(_ task: HermesAgentTask) -> Bool {
+        guard active,
+              task.status == .completed,
+              let result = task.result,
+              hermesResultAwaitingConfirmation.insert(task.id).inserted else { return false }
+        let envelope = """
+        SOMA_HERMES_TASK_RESULT
+        task_id: \(task.id.uuidString.lowercased())
+        title: \(task.title)
+        status: completed
+        result:
+        \(String(result.prefix(90_000)))
+        """
+        let sent = send([
+            "type": "append_text",
+            "taskID": task.id.uuidString.lowercased(),
+            "data": envelope,
+        ])
+        if !sent { hermesResultAwaitingConfirmation.remove(task.id) }
+        return sent
+    }
+
     /// A dedicated persistent App Server owns one opaque boot capability. It
     /// never becomes an interaction grant by itself: each call is projected
     /// through the active session's short-lived grant while the Live helper is
@@ -720,6 +759,19 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.embodimentMCPReady)
             case "embodiment_mcp_unavailable":
                 onEvent(.embodimentMCPUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
+            case "hermes_task_result_accepted":
+                if let rawID = event.taskID, let taskID = UUID(uuidString: rawID) {
+                    hermesResultAwaitingConfirmation.remove(taskID)
+                    onEvent(.hermesTaskResultAccepted(taskID: taskID))
+                }
+            case "hermes_task_result_rejected":
+                if let rawID = event.taskID, let taskID = UUID(uuidString: rawID) {
+                    hermesResultAwaitingConfirmation.remove(taskID)
+                }
+                onEvent(.hermesTaskResultRejected(
+                    taskID: event.taskID.flatMap(UUID.init(uuidString:)),
+                    reason: String((event.reason ?? "unknown").prefix(192))
+                ))
             case "person_context_ready":
                 onEvent(.personContextReady)
             case "person_context_unavailable":
@@ -793,6 +845,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.assistantSpeechEnded)
                 finishAssistantResponseIfNeeded()
                 onEvent(.responseCompleted)
+                if hermesResultAwaitingConfirmation.isEmpty,
+                   let pending = pendingHermesTasks().first {
+                    _ = sendHermesTaskResult(pending)
+                }
             case "ended":
                 guard active || gate.phase == .starting else { continue }
                 let threadID = event.threadID ?? activeThreadID
@@ -1102,6 +1158,7 @@ func testAppServerLiveVoiceLauncher() -> String {
              .proactiveOpeningExtraOutputSuppressed, .hearingUser,
              .visualContextAttached, .visualContextRejected,
              .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
+             .hermesTaskResultAccepted, .hermesTaskResultRejected,
              .personContextUnavailable, .embodimentMCPCall, .inputAccepted,
              .transcriptFinalized, .preparingResponse, .responseStarted,
              .assistantSpeechStarted, .assistantSpeechEnded, .responding, .responseCompleted, .ended:

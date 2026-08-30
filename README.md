@@ -29,7 +29,7 @@
 </p>
 
 > [!NOTE]
-> SOMA is not a “camera assistant” and not an autonomous task agent. It is a
+> SOMA is not a “camera assistant” or a general-purpose autonomous agent. It is a
 > research system for building an interface through which artificial
 > intelligence can perceive, attend to, remember, and interact with people in
 > a way that feels situated rather than merely reactive.
@@ -106,7 +106,7 @@ layers are connected, but they are not interchangeable.
 | **L0.5 · local semantic helper** | Sparse asynchronous inference and temporal evidence integration | Produces evidence deltas for L1 without blocking L0; it does not call the language model directly | No independent motor, speech, identity, memory, or wake authority |
 | **L1a · persistent thought stream** | Event-driven plus an adaptive stochastic clock | Maintains hypotheses, curiosity, goal-linked thought episodes, self-correction, and a probabilistically selected foreground thought in one persistent mental workspace | May form an abstract intention and request bounded visual evidence; cannot speak or move hardware |
 | **L1b · executive judgment** | Only when an L1a intention creates action pressure | Chooses one currently available social or attention action against a frozen workspace revision | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through existing leased MCP/L0 goals |
-| **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and goal-directed tool use when grounded information is needed | The same semantic embodiment interface as L1; never raw device velocity |
+| **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, goal-directed tool use, and explicit delegation of longer external work | The same semantic embodiment interface as L1 plus an administrator-only asynchronous Hermes task queue; never raw device velocity |
 
 L2 may inspect perception or memory and may request reversible attention actions
 without waiting for a literal tool command when that action advances the current
@@ -124,6 +124,18 @@ first; the linked thought and intention remain active until later evidence meets
 their observable completion condition, makes the goal impossible, or causes L1a
 to revise it. This keeps tool use inside the same perception-thought-action-
 verification loop as embodied behavior.
+
+Visual inspection closes that loop without requiring a conversation. When L1a
+has a concrete uncertainty about the currently grounded attention target, L1b
+may authorize one active inspection. L0 centres the verified scene entity,
+waits for stable pose, captures one short-lived view, and returns the image as
+new workspace evidence. L1a must then evaluate that image and resolve, revise,
+or abandon the goal. Equivalent unresolved target intentions collapse into one
+semantic episode even if the model emits a fresh UUID, so the same view cannot
+become a polling loop. The valid JPEG is copied only into the pending inference
+request before its file lease expires; that copy survives queue delay but is
+excluded from every encoded packet and mental checkpoint. Stopping the stream
+cancels the capture wait and removes its temporary motor target.
 
 L0.5 is intentionally a supporting process inside the L1 path, not a fourth
 mind. Its job is to make slow contextual reasoning more perceptive without
@@ -182,6 +194,17 @@ result stays in the current interaction, while only a bounded outcome summary
 and result fingerprint return to the mental workspace. That closes the
 perception–thought–action loop without duplicating successful equivalent calls
 or persisting raw tool payloads.
+
+Hermes is the worker for longer external jobs. L2 submits one bounded objective,
+receives a durable task ID immediately, and continues the spoken conversation
+without waiting. The owner-only SOMA runtime starts a Hermes Agent session,
+stores the task state and result in an encrypted bounded checkpoint, and
+retrieves the real completion event. If the same L2 conversation is still open,
+the result is returned as trusted controller context and L2 reports it in the
+participant's language. Otherwise it remains available through task-status
+tools for a later conversation. Continuations resume the same Hermes session;
+cancel and new work require an explicit administrator request. Participant
+sessions cannot submit, inspect, or cancel external tasks.
 
 ## Memory as continuity, not a transcript dump
 
@@ -268,6 +291,7 @@ SOMA's Swift package has no remote SwiftPM dependencies. A full runtime uses:
 - CMake for the native open UVC/XU gimbal, tracking, audio, and LED bridge
 - Ollama with the configured L1 model
 - A compatible signed-in Codex installation when L2 Live Voice is enabled
+- Optional Hermes CLI for administrator-only asynchronous agent work
 
 On a clean Apple Silicon Mac with Xcode and Homebrew, clone the repository and
 run the idempotent full setup command:
@@ -302,7 +326,9 @@ library.
 
 `soma-doctor` verifies tool versions, bundled-model hashes, the native helper
 build, Ollama/model availability, conditional Codex support, and optional
-MLX/ArcFace assets. See
+MLX/ArcFace assets. The installed Control Center exposes the same runtime audit
+under **System → External dependencies**, with failures and warnings surfaced
+before the complete check list. See
 [`DEPENDENCIES.md`](DEPENDENCIES.md) for the full clean-Mac procedure and
 supported overrides.
 

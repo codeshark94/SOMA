@@ -53,6 +53,39 @@ final class ConsciousnessStreamTests: XCTestCase {
         XCTAssertEqual(request.observedAt, Date(timeIntervalSince1970: 27))
     }
 
+    func testPendingEventCoalescingPreservesActiveCaptureVisual() {
+        let capture = L1VisualResource(
+            resourceID: "embodiment_capture:inspection-1",
+            projection: .currentView,
+            localPath: "/private/tmp/inspection-1.jpg",
+            expiresAt: Date(timeIntervalSince1970: 120)
+        )
+        let current = L1VisualResource(
+            resourceID: "current_frame",
+            projection: .currentView,
+            localPath: "/private/tmp/current.jpg",
+            expiresAt: Date(timeIntervalSince1970: 121)
+        )
+        var queue = L1ConsciousnessWorkQueue()
+        queue.enqueue(makeThoughtRequest(
+            wakeKind: .event,
+            revision: 6,
+            evidenceID: "active-vision:1",
+            visuals: [capture]
+        ))
+        queue.enqueue(makeThoughtRequest(
+            wakeKind: .event,
+            revision: 7,
+            evidenceID: "scene:7",
+            visuals: [current]
+        ))
+
+        guard case let .thought(request)? = queue.dequeue() else {
+            return XCTFail("coalesced event thought should be available")
+        }
+        XCTAssertEqual(request.visuals.map(\.resourceID), [capture.resourceID, current.resourceID])
+    }
+
     func testL1ARejectsAnyBehaviorOrSocialActionField() throws {
         let request = makeThoughtRequest()
         let data = Data("""
@@ -289,7 +322,8 @@ final class ConsciousnessStreamTests: XCTestCase {
         hypotheses: [MentalHypothesis] = [],
         wakeKind: L1ThoughtWakeKind = .event,
         revision: UInt64 = 4,
-        evidenceID: String = "scene:1"
+        evidenceID: String = "scene:1",
+        visuals: [L1VisualResource] = []
     ) -> L1ThoughtRequest {
         let evidence = MentalEvidenceEvent(
             id: evidenceID,
@@ -309,7 +343,8 @@ final class ConsciousnessStreamTests: XCTestCase {
                 processedEvidenceIDs: [evidence.id]
             ),
             evidence: [evidence],
-            beliefSummary: evidence.summary
+            beliefSummary: evidence.summary,
+            visuals: visuals
         )
     }
 

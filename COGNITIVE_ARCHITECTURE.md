@@ -14,7 +14,7 @@ not imply that a language model is part of the real-time control loop.
 | L0 subconscious | Local Core ML, temporal fusion, and deterministic control | Continuous perception, target continuity, VAD, spatial coverage, immediate motor control, and interaction-readiness evidence | Sole executor of hard real-time device commands and physical vetoes; supplies autonomous behaviour when no cognitive lease is active |
 | L1a persistent thought stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Evidence-grounded hypothesis maintenance, memory association, curiosity, self-correction, intentions, and foreground-thought competition | May request bounded visual context and form an abstract intention; cannot speak or control the gimbal |
 | L1b executive judgment | A separate call to the same `gemma4:31b-cloud` route | Decides whether one current intention should become one currently permitted social or attention action | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends device velocity directly |
-| L2 human interaction and executive reasoning | Codex account session with app-server GPT-Live WebRTC; explicit local fallback | Conversation, high-order reasoning, tool use, coding, and user-requested work | Opens directly from authorized L0 contact evidence, or from an L1-approved proactive opening; neither route waits on the other. It receives scoped text context, may pull image context through Codex/MCP, and uses leased embodiment goals when observation or expression is needed |
+| L2 human interaction and executive reasoning | Codex account session with app-server GPT-Live WebRTC; explicit local fallback | Conversation, high-order reasoning, tool use, and delegation of user-requested external work | Opens directly from authorized L0 contact evidence, or from an L1-approved proactive opening; neither route waits on the other. It receives scoped text context, may pull image context through Codex/MCP, uses leased embodiment goals when observation or expression is needed, and may delegate explicit administrator work to the durable Hermes worker queue |
 
 The fast 31B cloud route is the primary L1 stream and may run frequently while
 human or task context is active. E2B is a local visual helper within that same
@@ -51,10 +51,12 @@ flowchart LR
     Competition -->|"intention pressure"| L1B["L1b executive judgment"]
     L0 -->|"authorized eye contact + speech"| Speech["Codex app-server GPT-Live WebRTC"]
     L1B -->|"purposeful spoken opening"| Speech
-    Speech -->|"live conversation"| Codex["L2 Codex interaction and task worker"]
+    Speech -->|"live conversation"| Codex["L2 Codex interaction and executive reasoning"]
     Codex -->|"live spoken response"| Speech
     L1B --> MCP["SOMA embodiment MCP"]
     Codex --> MCP
+    Codex -->|"explicit delegated job"| Hermes["Hermes Agent worker session"]
+    Hermes -->|"durable result"| Codex
     MCP --> Arbiter["L0 owner arbiter and intent executor"]
     Arbiter --> Gimbal["Gimbal and supported LED controls"]
     L0 --> Atlas["Spherical scene atlas"]
@@ -116,6 +118,24 @@ the intention episode, and the currently available action set. It returns a
 strict `L1ExecutiveDecision`. Completion rechecks revision, current person,
 conversation state, and L0 authority. Each intention episode can be applied
 once without a wall-clock action cooldown.
+
+An `inspect_attention_target` decision is an active-sensing episode, not a
+tracking synonym. The runtime selects only a currently observed,
+motor-eligible scene entity whose detector label and spherical bearing ground
+the intention. L0 then centres that target, requires settled pose, captures one
+65-degree short-lived view, and returns it as an
+`active_visual_observation`. That image accompanies the resulting cognitive
+action evidence into the next L1a turn. The model must use the new observation
+to resolve, contradict, or revise the goal; dispatch evidence and the intention
+fingerprint prevent repeated capture from becoming a time-based polling loop.
+Fresh model UUIDs do not bypass this rule: unresolved visual goals are
+canonicalized by their grounded target. The image is materialized into the
+request's volatile memory before the backing file expires, is carried forward
+if a newer workspace revision supersedes that turn, and is omitted from Codable
+state. Stream shutdown cancels the bounded wait before removing the temporary
+target, which also clears that one-shot L0 motor goal.
+The temporary target binding is removed after the one-shot capture without
+releasing unrelated L1 attention state.
 
 Human presence and a recognized identity create a social-deliberation
 opportunity, not a speech trigger. Only a grounded L1b decision can choose a
@@ -694,6 +714,42 @@ Rotation-centre parallax and a labelled changed/unchanged scene evaluation
 remain open acceptance items. A
 time-misaligned panorama must never be described to L1 as a single current
 frame.
+
+## L2-to-Hermes delegated work
+
+Long-running external work is not executed inside the latency-sensitive Live
+Voice process. The administrator's L2 session calls the local
+`soma-embodiment` MCP task surface:
+
+- `delegate_hermes_task` creates an idempotent task from the L2 goal episode
+  and returns its task ID without waiting for execution;
+- `get_hermes_task` and `list_hermes_tasks` return current state and the actual
+  worker result;
+- `continue_hermes_task` resumes the stored Hermes session with a new explicit
+  instruction; and
+- `cancel_hermes_task` terminates queued or running work.
+
+Submission, continuation, cancellation, and every task read require an active
+administrator capability. Side-effecting operations additionally require a
+current explicit-request authorization basis. Task identity and lifecycle are
+owned by the 24/7 L0 process rather than a transient voice helper. One Hermes
+task runs at a time; queued and running state is restored after a SOMA restart.
+The checkpoint is bounded, atomically replaced, encrypted with an owner-only
+installation key, and separate from autobiographical memory.
+
+Each task starts an authenticated loopback `hermes serve` backend and creates
+or resumes one Hermes Agent session. `prompt.submit` returns immediately;
+SOMA waits asynchronously for the matching `message.complete` event. The
+Hermes stored-session identifier is checkpointed as soon as the session opens,
+so an interrupted job or a clarification requirement can continue in the same
+worker context. A task is never called complete from process exit, an ACK, or
+an L2 prediction: only the final Hermes protocol event supplies the result.
+
+If Live Voice is still active when the task completes, the runtime injects a
+`SOMA_HERMES_TASK_RESULT` controller envelope through App Server realtime text.
+The envelope is explicitly not participant speech; L2 reports the bounded
+result in the participant's language. If no session is active, the completed
+record remains pending for later retrieval.
 
 ## L2 voice and Codex account integration
 

@@ -109,10 +109,17 @@ private struct SOMARuntimeSnapshot: Equatable {
         let modifiedAt = (try? traceURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
         let isLive = modifiedAt.map { Date().timeIntervalSince($0) < 8 } ?? false
         let events = tailLines(from: traceURL, maximumBytes: 196_608)
-        var sources: [String: String] = [:]
-        var indicatorState: String?
-        var identity: IdentityObservation?
-        var administratorVerified = false
+        let healthURL = SOMAPaths.runtimeRoot.appendingPathComponent("runtime-health.json")
+        let durableHealth = try? RuntimeHealthSnapshot.load(from: healthURL)
+        var sources = durableHealth?.sources.mapValues(\.state) ?? [:]
+        var indicatorState = sources["social_indicator"]
+        var identity = isLive
+            ? currentIdentityObservation(notBeforeEpochMS: durableHealth?.startedAtEpochMS)
+            : nil
+        var administratorVerified = identity.map {
+            $0.state == "known_recognized"
+                && $0.subject == settings.administrator?.entityID.uuidString.lowercased()
+        } ?? false
 
         for line in events.reversed() {
             guard let data = line.data(using: .utf8),
@@ -124,7 +131,7 @@ private struct SOMARuntimeSnapshot: Equatable {
                sources[source] == nil {
                 sources[source] = state
             }
-            if eventName == "identity.observation", identity == nil,
+            if isLive, eventName == "identity.observation", identity == nil,
                let subject = event["subject"] as? String,
                let state = event["state"] as? String {
                 identity = IdentityObservation(
@@ -137,7 +144,7 @@ private struct SOMARuntimeSnapshot: Equatable {
                     administratorVerified = true
                 }
             }
-            if eventName == "administrator.identity",
+            if isLive, eventName == "administrator.identity",
                event["state"] as? String == "verified" {
                 administratorVerified = true
             }
@@ -152,6 +159,33 @@ private struct SOMARuntimeSnapshot: Equatable {
             sources: sources,
             identity: identity,
             administratorVerified: administratorVerified
+        )
+    }
+
+    func sourceIsOperational(_ source: String) -> Bool {
+        guard isLive, let state = sources[source] else { return false }
+        let inactiveStates: Set<String> = [
+            "color_unsupported_for_profile", "disabled", "fault", "lifecycle_shutdown_failed",
+            "palette_unverified_for_profile", "rejected", "runtime_error", "runtime_stalled",
+            "stopped", "suppressed", "unavailable",
+        ]
+        return !inactiveStates.contains(state)
+    }
+
+    private static func currentIdentityObservation(notBeforeEpochMS: Int64?) -> IdentityObservation? {
+        let url = SOMAPaths.runtimeRoot.appendingPathComponent("identity-current.json")
+        if let notBeforeEpochMS {
+            guard let modifiedAt = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  Int64(modifiedAt.timeIntervalSince1970 * 1_000) >= notBeforeEpochMS else { return nil }
+        }
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let subject = object["subject"] as? String,
+              let state = object["state"] as? String else { return nil }
+        return IdentityObservation(
+            subject: subject,
+            state: state,
+            confidence: object["confidence"] as? Double ?? 0
         )
     }
 
@@ -183,12 +217,29 @@ private struct SOMARuntimeSnapshot: Equatable {
     }
 }
 
+private enum OllamaConnectionState: Equatable {
+    case unchecked
+    case checking
+    case available(String)
+    case unavailable(String)
+}
+
+private enum ExternalDependencyAuditState: Equatable {
+    case unchecked
+    case checking
+    case loaded(ExternalDependencyAudit)
+    case unavailable(String)
+}
+
 @MainActor
 private final class SOMAControlModel: ObservableObject {
     @Published var settings: SOMAControlSettings
     @Published var envSettings: SOMAEnvSettings
     @Published private(set) var runtime = SOMARuntimeSnapshot.empty
     @Published private(set) var message: String?
+    @Published private(set) var ollamaConnection: OllamaConnectionState = .unchecked
+    @Published private(set) var externalDependencyAudit: ExternalDependencyAuditState = .unchecked
+    private var ollamaValidationGeneration = UUID()
     // Administrator identity fields stay locked until the Mac login password
     // (or Touch ID) unlocks them, so changing or removing the owner is not a
     // silent, unauthenticated action.
@@ -218,33 +269,102 @@ private final class SOMAControlModel: ObservableObject {
     }
 
     var latestAnonymousFace: String? {
-        // Prefer the dedicated always-current identity file the runtime writes;
-        // it is not subject to the trace-tail read window that sparse
-        // identity.observation events scroll out of. Accept both a stabilized
-        // anonymous face and an in-progress anonymous candidate so a person can
-        // enroll without waiting for full recognition confirmation.
-        if let file = Self.readIdentityFile(),
-           file.subject.hasPrefix("anon_"),
-           file.state == "anonymous_recognized" || file.state == "unknown_candidate" {
-            return file.subject
-        }
         guard let identity = runtime.identity,
               identity.state == "anonymous_recognized" || identity.state == "unknown_candidate",
               identity.subject.hasPrefix("anon_") else { return nil }
         return identity.subject
     }
 
-    static func readIdentityFile() -> (state: String, subject: String)? {
-        let url = SOMAPaths.runtimeRoot.appendingPathComponent("identity-current.json")
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let state = object["state"] as? String,
-              let subject = object["subject"] as? String else { return nil }
-        return (state, subject)
-    }
-
     func refresh() {
         runtime = SOMARuntimeSnapshot.read(settings: settings)
+    }
+
+    func clearMessage() {
+        message = nil
+    }
+
+    func invalidateOllamaConnection() {
+        ollamaValidationGeneration = UUID()
+        ollamaConnection = .unchecked
+    }
+
+    func validateOllamaConnection() async {
+        let generation = UUID()
+        ollamaValidationGeneration = generation
+        let host = envSettings.ollamaHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = envSettings.l1Model.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try envSettings.validate()
+        } catch {
+            ollamaConnection = .unavailable(error.localizedDescription)
+            return
+        }
+        guard let baseURL = URL(string: host) else {
+            ollamaConnection = .unavailable("Invalid Ollama host")
+            return
+        }
+        ollamaConnection = .checking
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/tags"))
+        request.timeoutInterval = 4
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard isCurrentOllamaQuery(host: host, model: model, generation: generation) else { return }
+            guard let http = response as? HTTPURLResponse,
+                  (200 ... 299).contains(http.statusCode) else {
+                ollamaConnection = .unavailable("Ollama did not accept the connection")
+                return
+            }
+            struct TagsResponse: Decodable {
+                struct Model: Decodable {
+                    let name: String?
+                    let model: String?
+                }
+                let models: [Model]
+            }
+            let tags = try JSONDecoder().decode(TagsResponse.self, from: data)
+            guard isCurrentOllamaQuery(host: host, model: model, generation: generation) else { return }
+            let available = Set(tags.models.flatMap { [$0.name, $0.model].compactMap { $0 } })
+            ollamaConnection = available.contains(model)
+                ? .available("Connected · model available")
+                : .unavailable("Connected, but this model is not available")
+        } catch {
+            guard isCurrentOllamaQuery(host: host, model: model, generation: generation) else { return }
+            ollamaConnection = .unavailable("Could not reach Ollama")
+        }
+    }
+
+    func checkExternalDependencies() {
+        guard externalDependencyAudit != .checking else { return }
+        guard let root = ProcessInfo.processInfo.environment["SOMA_ROOT"], root.hasPrefix("/") else {
+            externalDependencyAudit = .unavailable("SOMA source root is unavailable")
+            return
+        }
+        let doctor = URL(fileURLWithPath: root, isDirectory: true)
+            .appendingPathComponent("scripts/soma-doctor.zsh")
+        guard FileManager.default.isExecutableFile(atPath: doctor.path) else {
+            externalDependencyAudit = .unavailable("Dependency checker is unavailable")
+            return
+        }
+        externalDependencyAudit = .checking
+        Task { [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                Self.runProcessBlocking(at: doctor, arguments: ["--runtime"])
+            }.value
+            guard let self else { return }
+            let audit = ExternalDependencyAudit.parse(
+                output: result.output,
+                exitStatus: result.status
+            )
+            externalDependencyAudit = audit.checks.isEmpty
+                ? .unavailable(result.output.isEmpty ? "Dependency check returned no result" : result.output)
+                : .loaded(audit)
+        }
+    }
+
+    private func isCurrentOllamaQuery(host: String, model: String, generation: UUID) -> Bool {
+        ollamaValidationGeneration == generation
+            && envSettings.ollamaHost.trimmingCharacters(in: .whitespacesAndNewlines) == host
+            && envSettings.l1Model.trimmingCharacters(in: .whitespacesAndNewlines) == model
     }
 
     /// Prompts for the Mac login password / Touch ID (system dialog) and
@@ -272,8 +392,14 @@ private final class SOMAControlModel: ObservableObject {
 
     func save() {
         do {
+            let normalizedEnvSettings = envSettings.canonicalizedForPersistence()
+            try normalizedEnvSettings.validate()
+            settings.hermesAgentWorkspace = SOMAControlSettings.normalizedAbsolutePath(
+                settings.hermesAgentWorkspace
+            )
             try store.save(settings)
-            try envStore.save(envSettings)
+            try envStore.save(normalizedEnvSettings)
+            envSettings = normalizedEnvSettings
             message = "Saved locally. Restart SOMA to apply runtime changes."
             refresh()
         } catch {
@@ -436,6 +562,13 @@ private final class SOMAControlModel: ObservableObject {
     }
 
     private func runProcess(at executable: URL, arguments: [String]) -> (status: Int32, output: String) {
+        Self.runProcessBlocking(at: executable, arguments: arguments)
+    }
+
+    nonisolated private static func runProcessBlocking(
+        at executable: URL,
+        arguments: [String]
+    ) -> (status: Int32, output: String) {
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
             return (1, "Required SOMA executable is unavailable: \(executable.lastPathComponent)")
         }
@@ -447,11 +580,11 @@ private final class SOMAControlModel: ObservableObject {
         process.standardError = pipe
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return (1, error.localizedDescription)
         }
         let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        process.waitUntilExit()
         return (process.terminationStatus, output.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
@@ -562,6 +695,8 @@ private struct SOMASettingsView: View {
     var onOpenDiagnostics: () -> Void = {}
     @State private var selection: SOMASettingsSection = .experience
     @State private var revealAPIKey = false
+    @State private var revealOllamaAdvancedSettings = false
+    @State private var revealDependencyChecks = false
 
     private var selectedSection: SOMASettingsSection { selection }
 
@@ -606,6 +741,7 @@ private struct SOMASettingsView: View {
         }
         .frame(minWidth: 770, idealWidth: 820, minHeight: 580, idealHeight: 620)
         .tint(SOMAAccent.color)
+        .onChange(of: selection) { _ in model.clearMessage() }
     }
 
     private var sidebar: some View {
@@ -737,6 +873,31 @@ private struct SOMASettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            SettingsCard(
+                title: "Hermes agent delegation",
+                subtitle: "Run administrator-delegated work asynchronously and return the result to L2."
+            ) {
+                Toggle(
+                    "Enable delegated agent work",
+                    isOn: binding(\.hermesAgentDelegationEnabled)
+                )
+                .disabled(!model.settings.realtimeVoiceEnabled)
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                    GridRow {
+                        Text("Default workspace")
+                            .foregroundStyle(.secondary)
+                        TextField("SOMA project root", text: hermesAgentWorkspaceBinding)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+                .disabled(
+                    !model.settings.realtimeVoiceEnabled
+                        || !model.settings.hermesAgentDelegationEnabled
+                )
+                Text("L2 submits an explicit job and receives a task ID immediately. The owner-only runtime keeps the job alive after voice closes, stores its result encrypted, and makes that result available for reporting in the current or next conversation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             SettingsCard(title: "LED response", subtitle: "Set global visibility and brightness for the hardware indicator.") {
                 Picker("Reaction", selection: ledModeBinding) {
                     ForEach(SOMALEDResponseMode.allCases, id: \.self) { mode in
@@ -763,34 +924,69 @@ private struct SOMASettingsView: View {
 
     private var layers: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SettingsCard(title: "Ollama", subtitle: "The local server and the model L1 uses. The API key enables hosted web search.") {
-                HStack {
-                    Text("Host")
-                    TextField("http://127.0.0.1:11434", text: ollamaHostBinding)
-                        .textFieldStyle(.roundedBorder)
-                }
-                HStack {
-                    Text("L1 model")
-                    TextField("gemma4:31b-cloud", text: l1ModelBinding)
-                        .textFieldStyle(.roundedBorder)
-                }
+            SettingsCard(title: "L1 model runtime", subtitle: "SOMA automatically uses the configured local Ollama service.") {
                 HStack(spacing: 8) {
-                    Group {
-                        if revealAPIKey {
-                            TextField("Ollama API key", text: ollamaAPIKeyBinding)
-                        } else {
-                            SecureField("Ollama API key", text: ollamaAPIKeyBinding)
+                    ollamaConnectionStatus
+                    Spacer()
+                    Button("Check connection") {
+                        Task { await model.validateOllamaConnection() }
+                    }
+                    .disabled(model.ollamaConnection == .checking)
+                }
+                HStack {
+                    Text("Model").foregroundStyle(.secondary)
+                    Spacer()
+                    Text(model.envSettings.l1Model)
+                        .font(.system(.body, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                DisclosureGroup(
+                    "Advanced connection settings",
+                    isExpanded: $revealOllamaAdvancedSettings
+                ) {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                        GridRow {
+                            Text("Host").foregroundStyle(.secondary)
+                            TextField(SOMAEnvSettings.defaultOllamaHost, text: ollamaHostBinding)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        GridRow {
+                            Text("Model override").foregroundStyle(.secondary)
+                            TextField(SOMAEnvSettings.defaultL1Model, text: l1ModelBinding)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        GridRow {
+                            Text("Web search key").foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                Group {
+                                    if revealAPIKey {
+                                        TextField("Optional", text: ollamaAPIKeyBinding)
+                                    } else {
+                                        SecureField("Optional", text: ollamaAPIKeyBinding)
+                                    }
+                                }
+                                .textFieldStyle(.roundedBorder)
+                                Button(action: { revealAPIKey.toggle() }) {
+                                    Image(systemName: revealAPIKey ? "eye.slash.fill" : "eye.fill")
+                                }
+                                .buttonStyle(.plain)
+                                .help(revealAPIKey ? "Hide API key" : "Show API key")
+                            }
                         }
                     }
-                    .textFieldStyle(.roundedBorder)
-                    Button(action: { revealAPIKey.toggle() }) {
-                        Image(systemName: revealAPIKey ? "eye.slash.fill" : "eye.fill")
-                    }
-                    .buttonStyle(.plain)
-                    .help(revealAPIKey ? "Hide API key" : "Show API key")
+                    .padding(.top, 8)
+                    Text("Use these only for a remote Ollama server, a non-default model, or hosted web search.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
                 }
-                Text("Paste your key into the field, then Save. It is only needed for the hosted web_search / web_fetch tools. Create one at ollama.com/settings/keys; without it those tools stay disabled.")
-                    .font(.caption).foregroundStyle(.secondary)            }
+            }
+            .task(id: "\(model.envSettings.ollamaHost)|\(model.envSettings.l1Model)") {
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                guard !Task.isCancelled else { return }
+                await model.validateOllamaConnection()
+            }
             SettingsCard(title: "L0 — Perception & attention", subtitle: "What autonomous motion the attention controller may perform. These govern the gimbal and coverage scan.") {
                 Toggle("Track a verified human face", isOn: l0TrackingBinding)
                 Toggle("Explore when no verified target is present", isOn: l0ExploreBinding)
@@ -808,31 +1004,34 @@ private struct SOMASettingsView: View {
                     )
                 }
                 HStack {
-                    Toggle("On-device vision layer (E2B)", isOn: l05EnabledBinding)
+                    Toggle("Local semantic evidence (E2B)", isOn: l05EnabledBinding)
                         .toggleStyle(.switch)
                 }
                 HStack {
-                    Text("Local vision wake sensitivity")
+                    Text("Evidence proposal score")
                     Spacer()
                     Stepper("Score ≥ \(String(format: "%.2f", model.envSettings.l0E2BWakeScore))", value: l0E2BWakeScoreBinding, in: 0.1...0.95, step: 0.05)
                 }
                 HStack {
-                    Text("Local vision wake confidence")
+                    Text("Evidence confidence")
                     Spacer()
                     Stepper("Confidence ≥ \(String(format: "%.2f", model.envSettings.l0E2BWakeConfidence))", value: l0E2BWakeConfidenceBinding, in: 0.1...0.95, step: 0.05)
                 }
                 HStack {
-                    Text("Local vision semantic refresh")
+                    Text("Stable-scene refresh")
                     Spacer()
                     Stepper("Every \(Int(model.envSettings.l0E2BWakeIntervalMilliseconds / 1000)) s", value: l0E2BWakeIntervalBinding, in: 2...60, step: 1)
                 }
+                Text("E2B contributes semantic evidence to the workspace. It does not speak, move the gimbal, or wake L1 by itself.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
                 HStack {
-                    Text("Eye-contact sensitivity")
+                    Text("Contact evidence lifetime")
                     Spacer()
                     Stepper("\(Int(model.envSettings.l0EyeContactFreshnessMilliseconds)) ms", value: l0EyeContactFreshnessBinding, in: 100...2000, step: 50)
                 }
                 HStack {
-                    Text("Eye-contact pupil threshold")
+                    Text("Pupil-centering threshold")
                     Spacer()
                     Stepper(
                         "\(String(format: "%.2f", model.envSettings.l0EyeContactPupilThreshold))×",
@@ -846,16 +1045,16 @@ private struct SOMASettingsView: View {
                     Spacer()
                     Stepper("≥ \(String(format: "%.2f", model.envSettings.l0YoloConfidenceThreshold))", value: l0YoloConfidenceBinding, in: 0.1...0.95, step: 0.05)
                 }
-                Text("The on-device vision layer (E2B) wakes L1 on events. Lower thresholds wake L1 more eagerly; higher ones make it more selective. Eye-contact sensitivity is how long a fresh gaze stays valid for opening a spoken turn — lower is stricter. The pupil threshold scales how centered the pupil must be for a direct gaze — lower is stricter. 'Release fixation after no response' time-limits a held gaze that never becomes engagement; 'Keep gazing' disables that timer (E2B still releases a wrong fixation it judges to be non-person). Object detection confidence is the minimum YOLO score for reporting an object — higher filters out phantom detections (e.g. a toothbrush that is not there).")
+                Text("Contact lifetime controls how long a verified gaze remains current; lower is stricter. Lower pupil scaling requires more centered eyes. Object confidence filters weak scene labels.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            SettingsCard(title: "L1 — Conscious stream", subtitle: "How often L1 reasons, and whether it collects the topics it is curious about.") {
+            SettingsCard(title: "L1 — Conscious stream", subtitle: "Adaptive reflection, memory horizon, and curiosity.") {
                 HStack {
-                    Text("Reasoning cadence")
+                    Text("Quiet-state reflection baseline")
                     Spacer()
-                    Stepper("Every \(Int(model.envSettings.l1ReasoningCadenceSeconds)) s", value: l1ReasoningCadenceBinding, in: 30...600, step: 15)
+                    Stepper("≈ \(Int(model.envSettings.l1ReasoningCadenceSeconds)) s", value: l1ReasoningCadenceBinding, in: 30...600, step: 15)
                 }
-                Text("L1 reasons on a single unified cadence; local vision wakes provide the responsive, event-driven path.")
+                Text("This is the expected interval while the scene is quiet. Meaningful workspace changes request reflection immediately; unresolved thoughts shorten the interval stochastically.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Text("Default language")
@@ -882,7 +1081,7 @@ private struct SOMASettingsView: View {
                 Divider()
                 Toggle("Web curiosity collection", isOn: l1CuriosityEnabledBinding)
                 HStack {
-                    Text("Collect every")
+                    Text("Collection interval")
                     Picker("", selection: l1CollectionIntervalBinding) {
                         ForEach(SOMAEnvCollectionInterval.allCases, id: \.self) { interval in
                             Text(interval.label).tag(interval.hours)
@@ -891,7 +1090,6 @@ private struct SOMASettingsView: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
                     .frame(width: 110)
-                    Text("hours")
                 }
                 .disabled(!model.envSettings.l1CuriosityCollectionEnabled)
                 Divider()
@@ -957,7 +1155,7 @@ private struct SOMASettingsView: View {
                             Button("Lock profile", role: .cancel) {
                                 model.administratorProfileUnlocked = false
                             }
-                            Text("Edits are applied as you type.")
+                            Text("Press Save to keep profile edits.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     } else {
@@ -992,15 +1190,45 @@ private struct SOMASettingsView: View {
     private var system: some View {
         VStack(alignment: .leading, spacing: 14) {
             SettingsCard(title: model.runtime.isLive ? "SOMA is running" : "SOMA is not reporting activity", subtitle: runtimeSubtitle) {
-                ActivityRow(name: "Indicator", state: model.runtime.indicatorState ?? "waiting", active: model.runtime.indicatorState != nil)
-                ActivityRow(name: "Settings", state: model.runtime.sources["control_settings"] ?? "not loaded", active: model.runtime.sources["control_settings"] == "loaded")
-                ActivityRow(name: "Identity engine", state: model.runtime.sources["face_identity"] ?? "waiting", active: model.runtime.sources["face_identity"] == "configured")
+                ActivityRow(name: "Indicator", state: model.runtime.indicatorState ?? "waiting", active: model.runtime.sourceIsOperational("social_indicator"))
+                ActivityRow(name: "Settings", state: model.runtime.sources["control_settings"] ?? "not loaded", active: model.runtime.sourceIsOperational("control_settings"))
+                ActivityRow(name: "Identity engine", state: model.runtime.sources["face_identity"] ?? "waiting", active: model.runtime.sourceIsOperational("face_identity"))
             }
-            SettingsCard(title: "Current activity", subtitle: "A compact readout from the local runtime trace.") {
-                ActivityRow(name: "Vision", state: model.runtime.sources["face_neural_engine"] ?? "waiting", active: model.runtime.isLive)
-                ActivityRow(name: "Voice", state: model.settings.realtimeVoiceEnabled ? (model.runtime.sources["l2_live_voice"] ?? "armed") : "off", active: model.runtime.isLive && model.settings.realtimeVoiceEnabled)
-                ActivityRow(name: "Identity", state: identityState, active: model.runtime.identity != nil)
-                ActivityRow(name: "Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.isLive)
+            SettingsCard(title: "Runtime capabilities", subtitle: "Durable readiness from the current SOMA process.") {
+                ActivityRow(name: "Vision", state: model.runtime.sources["face_neural_engine"] ?? "waiting", active: model.runtime.sourceIsOperational("face_neural_engine"))
+                ActivityRow(name: "Voice", state: model.settings.realtimeVoiceEnabled ? (model.runtime.sources["l2_live_voice"] ?? "armed") : "off", active: model.settings.realtimeVoiceEnabled && model.runtime.sourceIsOperational("l2_live_voice"))
+                ActivityRow(name: "Identity", state: identityState, active: model.runtime.isLive && model.runtime.identity != nil)
+                ActivityRow(name: "Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.sourceIsOperational("attention_gimbal_bridge"))
+            }
+            SettingsCard(title: "External dependencies", subtitle: "Check the host services, tools, models, and hardware SOMA depends on.") {
+                HStack(spacing: 10) {
+                    externalDependencyStatus
+                    Spacer(minLength: 12)
+                    Button(model.externalDependencyAudit == .unchecked ? "Run check" : "Check again") {
+                        model.checkExternalDependencies()
+                    }
+                    .disabled(model.externalDependencyAudit == .checking)
+                }
+                if case let .loaded(audit) = model.externalDependencyAudit {
+                    let issues = audit.checks.filter { $0.level != .passed }
+                    if !issues.isEmpty {
+                        Divider()
+                        ForEach(issues) { check in
+                            ExternalDependencyRow(check: check)
+                        }
+                    }
+                    DisclosureGroup(
+                        "All checks (\(audit.checks.count))",
+                        isExpanded: $revealDependencyChecks
+                    ) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(audit.checks) { check in
+                                ExternalDependencyRow(check: check)
+                            }
+                        }
+                        .padding(.top, 8)
+                    }
+                }
             }
             SettingsCard(title: "Apply changes", subtitle: "Runtime settings are read at startup to keep L0 deterministic.") {
                 Text("Save writes settings to ~/Library/Application Support/SOMA/settings.json and layer/Ollama values to the owner-only .env beside it. Save & restart relaunches the existing local SOMA service so the layer values take effect.")
@@ -1016,8 +1244,55 @@ private struct SOMASettingsView: View {
 
     private var runtimeSubtitle: String {
         guard let date = model.runtime.lastActivity else { return "No local trace has been observed yet." }
+        if abs(Date().timeIntervalSince(date)) < 1.5 { return "Last local activity just now." }
         let formatter = RelativeDateTimeFormatter()
         return "Last local activity \(formatter.localizedString(for: date, relativeTo: Date()))."
+    }
+
+    @ViewBuilder private var externalDependencyStatus: some View {
+        switch model.externalDependencyAudit {
+        case .unchecked:
+            Label("Not checked", systemImage: "circle.dashed")
+                .foregroundStyle(.secondary)
+        case .checking:
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text("Checking dependencies…")
+            }
+            .foregroundStyle(.secondary)
+        case let .loaded(audit):
+            let summary = "\(audit.passedCount) ready"
+                + (audit.warningCount > 0 ? " · \(audit.warningCount) warning" : "")
+                + (audit.failedCount > 0 ? " · \(audit.failedCount) failed" : "")
+            Label(
+                summary,
+                systemImage: audit.isReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+            )
+            .foregroundStyle(audit.isReady ? .green : .orange)
+        case let .unavailable(reason):
+            Label(reason, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    @ViewBuilder private var ollamaConnectionStatus: some View {
+        switch model.ollamaConnection {
+        case .unchecked:
+            Label("Not checked", systemImage: "circle.dashed")
+                .foregroundStyle(.secondary)
+        case .checking:
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text("Checking connection…")
+            }
+            .foregroundStyle(.secondary)
+        case let .available(message):
+            Label(message, systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case let .unavailable(message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        }
     }
 
     private func binding<T>(_ keyPath: WritableKeyPath<SOMAControlSettings, T>) -> Binding<T> {
@@ -1036,6 +1311,17 @@ private struct SOMASettingsView: View {
                     max($0, SOMAControlSettings.realtimeVoiceSilenceTimeoutRange.lowerBound),
                     SOMAControlSettings.realtimeVoiceSilenceTimeoutRange.upperBound
                 )
+            }
+        )
+    }
+
+    private var hermesAgentWorkspaceBinding: Binding<String> {
+        Binding(
+            get: { model.settings.hermesAgentWorkspace ?? "" },
+            set: {
+                model.settings.hermesAgentWorkspace = $0.isEmpty
+                    ? nil
+                    : String($0.prefix(1_024))
             }
         )
     }
@@ -1089,7 +1375,10 @@ private struct SOMASettingsView: View {
     private var ollamaHostBinding: Binding<String> {
         Binding(
             get: { model.envSettings.ollamaHost },
-            set: { model.envSettings.ollamaHost = normalizeHost($0) }
+            set: {
+                model.envSettings.ollamaHost = String($0.prefix(256))
+                model.invalidateOllamaConnection()
+            }
         )
     }
 
@@ -1131,7 +1420,10 @@ private struct SOMASettingsView: View {
     private var l1ModelBinding: Binding<String> {
         Binding(
             get: { model.envSettings.l1Model },
-            set: { model.envSettings.l1Model = String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(96)) }
+            set: {
+                model.envSettings.l1Model = String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(96))
+                model.invalidateOllamaConnection()
+            }
         )
     }
 
@@ -1238,14 +1530,6 @@ private struct SOMASettingsView: View {
         )
     }
 
-    private func normalizeHost(_ value: String) -> String {
-        var host = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !host.hasPrefix("http://"), !host.hasPrefix("https://") {
-            host = "http://\(host)"
-        }
-        if host.hasSuffix("/") { host.removeLast() }
-        return String(host.prefix(256))
-    }
 }
 
 private enum SOMADefaultLanguage: String, CaseIterable {
@@ -1304,6 +1588,38 @@ private struct ActivityRow: View {
                 .textCase(.lowercase)
         }
         .font(.subheadline)
+    }
+}
+
+private struct ExternalDependencyRow: View {
+    let check: ExternalDependencyCheck
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
+            Image(systemName: symbol)
+                .foregroundStyle(color)
+                .frame(width: 14)
+            Text(check.detail)
+                .font(.subheadline)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var symbol: String {
+        switch check.level {
+        case .passed: "checkmark.circle.fill"
+        case .warning: "exclamationmark.triangle.fill"
+        case .failed: "xmark.octagon.fill"
+        }
+    }
+
+    private var color: Color {
+        switch check.level {
+        case .passed: .green
+        case .warning: .orange
+        case .failed: .red
+        }
     }
 }
 
@@ -1594,7 +1910,7 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
     private let menu = NSMenu()
     private let model = SOMAControlModel()
     private let opensSettingsOnLaunch: Bool
-    private var settingsPanel: NSPanel?
+    private var settingsWindow: NSWindow?
     private var diagnosticsPanel: NSPanel?
     private var openSettingsObserver: NSObjectProtocol?
 
@@ -1640,11 +1956,11 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
         menu.addItem(header)
         addDivider(to: menu)
         addSection("LIVE ACTIVITY", to: menu)
-        addStatus("Vision", state: model.runtime.sources["face_neural_engine"] ?? "waiting", active: model.runtime.isLive, to: menu)
-        addStatus("Voice", state: model.settings.realtimeVoiceEnabled ? (model.runtime.sources["l2_live_voice"] ?? "armed") : "off", active: model.settings.realtimeVoiceEnabled && model.runtime.isLive, to: menu)
+        addStatus("Vision", state: model.runtime.sources["face_neural_engine"] ?? "waiting", active: model.runtime.sourceIsOperational("face_neural_engine"), to: menu)
+        addStatus("Voice", state: model.settings.realtimeVoiceEnabled ? (model.runtime.sources["l2_live_voice"] ?? "armed") : "off", active: model.settings.realtimeVoiceEnabled && model.runtime.sourceIsOperational("l2_live_voice"), to: menu)
         let identityText = model.runtime.administratorVerified ? "administrator verified" : (model.runtime.identity?.state ?? "waiting")
-        addStatus("Identity", state: identityText, active: model.runtime.identity != nil, to: menu)
-        addStatus("Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.isLive, to: menu)
+        addStatus("Identity", state: identityText, active: model.runtime.isLive && model.runtime.identity != nil, to: menu)
+        addStatus("Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.sourceIsOperational("attention_gimbal_bridge"), to: menu)
         addDivider(to: menu)
         menu.addItem(item("Settings…", action: #selector(openSettings)))
         menu.addItem(item("Diagnostic panel…", action: #selector(openDiagnostics)))
@@ -1684,33 +2000,35 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     @objc private func openSettings() {
-        if let settingsPanel {
-            settingsPanel.makeKeyAndOrderFront(nil)
+        NSApp.setActivationPolicy(.regular)
+        if let settingsWindow {
+            settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        let panel = NSPanel(
+        let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 820, height: 620),
-            styleMask: [.titled, .closable, .utilityWindow, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        panel.title = "SOMA Settings"
-        panel.minSize = NSSize(width: 770, height: 580)
-        panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false
-        panel.delegate = self
-        panel.contentViewController = NSHostingController(rootView: SOMASettingsView(
+        window.title = "SOMA Settings"
+        window.minSize = NSSize(width: 770, height: 580)
+        window.level = .normal
+        window.collectionBehavior = [.managed, .participatesInCycle]
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.contentViewController = NSHostingController(rootView: SOMASettingsView(
             model: model,
             onSuccessfulRestart: { [weak self] in
-                self?.settingsPanel?.close()
+                self?.settingsWindow?.close()
             },
             onOpenDiagnostics: { [weak self] in self?.openDiagnostics() }
         ))
-        panel.center()
-        panel.makeKeyAndOrderFront(nil)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        settingsPanel = panel
+        settingsWindow = window
     }
 
     @objc private func openDiagnostics() {
@@ -1771,8 +2089,9 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     func windowWillClose(_ notification: Notification) {
-        if notification.object as? NSWindow === settingsPanel {
-            settingsPanel = nil
+        if notification.object as? NSWindow === settingsWindow {
+            settingsWindow = nil
+            NSApp.setActivationPolicy(.accessory)
         }
         if notification.object as? NSWindow === diagnosticsPanel {
             // Stop the runtime's live-diagnostic writer.

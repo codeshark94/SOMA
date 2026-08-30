@@ -204,6 +204,10 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
             .map(\.summary)
             .filter { !$0.isEmpty }
             .joined(separator: " | ")
+        var visualIDs = Set<String>()
+        let mergedVisuals = Array((visuals + newer.visuals).filter { visual in
+            visualIDs.insert(visual.resourceID).inserted
+        }.suffix(2))
 
         return Self(
             cycleID: newer.cycleID,
@@ -222,7 +226,7 @@ public struct L1ThoughtRequest: Codable, Equatable, Sendable {
             spatialContext: newer.spatialContext,
             dailyWorldMemory: newer.dailyWorldMemory,
             visualResourceOffers: newer.visualResourceOffers,
-            visuals: newer.visuals,
+            visuals: mergedVisuals,
             socialOpportunity: newer.socialOpportunity,
             contactPattern: newer.contactPattern,
             behaviorContext: newer.behaviorContext,

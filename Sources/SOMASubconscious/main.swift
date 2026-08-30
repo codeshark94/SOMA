@@ -2077,6 +2077,8 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
         return ("visual_followup", "status=requested_context")
     case "visual_request_unavailable":
         return ("visual_request_unavailable", "status=context_unavailable")
+    case "active_vision_completed", "active_vision_failed":
+        return (state, message)
     case "discarded", "decision_rejected", "opening_suppressed":
         return (state, "reason=policy_or_context_guard")
     case "memory_ready", "memory_consolidated", "conversation_memory_consolidated", "conversation_memory_recovery_finished", "memory_proposal_stored", "daily_world_memory_stored", "person_fact_stored", "person_preference_captured":
@@ -2869,6 +2871,7 @@ private final class JSONLWriter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "soma.subconscious.trace")
     private let detailedStore: RotatingJSONLStore
     private let importantStore: RotatingJSONLStore?
+    private let runtimeHealthStore: RuntimeHealthSnapshotStore?
     private let encoder: JSONEncoder
     private let reorderWindowNS: UInt64 = 20_000_000
     private var pending: [PendingEvent] = []
@@ -2894,6 +2897,12 @@ private final class JSONLWriter: @unchecked Sendable {
             } else {
                 importantStore = nil
             }
+            runtimeHealthStore = try? RuntimeHealthSnapshotStore(
+                fileURL: url
+                    .deletingLastPathComponent()
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("runtime-health.json")
+            )
         } catch {
             throw RuntimeError.configuration("Cannot create trace output: \(error.localizedDescription)")
         }
@@ -2904,6 +2913,15 @@ private final class JSONLWriter: @unchecked Sendable {
     func write<T: TraceEvent>(_ event: T) {
         queue.async { [weak self] in
             guard let self, var data = try? self.encoder.encode(event) else { return }
+            if let health = event as? RuntimeEvent,
+               health.event == "source.health",
+               RuntimeHealthProjectionPolicy.retains(source: health.source, state: health.state) {
+                _ = try? self.runtimeHealthStore?.update(
+                    source: health.source,
+                    state: health.state,
+                    monotonicNS: health.monotonicNS
+                )
+            }
             data.append(0x0A)
             self.enqueue(PendingEvent(
                 monotonicNS: event.monotonicNS,
@@ -3883,12 +3901,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     var recognizedIdentityProvider: (() -> String?)?
     private var actionableVisualContinuity = VisualEvidenceContinuity()
     private var socialTrackingContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 1_200)
-    /// While native AI owns the live visual loop the device itself is tracking
-    /// the person, and the app's ANE face detector can drop out for a second or
-    /// more while the gimbal moves. This longer window trusts device-confirmed
-    /// native tracking across those dropouts, releasing only after a sustained
-    /// absence that a genuine departure would produce.
-    private var nativeTrustContinuity = VisualEvidenceContinuity(lossConfirmationMilliseconds: 15_000)
+    /// Native tracking retains motor authority only while fresh human evidence
+    /// or measured recovery motion shows that the firmware is still following.
+    /// This prevents the device's lost-target state from holding the gimbal.
+    private var nativeTrackingRecovery = NativeTrackingRecovery()
     private var faceLock = FaceLockLease()
     /// Bounded recovery window for a verified face lock that has lost its face.
     /// The lock may hold through a short detector gap, but it must not pin the
@@ -4492,6 +4508,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 }
                 stopNativeHeartbeatLoop()
                 nativeTrackingLiveness.cancel()
+                nativeTrackingRecovery.reset()
                 nativeTrackingActive = false
                 nativeTrackingFunctionallyVerified = false
                 nativeTrackingStartPending = false
@@ -4858,9 +4875,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // A device-confirmed native AI lock owns its own live visual loop
             // (the OBSBOT tracks the person independently of this app's ANE
             // detector). While the device-confirmed native lock is held, an
-            // app-detector gap is a perception dropout, not a physical
-            // departure, and must not tear the native lock down: the longer
-            // native-trust window releases it only on a sustained absence. A
+            // isolated app-detector gap is a perception dropout rather than a
+            // physical departure. The recovery supervisor releases ownership
+            // after visual absence and measured gimbal motion no longer
+            // support reacquisition. A
             // pending, not-yet-device-confirmed start still yields to the
             // shorter social gap so a false start cannot hold the gimbal
             // forever.
@@ -4871,7 +4889,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // alone, so a stale person hypothesis could indefinitely suppress
             // exploration after the camera was no longer seeing a person.
             let socialEvidenceFresh = nativeTrackingFunctionallyVerified
-                ? !nativeTrustContinuity.confirmsLoss(at: now)
+                ? !nativeTrackingConfirmsTargetLoss(at: now)
                 : !socialTrackingContinuity.confirmsLoss(at: now)
             let socialFixationSupported = faceLock.permitsMotor(at: now)
                 && socialEvidenceFresh
@@ -4940,7 +4958,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             evidence: .visualObservation,
             socialFixationPermitted: faceLock.permitsInitialMotor(at: now)
                 && (nativeTrackingFunctionallyVerified
-                    ? !nativeTrustContinuity.confirmsLoss(at: now)
+                    ? !nativeTrackingConfirmsTargetLoss(at: now)
                     : !socialTrackingContinuity.confirmsLoss(at: now)),
             nativeSocialTrackingPermitted: faceLock.permitsInitialMotor(at: now),
             nativeSocialTrackingActive: nativeTrackingActive || nativeTrackingStartPending
@@ -5001,7 +5019,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // external velocity that yields the device's AI lock away. Retain
             // the lease through the competing candidate (same rule as
             // scene_observation and social_reframing); only a sustained
-            // absence confirmed by the native-trust window may tear it down.
+            // absence confirmed by the native recovery supervisor may tear it down.
             if retainNativeLeaseThroughCompetingAttention(at: now) {
                 cancelScan()
                 return
@@ -5081,10 +5099,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // blip: the current frame briefly lost its face target (nil, a
             // body/saliency candidate taking precedence, or a fast head move)
             // while the verified face lock still holds. Only a sustained
-            // absence confirmed by the 5 s native-trust continuity should tear
+            // absence confirmed by the native recovery supervisor should tear
             // the native lock down — the same principle as the vision_miss
             // retention above.
-            if gate.isActive, !verifiedCurrentFaceLock, !nativeTrustContinuity.confirmsLoss(at: now) {
+            if gate.isActive, !verifiedCurrentFaceLock, !nativeTrackingConfirmsTargetLoss(at: now) {
                 nativeAction = gate.heartbeatIfActive(at: now)
             } else {
                 nativeAction = gate.update(
@@ -5113,7 +5131,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     + " lockProvisional=\(faceLock.isProvisional(at: now))"
                     + " gateActive=\(gate.isActive)"
                     + " verifiedLock=\(verifiedCurrentFaceLock)"
-                    + " trustLoss=\(nativeTrustContinuity.confirmsLoss(at: now))"
+                    + " recovery=\(nativeTrackingRecovery.state.rawValue)"
                     + " enabled=\(nativeHumanTrackingEnabled)"
                     + " runtimeAvailability=\(nativeTrackingRuntimeAvailability.rawValue)"
                     + " nativeActive=\(nativeTrackingActive)"
@@ -5243,6 +5261,68 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         scanScheduledForEvidenceGeneration = nil
     }
 
+    private func recordNativeTrackingHumanEvidence(at monotonicNS: UInt64) {
+        let prior = nativeTrackingRecovery.state
+        nativeTrackingRecovery.recordHumanObservation(at: monotonicNS)
+        guard prior == .reacquiring else { return }
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNS,
+            source: "native_tracking",
+            state: "visual_reacquired",
+            message: "Fresh human evidence restored the native tracking lease"
+        ))
+        refreshIndicator(at: monotonicNS, forceHardwareReassertion: true)
+    }
+
+    /// Native tracking is retained only while it is visibly following the
+    /// person. A moving gimbal receives a bounded opportunity to bring an
+    /// off-screen target back; a stationary gimbal with no human evidence has
+    /// already stopped recovering and releases after that state is confirmed.
+    private func nativeTrackingConfirmsTargetLoss(at monotonicNS: UInt64) -> Bool {
+        // Pending and newly accepted handoffs are governed by their explicit
+        // acquisition/liveness deadline. Visual recovery becomes authoritative
+        // only after native motion has been functionally verified.
+        guard nativeTrackingActive, nativeTrackingFunctionallyVerified else {
+            return false
+        }
+        let prior = nativeTrackingRecovery.state
+        let next = nativeTrackingRecovery.evaluateAbsence(
+            at: monotonicNS,
+            measuredVelocity: poseStore.currentVelocity(maximumAgeNS: 250_000_000)
+        )
+        guard next != prior else { return next == .targetLost }
+        switch next {
+        case .tracking:
+            break
+        case .reacquiring:
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNS,
+                source: "native_tracking",
+                state: "visual_reacquisition_started",
+                message: "Human evidence absent; native motion remains under bounded observation"
+            ))
+            // Firmware can expose its own lost-target presentation as soon as
+            // the subject leaves frame. Preserve SOMA's semantic state while
+            // recovery is still in progress.
+            refreshIndicator(at: monotonicNS, forceHardwareReassertion: true)
+        case .targetLost:
+            indicatorInputs.visualState = .none
+            eyeContactIndicatorLease.clear()
+            lastFreshHumanObservationNS = nil
+            refreshIndicator(at: monotonicNS, forceHardwareReassertion: true)
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNS,
+                source: "native_tracking",
+                state: "target_departure_confirmed",
+                message: "No human evidence and no viable native recovery trajectory; releasing to spatial search"
+            ))
+        }
+        return next == .targetLost
+    }
+
     private func releaseSocialFaceLock(at monotonicNS: UInt64, reason: String) {
         let wasVerified = faceLock.permitsMotor(at: monotonicNS)
         let hadFaceLock = faceLock.isActive(at: monotonicNS)
@@ -5267,17 +5347,17 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// The device-confirmed native lease (or a pending handoff) owns the
     /// gimbal. Competing L0 attention — a body candidate of the tracked
     /// person, a scene/object candidate, or a detector-ID transition — is
-    /// perception-only while the native-trust continuity is fresh: it must
+    /// perception-only while native visual recovery remains viable: it must
     /// not tear the lease down (gate.invalidate sends a manual_stop, which
     /// kills the device's AI lock) nor steer the gimbal (an external motion
     /// would yield the device's tracking away). Only a sustained absence
-    /// confirmed by the 15 s native-trust window, an explicit release, or a
-    /// higher-authority motor claim may end the lease.
+    /// confirmed by visual absence plus measured gimbal recovery state, an
+    /// explicit release, or a higher-authority motor claim may end the lease.
     /// Returns true when the lease was retained this frame.
     @discardableResult
     private func retainNativeLeaseThroughCompetingAttention(at now: UInt64) -> Bool {
         guard nativeTrackingActive || nativeTrackingStartPending else { return false }
-        guard !nativeTrustContinuity.confirmsLoss(at: now) else { return false }
+        guard !nativeTrackingConfirmsTargetLoss(at: now) else { return false }
         let action = gate.heartbeatIfActive(at: now)
         if action != .none {
             apply(action, at: now, target: nil, reason: "native_lease_retained")
@@ -5363,7 +5443,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         let nativeAction = nativeTrackingMayStart
             ? (gate.isActive
-                && !nativeTrustContinuity.confirmsLoss(at: now)
+                && !nativeTrackingConfirmsTargetLoss(at: now)
                 ? gate.heartbeatIfActive(at: now)
                 : gate.update(belief, hasVisualEvidence: false))
             : gate.invalidate()
@@ -5834,6 +5914,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             nativeTrackingActive = false
             nativeTrackingFunctionallyVerified = false
             nativeTrackingStartPending = false
+            nativeTrackingRecovery.reset()
             writer.write(CameraIntentEvent(
                 monotonicNS: now,
                 owner: .nativeAI,
@@ -6084,6 +6165,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         if !socialHumanCandidates.isEmpty {
             lastFreshHumanObservationNS = monotonicNS
+            recordNativeTrackingHumanEvidence(at: monotonicNS)
             if auditoryOrientingLease.isActive {
                 stopAuditoryOrienting(
                     state: "visual_human_preempted_auditory_orientation",
@@ -6255,7 +6337,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     indicatorInputs.visualState = contactReady ? .eyeContact : .humanDetected
                     refreshIndicator(at: monotonicNS)
                     socialTrackingContinuity.recordObservation(at: monotonicNS)
-                    nativeTrustContinuity.recordObservation(at: monotonicNS)
+                    recordNativeTrackingHumanEvidence(at: monotonicNS)
                 }
                 // Invalidate any absence callback that was queued before this
                 // frame. It must not revive a search pulse after preemption.
@@ -11699,7 +11781,7 @@ private final class VisionWorker: @unchecked Sendable {
         candidates = facePersonFusion.fuse(candidates, at: faceVerificationNow)
         let directedContactFreshnessNS = UInt64(somaEnvDouble(
             "SOMA_L0_EYE_CONTACT_FRESHNESS_MS",
-            default: 350
+            default: SOMAEnvSettings.defaultEyeContactFreshnessMilliseconds
         )) * 1_000_000
         candidates = candidates.map { candidate in
             guard isFaceCandidate(candidate) else { return candidate }
@@ -12380,7 +12462,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "control_settings",
             state: "loaded",
-            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); active_turn_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
+            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); active_turn_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn); hermes_agent=\(controlSettings.hermesAgentDelegationEnabled); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
         ))
     } catch {
         controlSettings = .init()
@@ -12405,6 +12487,7 @@ private func run(_ options: Options) throws {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
         .appendingPathComponent("identity-current.json")
+    clearIdentityState(at: identityStateURL)
     let liveSessionCapabilities = SOMASessionCapabilityStore()
     let persistentLiveVoiceBroker: PersistentAppServerBroker?
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
@@ -12987,6 +13070,43 @@ private func run(_ options: Options) throws {
     let speechInteractionBox = SpeechInteractionBox()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     let liveVoiceBox = LiveVoiceLauncherBox()
+    let hermesAgentDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/SOMA/hermes-agent", isDirectory: true)
+    let hermesAgentKey = try OwnerOnlyInstallationSecret.loadOrCreate(
+        in: hermesAgentDirectory,
+        filename: "installation-key-v1.bin"
+    )
+    let hermesAgentStore = try HermesAgentTaskStore(
+        directoryURL: hermesAgentDirectory,
+        encryptionKey: hermesAgentKey
+    )
+    let hermesAgentCoordinator = try HermesAgentTaskCoordinator(
+        store: hermesAgentStore,
+        enabled: controlSettings.hermesAgentDelegationEnabled,
+        defaultWorkingDirectory: controlSettings.hermesAgentWorkspace
+            ?? ProcessInfo.processInfo.environment["SOMA_ROOT"]
+            ?? FileManager.default.currentDirectoryPath,
+        onCompletion: { task in
+            let delivered = liveVoiceBox.launcher?.deliverHermesTaskResult(task) ?? false
+            writer.write(RuntimeEvent(
+                event: "hermes.task",
+                monotonicNS: monotonicNanoseconds(),
+                source: "hermes_agent",
+                state: delivered ? "result_delivery_requested" : "result_pending",
+                message: "task_id=\(task.id.uuidString.lowercased()); status=\(task.status.rawValue)"
+            ))
+        },
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "hermes_agent",
+                state: state,
+                message: message
+            ))
+        }
+    )
+    defer { hermesAgentCoordinator.stop() }
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(
             voice: controlSettings.realtimeVoice,
@@ -12996,6 +13116,9 @@ private func run(_ options: Options) throws {
             embodimentSocketURL: options.embodimentShadowSocketURL,
             requireVerifiedSpeakerForEveryTurn: controlSettings
                 .realtimeVoiceRequiresEyeContactForEveryTurn,
+            pendingHermesTasks: {
+                hermesAgentCoordinator.pendingCompletedTasks()
+            },
             inactivityTimeoutMilliseconds: UInt64(
                 controlSettings.realtimeVoiceSilenceTimeoutSeconds
             ) * 1_000,
@@ -13280,6 +13403,26 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "ended",
                     message: reason
+                ))
+            case let .hermesTaskResultAccepted(taskID):
+                _ = hermesAgentCoordinator.handle(.init(
+                    operation: .markReported,
+                    taskID: taskID
+                ))
+                writer.write(RuntimeEvent(
+                    event: "hermes.task",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "result_accepted",
+                    message: "task_id=\(taskID.uuidString.lowercased())"
+                ))
+            case let .hermesTaskResultRejected(taskID, reason):
+                writer.write(RuntimeEvent(
+                    event: "hermes.task",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "result_delivery_rejected",
+                    message: "task_id=\(taskID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
                 ))
             case let .failed(threadID, personEntityID, reason):
                 l1LiveConversationState.end()
@@ -13659,6 +13802,9 @@ private func run(_ options: Options) throws {
                 }
             },
             toolExecutor: l1ToolExecutor,
+            activeVisionExecutor: { [l1EmbodimentTools] request in
+                l1EmbodimentTools.performActiveInspection(request)
+            },
             onCuriosityNeeds: { needs in
                 l1CuriosityCollector.registerTopics(from: needs)
             },
@@ -14045,6 +14191,22 @@ private func run(_ options: Options) throws {
                 case let .failure(error):
                     return .failure(error)
                 }
+            },
+            hermesAgentTaskProvider: { request in
+                let result = hermesAgentCoordinator.handle(request)
+                if case let .success(value) = result {
+                    let task = value.task ?? value.tasks.first
+                    writer.write(RuntimeEvent(
+                        event: "hermes.task",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "l2_mcp",
+                        state: request.operation.rawValue,
+                        message: task.map {
+                            "task_id=\($0.id.uuidString.lowercased()); status=\($0.status.rawValue); deduplicated=\(value.deduplicated)"
+                        }
+                    ))
+                }
+                return result
             },
             onHealth: { state, message in
                 writer.write(RuntimeEvent(
@@ -15515,6 +15677,7 @@ private func printUsage() {
     print("       soma-subconscious --speech-recognition-file <locale> <absolute-audio-path>")
     print("       soma-subconscious --speech-synthesis-test <locale> <text>")
     print("       soma-subconscious --live-voice-test")
+    print("       soma-subconscious --hermes-agent-test")
     print("       soma-subconscious --face-identity-status")
     print("       soma-subconscious --promote-anonymous-face <anon_handle>")
     print("       soma-subconscious --remove-face-identity <entity_uuid>")
@@ -15578,6 +15741,19 @@ if somaArguments.first == "--speech-recognition-status" {
     let result = testAppServerLiveVoiceLauncher()
     print("live_voice=\(result)")
         Foundation.exit(result == "active" ? EXIT_SUCCESS : EXIT_FAILURE)
+} else if somaArguments.first == "--hermes-agent-test" {
+    guard somaArguments.count == 1 else {
+        fputs("soma-subconscious: --hermes-agent-test takes no additional arguments\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        let result = try await testHermesAgentProtocolBridge()
+        print("hermes_agent=\(result)")
+        Foundation.exit(result == "SOMA_HERMES_BRIDGE_OK" ? EXIT_SUCCESS : EXIT_FAILURE)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
 } else if somaArguments.first == "--face-identity-status" {
     guard somaArguments.count == 1 else {
         fputs("soma-subconscious: --face-identity-status takes no additional arguments\n", stderr)

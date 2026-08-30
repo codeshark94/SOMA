@@ -119,6 +119,10 @@ final class SOMADiagnosticsModel: ObservableObject {
                 return .init(category: "VISUAL CONTEXT", title: "Requested additional visual context", detail: "Checking scene detail needed for the current judgment.")
             case "visual_request_unavailable":
                 return .init(category: "VISUAL CONTEXT", title: "Additional visual context unavailable", detail: "Continuing with currently observed evidence.")
+            case "active_vision_completed":
+                return .init(category: "ACTIVE VISION", title: "Settled target view captured", detail: readableMetadata())
+            case "active_vision_failed":
+                return .init(category: "ACTIVE VISION", title: "Target view was unavailable", detail: trailingValue(for: "reason") ?? readableMetadata())
             case "discarded", "decision_rejected", "opening_suppressed":
                 return .init(category: "HELD", title: "Social action not taken", detail: "The current relationship context or policy does not support it.")
             default:
@@ -519,9 +523,9 @@ struct SOMADiagnosticsView: View {
         switch state {
         case "thought_wake", "executive_wake": .blue
         case "model_started", "model_retry", "thought_superseded": .orange
-        case "foreground_thought", "action_applied": .green
+        case "foreground_thought", "action_applied", "active_vision_completed": .green
         case "model_failed", "action_held", "executive_held", "thought_held",
-             "discarded", "decision_rejected", "opening_suppressed": .red
+             "active_vision_failed", "discarded", "decision_rejected", "opening_suppressed": .red
         default: .primary
         }
     }

@@ -59,19 +59,85 @@ public struct L1VisualResource: Codable, Equatable, Sendable {
     /// This describes when the camera observed the view, not when the backing
     /// file was atomically written.
     public let capturedAt: Date?
+    /// A request-scoped copy of the encoded image. It is intentionally omitted
+    /// from Codable so pixels cannot enter model packets, checkpoints, or
+    /// diagnostic traces. Active sensing materializes this while the backing
+    /// resource is valid, allowing queued inference to survive file expiry.
+    public let inlineImageData: Data?
 
     public init(
         resourceID: String,
         projection: L1VisualProjection,
         localPath: String,
         expiresAt: Date,
-        capturedAt: Date? = nil
+        capturedAt: Date? = nil,
+        inlineImageData: Data? = nil
     ) {
         self.resourceID = String(resourceID.prefix(256))
         self.projection = projection
         self.localPath = localPath
         self.expiresAt = expiresAt
         self.capturedAt = capturedAt
+        self.inlineImageData = inlineImageData
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case resourceID
+        case projection
+        case localPath
+        case expiresAt
+        case capturedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        resourceID = try values.decode(String.self, forKey: .resourceID)
+        projection = try values.decode(L1VisualProjection.self, forKey: .projection)
+        localPath = try values.decode(String.self, forKey: .localPath)
+        expiresAt = try values.decode(Date.self, forKey: .expiresAt)
+        capturedAt = try values.decodeIfPresent(Date.self, forKey: .capturedAt)
+        inlineImageData = nil
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(resourceID, forKey: .resourceID)
+        try values.encode(projection, forKey: .projection)
+        try values.encode(localPath, forKey: .localPath)
+        try values.encode(expiresAt, forKey: .expiresAt)
+        try values.encodeIfPresent(capturedAt, forKey: .capturedAt)
+    }
+
+    public func imageData(
+        at date: Date = Date(),
+        maximumBytes: Int = 4 * 1_024 * 1_024
+    ) -> Data? {
+        if let inlineImageData,
+           !inlineImageData.isEmpty,
+           inlineImageData.count <= maximumBytes {
+            return inlineImageData
+        }
+        guard expiresAt > date,
+              FileManager.default.isReadableFile(atPath: localPath),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: localPath),
+              let size = attributes[.size] as? NSNumber,
+              size.intValue > 0,
+              size.intValue <= maximumBytes else {
+            return nil
+        }
+        return try? Data(contentsOf: URL(fileURLWithPath: localPath), options: .mappedIfSafe)
+    }
+
+    public func materializedForInference(at date: Date = Date()) -> Self? {
+        guard let data = imageData(at: date) else { return nil }
+        return Self(
+            resourceID: resourceID,
+            projection: projection,
+            localPath: localPath,
+            expiresAt: expiresAt,
+            capturedAt: capturedAt,
+            inlineImageData: data
+        )
     }
 }
 

@@ -21,6 +21,7 @@ public enum CognitiveActionEffect: String, Codable, CaseIterable, Sendable {
     case durableMemory = "durable_memory"
     case identityManagement = "identity_management"
     case conversationControl = "conversation_control"
+    case externalWork = "external_work"
 }
 
 public enum CognitiveActionStatus: String, Codable, CaseIterable, Sendable {
@@ -149,7 +150,7 @@ public enum L2CognitiveToolPolicy {
     public static let instruction = """
     Cognitive tool initiative: privately maintain one current conversational goal. Before each response, decide whether a permitted SOMA MCP action would materially reduce an uncertainty that blocks a useful answer, ground a deictic or embodied reference, advance that goal, preserve an explicitly stated durable fact, or verify completion. When it would, call the narrowest suitable tool proactively and silently; do not wait for the participant to name the tool or issue a command, do not speak a provisional wait message, and use the returned result before responding. When no tool materially helps, answer directly without a ceremonial call.
 
-    Autonomous read-only perception, memory lookup, and current-state inspection are epistemic actions. Reversible camera orientation, tracking, or reframing may also be initiated when it is necessary for the active conversational goal and remains subject to L0 authority. Durable memory writes require an explicit fact or preference supplied or confirmed by the participant. Identity enrollment requires explicit consent. Ending the conversation and external file, shell, network, service, or system changes still require the participant's explicit request and applicable authority.
+    Autonomous read-only perception, memory lookup, and current-state inspection are epistemic actions. Reversible camera orientation, tracking, or reframing may also be initiated when it is necessary for the active conversational goal and remains subject to L0 authority. Durable memory writes require an explicit fact or preference supplied or confirmed by the participant. Identity enrollment requires explicit consent. Ending the conversation and external file, shell, network, service, or system changes still require the participant's explicit request and applicable authority. When the administrator explicitly delegates external work, use delegate_hermes_task once and return its task ID immediately instead of pretending to perform the work in the voice turn. Use get_hermes_task or list_hermes_tasks to retrieve actual progress and results. Continue or cancel the external worker only on an explicit request.
 
     Every non-read-only SOMA MCP call, and every autonomous read, must include cognitive_intent with one stable goal_episode_id reused across calls serving the same conversational objective, a concise private purpose, expected_information_gain from 0 to 1, only supplied evidence_ids, and authorization_basis. Use autonomous_goal only for read-only perception/memory or reversible goal-bound orientation, tracking, reframing, and expression. Use explicit_statement for a fact or preference the participant just supplied, explicit_consent for identity enrollment, and explicit_request for conversation termination or device configuration the participant explicitly requested. Generate a new goal_episode_id when the conversational objective materially changes. Never expose these fields to the participant. Do not repeat a call when the same goal and semantic request already produced an equivalent result; treat tool failure as evidence and never claim an unverified result.
     """
@@ -167,6 +168,10 @@ public enum L2CognitiveToolPolicy {
         case "enroll_present_identity":
             .explicitConsent
         case "end_conversation":
+            .explicitRequest
+        case "get_hermes_task", "list_hermes_tasks":
+            .epistemic
+        case "delegate_hermes_task", "continue_hermes_task", "cancel_hermes_task":
             .explicitRequest
         case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
              "track_target", "orient_to", "set_exploration_policy", "capture_view",
@@ -197,6 +202,10 @@ public enum L2CognitiveToolPolicy {
             .identityManagement
         case "end_conversation":
             .conversationControl
+        case "get_hermes_task", "list_hermes_tasks":
+            .epistemic
+        case "delegate_hermes_task", "continue_hermes_task", "cancel_hermes_task":
+            .externalWork
         default:
             autonomy(for: toolName) == nil ? nil : .reversibleEmbodiment
         }
@@ -220,6 +229,19 @@ public enum L2CognitiveToolPolicy {
         case nil:
             false
         }
+    }
+
+    /// Task status evolves while its semantic query remains the same, while
+    /// task creation has its own durable idempotency key in the coordinator.
+    /// Neither belongs in the completed-action deduplication cache.
+    public static func usesSemanticDeduplication(for toolName: String) -> Bool {
+        ![
+            "delegate_hermes_task",
+            "continue_hermes_task",
+            "get_hermes_task",
+            "list_hermes_tasks",
+            "cancel_hermes_task",
+        ].contains(toolName)
     }
 }
 

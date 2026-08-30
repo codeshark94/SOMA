@@ -192,6 +192,14 @@ else
 fi
 
 soma_cmake=${SOMA_CMAKE:-$(command -v cmake 2>/dev/null || true)}
+if [[ -z "$soma_cmake" ]]; then
+  for soma_candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+    if [[ -x "$soma_candidate" ]]; then
+      soma_cmake="$soma_candidate"
+      break
+    fi
+  done
+fi
 if [[ -n "$soma_cmake" && -x "$soma_cmake" ]]; then
   soma_native_check_root="$soma_root/.build/soma-doctor-native"
   if "$soma_cmake" -S "$soma_root/Sources/SOMANativeTracking" -B "$soma_native_check_root" \
@@ -292,6 +300,24 @@ if [[ "$soma_mode" == "--runtime" ]]; then
     fi
   else
     soma_fail 'Ollama is unavailable; install it from Brewfile and start its local server'
+  fi
+
+  soma_hermes=${SOMA_HERMES_BINARY:-}
+  if [[ -n "$soma_hermes" && ! -x "$soma_hermes" ]]; then
+    soma_fail "configured Hermes Agent executable is unavailable: $soma_hermes"
+  else
+    if [[ -z "$soma_hermes" && -x "$HOME/.local/bin/hermes" ]]; then
+      soma_hermes="$HOME/.local/bin/hermes"
+    fi
+    if [[ -z "$soma_hermes" ]]; then
+      soma_hermes=$(command -v hermes 2>/dev/null || true)
+    fi
+    if [[ -n "$soma_hermes" && -x "$soma_hermes" ]]; then
+      soma_hermes_version=$("$soma_hermes" --version 2>/dev/null | head -n 1)
+      soma_ok "${soma_hermes_version:-Hermes Agent} at $soma_hermes"
+    else
+      soma_warn 'optional Hermes Agent is unavailable; L2 task delegation is disabled'
+    fi
   fi
 
   if [[ "${SOMA_ENABLE_L2_LIVE_VOICE:-1}" == 1 ]]; then

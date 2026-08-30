@@ -609,6 +609,88 @@ final class PersistentMentalWorkspaceTests: XCTestCase {
         XCTAssertNotNil(completed.intentions.first?.completedAt)
     }
 
+    func testEquivalentActiveVisualIntentionsCoalesceAcrossFreshModelUUIDs() async throws {
+        let start = Date(timeIntervalSince1970: 625)
+        let workspace = PersistentMentalWorkspace()
+        let firstEvidence = await workspace.ingest(MentalEvidenceEvent(
+            id: "object:book:presented",
+            observedAt: start,
+            kind: .objectPresentation,
+            summary: "A book is currently available for inspection.",
+            confidence: 1,
+            novelty: 0.9
+        ))
+        let canonicalID = UUID()
+        let first = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: firstEvidence.after.revision,
+            evidenceIDs: ["object:book:presented"],
+            innerMonologue: "I need one current view to resolve what is on the book cover.",
+            channel: .curiosity,
+            continuity: .associate,
+            confidence: 0.9,
+            salience: 0.9,
+            novelty: 0.8,
+            intention: MentalIntention(
+                id: canonicalID,
+                domain: "visual inspection",
+                objective: "Read the visible book cover.",
+                completionCondition: "A settled current image answers the cover question.",
+                attentionTargetLabel: "Book",
+                pressure: 0.8,
+                evidenceIDs: ["object:book:presented"],
+                createdAt: start
+            )
+        ), at: start, draw: 0)
+        let marked = await workspace.markIntentionExecuted(
+            canonicalID,
+            using: ["object:book:presented"],
+            actionFingerprint: "inspect_attention_target",
+            at: start.addingTimeInterval(1)
+        )
+        XCTAssertTrue(marked)
+        let followupEvidence = await workspace.ingest(MentalEvidenceEvent(
+            id: "object:book:stable",
+            observedAt: start.addingTimeInterval(2),
+            kind: .ordinaryObservation,
+            summary: "The same book remains available.",
+            confidence: 1,
+            novelty: 0.2
+        ))
+        let freshModelID = UUID()
+        let repeated = try await workspace.applyThoughtUpdate(L1ThoughtUpdate(
+            expectedRevision: followupEvidence.after.revision,
+            evidenceIDs: ["object:book:stable"],
+            innerMonologue: "The same unresolved cover question remains; it is not a new inspection goal.",
+            channel: .curiosity,
+            continuity: .revise,
+            parentThoughtID: first.after.foregroundThought?.id,
+            confidence: 0.8,
+            salience: 0.7,
+            novelty: 0.2,
+            intention: MentalIntention(
+                id: freshModelID,
+                domain: "perceptual inquiry",
+                objective: "Inspect the book again.",
+                completionCondition: "A current view resolves the uncertainty.",
+                attentionTargetLabel: " book ",
+                pressure: 0.7,
+                evidenceIDs: ["object:book:stable"],
+                createdAt: start.addingTimeInterval(2)
+            )
+        ), at: start.addingTimeInterval(2), draw: 0)
+
+        let active = repeated.after.intentions.filter { $0.completedAt == nil }
+        XCTAssertEqual(active.count, 1)
+        XCTAssertEqual(active.first?.id, canonicalID)
+        XCTAssertEqual(active.first?.lastDispatchedActionFingerprint, "inspect_attention_target")
+        XCTAssertTrue(repeated.delta.changedFields.contains("intention_coalesced:\(canonicalID.uuidString.lowercased())"))
+        XCTAssertEqual(repeated.after.thoughtEpisodes.last?.goalEpisodeID, canonicalID)
+        XCTAssertFalse(active[0].canDispatch(
+            using: ["object:book:stable"],
+            actionFingerprint: "inspect_attention_target"
+        ))
+    }
+
     func testEquivalentCognitiveActionOutcomeIsIdempotentWithinOneGoal() async {
         let goalID = UUID()
         let firstEpisode = CognitiveActionEpisode(

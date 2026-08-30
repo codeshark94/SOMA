@@ -11,14 +11,17 @@ public enum MentalEvidenceKind: String, Codable, CaseIterable, Hashable, Sendabl
     case memoryAssociation = "memory_association"
     case conversationOutcome = "conversation_outcome"
     case cognitiveActionOutcome = "cognitive_action_outcome"
+    case activeVisualObservation = "active_visual_observation"
     case elapsedTime = "elapsed_time"
 
     public var demandsImmediateReflection: Bool {
         switch self {
         case .personArrived, .personDeparted, .directSocialBid,
-             .objectPresentation, .sceneTransition, .conversationOutcome:
+             .objectPresentation, .sceneTransition, .conversationOutcome,
+             .activeVisualObservation:
             true
-        case .ordinaryObservation, .memoryAssociation, .cognitiveActionOutcome, .elapsedTime:
+        case .ordinaryObservation, .memoryAssociation, .cognitiveActionOutcome,
+             .elapsedTime:
             false
         }
     }
@@ -490,6 +493,26 @@ public struct MentalIntention: Codable, Equatable, Identifiable, Sendable {
         guard hasPostDispatchEvidence(evidenceIDs) else { return false }
         guard executedAt != nil else { return true }
         return lastDispatchedActionFingerprint != actionFingerprint.lowercased()
+    }
+
+    /// Stable semantic identity for an unresolved goal. A visual target may
+    /// have only one active inspection episode at a time; other goals use their
+    /// normalized domain, objective, and completion boundary.
+    public var semanticKey: String {
+        if let target = attentionTargetLabel,
+           !Self.normalizedSemanticComponent(target).isEmpty {
+            return "attention:\(Self.normalizedSemanticComponent(target))"
+        }
+        return [domain, objective, completionCondition ?? ""]
+            .map(Self.normalizedSemanticComponent)
+            .joined(separator: "|")
+    }
+
+    private static func normalizedSemanticComponent(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 }
 
@@ -1121,10 +1144,35 @@ public actor PersistentMentalWorkspace {
         }
 
         var intentions = state.intentions
-        if let intention = update.intention,
-           !intentions.contains(where: { $0.id == intention.id }) {
-            intentions.append(intention)
-            changes.append("intention_created:\(intention.id.uuidString.lowercased())")
+        var effectiveIntention = update.intention
+        if let proposed = update.intention {
+            if let index = intentions.firstIndex(where: {
+                $0.completedAt == nil && $0.semanticKey == proposed.semanticKey
+            }) {
+                let existing = intentions[index]
+                let merged = MentalIntention(
+                    id: existing.id,
+                    domain: existing.domain,
+                    objective: existing.objective,
+                    completionCondition: existing.completionCondition,
+                    attentionTargetLabel: existing.attentionTargetLabel,
+                    pressure: max(existing.pressure, proposed.pressure),
+                    evidenceIDs: existing.evidenceIDs + proposed.evidenceIDs + update.evidenceIDs,
+                    createdAt: existing.createdAt,
+                    executedAt: existing.executedAt,
+                    dispatchEvidenceIDs: existing.dispatchEvidenceIDs,
+                    lastDispatchedActionFingerprint: existing.lastDispatchedActionFingerprint,
+                    completedAt: existing.completedAt
+                )
+                intentions[index] = merged
+                effectiveIntention = merged
+                if existing.id != proposed.id {
+                    changes.append("intention_coalesced:\(existing.id.uuidString.lowercased())")
+                }
+            } else if !intentions.contains(where: { $0.id == proposed.id }) {
+                intentions.append(proposed)
+                changes.append("intention_created:\(proposed.id.uuidString.lowercased())")
+            }
         }
         let episodeStatus: MentalThoughtEpisodeStatus
         switch update.continuity {
@@ -1141,7 +1189,7 @@ public actor PersistentMentalWorkspace {
                 id: existing.id,
                 rootThoughtID: existing.rootThoughtID,
                 currentThoughtID: candidateID,
-                goalEpisodeID: update.intention?.id ?? existing.goalEpisodeID,
+                goalEpisodeID: effectiveIntention?.id ?? existing.goalEpisodeID,
                 status: episodeStatus,
                 evidenceIDs: existing.evidenceIDs + update.evidenceIDs,
                 startedAt: existing.startedAt,
@@ -1153,7 +1201,7 @@ public actor PersistentMentalWorkspace {
                 id: candidateEpisodeID,
                 rootThoughtID: candidateID,
                 currentThoughtID: candidateID,
-                goalEpisodeID: update.intention?.id,
+                goalEpisodeID: effectiveIntention?.id,
                 status: episodeStatus,
                 evidenceIDs: update.evidenceIDs,
                 startedAt: date,
@@ -1162,7 +1210,7 @@ public actor PersistentMentalWorkspace {
             changes.append("thought_episode_created:\(candidateEpisodeID.uuidString.lowercased())")
         }
         if episodeStatus == .retired {
-            let goalID = update.intention?.id
+            let goalID = effectiveIntention?.id
                 ?? episodes.first(where: { $0.id == candidateEpisodeID })?.goalEpisodeID
             if let goalID,
                let intentionIndex = intentions.firstIndex(where: {

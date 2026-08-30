@@ -19,6 +19,9 @@ public enum SOMASessionCapabilityScope: Equatable, Sendable {
     /// embeddings, raw frames, or transcript text.
     case identityRoster
     case identityManagement
+    /// External work may read or change resources outside SOMA's embodied
+    /// sensor loop, so only the local administrator can delegate or inspect it.
+    case externalTaskDelegation
     case embodimentControl
     /// Records a privacy-bounded outcome from a tool call made by this live
     /// session. It grants no additional read, write, or motor authority.
@@ -40,6 +43,7 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
     case personContextDenied
     case identityRosterDenied
     case identityManagementDenied
+    case externalTaskDelegationDenied
     case embodimentDenied
     case currentParticipantTurnRequired
 
@@ -51,6 +55,7 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
         case .personContextDenied: "This session may access only its own person context"
         case .identityRosterDenied: "Only the local administrator may read the identity roster"
         case .identityManagementDenied: "Only the local administrator may enroll or remove local identities"
+        case .externalTaskDelegationDenied: "Only the local administrator may delegate or inspect external tasks"
         case .embodimentDenied: "Only the local administrator may control SOMA embodiment"
         case .currentParticipantTurnRequired: "This cognitive action requires the current participant turn"
         }
@@ -179,6 +184,10 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
             return grant.authority == .administrator
                 ? .success(())
                 : .failure(.identityManagementDenied)
+        case .externalTaskDelegation:
+            return grant.authority == .administrator
+                ? .success(())
+                : .failure(.externalTaskDelegationDenied)
         case .embodimentControl:
             // Looking, tracking, exploring, and brief expression are SOMA's
             // ordinary embodied conversation, not administrator-only work.

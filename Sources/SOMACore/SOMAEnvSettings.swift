@@ -12,6 +12,10 @@ import Foundation
 /// surface are preserved when the Control Center saves the file.
 public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     public static let currentSchemaVersion = 1
+    public static let defaultOllamaHost = "http://127.0.0.1:11434"
+    public static let defaultL1Model = "gemma4:31b-cloud"
+    public static let defaultEyeContactFreshnessMilliseconds = 450.0
+    public static let supportedCuriosityIntervals: Set<Double> = [6, 12, 24, 168]
 
     public var schemaVersion: Int
 
@@ -101,8 +105,8 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
     public init(
         schemaVersion: Int = SOMAEnvSettings.currentSchemaVersion,
         ollamaAPIKey: String = "",
-        ollamaHost: String = "http://127.0.0.1:11434",
-        l1Model: String = "gemma4:31b-cloud",
+        ollamaHost: String = SOMAEnvSettings.defaultOllamaHost,
+        l1Model: String = SOMAEnvSettings.defaultL1Model,
         l0TrackingEnabled: Bool = true,
         l0ExploreEnabled: Bool = true,
         l0FaceFixationReleaseSeconds: Double = 0,
@@ -115,7 +119,7 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         l0E2BWakeConfidence: Double = 0.55,
         l0E2BWakeIntervalMilliseconds: Double = 5_000,
         l05Enabled: Bool = true,
-        l0EyeContactFreshnessMilliseconds: Double = 450,
+        l0EyeContactFreshnessMilliseconds: Double = SOMAEnvSettings.defaultEyeContactFreshnessMilliseconds,
         l0EyeContactPupilThreshold: Double = 0.9,
         l0YoloConfidenceThreshold: Double = 0.5,
         memoryShortTermRetentionHours: Double = 24,
@@ -130,26 +134,96 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         self.l1Model = l1Model
         self.l0TrackingEnabled = l0TrackingEnabled
         self.l0ExploreEnabled = l0ExploreEnabled
-        self.l0FaceFixationReleaseSeconds = max(l0FaceFixationReleaseSeconds, 0)
-        self.l1ReasoningCadenceSeconds = min(max(l1ReasoningCadenceSeconds, 30), 600)
+        self.l0FaceFixationReleaseSeconds = l0FaceFixationReleaseSeconds
+        self.l1ReasoningCadenceSeconds = l1ReasoningCadenceSeconds
         self.l1CuriosityCollectionEnabled = l1CuriosityCollectionEnabled
         self.l1CollectionIntervalHours = l1CollectionIntervalHours
-        self.l1SpokenOpeningTendency = min(max(l1SpokenOpeningTendency, 0), 1)
+        self.l1SpokenOpeningTendency = l1SpokenOpeningTendency
         self.l1DefaultLanguage = l1DefaultLanguage
-        self.l0E2BWakeScore = min(max(l0E2BWakeScore, 0), 1)
-        self.l0E2BWakeConfidence = min(max(l0E2BWakeConfidence, 0), 1)
-        self.l0E2BWakeIntervalMilliseconds = max(l0E2BWakeIntervalMilliseconds, 1_000)
+        self.l0E2BWakeScore = l0E2BWakeScore
+        self.l0E2BWakeConfidence = l0E2BWakeConfidence
+        self.l0E2BWakeIntervalMilliseconds = l0E2BWakeIntervalMilliseconds
         self.l05Enabled = l05Enabled
-        self.l0EyeContactFreshnessMilliseconds = min(max(l0EyeContactFreshnessMilliseconds, 100), 2_000)
-        self.l0EyeContactPupilThreshold = min(max(l0EyeContactPupilThreshold, 0.1), 2.0)
-        self.l0YoloConfidenceThreshold = min(max(l0YoloConfidenceThreshold, 0.1), 0.95)
-        self.memoryShortTermRetentionHours = min(max(memoryShortTermRetentionHours, 1), 24)
+        self.l0EyeContactFreshnessMilliseconds = l0EyeContactFreshnessMilliseconds
+        self.l0EyeContactPupilThreshold = l0EyeContactPupilThreshold
+        self.l0YoloConfidenceThreshold = l0YoloConfidenceThreshold
+        self.memoryShortTermRetentionHours = memoryShortTermRetentionHours
         self.l2ProactiveOpeningsEnabled = l2ProactiveOpeningsEnabled
         self.l1OpenWithUnknownIdentity = l1OpenWithUnknownIdentity
-        self.l2CodexSandbox = ["read-only", "workspace-write", "danger-full-access"].contains(l2CodexSandbox)
-            ? l2CodexSandbox
-            : "danger-full-access"
+        self.l2CodexSandbox = l2CodexSandbox
         self.l2CodexAdminOnly = l2CodexAdminOnly
+    }
+
+    public func validate() throws {
+        let host = ollamaHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeHostCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".:_-[]/"))
+        guard host == ollamaHost,
+              host.unicodeScalars.allSatisfy(safeHostCharacters.contains),
+              let components = URLComponents(string: host),
+              ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+              components.host?.isEmpty == false,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.port.map({ (1 ... 65_535).contains($0) }) ?? true,
+              components.path.isEmpty || components.path == "/" else {
+            throw SOMAEnvStoreError.invalidValue("Enter an Ollama base URL such as http://127.0.0.1:11434")
+        }
+        let model = l1Model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowedModelCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._/:@-"))
+        guard model == l1Model,
+              !model.isEmpty,
+              model.count <= 96,
+              model.unicodeScalars.allSatisfy(allowedModelCharacters.contains) else {
+            throw SOMAEnvStoreError.invalidValue("Enter a valid Ollama model name")
+        }
+        let safeSecretCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        guard ollamaAPIKey.isEmpty
+                || ollamaAPIKey.unicodeScalars.allSatisfy(safeSecretCharacters.contains) else {
+            throw SOMAEnvStoreError.invalidValue("The Ollama API key contains unsupported characters")
+        }
+        let languagePattern = #"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$"#
+        guard l1DefaultLanguage.range(of: languagePattern, options: .regularExpression) != nil else {
+            throw SOMAEnvStoreError.invalidValue("Enter a valid default language tag")
+        }
+        guard Self.supportedCuriosityIntervals.contains(l1CollectionIntervalHours) else {
+            throw SOMAEnvStoreError.invalidValue("Choose a supported curiosity collection interval")
+        }
+        guard l0FaceFixationReleaseSeconds.isFinite,
+              (0 ... 120).contains(l0FaceFixationReleaseSeconds),
+              l1ReasoningCadenceSeconds.isFinite,
+              (30 ... 600).contains(l1ReasoningCadenceSeconds),
+              l1SpokenOpeningTendency.isFinite,
+              (0 ... 1).contains(l1SpokenOpeningTendency),
+              l0E2BWakeScore.isFinite,
+              (0.1 ... 0.95).contains(l0E2BWakeScore),
+              l0E2BWakeConfidence.isFinite,
+              (0.1 ... 0.95).contains(l0E2BWakeConfidence),
+              l0E2BWakeIntervalMilliseconds.isFinite,
+              (2_000 ... 60_000).contains(l0E2BWakeIntervalMilliseconds),
+              l0EyeContactFreshnessMilliseconds.isFinite,
+              (100 ... 2_000).contains(l0EyeContactFreshnessMilliseconds),
+              l0EyeContactPupilThreshold.isFinite,
+              (0.5 ... 2).contains(l0EyeContactPupilThreshold),
+              l0YoloConfidenceThreshold.isFinite,
+              (0.1 ... 0.95).contains(l0YoloConfidenceThreshold),
+              memoryShortTermRetentionHours.isFinite,
+              (1 ... 24).contains(memoryShortTermRetentionHours),
+              ["read-only", "workspace-write", "danger-full-access"].contains(l2CodexSandbox) else {
+            throw SOMAEnvStoreError.invalidValue("One or more layer settings are outside their supported range")
+        }
+    }
+
+    public func canonicalizedForPersistence() -> SOMAEnvSettings {
+        var normalized = self
+        normalized.ollamaHost = ollamaHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.ollamaHost.hasSuffix("/") {
+            normalized.ollamaHost.removeLast()
+        }
+        normalized.l1Model = l1Model.trimmingCharacters(in: .whitespacesAndNewlines)
+        normalized.l1DefaultLanguage = l1DefaultLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized
     }
 
     /// Lines written to the `.env` file. Keys that have no value (empty secret)
@@ -217,38 +291,37 @@ public struct SOMAEnvSettings: Codable, Equatable, Sendable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         ollamaAPIKey = try values.decodeIfPresent(String.self, forKey: .ollamaAPIKey) ?? ""
-        ollamaHost = try values.decodeIfPresent(String.self, forKey: .ollamaHost) ?? "http://127.0.0.1:11434"
-        l1Model = try values.decodeIfPresent(String.self, forKey: .l1Model) ?? "gemma4:31b-cloud"
+        ollamaHost = try values.decodeIfPresent(String.self, forKey: .ollamaHost) ?? Self.defaultOllamaHost
+        l1Model = try values.decodeIfPresent(String.self, forKey: .l1Model) ?? Self.defaultL1Model
         l0TrackingEnabled = try values.decodeIfPresent(Bool.self, forKey: .l0TrackingEnabled) ?? true
         l0ExploreEnabled = try values.decodeIfPresent(Bool.self, forKey: .l0ExploreEnabled) ?? true
-        l0FaceFixationReleaseSeconds = max(try values.decodeIfPresent(Double.self, forKey: .l0FaceFixationReleaseSeconds) ?? 0, 0)
-        l1ReasoningCadenceSeconds = min(max(
-            try values.decodeIfPresent(Double.self, forKey: .l1ReasoningCadenceSeconds) ?? 150,
-            30
-        ), 600)
+        l0FaceFixationReleaseSeconds = try values.decodeIfPresent(Double.self, forKey: .l0FaceFixationReleaseSeconds) ?? 0
+        l1ReasoningCadenceSeconds = try values.decodeIfPresent(Double.self, forKey: .l1ReasoningCadenceSeconds) ?? 150
         l1CuriosityCollectionEnabled = try values.decodeIfPresent(Bool.self, forKey: .l1CuriosityCollectionEnabled) ?? true
         l1CollectionIntervalHours = try values.decodeIfPresent(Double.self, forKey: .l1CollectionIntervalHours) ?? 24
-        l1SpokenOpeningTendency = min(max(try values.decodeIfPresent(Double.self, forKey: .l1SpokenOpeningTendency) ?? 0.7, 0), 1)
+        l1SpokenOpeningTendency = try values.decodeIfPresent(Double.self, forKey: .l1SpokenOpeningTendency) ?? 0.7
         l1DefaultLanguage = try values.decodeIfPresent(String.self, forKey: .l1DefaultLanguage) ?? "ko"
-        l0E2BWakeScore = min(max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeScore) ?? 0.65, 0), 1)
-        l0E2BWakeConfidence = min(max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeConfidence) ?? 0.55, 0), 1)
-        l0E2BWakeIntervalMilliseconds = max(try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeIntervalMilliseconds) ?? 5_000, 1_000)
+        l0E2BWakeScore = try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeScore) ?? 0.65
+        l0E2BWakeConfidence = try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeConfidence) ?? 0.55
+        l0E2BWakeIntervalMilliseconds = try values.decodeIfPresent(Double.self, forKey: .l0E2BWakeIntervalMilliseconds) ?? 5_000
         l05Enabled = try values.decodeIfPresent(Bool.self, forKey: .l05Enabled) ?? true
-        l0EyeContactFreshnessMilliseconds = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactFreshnessMilliseconds) ?? 450, 100), 2_000)
-        l0EyeContactPupilThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0EyeContactPupilThreshold) ?? 0.9, 0.1), 2.0)
-        l0YoloConfidenceThreshold = min(max(try values.decodeIfPresent(Double.self, forKey: .l0YoloConfidenceThreshold) ?? 0.5, 0.1), 0.95)
-        memoryShortTermRetentionHours = min(max(try values.decodeIfPresent(Double.self, forKey: .memoryShortTermRetentionHours) ?? 24, 1), 24)
+        l0EyeContactFreshnessMilliseconds = try values.decodeIfPresent(Double.self, forKey: .l0EyeContactFreshnessMilliseconds) ?? Self.defaultEyeContactFreshnessMilliseconds
+        l0EyeContactPupilThreshold = try values.decodeIfPresent(Double.self, forKey: .l0EyeContactPupilThreshold) ?? 0.9
+        l0YoloConfidenceThreshold = try values.decodeIfPresent(Double.self, forKey: .l0YoloConfidenceThreshold) ?? 0.5
+        memoryShortTermRetentionHours = try values.decodeIfPresent(Double.self, forKey: .memoryShortTermRetentionHours) ?? 24
         l2ProactiveOpeningsEnabled = try values.decodeIfPresent(Bool.self, forKey: .l2ProactiveOpeningsEnabled) ?? true
         l1OpenWithUnknownIdentity = try values.decodeIfPresent(Bool.self, forKey: .l1OpenWithUnknownIdentity) ?? false
         let sandbox = try values.decodeIfPresent(String.self, forKey: .l2CodexSandbox) ?? "danger-full-access"
-        l2CodexSandbox = ["read-only", "workspace-write", "danger-full-access"].contains(sandbox) ? sandbox : "danger-full-access"
+        l2CodexSandbox = sandbox
         l2CodexAdminOnly = try values.decodeIfPresent(Bool.self, forKey: .l2CodexAdminOnly) ?? false
+        try validate()
     }
 }
 
 public enum SOMAEnvStoreError: LocalizedError, Equatable, Sendable {
     case corruptEnv
     case insecurePermissions
+    case invalidValue(String)
 
     public var errorDescription: String? {
         switch self {
@@ -256,6 +329,8 @@ public enum SOMAEnvStoreError: LocalizedError, Equatable, Sendable {
             "SOMA .env could not be read"
         case .insecurePermissions:
             "SOMA .env permissions must be owner-only"
+        case let .invalidValue(message):
+            message
         }
     }
 }
@@ -300,37 +375,46 @@ public struct SOMAEnvStore: Sendable {
             }
             values[key] = clean
         }
-        return SOMAEnvSettings(
+        let settings = SOMAEnvSettings(
             ollamaAPIKey: values["OLLAMA_API_KEY"] ?? "",
-            ollamaHost: values["OLLAMA_HOST"] ?? "http://127.0.0.1:11434",
-            l1Model: values["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud",
-            l0TrackingEnabled: boolValue(values["SOMA_L0_TRACKING_ENABLED"], default: true),
-            l0ExploreEnabled: boolValue(values["SOMA_L0_EXPLORE_ENABLED"], default: true),
-            l0FaceFixationReleaseSeconds: doubleValue(values["SOMA_L0_FIXATION_RELEASE_SECONDS"], default: 0),
-            l1ReasoningCadenceSeconds: doubleValue(
+            ollamaHost: values["OLLAMA_HOST"] ?? SOMAEnvSettings.defaultOllamaHost,
+            l1Model: values["SOMA_L1_MODEL"] ?? SOMAEnvSettings.defaultL1Model,
+            l0TrackingEnabled: try boolValue(values["SOMA_L0_TRACKING_ENABLED"], key: "SOMA_L0_TRACKING_ENABLED", default: true),
+            l0ExploreEnabled: try boolValue(values["SOMA_L0_EXPLORE_ENABLED"], key: "SOMA_L0_EXPLORE_ENABLED", default: true),
+            l0FaceFixationReleaseSeconds: try doubleValue(values["SOMA_L0_FIXATION_RELEASE_SECONDS"], key: "SOMA_L0_FIXATION_RELEASE_SECONDS", default: 0),
+            l1ReasoningCadenceSeconds: try doubleValue(
                 values["SOMA_L1_REASONING_CADENCE_SECONDS"] ?? values["SOMA_L1_IDLE_CADENCE_SECONDS"],
+                key: "SOMA_L1_REASONING_CADENCE_SECONDS",
                 default: 150
             ),
-            l1CuriosityCollectionEnabled: boolValue(values["SOMA_L1_CURIOSITY_ENABLED"], default: true),
-            l1CollectionIntervalHours: doubleValue(values["SOMA_L1_CURIOSITY_INTERVAL_HOURS"], default: 24),
-            l1SpokenOpeningTendency: doubleValue(values["SOMA_L1_SPOKEN_OPENING_TENDENCY"], default: 0.7),
+            l1CuriosityCollectionEnabled: try boolValue(values["SOMA_L1_CURIOSITY_ENABLED"], key: "SOMA_L1_CURIOSITY_ENABLED", default: true),
+            l1CollectionIntervalHours: try doubleValue(values["SOMA_L1_CURIOSITY_INTERVAL_HOURS"], key: "SOMA_L1_CURIOSITY_INTERVAL_HOURS", default: 24),
+            l1SpokenOpeningTendency: try doubleValue(values["SOMA_L1_SPOKEN_OPENING_TENDENCY"], key: "SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.7),
             l1DefaultLanguage: values["SOMA_L1_DEFAULT_LANGUAGE"] ?? "ko",
-            l0E2BWakeScore: doubleValue(values["SOMA_L0_E2B_WAKE_SCORE"], default: 0.65),
-            l0E2BWakeConfidence: doubleValue(values["SOMA_L0_E2B_WAKE_CONFIDENCE"], default: 0.55),
-            l0E2BWakeIntervalMilliseconds: doubleValue(values["SOMA_L0_E2B_WAKE_INTERVAL_MS"], default: 5_000),
-            l05Enabled: boolValue(values["SOMA_ENABLE_L05_VLM"], default: true),
-            l0EyeContactFreshnessMilliseconds: doubleValue(values["SOMA_L0_EYE_CONTACT_FRESHNESS_MS"], default: 450),
-            l0EyeContactPupilThreshold: doubleValue(values["SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD"], default: 0.9),
-            l0YoloConfidenceThreshold: doubleValue(values["SOMA_YOLO_CONFIDENCE_THRESHOLD"], default: 0.5),
-            memoryShortTermRetentionHours: doubleValue(values["SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS"], default: 24),
-            l2ProactiveOpeningsEnabled: boolValue(values["SOMA_L2_PROACTIVE_OPENINGS"], default: true),
-            l1OpenWithUnknownIdentity: boolValue(values["SOMA_L1_OPEN_WITH_UNKNOWN"], default: false),
+            l0E2BWakeScore: try doubleValue(values["SOMA_L0_E2B_WAKE_SCORE"], key: "SOMA_L0_E2B_WAKE_SCORE", default: 0.65),
+            l0E2BWakeConfidence: try doubleValue(values["SOMA_L0_E2B_WAKE_CONFIDENCE"], key: "SOMA_L0_E2B_WAKE_CONFIDENCE", default: 0.55),
+            l0E2BWakeIntervalMilliseconds: try doubleValue(values["SOMA_L0_E2B_WAKE_INTERVAL_MS"], key: "SOMA_L0_E2B_WAKE_INTERVAL_MS", default: 5_000),
+            l05Enabled: try boolValue(values["SOMA_ENABLE_L05_VLM"], key: "SOMA_ENABLE_L05_VLM", default: true),
+            l0EyeContactFreshnessMilliseconds: try doubleValue(
+                values["SOMA_L0_EYE_CONTACT_FRESHNESS_MS"],
+                key: "SOMA_L0_EYE_CONTACT_FRESHNESS_MS",
+                default: SOMAEnvSettings.defaultEyeContactFreshnessMilliseconds
+            ),
+            l0EyeContactPupilThreshold: try doubleValue(values["SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD"], key: "SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD", default: 0.9),
+            l0YoloConfidenceThreshold: try doubleValue(values["SOMA_YOLO_CONFIDENCE_THRESHOLD"], key: "SOMA_YOLO_CONFIDENCE_THRESHOLD", default: 0.5),
+            memoryShortTermRetentionHours: try doubleValue(values["SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS"], key: "SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS", default: 24),
+            l2ProactiveOpeningsEnabled: try boolValue(values["SOMA_L2_PROACTIVE_OPENINGS"], key: "SOMA_L2_PROACTIVE_OPENINGS", default: true),
+            l1OpenWithUnknownIdentity: try boolValue(values["SOMA_L1_OPEN_WITH_UNKNOWN"], key: "SOMA_L1_OPEN_WITH_UNKNOWN", default: false),
             l2CodexSandbox: values["SOMA_L2_CODEX_SANDBOX"] ?? "danger-full-access",
-            l2CodexAdminOnly: boolValue(values["SOMA_L2_CODEX_ADMIN_ONLY"], default: false)
+            l2CodexAdminOnly: try boolValue(values["SOMA_L2_CODEX_ADMIN_ONLY"], key: "SOMA_L2_CODEX_ADMIN_ONLY", default: false)
         )
+        try settings.validate()
+        return settings
     }
 
     public func save(_ settings: SOMAEnvSettings) throws {
+        let settings = settings.canonicalizedForPersistence()
+        try settings.validate()
         let fileManager = FileManager.default
         let directoryURL = fileURL.deletingLastPathComponent()
         var unmanagedLines: [String] = []
@@ -396,17 +480,20 @@ public struct SOMAEnvStore: Sendable {
         return key
     }
 
-    private func boolValue(_ raw: String?, default defaultValue: Bool) -> Bool {
+    private func boolValue(_ raw: String?, key: String, default defaultValue: Bool) throws -> Bool {
         guard let raw else { return defaultValue }
         switch raw.lowercased() {
         case "true", "1", "yes", "on": return true
         case "false", "0", "no", "off": return false
-        default: return defaultValue
+        default: throw SOMAEnvStoreError.invalidValue("\(key) must be true or false")
         }
     }
 
-    private func doubleValue(_ raw: String?, default defaultValue: Double) -> Double {
-        guard let raw, let value = Double(raw), value > 0 else { return defaultValue }
+    private func doubleValue(_ raw: String?, key: String, default defaultValue: Double) throws -> Double {
+        guard let raw else { return defaultValue }
+        guard let value = Double(raw), value.isFinite else {
+            throw SOMAEnvStoreError.invalidValue("\(key) must be a finite number")
+        }
         return value
     }
 }

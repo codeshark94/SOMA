@@ -444,7 +444,7 @@ public struct SOMAAdministratorIdentity: Codable, Equatable, Sendable {
 /// User-controlled settings consumed by the local runtime at process launch.
 /// None of the fields contain face embeddings or other raw biometric material.
 public struct SOMAControlSettings: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 11
+    public static let currentSchemaVersion = 13
     public static let defaultRealtimeVoiceSilenceTimeoutSeconds = 60
     public static let realtimeVoiceSilenceTimeoutRange = 15...600
 
@@ -457,6 +457,12 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
     /// User silence closes the account-backed realtime session so an idle
     /// microphone never holds conversation resources indefinitely.
     public var realtimeVoiceSilenceTimeoutSeconds: Int
+    /// Enables durable asynchronous work delegated by the administrator's L2
+    /// session to a local Hermes Agent worker.
+    public var hermesAgentDelegationEnabled: Bool
+    /// Default filesystem context for delegated work. A task may override it
+    /// only with another existing absolute directory.
+    public var hermesAgentWorkspace: String?
     public var led: SOMALEDSettings
     /// These settings only narrow the launch-agent capabilities; they can
     /// never grant motion authority that the service was not launched with.
@@ -470,6 +476,8 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoice: SOMARealtimeVoice = .maple,
         realtimeVoiceRequiresEyeContactForEveryTurn: Bool = false,
         realtimeVoiceSilenceTimeoutSeconds: Int = SOMAControlSettings.defaultRealtimeVoiceSilenceTimeoutSeconds,
+        hermesAgentDelegationEnabled: Bool = true,
+        hermesAgentWorkspace: String? = nil,
         led: SOMALEDSettings = .init(),
         nativeHumanTrackingEnabled: Bool = true,
         autonomousExplorationEnabled: Bool = true,
@@ -483,6 +491,8 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             max(realtimeVoiceSilenceTimeoutSeconds, Self.realtimeVoiceSilenceTimeoutRange.lowerBound),
             Self.realtimeVoiceSilenceTimeoutRange.upperBound
         )
+        self.hermesAgentDelegationEnabled = hermesAgentDelegationEnabled
+        self.hermesAgentWorkspace = Self.normalizedAbsolutePath(hermesAgentWorkspace)
         self.led = led
         self.nativeHumanTrackingEnabled = nativeHumanTrackingEnabled
         self.autonomousExplorationEnabled = autonomousExplorationEnabled
@@ -497,6 +507,8 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         case realtimeVoice
         case realtimeVoiceRequiresEyeContactForEveryTurn
         case realtimeVoiceSilenceTimeoutSeconds
+        case hermesAgentDelegationEnabled
+        case hermesAgentWorkspace
         case led
         case nativeHumanTrackingEnabled
         case autonomousExplorationEnabled
@@ -524,6 +536,13 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoiceSilenceTimeoutSeconds = min(
             max(decodedSilenceTimeout, Self.realtimeVoiceSilenceTimeoutRange.lowerBound),
             Self.realtimeVoiceSilenceTimeoutRange.upperBound
+        )
+        hermesAgentDelegationEnabled = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .hermesAgentDelegationEnabled
+        ) ?? true
+        hermesAgentWorkspace = Self.normalizedAbsolutePath(
+            try values.decodeIfPresent(String.self, forKey: .hermesAgentWorkspace)
         )
         var decodedLED = try values.decodeIfPresent(SOMALEDSettings.self, forKey: .led) ?? .init()
         if sourceVersion < 6,
@@ -569,10 +588,24 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             realtimeVoiceSilenceTimeoutSeconds,
             forKey: .realtimeVoiceSilenceTimeoutSeconds
         )
+        try values.encode(hermesAgentDelegationEnabled, forKey: .hermesAgentDelegationEnabled)
+        try values.encodeIfPresent(
+            Self.normalizedAbsolutePath(hermesAgentWorkspace),
+            forKey: .hermesAgentWorkspace
+        )
         try values.encode(led, forKey: .led)
         try values.encode(nativeHumanTrackingEnabled, forKey: .nativeHumanTrackingEnabled)
         try values.encode(autonomousExplorationEnabled, forKey: .autonomousExplorationEnabled)
         try values.encodeIfPresent(administrator, forKey: .administrator)
+    }
+
+    public static func normalizedAbsolutePath(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/"), !trimmed.contains("\n"), !trimmed.contains("\0") else {
+            return nil
+        }
+        return String(URL(fileURLWithPath: trimmed).standardizedFileURL.path.prefix(1_024))
     }
 }
 

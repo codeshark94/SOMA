@@ -272,6 +272,26 @@ private struct InformationNeedsArguments: Codable {
     }
 }
 
+private struct DelegateHermesTaskArguments: Codable {
+    let title: String
+    let objective: String
+    let workingDirectory: String?
+}
+
+private struct ContinueHermesTaskArguments: Codable {
+    let taskId: UUID
+    let objective: String
+    let title: String?
+}
+
+private struct HermesTaskReferenceArguments: Codable {
+    let taskId: UUID
+}
+
+private struct ListHermesTasksArguments: Codable {
+    let statuses: [HermesAgentTaskStatus]?
+}
+
 private struct CognitiveIntentArguments: Codable {
     let goalEpisodeId: UUID
     let purpose: String
@@ -406,7 +426,8 @@ private final class EmbodimentMCPServer {
             }
             let requestFingerprint = semanticRequestFingerprint(toolName: name, arguments: arguments)
             do {
-                if try cognitiveActionAlreadyRecorded(
+                if L2CognitiveToolPolicy.usesSemanticDeduplication(for: name),
+                   try cognitiveActionAlreadyRecorded(
                     toolName: name,
                     intent: cognitiveIntent,
                     requestFingerprint: requestFingerprint
@@ -424,7 +445,11 @@ private final class EmbodimentMCPServer {
                 return
             }
             do {
-                let reply = try callTool(name: name, arguments: arguments)
+                let reply = try callTool(
+                    name: name,
+                    arguments: arguments,
+                    cognitiveIntent: cognitiveIntent
+                )
                 guard recordCognitiveAction(
                     toolName: name,
                     intent: cognitiveIntent,
@@ -463,7 +488,11 @@ private final class EmbodimentMCPServer {
         }
     }
 
-    private func callTool(name: String, arguments: [String: Any]) throws -> EmbodimentIPCReply {
+    private func callTool(
+        name: String,
+        arguments: [String: Any],
+        cognitiveIntent: L2CognitiveToolIntent
+    ) throws -> EmbodimentIPCReply {
         let sessionAuthorization = try sessionAuthorization(for: name, arguments: arguments)
         let toolArguments = arguments
         switch name {
@@ -544,6 +573,61 @@ private final class EmbodimentMCPServer {
                 .init(
                     kind: .informationNeeds,
                     informationNeeds: try value.request(for: operation),
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        case "delegate_hermes_task":
+            let value: DelegateHermesTaskArguments = try decode(toolArguments)
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .hermesAgentTask,
+                    hermesAgentTask: .init(
+                        operation: .submit,
+                        goalEpisodeID: cognitiveIntent.goalEpisodeID,
+                        title: value.title,
+                        objective: value.objective,
+                        workingDirectory: value.workingDirectory
+                    ),
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        case "continue_hermes_task":
+            let value: ContinueHermesTaskArguments = try decode(toolArguments)
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .hermesAgentTask,
+                    hermesAgentTask: .init(
+                        operation: .continueTask,
+                        taskID: value.taskId,
+                        goalEpisodeID: cognitiveIntent.goalEpisodeID,
+                        title: value.title,
+                        objective: value.objective
+                    ),
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        case "get_hermes_task", "cancel_hermes_task":
+            let value: HermesTaskReferenceArguments = try decode(toolArguments)
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .hermesAgentTask,
+                    hermesAgentTask: .init(
+                        operation: name == "get_hermes_task" ? .get : .cancel,
+                        taskID: value.taskId
+                    ),
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        case "list_hermes_tasks":
+            let value: ListHermesTasksArguments = try decode(toolArguments)
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .hermesAgentTask,
+                    hermesAgentTask: .init(operation: .list, statuses: value.statuses),
                     sessionAuthorization: sessionAuthorization
                 ),
                 socketURL: socketURL
@@ -860,6 +944,12 @@ private final class EmbodimentMCPServer {
             return "A consented present identity was enrolled."
         case "end_conversation":
             return "The active conversation was ended."
+        case "delegate_hermes_task", "continue_hermes_task":
+            return "External work was accepted by the Hermes agent task queue."
+        case "get_hermes_task", "list_hermes_tasks":
+            return "Hermes agent task state was refreshed."
+        case "cancel_hermes_task":
+            return "The Hermes agent task was cancelled."
         default:
             if let reason = reply.decision?.reason, !reason.isEmpty {
                 return "The embodied cognitive action completed: \(bounded(reason))"
@@ -934,6 +1024,9 @@ private final class EmbodimentMCPServer {
             projected["recalled_episodes"] = reply.recalledEpisodes ?? []
         case "list_information_needs", "record_information_need_answer":
             if let needs = reply.informationNeeds { projected["information_needs"] = try? jsonObject(needs) }
+        case "delegate_hermes_task", "continue_hermes_task", "get_hermes_task",
+             "list_hermes_tasks", "cancel_hermes_task":
+            if let task = reply.hermesAgentTask { projected["hermes_agent_task"] = try? jsonObject(task) }
         case "capture_view":
             if let decision = reply.decision { projected["decision"] = try? jsonObject(decision) }
             if let resource = reply.viewResource { projected["view_resource"] = try? jsonObject(resource) }
@@ -1059,6 +1152,11 @@ private final class EmbodimentMCPServer {
             "recall_episodes",
             "list_information_needs",
             "record_information_need_answer",
+            "delegate_hermes_task",
+            "continue_hermes_task",
+            "get_hermes_task",
+            "list_hermes_tasks",
+            "cancel_hermes_task",
         ]
     }
 
@@ -1073,6 +1171,7 @@ private final class EmbodimentMCPServer {
             + identityTools()
             + personContextTools()
             + informationNeedTools()
+            + hermesAgentTools()
             + embodimentControlTools()
     }
 
@@ -1159,6 +1258,33 @@ private final class EmbodimentMCPServer {
                 "motive_id": uuidSchema(),
                 "acquired_fact": stringSchema(maxLength: 1024),
             ], required: ["person_entity_id", "motive_id", "acquired_fact"])),
+        ]
+    }
+
+    private func hermesAgentTools() -> [[String: Any]] {
+        [
+            tool("delegate_hermes_task", "Delegate an explicitly requested external job to the local Hermes Agent. Returns immediately with a durable task ID; it does not imply completion.", objectSchema([
+                "title": stringSchema(maxLength: 160),
+                "objective": stringSchema(maxLength: 24_000),
+                "working_directory": stringSchema(maxLength: 1_024),
+            ], required: ["title", "objective"])),
+            tool("continue_hermes_task", "Continue a completed, failed, or input-blocked Hermes task in its preserved worker session after an explicit administrator request.", objectSchema([
+                "task_id": uuidSchema(),
+                "objective": stringSchema(maxLength: 24_000),
+                "title": stringSchema(maxLength: 160),
+            ], required: ["task_id", "objective"])),
+            tool("get_hermes_task", "Read the current status and actual result of one delegated Hermes task.", objectSchema([
+                "task_id": uuidSchema(),
+            ], required: ["task_id"]), readOnly: true),
+            tool("list_hermes_tasks", "List recent delegated Hermes tasks, optionally filtered by status. Completed entries contain the actual worker result.", objectSchema([
+                "statuses": [
+                    "type": "array", "maxItems": HermesAgentTaskStatus.allCases.count,
+                    "items": ["type": "string", "enum": HermesAgentTaskStatus.allCases.map(\.rawValue)],
+                ],
+            ], required: []), readOnly: true),
+            tool("cancel_hermes_task", "Cancel one queued or running Hermes task after an explicit administrator request.", objectSchema([
+                "task_id": uuidSchema(),
+            ], required: ["task_id"])),
         ]
     }
 

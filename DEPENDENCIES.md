@@ -89,6 +89,12 @@ The cloud model may require the operator to sign in to Ollama. Set
 Git. L2 Live Voice additionally requires the Codex app, a signed-in account,
 and the `realtime_conversation` App Server capability. Set
 `SOMA_ENABLE_L2_LIVE_VOICE=0` when that component is intentionally absent.
+If the Hermes CLI is installed, SOMA auto-detects it at
+`$HOME/.local/bin/hermes` or on `PATH`; `SOMA_HERMES_BINARY` overrides
+discovery. The agent runtime can then execute explicit administrator-delegated
+jobs through its authenticated loopback protocol. Only administrator Live Voice
+threads receive the task capability, and Hermes remains optional for every
+other runtime feature.
 
 Before the first local app installation,
 `scripts/ensure-soma-signing-identity.zsh` creates a ten-year machine-local

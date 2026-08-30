@@ -19,6 +19,8 @@ final class SOMAControlSettingsTests: XCTestCase {
             realtimeVoice: .maple,
             realtimeVoiceRequiresEyeContactForEveryTurn: true,
             realtimeVoiceSilenceTimeoutSeconds: 90,
+            hermesAgentDelegationEnabled: true,
+            hermesAgentWorkspace: "/tmp/soma-worker",
             led: .init(responseMode: .contextual, brightness: 3),
             nativeHumanTrackingEnabled: true,
             autonomousExplorationEnabled: false,
@@ -53,6 +55,8 @@ final class SOMAControlSettingsTests: XCTestCase {
         )
         XCTAssertFalse(migrated.realtimeVoiceRequiresEyeContactForEveryTurn)
         XCTAssertEqual(migrated.realtimeVoiceSilenceTimeoutSeconds, 60)
+        XCTAssertTrue(migrated.hermesAgentDelegationEnabled)
+        XCTAssertNil(migrated.hermesAgentWorkspace)
         XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)
     }
 
@@ -70,6 +74,21 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: JSONEncoder().encode(settings)
         )
         XCTAssertEqual(bounded.realtimeVoiceSilenceTimeoutSeconds, 600)
+    }
+
+    func testHermesAgentSettingsPersistAndNormalizeWorkspace() throws {
+        let settings = SOMAControlSettings(
+            hermesAgentDelegationEnabled: true,
+            hermesAgentWorkspace: "/tmp/../tmp/soma-worker"
+        )
+        let restored = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: JSONEncoder().encode(settings)
+        )
+
+        XCTAssertTrue(restored.hermesAgentDelegationEnabled)
+        XCTAssertEqual(restored.hermesAgentWorkspace, "/tmp/soma-worker")
+        XCTAssertNil(SOMAControlSettings.normalizedAbsolutePath("relative/path"))
     }
 
     func testRealtimeVoicePickerMatchesCodexAppServerV3Contract() {

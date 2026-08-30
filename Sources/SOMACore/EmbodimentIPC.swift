@@ -19,6 +19,7 @@ public enum EmbodimentIPCCommandKind: String, Codable, Equatable, Sendable {
     case cognitiveTurnStarted = "cognitive_turn_started"
     case cognitiveTurnEnded = "cognitive_turn_ended"
     case cognitiveAuthorization = "cognitive_authorization"
+    case hermesAgentTask = "hermes_agent_task"
 }
 
 /// Local-only person-context operations exposed through the same current-user
@@ -201,6 +202,7 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
     public let cognitiveActionQuery: CognitiveActionQuery?
     public let cognitiveAction: CognitiveActionEpisode?
     public let cognitiveAuthorizationBasis: L2CognitiveAuthorizationBasis?
+    public let hermesAgentTask: HermesAgentTaskIPCRequest?
     /// An opaque capability issued by the owning L0 process for one live
     /// participant. It is checked locally and never persists in memory/trace.
     public let sessionAuthorization: String?
@@ -219,6 +221,7 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         cognitiveActionQuery: CognitiveActionQuery? = nil,
         cognitiveAction: CognitiveActionEpisode? = nil,
         cognitiveAuthorizationBasis: L2CognitiveAuthorizationBasis? = nil,
+        hermesAgentTask: HermesAgentTaskIPCRequest? = nil,
         sessionAuthorization: String? = nil,
         indicatorPreset: SOMALEDFirmwarePreset? = nil
     ) {
@@ -232,6 +235,7 @@ public struct EmbodimentIPCCommand: Codable, Equatable, Sendable {
         self.cognitiveActionQuery = cognitiveActionQuery
         self.cognitiveAction = cognitiveAction
         self.cognitiveAuthorizationBasis = cognitiveAuthorizationBasis
+        self.hermesAgentTask = hermesAgentTask
         self.sessionAuthorization = sessionAuthorization.map { String($0.prefix(128)) }
         self.indicatorPreset = indicatorPreset
     }
@@ -249,6 +253,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
     public let identityEnrollment: IdentityEnrollmentResult?
     public let cognitiveActionDuplicate: Bool?
     public let recalledEpisodes: [String]?
+    public let hermesAgentTask: HermesAgentTaskIPCResult?
 
     public init(
         ok: Bool,
@@ -261,7 +266,8 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         identityRoster: IdentityRosterSnapshot? = nil,
         identityEnrollment: IdentityEnrollmentResult? = nil,
         cognitiveActionDuplicate: Bool? = nil,
-        recalledEpisodes: [String]? = nil
+        recalledEpisodes: [String]? = nil,
+        hermesAgentTask: HermesAgentTaskIPCResult? = nil
     ) {
         self.ok = ok
         self.error = error.map { String($0.prefix(240)) }
@@ -274,6 +280,7 @@ public struct EmbodimentIPCReply: Codable, Equatable, Sendable {
         self.identityEnrollment = identityEnrollment
         self.cognitiveActionDuplicate = cognitiveActionDuplicate
         self.recalledEpisodes = recalledEpisodes.map { Array($0.prefix(8)).map { String($0.prefix(1_200)) } }
+        self.hermesAgentTask = hermesAgentTask
     }
 }
 
@@ -349,6 +356,9 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         _ token: String?,
         _ scope: SOMASessionCapabilityScope
     ) -> Result<Void, Error>
+    public typealias HermesAgentTaskProvider = @Sendable (
+        _ request: HermesAgentTaskIPCRequest
+    ) -> Result<HermesAgentTaskIPCResult, Error>
 
     private let socketURL: URL
     private let arbiter: ShadowEmbodimentArbiter
@@ -367,6 +377,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
     private let conversationTerminationHandler: ConversationTerminationHandler
     private let runtimeShutdownHandler: RuntimeShutdownHandler
     private let sessionAuthorizationProvider: SessionAuthorizationProvider
+    private let hermesAgentTaskProvider: HermesAgentTaskProvider
     private let queue = DispatchQueue(label: "soma.embodiment.shadow.socket")
     private let group = DispatchGroup()
     private let stateLock = NSLock()
@@ -393,6 +404,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         runtimeShutdownHandler: @escaping RuntimeShutdownHandler = { .failure(EmbodimentIPCError.unavailable) },
         conversationTerminationHandler: @escaping ConversationTerminationHandler = { _ in .failure(EmbodimentIPCError.unavailable) },
         sessionAuthorizationProvider: @escaping SessionAuthorizationProvider = { _, _ in .success(()) },
+        hermesAgentTaskProvider: @escaping HermesAgentTaskProvider = { _ in .failure(EmbodimentIPCError.unavailable) },
         onHealth: @escaping HealthHandler = { _, _ in }
     ) {
         self.socketURL = socketURL
@@ -411,6 +423,7 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
         self.conversationTerminationHandler = conversationTerminationHandler
         self.runtimeShutdownHandler = runtimeShutdownHandler
         self.sessionAuthorizationProvider = sessionAuthorizationProvider
+        self.hermesAgentTaskProvider = hermesAgentTaskProvider
         self.onHealth = onHealth
     }
 
@@ -506,6 +519,9 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
             }
             if command.kind != .cognitiveAuthorization,
                command.cognitiveAuthorizationBasis != nil {
+                throw EmbodimentIPCError.malformedMessage
+            }
+            if command.kind != .hermesAgentTask, command.hermesAgentTask != nil {
                 throw EmbodimentIPCError.malformedMessage
             }
             switch command.kind {
@@ -796,6 +812,27 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                 }
                 try authorize(command.sessionAuthorization, scope: .cognitiveBasis(basis))
                 writeReply(.init(ok: true), to: clientFD)
+            case .hermesAgentTask:
+                guard command.request == nil,
+                      command.requestID == nil,
+                      command.personContext == nil,
+                      command.informationNeeds == nil,
+                      command.identityRosterQuery == nil,
+                      command.identityEnrollment == nil,
+                      command.indicatorPreset == nil,
+                      command.cognitiveActionQuery == nil,
+                      command.cognitiveAction == nil,
+                      command.cognitiveAuthorizationBasis == nil,
+                      let request = command.hermesAgentTask else {
+                    throw EmbodimentIPCError.malformedMessage
+                }
+                try authorize(command.sessionAuthorization, scope: .externalTaskDelegation)
+                switch hermesAgentTaskProvider(request) {
+                case let .success(result):
+                    writeReply(.init(ok: true, hermesAgentTask: result), to: clientFD)
+                case let .failure(error):
+                    writeReply(.init(ok: false, error: error.localizedDescription), to: clientFD)
+                }
             }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

@@ -51,11 +51,19 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
 
     private struct QueuedEvidence: Sendable {
         let event: MentalEvidenceEvent
+        /// `nil` means use the ordinary event-time current frame. An explicit
+        /// empty array means the event has no valid pixels to attach.
+        let visuals: [L1VisualResource]?
         let completion: (@Sendable (WorkspaceTransition, Bool) -> Void)?
     }
 
     private let queue = DispatchQueue(label: "soma.l1.persistent-consciousness", qos: .utility)
+    private let activeVisionQueue = DispatchQueue(
+        label: "soma.l1.active-vision",
+        qos: .userInitiated
+    )
     private let queueKey = DispatchSpecificKey<UInt8>()
+    private let activeVisionQueueKey = DispatchSpecificKey<UInt8>()
     private let workspace: PersistentMentalWorkspace
     private let checkpointStore: MentalWorkspaceCheckpointStore
     private var reasoner: GemmaConsciousnessRuntime!
@@ -76,6 +84,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     private let onMemoryProposals: @Sendable ([L1MemoryProposal], UUID?) -> Void
     private let activeLanguageProvider: @Sendable () -> String?
     private let toolExecutor: @Sendable (String, String) -> String
+    private let activeVisionExecutor: @Sendable (L1ActiveVisionRequest) -> L1ActiveVisionResult
+    private let activeVisionCancellation = L1ActiveVisionCancellationToken()
 
     private var scheduler = KnownPersonSocialOpportunityScheduler()
     private var presences: [UUID: PresenceState] = [:]
@@ -113,11 +123,13 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         behaviorContextProvider: @escaping @Sendable () -> L1BehaviorContext? = { nil },
         onAttentionAction: @escaping @Sendable (L1ExecutiveAction, String, UInt64) -> Bool = { _, _, _ in false },
         toolExecutor: @escaping @Sendable (String, String) -> String = { _, _ in "{}" },
+        activeVisionExecutor: @escaping @Sendable (L1ActiveVisionRequest) -> L1ActiveVisionResult,
         onCuriosityNeeds: @escaping @Sendable ([L1InformationNeed]) -> Void = { _ in },
         onMemoryProposals: @escaping @Sendable ([L1MemoryProposal], UUID?) -> Void = { _, _ in },
         activeLanguageProvider: @escaping @Sendable () -> String? = { nil }
     ) throws {
         queue.setSpecific(key: queueKey, value: 1)
+        activeVisionQueue.setSpecific(key: activeVisionQueueKey, value: 1)
         self.memoryContext = memoryContext
         self.runtimeContext = runtimeContext
         self.socialAvailability = socialAvailability
@@ -134,6 +146,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         self.onMemoryProposals = onMemoryProposals
         self.activeLanguageProvider = activeLanguageProvider
         self.toolExecutor = toolExecutor
+        self.activeVisionExecutor = activeVisionExecutor
 
         let memoryDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/SOMA/memory", isDirectory: true)
@@ -340,6 +353,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     }
 
     func stop() {
+        activeVisionCancellation.cancel()
         queue.sync {
             stopped = true
             awarenessTimer?.cancel()
@@ -350,6 +364,12 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             presences.removeAll()
             pendingObservations.removeAll()
             evidenceQueue.removeAll()
+        }
+        if DispatchQueue.getSpecific(key: activeVisionQueueKey) == nil {
+            // Cancellation interrupts the 50 ms capture poll. Waiting for this
+            // queue guarantees its defer removed the temporary target before
+            // the embodiment relay can be torn down by the process owner.
+            activeVisionQueue.sync {}
         }
     }
 
@@ -454,11 +474,12 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
 
     private func enqueueEvidence(
         _ event: MentalEvidenceEvent,
+        visuals: [L1VisualResource]? = nil,
         completion: (@Sendable (WorkspaceTransition, Bool) -> Void)? = nil
     ) {
         guard !event.id.isEmpty else { return }
         if evidenceQueue.contains(where: { $0.event.id == event.id }) { return }
-        evidenceQueue.append(.init(event: event, completion: completion))
+        evidenceQueue.append(.init(event: event, visuals: visuals, completion: completion))
         drainEvidenceQueue()
     }
 
@@ -479,7 +500,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                     submitThought(
                         for: event,
                         snapshot: transition.after,
-                        wakeKind: forcedPeriodic ? .periodic : .event
+                        wakeKind: forcedPeriodic ? .periodic : .event,
+                        suppliedVisuals: queued.visuals
                     )
                 }
                 if transition.changed, queued.completion != nil {
@@ -514,7 +536,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     private func submitThought(
         for event: MentalEvidenceEvent,
         snapshot: MentalWorkspaceSnapshot,
-        wakeKind: L1ThoughtWakeKind
+        wakeKind: L1ThoughtWakeKind,
+        suppliedVisuals: [L1VisualResource]? = nil
     ) {
         let entityID = event.subjectEntityID ?? snapshot.context.presentEntityIDs.first
         let memory = entityID.flatMap { cachedMemoryContexts[$0]?.context }
@@ -525,6 +548,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         // while periodic thought must explicitly request visual evidence if its
         // existing hypotheses genuinely require it.
         let visual = wakeKind == .event ? currentFrameProvider() : nil
+        let attachedVisuals = suppliedVisuals ?? [visual].compactMap { $0 }
         let state = entityID.flatMap { presences[$0] }
         let request = L1ThoughtRequest(
             observedAt: Date(),
@@ -541,7 +565,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             spatialContext: environment.spatialContext,
             dailyWorldMemory: environment.dailyWorldMemory,
             visualResourceOffers: environment.visualResourceOffers,
-            visuals: [visual].compactMap { $0 },
+            visuals: attachedVisuals,
             socialOpportunity: state?.opportunity,
             contactPattern: contactIntegrator.snapshot(at: DispatchTime.now().uptimeNanoseconds),
             behaviorContext: behaviorContextProvider(),
@@ -549,7 +573,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             personPreferences: memory?.personPreferences,
             spokenOpeningTendency: min(max(somaEnvDouble("SOMA_L1_SPOKEN_OPENING_TENDENCY", default: 0.7), 0), 1),
             recalledEpisodes: memory?.recalledEpisodes ?? [],
-            perceptionAgeSeconds: perceptionAgeSeconds(of: visual)
+            perceptionAgeSeconds: perceptionAgeSeconds(of: attachedVisuals.first)
         )
         onHealth(
             "thought_wake",
@@ -602,11 +626,40 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                                 "thought_superseded",
                                 "expected_revision=\(expected); actual_revision=\(actual); pending_evidence_is_coalesced=true"
                             )
+                            self?.rebaseVisualThoughtIfNeeded(request)
                         } else {
                             self?.onHealth("thought_held", "reason=\(String(error.localizedDescription.prefix(240)))")
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// A model turn can become stale while high-rate evidence advances the
+    /// workspace. Ordinary observations may be dropped because their scalar
+    /// evidence is already durable, but an active-sensing image exists only in
+    /// its request-scoped memory lease and must follow the newest revision
+    /// until L1a has evaluated it.
+    private func rebaseVisualThoughtIfNeeded(_ request: L1ThoughtRequest) {
+        guard !stopped,
+              !request.visuals.isEmpty,
+              let event = request.evidence.last else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await workspace.currentSnapshot()
+            queue.async { [weak self] in
+                guard let self, !stopped else { return }
+                onHealth(
+                    "visual_thought_rebased",
+                    "from_revision=\(request.workspace.revision); to_revision=\(snapshot.revision); resources=\(request.visuals.count)"
+                )
+                submitThought(
+                    for: event,
+                    snapshot: snapshot,
+                    wakeKind: .event,
+                    suppliedVisuals: request.visuals
+                )
             }
         }
     }
@@ -625,19 +678,24 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             onMemoryProposals(update.memoryProposals, request.socialOpportunity?.entityID)
         }
         if !request.informationNeeds.isEmpty { onCuriosityNeeds(request.informationNeeds) }
-        guard let intention = update.intention,
-              intention.pressure > 0,
-              let storedIntention = transition.after.intentions.first(where: { $0.id == intention.id }),
+        guard let proposedIntention = update.intention,
+              proposedIntention.pressure > 0,
+              let storedIntention = transition.after.intentions.first(where: {
+                  $0.completedAt == nil && (
+                      $0.id == proposedIntention.id
+                          || $0.semanticKey == proposedIntention.semanticKey
+                  )
+              }),
               storedIntention.completedAt == nil,
               let foreground = transition.after.foregroundThought else {
             return
         }
         guard storedIntention.hasPostDispatchEvidence(update.evidenceIDs) else { return }
-        let actions = availableActions(for: request, intention: intention)
+        let actions = availableActions(for: request, intention: storedIntention)
         let executive = L1ExecutiveRequest(
             observedAt: Date(),
             workspaceRevision: transition.after.revision,
-            intention: intention,
+            intention: storedIntention,
             foregroundThought: foreground,
             relatedHypotheses: transition.after.hypotheses.filter {
                 foreground.hypothesisIDs.contains($0.id)
@@ -653,11 +711,11 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             personPreferences: request.personPreferences,
             memorySummaries: request.memory.map(\.summary),
             recalledEpisodes: request.recalledEpisodes,
-            evidenceIDs: intention.evidenceIDs
+            evidenceIDs: storedIntention.evidenceIDs
         )
         onHealth(
             "executive_wake",
-            "revision=\(executive.workspaceRevision); intention=\(intention.id.uuidString.lowercased()); pressure=\(String(format: "%.2f", intention.pressure)); actions=\(actions.map(\.rawValue).joined(separator: ","))"
+            "revision=\(executive.workspaceRevision); intention=\(storedIntention.id.uuidString.lowercased()); pressure=\(String(format: "%.2f", storedIntention.pressure)); actions=\(actions.map(\.rawValue).joined(separator: ","))"
         )
         reasoner.submitExecutive(executive)
     }
@@ -705,6 +763,13 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                         onHealth(
                             "action_held",
                             "action=\(decision.action.rawValue); intention=\(decision.intentionEpisodeID.uuidString.lowercased()); reason=same_action_or_no_new_evidence"
+                        )
+                        return
+                    }
+                    if decision.action == .inspectAttentionTarget {
+                        dispatchActiveVisualInspection(
+                            decision: decision,
+                            request: request
                         )
                         return
                     }
@@ -757,7 +822,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         case .resumeScanning, .seekPeople:
             return onAttentionAction(decision.action, decision.rationale, monotonicNS)
         case .inspectAttentionTarget:
-            return executeInspectionIntention(request.intention)
+            return false
         case .nonverbalInvitation, .spokenOpening:
             guard let opportunity = request.socialOpportunity,
                   var state = presences[opportunity.entityID],
@@ -790,6 +855,108 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         }
     }
 
+    private func dispatchActiveVisualInspection(
+        decision: L1ExecutiveDecision,
+        request: L1ExecutiveRequest
+    ) {
+        guard let targetLabel = request.intention.attentionTargetLabel?.nilIfEmpty else {
+            onHealth(
+                "action_held",
+                "action=inspect_attention_target; intention=\(request.intention.id.uuidString.lowercased()); reason=missing_attention_target"
+            )
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let marked = await workspace.markIntentionExecuted(
+                request.intention.id,
+                using: request.evidenceIDs,
+                actionFingerprint: decision.action.rawValue,
+                at: Date()
+            )
+            guard marked else {
+                onHealth(
+                    "action_held",
+                    "action=inspect_attention_target; intention=\(request.intention.id.uuidString.lowercased()); reason=dispatch_boundary_changed"
+                )
+                return
+            }
+            let saved = await workspace.currentSnapshot()
+            try? await checkpointStore.save(saved)
+            let activeRequest = L1ActiveVisionRequest(
+                intentionID: request.intention.id,
+                objective: request.intention.objective,
+                targetLabel: targetLabel,
+                pressure: request.intention.pressure,
+                evidenceIDs: request.evidenceIDs,
+                cancellation: activeVisionCancellation
+            )
+            queue.async { [weak self] in
+                guard let self, !stopped else { return }
+                onHealth(
+                    "action_applied",
+                    "action=inspect_attention_target; intention=\(request.intention.id.uuidString.lowercased()); phase=capture_dispatched; rationale=\(decision.rationale)"
+                )
+                activeVisionQueue.async { [weak self] in
+                    guard let self else { return }
+                    let result = activeVisionExecutor(activeRequest)
+                    queue.async { [weak self] in
+                        guard let self, !stopped else { return }
+                        recordActiveVisualInspection(result, subjectEntityID: request.context.presentEntityIDs.first)
+                    }
+                }
+            }
+        }
+    }
+
+    private func recordActiveVisualInspection(
+        _ result: L1ActiveVisionResult,
+        subjectEntityID: UUID?
+    ) {
+        let status: CognitiveActionStatus = result.succeeded ? .succeeded : .failed
+        let failure = result.failureReason ?? "none"
+        let summary: String
+        if result.succeeded {
+            summary = "A fresh settled view of the requested \(result.request.targetLabel) target was captured and attached as current visual evidence."
+        } else {
+            summary = "The active visual inspection of \(result.request.targetLabel) produced no usable current view: \(failure)."
+        }
+        let action = CognitiveActionEpisode(
+            goalEpisodeID: result.request.intentionID,
+            sourceLayer: .l1,
+            toolName: "capture_target_view",
+            effect: .reversibleEmbodiment,
+            purpose: result.request.objective,
+            expectedInformationGain: result.request.pressure,
+            evidenceIDs: result.request.evidenceIDs,
+            status: status,
+            resultFingerprint: result.captureRequestID ?? "failed:\(failure)",
+            requestFingerprint: [
+                "l1-active-vision",
+                result.request.intentionID.uuidString.lowercased(),
+                result.request.targetLabel.lowercased(),
+                String(format: "%.1f", result.fieldOfViewDegrees),
+            ].joined(separator: ":"),
+            resultSummary: summary
+        )
+        let event = MentalEvidenceEvent(
+            id: "active-vision:\(action.id.uuidString.lowercased())",
+            observedAt: action.completedAt,
+            kind: .activeVisualObservation,
+            summary: summary,
+            subjectEntityID: subjectEntityID,
+            confidence: result.succeeded ? 1 : 0.8,
+            novelty: result.succeeded ? max(0.6, result.request.pressure) : 0.55,
+            driveSignal: MentalDriveSignal(concern: result.succeeded ? 0 : 0.08),
+            cognitiveAction: action
+        )
+        onHealth(
+            result.succeeded ? "active_vision_completed" : "active_vision_failed",
+            "intention=\(result.request.intentionID.uuidString.lowercased()); target=\(result.request.targetLabel); scene=\(result.sceneID ?? "none"); request=\(result.captureRequestID ?? "none"); fov=\(String(format: "%.1f", result.fieldOfViewDegrees)); reason=\(failure)"
+        )
+        enqueueEvidence(event, visuals: result.visual.map { [$0] } ?? [])
+    }
+
     private func availableActions(
         for request: L1ThoughtRequest,
         intention: MentalIntention
@@ -814,78 +981,6 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         }
         return result
     }
-
-    private func executeInspectionIntention(_ intention: MentalIntention) -> Bool {
-        guard let requestedLabel = intention.attentionTargetLabel?.nilIfEmpty,
-              let inventory = executeTool(
-                  "inspect_scene",
-                  ["reason": "Ground the current inspection intention in fresh L0 scene evidence."]
-              ),
-              inventory["ok"] as? Bool == true,
-              let entities = inventory["scene_entities"] as? [[String: Any]] else {
-            return false
-        }
-        let candidates = entities.filter {
-            ($0["observed_now"] as? Bool) == true
-                && ($0["action_eligible"] as? Bool) == true
-                && (($0["label"] as? String)?.caseInsensitiveCompare(requestedLabel) == .orderedSame)
-        }
-        guard let entity = candidates.max(by: {
-            ($0["confidence"] as? Double ?? 0) < ($1["confidence"] as? Double ?? 0)
-        }),
-        let sceneID = entity["scene_id"] as? String,
-        let label = entity["label"] as? String else {
-            return false
-        }
-        let targetReference = "l1-intention:\(intention.id.uuidString.lowercased())"
-        let reason = String(intention.objective.prefix(320))
-        guard executeTool(
-            "register_attention_target",
-            [
-                "target_reference": targetReference,
-                "scene_id": sceneID,
-                "label": label,
-                "expected_kind": entity["kind"] as? String ?? "unknown",
-                "selection_log_prior": -2 + intention.pressure * 8,
-                "reason": reason,
-            ]
-        )?["ok"] as? Bool == true else {
-            return false
-        }
-        _ = executeTool(
-            "set_target_attention",
-            [
-                "target_reference": targetReference,
-                "selection_log_prior": -2 + intention.pressure * 8,
-                "tracking_commitment": 0.4 + intention.pressure * 0.55,
-                "selection_temperature": 1.2 - intention.pressure * 0.7,
-                "novelty_strength": 0.5,
-                "habituation_strength": 0.5,
-                "reason": reason,
-            ]
-        )
-        return executeTool(
-            "track_attention_target",
-            [
-                "target_reference": targetReference,
-                "motion_style": "attentive",
-                "reacquire_if_occluded": true,
-                "lease_ms": 15_000,
-                "reason": reason,
-            ]
-        )?["ok"] as? Bool == true
-    }
-
-    private func executeTool(_ name: String, _ arguments: [String: Any]) -> [String: Any]? {
-        guard JSONSerialization.isValidJSONObject(arguments),
-              let data = try? JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys]) else {
-            return nil
-        }
-        let response = toolExecutor(name, String(decoding: data, as: UTF8.self))
-        guard let responseData = response.data(using: .utf8) else { return nil }
-        return try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]
-    }
-
 
     private func startAwarenessTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)

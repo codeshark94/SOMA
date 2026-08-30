@@ -1,9 +1,40 @@
 import Foundation
 import SOMACore
 
+struct L1ActiveVisionRequest: Equatable, Sendable {
+    let intentionID: UUID
+    let objective: String
+    let targetLabel: String
+    let pressure: Double
+    let evidenceIDs: [String]
+    let cancellation: L1ActiveVisionCancellationToken
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.intentionID == rhs.intentionID
+            && lhs.objective == rhs.objective
+            && lhs.targetLabel == rhs.targetLabel
+            && lhs.pressure == rhs.pressure
+            && lhs.evidenceIDs == rhs.evidenceIDs
+            && lhs.cancellation === rhs.cancellation
+    }
+}
+
+struct L1ActiveVisionResult: Equatable, Sendable {
+    let request: L1ActiveVisionRequest
+    let captureRequestID: String?
+    let sceneID: String?
+    let visual: L1VisualResource?
+    let fieldOfViewDegrees: Double
+    let failureReason: String?
+
+    var succeeded: Bool { visual != nil && failureReason == nil }
+}
+
 /// In-process endpoint for L1's semantic embodiment tools. It shares the L2
-/// MCP request model but has no access to velocity, device packets, or image transport.
-/// The handler is installed only after the L0 motor adapter exists.
+/// MCP request model but has no access to velocity or device packets. Image
+/// access is restricted to expiring capture resources returned by L0 after a
+/// settled one-shot observation. The handler is installed only after the L0
+/// motor adapter exists.
 final class L1EmbodimentToolRelay: @unchecked Sendable {
     typealias Submitter = @Sendable (CognitiveEmbodimentRequest) -> EmbodimentShadowDecision?
     typealias SnapshotProvider = @Sendable () -> EmbodimentShadowSnapshot?
@@ -53,7 +84,8 @@ final class L1EmbodimentToolRelay: @unchecked Sendable {
     func waitForCapture(
         requestID: String,
         leaseExpiresAtNS: UInt64,
-        maximumWaitMilliseconds: UInt64 = 15_000
+        maximumWaitMilliseconds: UInt64 = 15_000,
+        isCancelled: @Sendable () -> Bool = { false }
     ) -> EmbodimentViewResource? {
         let now = DispatchTime.now().uptimeNanoseconds
         let maximumWaitNS = maximumWaitMilliseconds.multipliedReportingOverflow(by: 1_000_000)
@@ -62,10 +94,12 @@ final class L1EmbodimentToolRelay: @unchecked Sendable {
             maximumWaitNS.overflow ? UInt64.max : now.addingReportingOverflow(maximumWaitNS.partialValue).partialValue
         )
         while DispatchTime.now().uptimeNanoseconds < deadline {
+            if isCancelled() { return nil }
             lock.lock()
             let captureResultProvider = self.captureResultProvider
             lock.unlock()
-            guard let resource = captureResultProvider?(requestID, DispatchTime.now().uptimeNanoseconds) else {
+            guard let captureResultProvider else { return nil }
+            guard let resource = captureResultProvider(requestID, DispatchTime.now().uptimeNanoseconds) else {
                 Thread.sleep(forTimeInterval: 0.05)
                 continue
             }
@@ -531,14 +565,132 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
     /// Returns the one short-lived image produced by the immediately preceding
     /// capture tool call. The local path is never included in the model-facing
     /// tool result or in the scalar runtime trace.
-    func consumeCaptureVisual() -> [L1VisualResource] {
+    func consumeCaptureVisual(requestID: String? = nil) -> [L1VisualResource] {
         visualLock.lock()
         defer { visualLock.unlock() }
         guard !pendingCaptureVisuals.isEmpty else { return [] }
-        return [pendingCaptureVisuals.removeFirst()]
+        guard let requestID else { return [pendingCaptureVisuals.removeFirst()] }
+        let resourceID = "embodiment_capture:\(requestID)"
+        guard let index = pendingCaptureVisuals.firstIndex(where: {
+            $0.resourceID == resourceID
+        }) else { return [] }
+        return [pendingCaptureVisuals.remove(at: index)]
     }
 
-    private func captureTargetView(arguments: [String: Any], reason: String) -> String {
+    /// Closes one L1 active-sensing episode: ground a currently visible target,
+    /// bind it to the semantic motor boundary, acquire a settled frame, and
+    /// return only the expiring visual resource. The per-intention binding is
+    /// removed afterward without releasing unrelated L1 attention state.
+    func performActiveInspection(_ request: L1ActiveVisionRequest) -> L1ActiveVisionResult {
+        let policy = L1ActiveVisionPolicy()
+        guard !request.cancellation.isCancelled else {
+            return activeVisionFailure(request, policy: policy, reason: "capture_cancelled")
+        }
+        guard let snapshot = relay.snapshot() else {
+            return activeVisionFailure(request, policy: policy, reason: "l0_embodiment_unavailable")
+        }
+        guard let target = policy.selectTarget(label: request.targetLabel, from: snapshot.sceneEntities) else {
+            return activeVisionFailure(request, policy: policy, reason: "current_grounded_target_unavailable")
+        }
+        let targetReference = "l1-inspection:\(request.intentionID.uuidString.lowercased())"
+        let reason = String(request.objective.prefix(320))
+        let registration = SemanticTargetRegistration(
+            targetReference: targetReference,
+            sceneID: target.sceneID,
+            label: target.label ?? request.targetLabel,
+            expectedKind: target.kind,
+            initialSelectionLogPrior: -2 + min(max(request.pressure, 0), 1) * 8
+        )
+        guard let submitted = submitDecision(
+            reason: reason,
+            durationMilliseconds: 120_000,
+            operation: .registerTarget(registration)
+        ), submitted.decision.status != .rejected else {
+            return activeVisionFailure(
+                request,
+                policy: policy,
+                sceneID: target.sceneID,
+                reason: "target_registration_rejected"
+            )
+        }
+        defer {
+            _ = submit(
+                reason: "The bounded L1 visual inspection completed.",
+                durationMilliseconds: 1_000,
+                operation: .removeTarget(targetReference)
+            )
+        }
+
+        guard !request.cancellation.isCancelled else {
+            return activeVisionFailure(
+                request,
+                policy: policy,
+                sceneID: target.sceneID,
+                reason: "capture_cancelled"
+            )
+        }
+
+        let response = captureTargetView(arguments: [
+            "target_reference": targetReference,
+            "field_of_view_degrees": policy.fieldOfViewDegrees,
+            "lease_ms": 15_000,
+        ], reason: reason, cancellation: request.cancellation)
+        guard let data = response.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              payload["ok"] as? Bool == true,
+              let captureRequestID = payload["request_id"] as? String else {
+            let failure = response.data(using: .utf8).flatMap {
+                (try? JSONSerialization.jsonObject(with: $0) as? [String: Any])?["error"] as? String
+            } ?? "capture_failed"
+            return activeVisionFailure(
+                request,
+                policy: policy,
+                sceneID: target.sceneID,
+                reason: failure
+            )
+        }
+        guard let visual = consumeCaptureVisual(requestID: captureRequestID).first,
+              let materialized = visual.materializedForInference() else {
+            return activeVisionFailure(
+                request,
+                policy: policy,
+                captureRequestID: captureRequestID,
+                sceneID: target.sceneID,
+                reason: "capture_resource_missing"
+            )
+        }
+        return L1ActiveVisionResult(
+            request: request,
+            captureRequestID: captureRequestID,
+            sceneID: target.sceneID,
+            visual: materialized,
+            fieldOfViewDegrees: policy.fieldOfViewDegrees,
+            failureReason: nil
+        )
+    }
+
+    private func activeVisionFailure(
+        _ request: L1ActiveVisionRequest,
+        policy: L1ActiveVisionPolicy,
+        captureRequestID: String? = nil,
+        sceneID: String? = nil,
+        reason: String
+    ) -> L1ActiveVisionResult {
+        L1ActiveVisionResult(
+            request: request,
+            captureRequestID: captureRequestID,
+            sceneID: sceneID,
+            visual: nil,
+            fieldOfViewDegrees: policy.fieldOfViewDegrees,
+            failureReason: String(reason.prefix(240))
+        )
+    }
+
+    private func captureTargetView(
+        arguments: [String: Any],
+        reason: String,
+        cancellation: L1ActiveVisionCancellationToken? = nil
+    ) -> String {
         let targetReference = string(arguments, "target_reference")
         let bearing = bearing(arguments)
         guard targetReference != nil || bearing != nil else {
@@ -574,11 +726,14 @@ final class L1EmbodimentToolGateway: @unchecked Sendable {
         }
         guard let resource = relay.waitForCapture(
             requestID: decision.requestID,
-            leaseExpiresAtNS: submission.leaseExpiresAtNS
+            leaseExpiresAtNS: submission.leaseExpiresAtNS,
+            isCancelled: { cancellation?.isCancelled ?? false }
         ) else {
             return Self.json([
                 "ok": false,
-                "error": "capture_wait_timeout",
+                "error": cancellation?.isCancelled == true
+                    ? "capture_cancelled"
+                    : "capture_wait_timeout",
                 "request_id": decision.requestID,
             ])
         }
