@@ -292,6 +292,11 @@ private struct ListHermesTasksArguments: Codable {
     let statuses: [HermesAgentTaskStatus]?
 }
 
+private struct ResolveHermesReportOfferArguments: Codable {
+    let taskId: UUID
+    let wantsReport: Bool
+}
+
 private struct CognitiveIntentArguments: Codable {
     let goalEpisodeId: UUID
     let purpose: String
@@ -362,8 +367,8 @@ private final class EmbodimentMCPServer {
             write(result: [
                 "protocolVersion": supportedProtocolVersion,
                 "capabilities": ["tools": ["listChanged": false]],
-                "serverInfo": ["name": "soma-embodiment", "version": "0.3.0"],
-                "instructions": "Leased semantic embodiment control routed to the local SOMA L0 arbiter. Text tool results are interaction context. capture_view returns both an MCP image content block and a short-lived local resource link when a settled frame is ready. Inspect physical_actuation_enabled before assuming a goal can move hardware; L0 always retains route, stabilization, watchdog, and device authority."
+                "serverInfo": ["name": "soma-embodiment", "version": "0.5.0"],
+                "instructions": "Leased SOMA cognition tools routed to the local L0 owner. get_robot_body_state describes only camera, gimbal, and attention state; host-computer work belongs to delegate_hermes_task when explicitly requested by the administrator. capture_view returns an MCP image and a short-lived local resource link. Inspect physical_actuation_enabled before assuming a goal can move hardware; L0 always retains route, stabilization, watchdog, and device authority."
             ], id: id)
         case "notifications/initialized", "notifications/cancelled":
             return
@@ -504,7 +509,7 @@ private final class EmbodimentMCPServer {
                 .init(kind: .endConversation, sessionAuthorization: sessionAuthorization),
                 socketURL: socketURL
             )
-        case "get_embodiment_state", "list_scene_entities", "get_spatial_map":
+        case "get_robot_body_state", "list_scene_entities", "get_spatial_map":
             guard toolArguments.isEmpty else {
                 throw ServerFailure.invalidArguments("\(name) takes no arguments")
             }
@@ -628,6 +633,20 @@ private final class EmbodimentMCPServer {
                 .init(
                     kind: .hermesAgentTask,
                     hermesAgentTask: .init(operation: .list, statuses: value.statuses),
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+            )
+        case "resolve_hermes_report_offer":
+            let value: ResolveHermesReportOfferArguments = try decode(toolArguments)
+            return try EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .hermesAgentTask,
+                    hermesAgentTask: .init(
+                        operation: .resolveReportOffer,
+                        taskID: value.taskId,
+                        wantsReport: value.wantsReport
+                    ),
                     sessionAuthorization: sessionAuthorization
                 ),
                 socketURL: socketURL
@@ -948,6 +967,10 @@ private final class EmbodimentMCPServer {
             return "External work was accepted by the Hermes agent task queue."
         case "get_hermes_task", "list_hermes_tasks":
             return "Hermes agent task state was refreshed."
+        case "resolve_hermes_report_offer":
+            return reply.hermesAgentTask?.reportDecision == .accepted
+                ? "The participant accepted the pending Hermes report and its result was returned."
+                : "The participant declined the pending Hermes report."
         case "cancel_hermes_task":
             return "The Hermes agent task was cancelled."
         default:
@@ -1009,7 +1032,7 @@ private final class EmbodimentMCPServer {
         var projected: [String: Any] = ["ok": reply.ok]
         if let error = reply.error { projected["error"] = error }
         switch toolName {
-        case "get_embodiment_state", "list_scene_entities", "get_spatial_map":
+        case "get_robot_body_state", "list_scene_entities", "get_spatial_map":
             if let snapshot = reply.snapshot { projected["snapshot"] = try? jsonObject(snapshot) }
         case "get_view_capture":
             if let resource = reply.viewResource { projected["view_resource"] = try? jsonObject(resource) }
@@ -1025,7 +1048,7 @@ private final class EmbodimentMCPServer {
         case "list_information_needs", "record_information_need_answer":
             if let needs = reply.informationNeeds { projected["information_needs"] = try? jsonObject(needs) }
         case "delegate_hermes_task", "continue_hermes_task", "get_hermes_task",
-             "list_hermes_tasks", "cancel_hermes_task":
+             "list_hermes_tasks", "cancel_hermes_task", "resolve_hermes_report_offer":
             if let task = reply.hermesAgentTask { projected["hermes_agent_task"] = try? jsonObject(task) }
         case "capture_view":
             if let decision = reply.decision { projected["decision"] = try? jsonObject(decision) }
@@ -1114,7 +1137,7 @@ private final class EmbodimentMCPServer {
     private var knownToolNames: Set<String> {
         return [
             "end_conversation",
-            "get_embodiment_state",
+            "get_robot_body_state",
             "list_scene_entities",
             "get_spatial_map",
             "get_view_capture",
@@ -1157,6 +1180,7 @@ private final class EmbodimentMCPServer {
             "get_hermes_task",
             "list_hermes_tasks",
             "cancel_hermes_task",
+            "resolve_hermes_report_offer",
         ]
     }
 
@@ -1177,7 +1201,7 @@ private final class EmbodimentMCPServer {
 
     private func embodimentStateTools() -> [[String: Any]] {
         [
-            tool("get_embodiment_state", "Read current L0 embodiment lease, target, and policy state for this interaction.", objectSchema([:], required: []), readOnly: true),
+            tool("get_robot_body_state", L2TaskRoutingPolicy.embodimentStateToolDescription, objectSchema([:], required: []), readOnly: true),
             tool("list_scene_entities", "Read the bounded scalar projection of L0's persistent scene entities and semantic bindings for this interaction.", objectSchema([:], required: []), readOnly: true),
             tool("get_spatial_map", "Read L0's bounded spherical coverage atlas, rolling panorama status, remembered scene bearings, and shared gimbal reachability envelope.", objectSchema([:], required: []), readOnly: true),
             tool("get_view_capture", "Read one short-lived capture result by request ID.", objectSchema([
@@ -1263,7 +1287,7 @@ private final class EmbodimentMCPServer {
 
     private func hermesAgentTools() -> [[String: Any]] {
         [
-            tool("delegate_hermes_task", "Delegate an explicitly requested external job to the local Hermes Agent. Returns immediately with a durable task ID; it does not imply completion.", objectSchema([
+            tool("delegate_hermes_task", L2TaskRoutingPolicy.hermesDelegationToolDescription, objectSchema([
                 "title": stringSchema(maxLength: 160),
                 "objective": stringSchema(maxLength: 24_000),
                 "working_directory": stringSchema(maxLength: 1_024),
@@ -1285,6 +1309,10 @@ private final class EmbodimentMCPServer {
             tool("cancel_hermes_task", "Cancel one queued or running Hermes task after an explicit administrator request.", objectSchema([
                 "task_id": uuidSchema(),
             ], required: ["task_id"])),
+            tool("resolve_hermes_report_offer", "Resolve the one controller-authorized pending Hermes report offer after the administrator clearly accepts or declines it. Set wants_report=true only after acceptance; the tool then returns the actual result to report. Set false after a decline and do not reveal the result. Never call this without the matching pending report-offer context.", objectSchema([
+                "task_id": uuidSchema(),
+                "wants_report": ["type": "boolean"],
+            ], required: ["task_id", "wants_report"])),
         ]
     }
 

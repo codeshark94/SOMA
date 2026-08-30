@@ -74,7 +74,7 @@ private enum HermesAgentProtocolRunner {
         onHandle: @escaping @Sendable (HermesAgentProcessHandle) -> Void,
         onSessionOpened: @escaping @Sendable (_ storedSessionID: String) -> Void
     ) async throws -> HermesAgentRunResult {
-        let executable = try discoverExecutable()
+        let runtime = try discoverRuntime()
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("soma-hermes-\(task.id.uuidString.lowercased())", isDirectory: true)
@@ -87,8 +87,8 @@ private enum HermesAgentProtocolRunner {
         let readyURL = temporaryDirectory.appendingPathComponent("ready.json")
 
         let process = Process()
-        process.executableURL = executable
-        process.arguments = ["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"]
+        process.executableURL = URL(fileURLWithPath: runtime.executablePath)
+        process.arguments = runtime.loopbackWorkerArguments
         var environment = ProcessInfo.processInfo.environment
         environment["HERMES_DASHBOARD_SESSION_TOKEN"] = token
         environment["HERMES_DESKTOP_READY_FILE"] = readyURL.path
@@ -124,6 +124,7 @@ private enum HermesAgentProtocolRunner {
         let session = try await openSession(
             socket: socket,
             task: task,
+            profileName: runtime.profileName,
             resumeStoredSessionID: resumeStoredSessionID
         )
         onSessionOpened(session.storedID)
@@ -139,12 +140,34 @@ private enum HermesAgentProtocolRunner {
         )
 
         var submitAccepted = false
+        var workspaceAnchorRequested = false
+        var workspaceAnchored = false
+        var completedText: String?
         let deadline = Date().addingTimeInterval(2 * 60 * 60)
         while Date() < deadline {
             let value = try await receiveObject(socket)
             if let id = value["id"] as? Int, id == promptID {
                 if let error = rpcError(value) { throw HermesAgentRunnerError.rpc(error) }
                 submitAccepted = true
+                try await sendRPC(
+                    socket: socket,
+                    id: 3,
+                    method: "session.workspace.move",
+                    params: [
+                        "session_key": session.storedID,
+                        "cwd": task.workingDirectory,
+                        "profile": runtime.profileName,
+                    ]
+                )
+                workspaceAnchorRequested = true
+                continue
+            }
+            if let id = value["id"] as? Int, id == 3 {
+                if let error = rpcError(value) { throw HermesAgentRunnerError.rpc(error) }
+                workspaceAnchored = true
+                if let completedText {
+                    return HermesAgentRunResult(storedSessionID: session.storedID, text: completedText)
+                }
                 continue
             }
             guard value["method"] as? String == "event",
@@ -157,7 +180,11 @@ private enum HermesAgentProtocolRunner {
                 if status == "complete",
                    let text = payload["text"] as? String,
                    !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return HermesAgentRunResult(storedSessionID: session.storedID, text: text)
+                    if workspaceAnchored {
+                        return HermesAgentRunResult(storedSessionID: session.storedID, text: text)
+                    }
+                    completedText = text
+                    continue
                 }
                 let message = payload["error"] as? String
                     ?? payload["text"] as? String
@@ -168,14 +195,17 @@ private enum HermesAgentProtocolRunner {
                 throw HermesAgentRunnerError.rpc("worker_requires_input: \(type)")
             }
         }
+        if completedText != nil, workspaceAnchorRequested, !workspaceAnchored {
+            throw HermesAgentRunnerError.rpc("workspace_anchor_not_confirmed")
+        }
         throw submitAccepted ? HermesAgentRunnerError.taskTimeout : HermesAgentRunnerError.rpc("prompt_not_accepted")
     }
 
-    private static func discoverExecutable() throws -> URL {
-        guard let path = HermesAgentRuntimeConfiguration.discover()?.executablePath else {
+    private static func discoverRuntime() throws -> HermesAgentRuntimeConfiguration {
+        guard let runtime = HermesAgentRuntimeConfiguration.discover() else {
             throw HermesAgentRunnerError.executableUnavailable
         }
-        return URL(fileURLWithPath: path)
+        return runtime
     }
 
     private static func waitForPort(at readyURL: URL, process: Process) async throws -> Int {
@@ -195,6 +225,7 @@ private enum HermesAgentProtocolRunner {
     private static func openSession(
         socket: URLSessionWebSocketTask,
         task: HermesAgentTask,
+        profileName: String,
         resumeStoredSessionID: String?
     ) async throws -> (runtimeID: String, storedID: String) {
         let id = 1
@@ -214,6 +245,7 @@ private enum HermesAgentProtocolRunner {
                     "title": task.title,
                     "cwd": task.workingDirectory,
                     "source": "soma",
+                    "profile": profileName,
                     "reasoning_effort": "medium",
                 ]
             )
@@ -327,9 +359,10 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
                           let title = normalized(request.title, limit: 160) else {
                         throw HermesAgentCoordinatorError(message: "hermes_task_request_invalid")
                     }
-                    if let existing = tasks.last(where: {
-                        $0.goalEpisodeID == goalEpisodeID && $0.parentTaskID == nil && $0.objective == objective
-                    }) {
+                    if let existing = HermesAgentTaskDeduplication.rootTask(
+                        for: goalEpisodeID,
+                        in: tasks
+                    ) {
                         return .success(.init(task: existing, deduplicated: true))
                     }
                     let directory = try validatedDirectory(request.workingDirectory)
@@ -398,6 +431,30 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
                     try persist()
                     startNextIfNeeded()
                     return .success(.init(task: tasks[index]))
+                case .markReportOffered:
+                    guard let taskID = request.taskID,
+                          let index = tasks.firstIndex(where: { $0.id == taskID }) else {
+                        throw HermesAgentCoordinatorError(message: "hermes_report_offer_invalid")
+                    }
+                    tasks[index] = try HermesAgentReportWorkflow.markOffered(tasks[index])
+                    try persist()
+                    return .success(.init(task: tasks[index]))
+                case .resolveReportOffer:
+                    guard let taskID = request.taskID,
+                          let wantsReport = request.wantsReport,
+                          let index = tasks.firstIndex(where: { $0.id == taskID }) else {
+                        throw HermesAgentCoordinatorError(message: "hermes_report_offer_resolution_invalid")
+                    }
+                    let resolution = try HermesAgentReportWorkflow.resolve(
+                        tasks[index],
+                        wantsReport: wantsReport
+                    )
+                    tasks[index] = resolution.task
+                    try persist()
+                    return .success(.init(
+                        reportDecision: resolution.task.reportDecision,
+                        reportResult: resolution.result
+                    ))
                 case .markReported:
                     guard let taskID = request.taskID,
                           let index = tasks.firstIndex(where: { $0.id == taskID }),
@@ -414,9 +471,9 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
         }
     }
 
-    func pendingCompletedTasks() -> [HermesAgentTask] {
+    func pendingReportOffers() -> [HermesAgentTask] {
         queue.sync {
-            Array(tasks.reversed().filter { $0.status == .completed && $0.reportedAt == nil }.prefix(8))
+            Array(HermesAgentReportWorkflow.pendingOffers(in: Array(tasks.reversed())).prefix(8))
         }
     }
 

@@ -897,6 +897,9 @@ private struct SOMASettingsView: View {
                 Text("L2 submits an explicit job and receives a task ID immediately. The owner-only runtime keeps the job alive after voice closes, stores its result encrypted, and makes that result available for reporting in the current or next conversation.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text("Jobs run through Hermes' primary computer-supervisor profile and remain attached to the selected workspace instead of falling into Home.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             SettingsCard(title: "LED response", subtitle: "Set global visibility and brightness for the hardware indicator.") {
                 Picker("Reaction", selection: ledModeBinding) {

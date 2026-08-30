@@ -14,6 +14,7 @@ final class HermesAgentRuntimeTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration?.executablePath, executable)
+        XCTAssertEqual(configuration?.profileName, "default")
     }
 
     func testInvalidExplicitOverrideDisablesDiscovery() {
@@ -37,5 +38,18 @@ final class HermesAgentRuntimeTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration?.executablePath, "/Users/test/.local/bin/hermes")
+        XCTAssertEqual(configuration?.profileName, "default")
+    }
+
+    func testLoopbackWorkerAlwaysPinsThePrimaryComputerSupervisor() {
+        let configuration = HermesAgentRuntimeConfiguration(executablePath: "/usr/local/bin/hermes")
+
+        XCTAssertEqual(
+            configuration.loopbackWorkerArguments,
+            [
+                "--profile", "default",
+                "serve", "--host", "127.0.0.1", "--port", "0", "--skip-build",
+            ]
+        )
     }
 }

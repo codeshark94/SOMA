@@ -195,16 +195,36 @@ and result fingerprint return to the mental workspace. That closes the
 perception–thought–action loop without duplicating successful equivalent calls
 or persisting raw tool payloads.
 
-Hermes is the worker for longer external jobs. L2 submits one bounded objective,
-receives a durable task ID immediately, and continues the spoken conversation
-without waiting. The owner-only SOMA runtime starts a Hermes Agent session,
+Hermes is the worker for external jobs that can proceed independently of the
+spoken exchange. When delegation is enabled, L2 separates direct conversation
+and SOMA embodiment from explicit administrator work involving the host Mac,
+files, repositories, coding, services, or research; the administrator does not
+need to name Hermes. L2 submits one bounded objective, receives a durable task
+ID immediately, acknowledges the accepted handoff aloud, and continues the
+spoken conversation without waiting. The acknowledgement never reads the
+internal task ID. If the model finishes the successful tool turn silently, the
+Live Voice controller emits the same one-time acknowledgement in the person's
+preferred language; an acknowledgement already spoken by the model is not
+duplicated. The owner-only SOMA runtime starts a Hermes Agent session,
 stores the task state and result in an encrypted bounded checkpoint, and
 retrieves the real completion event. If the same L2 conversation is still open,
 the result is returned as trusted controller context and L2 reports it in the
-participant's language. Otherwise it remains available through task-status
-tools for a later conversation. Continuations resume the same Hermes session;
-cancel and new work require an explicit administrator request. Participant
-sessions cannot submit, inspect, or cancel external tasks.
+participant's language. If that conversation has ended, the result stays
+private until the recognized administrator is present; SOMA asks once whether
+to report it, discloses it only after acceptance, and records either decision so
+the offer cannot loop. Continuations resume the same Hermes session; cancel and
+new work require an explicit administrator request. Participant sessions cannot
+submit, inspect, resolve report offers, or cancel external tasks.
+
+SOMA uses Hermes's authenticated loopback worker WebSocket, which preserves
+tool events and stored-session identity and makes the worker session visible in
+Hermes Desktop. The separate **Messaging → API server** toggle exposes an
+OpenAI-compatible endpoint for generic frontends; it is not required for the
+SOMA worker connection. Delegation is explicitly bound to Hermes's primary
+(`default`) computer-supervisor profile. Before accepting completion, SOMA also
+anchors the stored worker session to its selected workspace so it remains under
+the correct project instead of falling into Hermes Desktop's synthetic Home
+bucket.
 
 ## Memory as continuity, not a transcript dump
 

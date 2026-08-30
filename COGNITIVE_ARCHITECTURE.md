@@ -511,7 +511,7 @@ shadow-only, while the authorized persistent launcher reports `mode=active`.
 The current executable is `soma-embodiment`. It implements the MCP lifecycle
 and tool calls over newline-delimited stdio, then forwards one bounded request
 per connection to the L0 socket. The deployed surface contains
-`get_embodiment_state`, `list_scene_entities`, `get_spatial_map`,
+`get_robot_body_state`, `list_scene_entities`, `get_spatial_map`,
 `get_view_capture`,
 `register_semantic_target`, `remove_semantic_target`,
 `set_attention_policy`, `track_target`, `orient_to`,
@@ -727,7 +727,24 @@ Voice process. The administrator's L2 session calls the local
   worker result;
 - `continue_hermes_task` resumes the stored Hermes session with a new explicit
   instruction; and
-- `cancel_hermes_task` terminates queued or running work.
+- `cancel_hermes_task` terminates queued or running work; and
+- `resolve_hermes_report_offer` records the administrator's explicit yes/no
+  response and returns the actual result only after acceptance.
+
+At session start L2 receives one execution-domain contract that distinguishes
+direct conversation, SOMA perception/embodiment, and external worker jobs.
+Host operating-system state, shell/process work, files, repositories, coding,
+services, APIs, and research belong to the external domain when the
+administrator explicitly requests the outcome. `get_robot_body_state` is
+reserved for the robot body's L0 lease, attention target, and policy; it cannot
+stand in for host-computer inspection. A successful submission ends the tool
+turn immediately, leaves Live Voice listening, and never polls the worker from
+the spoken response path. L2 then gives one short spoken acceptance without
+reading the durable task ID. `turn/completed` is the protocol boundary: when it
+contains a completed `delegate_hermes_task` call but no assistant audio was
+observed for that turn, the controller injects one localized
+`SOMA_HERMES_DELEGATION_ACCEPTED` event. Turn identity makes this fallback
+idempotent, while any acknowledgement already spoken suppresses it.
 
 Submission, continuation, cancellation, and every task read require an active
 administrator capability. Side-effecting operations additionally require a
@@ -744,12 +761,28 @@ Hermes stored-session identifier is checkpointed as soon as the session opens,
 so an interrupted job or a clarification requirement can continue in the same
 worker context. A task is never called complete from process exit, an ACK, or
 an L2 prediction: only the final Hermes protocol event supplies the result.
+This WebSocket worker protocol is distinct from Hermes Desktop's optional
+OpenAI-compatible Messaging API server. The latter is intended for generic
+chat frontends and does not provide SOMA's task-event and stored-session
+contract, so SOMA does not require that toggle or its bearer key.
+
+The worker explicitly selects Hermes's primary `default` profile, the
+machine-level supervisor rather than a specialist project profile. After the
+first prompt is admitted, SOMA confirms `session.workspace.move` against the
+stored session before accepting completion. This synchronous workspace anchor
+persists repository identity even though the per-task backend exits, preventing
+Hermes Desktop from misclassifying delegated jobs under Home.
 
 If Live Voice is still active when the task completes, the runtime injects a
 `SOMA_HERMES_TASK_RESULT` controller envelope through App Server realtime text.
 The envelope is explicitly not participant speech; L2 reports the bounded
 result in the participant's language. If no session is active, the completed
-record remains pending for later retrieval.
+record remains pending. Once the enrolled administrator is present and no Live
+Voice session is active, SOMA opens one controller-originated report offer in
+the person's preferred language. The task ID remains private context. A clear
+acceptance resolves the offer and returns the stored result to L2; a decline
+resolves it without exposing the result. Offered and resolved states are
+checkpointed so a completed task cannot repeatedly solicit the administrator.
 
 ## L2 voice and Codex account integration
 
@@ -786,9 +819,15 @@ list, and negotiates V3 WebRTC under the existing ChatGPT account. L0 batches it
 already captured OBSBOT PCM into 60 ms packets and feeds a persistent Web Audio
 worklet on that peer connection, including a bounded one-second memory-only
 pre-roll. There is no Accessibility shortcut and no second microphone capture.
-The remote WebRTC audio track is played directly. GPT-Live owns multilingual recognition,
-interruption handling, spoken output, and Codex response handoff. SOMA does not
-persist raw audio. Each finalized Live transcript turn is written into the
+GPT-Live owns multilingual recognition, spoken output, and Codex response
+handoff. The remote WebRTC audio track passes through a short Web Audio delay
+line that emits its exact PCM into a memory-only echo reference before the
+same samples reach the speaker. During output, the OBSBOT microphone stream must be
+acoustically independent of that delay- and gain-aligned reference before
+visual speaker evidence can admit a barge-in. Ambiguous or matching playback
+stays quarantined; direct gaze remains an optional additional per-turn policy,
+not a universal interruption requirement. Neither reference nor microphone
+audio is persisted. Each finalized Live transcript turn is written into the
 encrypted short-term local journal; no raw transcript enters the scalar trace
 or remote L1 packet. L1 consolidation of those local turns into durable typed
 memories remains a separate pending pass.

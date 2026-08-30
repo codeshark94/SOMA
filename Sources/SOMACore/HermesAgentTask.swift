@@ -15,6 +15,11 @@ public enum HermesAgentTaskStatus: String, Codable, CaseIterable, Sendable {
     }
 }
 
+public enum HermesAgentReportDecision: String, Codable, Equatable, Sendable {
+    case accepted
+    case declined
+}
+
 public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
     public let goalEpisodeID: UUID
@@ -29,6 +34,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
     public let createdAt: Date
     public let updatedAt: Date
     public let completedAt: Date?
+    public let reportOfferAt: Date?
+    public let reportDecision: HermesAgentReportDecision?
     public let reportedAt: Date?
 
     public init(
@@ -45,6 +52,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         completedAt: Date? = nil,
+        reportOfferAt: Date? = nil,
+        reportDecision: HermesAgentReportDecision? = nil,
         reportedAt: Date? = nil
     ) {
         self.id = id
@@ -60,6 +69,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.completedAt = completedAt
+        self.reportOfferAt = reportOfferAt
+        self.reportDecision = reportDecision
         self.reportedAt = reportedAt
     }
 
@@ -69,6 +80,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
         result: String?? = nil,
         error: String?? = nil,
         completedAt: Date?? = nil,
+        reportOfferAt: Date?? = nil,
+        reportDecision: HermesAgentReportDecision?? = nil,
         reportedAt: Date?? = nil,
         at date: Date = Date()
     ) -> Self {
@@ -86,6 +99,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
             createdAt: createdAt,
             updatedAt: date,
             completedAt: completedAt ?? self.completedAt,
+            reportOfferAt: reportOfferAt ?? self.reportOfferAt,
+            reportDecision: reportDecision ?? self.reportDecision,
             reportedAt: reportedAt ?? self.reportedAt
         )
     }
@@ -101,6 +116,8 @@ public enum HermesAgentTaskOperation: String, Codable, Sendable {
     case get
     case list
     case cancel
+    case markReportOffered = "mark_report_offered"
+    case resolveReportOffer = "resolve_report_offer"
     case markReported = "mark_reported"
 }
 
@@ -112,6 +129,7 @@ public struct HermesAgentTaskIPCRequest: Codable, Equatable, Sendable {
     public let objective: String?
     public let workingDirectory: String?
     public let statuses: [HermesAgentTaskStatus]?
+    public let wantsReport: Bool?
 
     public init(
         operation: HermesAgentTaskOperation,
@@ -120,7 +138,8 @@ public struct HermesAgentTaskIPCRequest: Codable, Equatable, Sendable {
         title: String? = nil,
         objective: String? = nil,
         workingDirectory: String? = nil,
-        statuses: [HermesAgentTaskStatus]? = nil
+        statuses: [HermesAgentTaskStatus]? = nil,
+        wantsReport: Bool? = nil
     ) {
         self.operation = operation
         self.taskID = taskID
@@ -129,6 +148,7 @@ public struct HermesAgentTaskIPCRequest: Codable, Equatable, Sendable {
         self.objective = objective.map { String($0.prefix(24_000)) }
         self.workingDirectory = workingDirectory.map { String($0.prefix(1_024)) }
         self.statuses = statuses.map { Array($0.prefix(HermesAgentTaskStatus.allCases.count)) }
+        self.wantsReport = wantsReport
     }
 }
 
@@ -136,11 +156,103 @@ public struct HermesAgentTaskIPCResult: Codable, Equatable, Sendable {
     public let task: HermesAgentTask?
     public let tasks: [HermesAgentTask]
     public let deduplicated: Bool
+    public let reportDecision: HermesAgentReportDecision?
+    public let reportResult: String?
 
-    public init(task: HermesAgentTask? = nil, tasks: [HermesAgentTask] = [], deduplicated: Bool = false) {
+    public init(
+        task: HermesAgentTask? = nil,
+        tasks: [HermesAgentTask] = [],
+        deduplicated: Bool = false,
+        reportDecision: HermesAgentReportDecision? = nil,
+        reportResult: String? = nil
+    ) {
         self.task = task
         self.tasks = Array(tasks.prefix(100))
         self.deduplicated = deduplicated
+        self.reportDecision = reportDecision
+        self.reportResult = reportResult.map { String($0.prefix(96_000)) }
+    }
+}
+
+public enum HermesReportOfferPrompt {
+    public static func question(languageTag: String?) -> String {
+        let language = (languageTag ?? "").lowercased().split(separator: "-").first.map(String.init) ?? ""
+        return switch language {
+        case "ko": "맡겨 주신 작업이 끝났어요. 지금 결과를 보고드릴까요?"
+        case "zh": "您交给我的任务已经完成。现在要听结果吗？"
+        case "ja": "お任せいただいた作業が完了しました。今、結果をご報告しましょうか？"
+        case "es": "La tarea que me encargaste ya terminó. ¿Quieres que te informe del resultado ahora?"
+        case "fr": "La tâche que vous m'avez confiée est terminée. Voulez-vous le résultat maintenant ?"
+        case "de": "Die beauftragte Aufgabe ist abgeschlossen. Soll ich das Ergebnis jetzt berichten?"
+        case "pt": "A tarefa que você me passou terminou. Quer que eu relate o resultado agora?"
+        case "it": "Il compito che mi hai affidato è terminato. Vuoi che ti riferisca il risultato ora?"
+        case "ru": "Порученная задача завершена. Сообщить результат сейчас?"
+        case "ar": "اكتملت المهمة التي طلبتها. هل تريد أن أبلغك بالنتيجة الآن؟"
+        case "hi": "आपने जो काम सौंपा था वह पूरा हो गया है। क्या मैं अभी परिणाम बताऊँ?"
+        default: "The task you asked me to handle is complete. Would you like the result now?"
+        }
+    }
+}
+
+public enum HermesAgentReportWorkflowError: Error, Equatable, Sendable {
+    case unavailable
+    case notOffered
+}
+
+public enum HermesAgentReportWorkflow {
+    public static func pendingOffers(in tasks: [HermesAgentTask]) -> [HermesAgentTask] {
+        tasks.filter {
+            $0.status == .completed
+                && $0.reportedAt == nil
+                && $0.reportOfferAt == nil
+        }
+    }
+
+    public static func markOffered(
+        _ task: HermesAgentTask,
+        at date: Date = Date()
+    ) throws -> HermesAgentTask {
+        guard task.status == .completed, task.reportedAt == nil else {
+            throw HermesAgentReportWorkflowError.unavailable
+        }
+        guard task.reportOfferAt == nil else { return task }
+        return task.updating(reportOfferAt: .some(date), at: date)
+    }
+
+    public static func resolve(
+        _ task: HermesAgentTask,
+        wantsReport: Bool,
+        at date: Date = Date()
+    ) throws -> (task: HermesAgentTask, result: String?) {
+        guard task.status == .completed, task.reportedAt == nil else {
+            throw HermesAgentReportWorkflowError.unavailable
+        }
+        guard task.reportOfferAt != nil else {
+            throw HermesAgentReportWorkflowError.notOffered
+        }
+        let decision: HermesAgentReportDecision = wantsReport ? .accepted : .declined
+        return (
+            task.updating(
+                reportDecision: .some(decision),
+                reportedAt: .some(date),
+                at: date
+            ),
+            wantsReport ? task.result : nil
+        )
+    }
+}
+
+public enum HermesAgentTaskDeduplication {
+    /// One explicit request episode owns at most one root worker. Objective
+    /// wording is model-authored and may vary across retries, so it cannot be
+    /// part of the root idempotency key.
+    public static func rootTask(
+        for goalEpisodeID: UUID,
+        in tasks: [HermesAgentTask]
+    ) -> HermesAgentTask? {
+        tasks.last {
+            $0.goalEpisodeID == goalEpisodeID && $0.parentTaskID == nil
+        }
     }
 }
 

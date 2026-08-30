@@ -1679,6 +1679,85 @@ final class EventImportanceTests: XCTestCase {
         ))
     }
 
+    func testPlaybackReferenceIdentifiesDelayedGainChangedEcho() {
+        var matcher = LiveVoiceEchoReferenceMatcher()
+        let reference = deterministicAudio(count: 24_000, seed: 0xA11CE)
+        matcher.appendReference(reference, sampleRate: 16_000)
+        let microphone = reference[8_000..<16_000].map { $0 * -0.34 }
+        matcher.appendMicrophone(Array(microphone), sampleRate: 16_000)
+
+        let assessment = matcher.assess()
+        XCTAssertEqual(assessment.relationship, .echoDominated)
+        XCTAssertGreaterThan(assessment.maximumCorrelation, 0.9)
+        XCTAssertFalse(assessment.permitsBargeIn)
+    }
+
+    func testPlaybackReferenceAllowsAcousticallyIndependentInterruptionWithoutGaze() {
+        var matcher = LiveVoiceEchoReferenceMatcher()
+        matcher.appendReference(
+            deterministicAudio(count: 24_000, seed: 0xA11CE),
+            sampleRate: 16_000
+        )
+        matcher.appendMicrophone(
+            deterministicAudio(count: 8_000, seed: 0xBADC0DE),
+            sampleRate: 16_000
+        )
+
+        let assessment = matcher.assess()
+        XCTAssertEqual(assessment.relationship, .acousticallyIndependent)
+        XCTAssertLessThan(assessment.maximumCorrelation, 0.2)
+        XCTAssertTrue(assessment.permitsBargeIn)
+        XCTAssertTrue(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+            trackedFaceVisible: true,
+            independentSpeakerEvidence: true,
+            speechEvidenceQualified: true,
+            directContactConfirmed: false,
+            speakerAttributionRejected: false,
+            requiresDirectGaze: false
+        ))
+    }
+
+    func testPlaybackReferenceFailsClosedUntilEnoughAudioExists() {
+        var matcher = LiveVoiceEchoReferenceMatcher()
+        matcher.appendReference([Float](repeating: 0.1, count: 200), sampleRate: 8_000)
+        matcher.appendMicrophone([Float](repeating: 0.1, count: 200), sampleRate: 8_000)
+
+        let assessment = matcher.assess()
+        XCTAssertEqual(assessment.relationship, .insufficientEvidence)
+        XCTAssertFalse(assessment.permitsBargeIn)
+    }
+
+    func testRenderedPlaybackReferencePreemptsAndPermanentlyRejectsUpstreamAudio() {
+        var arbiter = LiveVoicePlaybackReferenceArbiter()
+
+        XCTAssertEqual(
+            arbiter.observe(.appServer),
+            .init(accepted: true, resetsReference: false)
+        )
+        XCTAssertEqual(
+            arbiter.observe(.webRTCPlayback),
+            .init(accepted: true, resetsReference: true)
+        )
+        XCTAssertEqual(
+            arbiter.observe(.appServer),
+            .init(accepted: false, resetsReference: false)
+        )
+        XCTAssertEqual(
+            arbiter.observe(.webRTCPlayback),
+            .init(accepted: true, resetsReference: false)
+        )
+    }
+
+    private func deterministicAudio(count: Int, seed: UInt64) -> [Float] {
+        var state = seed
+        return (0..<count).map { index in
+            state = state &* 6_364_136_223_846_793_005 &+ 1
+            let noise = Float(Double((state >> 32) & 0xFFFF) / 32_767.5 - 1)
+            let carrier = Float(sin(Double(index) * 0.071) * 0.45)
+            return carrier + noise * 0.25
+        }
+    }
+
     func testContradictedSpeakerEpisodeCannotReleaseDuplexCapture() {
         var episode = audiovisualEpisodeGate()
         let initial = episode.observe(

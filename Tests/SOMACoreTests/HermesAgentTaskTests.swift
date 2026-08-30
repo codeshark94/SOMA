@@ -64,6 +64,133 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertEqual(L2CognitiveToolPolicy.autonomy(for: "get_hermes_task"), .epistemic)
         XCTAssertTrue(L2CognitiveToolPolicy.permits(.autonomousGoal, for: "get_hermes_task"))
         XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "get_hermes_task"))
+        XCTAssertEqual(L2CognitiveToolPolicy.autonomy(for: "resolve_hermes_report_offer"), .explicitRequest)
+        XCTAssertTrue(L2CognitiveToolPolicy.permits(.explicitRequest, for: "resolve_hermes_report_offer"))
+        XCTAssertFalse(L2CognitiveToolPolicy.permits(.autonomousGoal, for: "resolve_hermes_report_offer"))
+    }
+
+    func testTaskRoutingSeparatesHostWorkFromRobotEmbodiment() {
+        let enabled = L2TaskRoutingPolicy.instruction(hermesEnabled: true)
+        XCTAssertTrue(enabled.contains("host computer"))
+        XCTAssertTrue(enabled.contains("delegate_hermes_task exactly once"))
+        XCTAssertTrue(enabled.contains("keep listening and converse normally"))
+        XCTAssertTrue(enabled.contains("acknowledge aloud"))
+        XCTAssertTrue(enabled.contains("Do not read the task UUID aloud"))
+        XCTAssertTrue(enabled.contains("Do not substitute get_robot_body_state"))
+        XCTAssertTrue(L2TaskRoutingPolicy.embodimentStateToolDescription.contains("not the host Mac"))
+        XCTAssertTrue(L2TaskRoutingPolicy.hermesDelegationToolDescription.contains("while the voice conversation remains responsive"))
+
+        let disabled = L2TaskRoutingPolicy.instruction(hermesEnabled: false)
+        XCTAssertTrue(disabled.contains("delegation is disabled"))
+        XCTAssertFalse(disabled.contains("call delegate_hermes_task exactly once"))
+    }
+
+    func testDelegationAcknowledgementIsLocalizedAndInjectedOnlyForSilentSuccess() {
+        XCTAssertEqual(
+            HermesDelegationAcknowledgement.phrase(languageTag: "ko-KR"),
+            "컴퓨터 관리자에게 맡겼어요. 끝나면 알려드릴게요."
+        )
+        XCTAssertTrue(
+            HermesDelegationAcknowledgement.controllerEvent(languageTag: "ko-KR")
+                .contains("SOMA_HERMES_DELEGATION_ACCEPTED language=ko-kr")
+        )
+        XCTAssertTrue(HermesDelegationAcknowledgementPolicy.shouldInject(
+            successfulDelegation: true,
+            assistantSpeechObserved: false,
+            alreadyHandled: false
+        ))
+        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldInject(
+            successfulDelegation: true,
+            assistantSpeechObserved: true,
+            alreadyHandled: false
+        ))
+        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldInject(
+            successfulDelegation: false,
+            assistantSpeechObserved: false,
+            alreadyHandled: false
+        ))
+        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldInject(
+            successfulDelegation: true,
+            assistantSpeechObserved: false,
+            alreadyHandled: true
+        ))
+    }
+
+    func testRootHermesSubmissionIsIdempotentAcrossObjectiveParaphrases() {
+        let goalEpisodeID = UUID()
+        let original = HermesAgentTask(
+            goalEpisodeID: goalEpisodeID,
+            title: "Inspect host state",
+            objective: "Count the running SOMA processes.",
+            workingDirectory: "/tmp"
+        )
+        let unrelated = HermesAgentTask(
+            goalEpisodeID: UUID(),
+            title: "Other request",
+            objective: "Read another status.",
+            workingDirectory: "/tmp"
+        )
+        let paraphrasedObjective = "Report how many SOMA processes are currently running."
+        XCTAssertNotEqual(paraphrasedObjective, original.objective)
+
+        XCTAssertEqual(
+            HermesAgentTaskDeduplication.rootTask(
+                for: goalEpisodeID,
+                in: [original, unrelated]
+            ),
+            original
+        )
+    }
+
+    func testCompletedHermesResultIsOfferedOnceAndDisclosedOnlyAfterAcceptance() throws {
+        let completedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let task = HermesAgentTask(
+            goalEpisodeID: UUID(),
+            title: "Inspect runtime",
+            objective: "Inspect the current runtime.",
+            workingDirectory: "/tmp",
+            status: .completed,
+            result: "Verified result",
+            completedAt: completedAt
+        )
+
+        XCTAssertEqual(HermesAgentReportWorkflow.pendingOffers(in: [task]), [task])
+        let offered = try HermesAgentReportWorkflow.markOffered(
+            task,
+            at: completedAt.addingTimeInterval(1)
+        )
+        XCTAssertTrue(HermesAgentReportWorkflow.pendingOffers(in: [offered]).isEmpty)
+        XCTAssertThrowsError(
+            try HermesAgentReportWorkflow.resolve(task, wantsReport: true)
+        ) { error in
+            XCTAssertEqual(error as? HermesAgentReportWorkflowError, .notOffered)
+        }
+
+        let accepted = try HermesAgentReportWorkflow.resolve(
+            offered,
+            wantsReport: true,
+            at: completedAt.addingTimeInterval(2)
+        )
+        XCTAssertEqual(accepted.task.reportDecision, .accepted)
+        XCTAssertEqual(accepted.result, "Verified result")
+        XCTAssertNotNil(accepted.task.reportedAt)
+
+        let declined = try HermesAgentReportWorkflow.resolve(
+            offered,
+            wantsReport: false,
+            at: completedAt.addingTimeInterval(3)
+        )
+        XCTAssertEqual(declined.task.reportDecision, .declined)
+        XCTAssertNil(declined.result)
+    }
+
+    func testHermesReportOfferUsesPreferredLanguage() {
+        XCTAssertEqual(
+            HermesReportOfferPrompt.question(languageTag: "ko-KR"),
+            "맡겨 주신 작업이 끝났어요. 지금 결과를 보고드릴까요?"
+        )
+        XCTAssertTrue(HermesReportOfferPrompt.question(languageTag: "zh-CN").contains("结果"))
+        XCTAssertTrue(HermesReportOfferPrompt.question(languageTag: "en-US").contains("result"))
     }
 
     func testHermesTaskRoundTripsThroughOwnerOnlyIPC() throws {

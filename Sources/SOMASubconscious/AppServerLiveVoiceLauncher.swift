@@ -12,6 +12,7 @@ enum AppServerLiveVoiceEvent: Sendable {
     case interruptedAudioCleared
     case proactiveOpeningTriggered
     case proactiveOpeningExtraOutputSuppressed
+    case hermesReportOfferStarted(taskID: UUID)
     case hearingUser
     case visualContextAttached
     case visualContextRejected(reason: String)
@@ -28,7 +29,9 @@ enum AppServerLiveVoiceEvent: Sendable {
     case responseStarted(latencyMilliseconds: Double)
     case assistantSpeechStarted
     case assistantSpeechEnded
+    case assistantOutputReferenceReady(sampleRate: Int, samples: Int)
     case microphoneCaptureSuppressed
+    case playbackEchoAssessed(relationship: LiveVoiceEchoRelationship, correlation: Double)
     case participantBargeInAdmitted(bufferedMilliseconds: Double)
     case acousticEchoDiscarded
     case responding
@@ -48,6 +51,11 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let status: String?
     let error: String?
     let taskID: String?
+    let data: String?
+    let sampleRate: Int?
+    let samplesPerChannel: Int?
+    let numChannels: Int?
+    let resetReference: Bool?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -60,6 +68,11 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case status
         case error
         case taskID = "task_id"
+        case data
+        case sampleRate = "sample_rate"
+        case samplesPerChannel = "samples_per_channel"
+        case numChannels = "num_channels"
+        case resetReference = "reset_reference"
     }
 }
 
@@ -105,7 +118,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     ) -> Result<Void, SOMASessionCapabilityError>)?
     private let cameraContextAutoInjection: Bool
     private let requireVerifiedSpeakerForEveryTurn: Bool
-    private let pendingHermesTasks: @Sendable () -> [HermesAgentTask]
+    private let hermesAgentDelegationEnabled: Bool
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
     private var gate = LiveVoiceLaunchGate()
     private var inactivityGate = LiveVoiceSessionInactivityGate()
@@ -123,6 +136,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var capturingInitiatingTurn = false
     private var inputLeveler = LiveVoiceInputLeveler()
     private var duplexCaptureGate = LiveVoiceDuplexCaptureGate()
+    private var echoReferenceMatcher = LiveVoiceEchoReferenceMatcher()
+    private var lastEchoRelationship: LiveVoiceEchoRelationship?
+    private var outputReferenceReported = false
     private var duplexEpisodeInProgress = false
     private var duplexEpisodeAdmitted = false
     private var inputTransportReported = false
@@ -141,6 +157,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var initialTurnValidation: LiveVoiceInitialTurnValidation
     private var proactiveOpeningAwaitingParticipant = false
     private var proactiveOpeningDelivered = false
+    private var pendingHermesReportOfferTaskID: UUID?
     private var hermesResultAwaitingConfirmation = Set<UUID>()
 
     init(
@@ -149,7 +166,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         embodimentSocketURL: URL? = nil,
         requireVerifiedSpeakerForEveryTurn: Bool = false,
-        pendingHermesTasks: @escaping @Sendable () -> [HermesAgentTask] = { [] },
+        hermesAgentDelegationEnabled: Bool = true,
         inactivityTimeoutMilliseconds: UInt64 = 60_000,
         initialParticipantTranscriptTimeoutMilliseconds: UInt64 = 3_500,
         persistentAppServer: PersistentAppServerBroker? = nil,
@@ -167,7 +184,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.currentCameraImageDataURI = currentCameraImageDataURI
         self.embodimentSocketURL = embodimentSocketURL
         self.requireVerifiedSpeakerForEveryTurn = requireVerifiedSpeakerForEveryTurn
-        self.pendingHermesTasks = pendingHermesTasks
+        self.hermesAgentDelegationEnabled = hermesAgentDelegationEnabled
         inactivityGate = LiveVoiceSessionInactivityGate(
             timeoutMilliseconds: inactivityTimeoutMilliseconds
         )
@@ -178,6 +195,15 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.persistentSessionAuthorizer = persistentSessionAuthorizer
         cameraContextAutoInjection = somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: true)
         self.onEvent = onEvent
+    }
+
+    func canStartHermesReportOffer(at monotonicNS: UInt64) -> Bool {
+        queue.sync {
+            !stopped
+                && !active
+                && gate.phase == .inactive
+                && monotonicNS >= gate.retryAfterNS
+        }
     }
 
     func startIfNeeded(
@@ -237,6 +263,46 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 personEntityID: personEntityID,
                 personContextReference: context?.personContextAvailable == true ? context?.personEntityID : nil,
                 interactionAuthority: context?.interactionAuthority,
+                at: monotonicNS
+            )
+        }
+    }
+
+    /// A completed external task is a durable controller event, not synthetic
+    /// participant speech. Offer it once to the currently recognized
+    /// administrator and let L2 resolve the explicit yes/no answer through the
+    /// task MCP before any result is disclosed.
+    func startHermesReportOffer(
+        context: CodexInteractionContext,
+        task: HermesAgentTask,
+        personEntityID: UUID,
+        at monotonicNS: UInt64
+    ) {
+        queue.async { [weak self] in
+            guard let self, !stopped,
+                  task.status == .completed,
+                  task.reportedAt == nil,
+                  task.reportOfferAt == nil,
+                  gate.beginLaunch(at: monotonicNS) else { return }
+            let base = Self.contextText(context)
+            let directive = """
+            This is a controller-authorized offer to report one completed Hermes task, not participant speech.
+            pending_hermes_report_task_id: \(task.id.uuidString.lowercased())
+            Ask the exact supplied opening once, then listen. Do not expose, summarize, or fetch the result before the administrator answers. After a clear acceptance, call resolve_hermes_report_offer once with this task ID and wants_report=true, then report only the returned actual result. After a clear decline, call it once with wants_report=false, acknowledge briefly, and do not reveal the result. If the answer is ambiguous, ask one concise clarification without calling the tool. Never delegate a new task for this offer.
+            """
+            pendingHermesReportOfferTaskID = task.id
+            launch(
+                authorization: "hermes_report_offer",
+                initialContext: String([base, directive].filter { !$0.isEmpty }.joined(separator: "\n\n").prefix(24_000)),
+                sessionCapability: context.sessionCapability,
+                preferredLanguageTag: context.preferredLanguageTag,
+                languageStartInstruction: context.languageStartInstruction,
+                proactiveOpeningText: HermesReportOfferPrompt.question(
+                    languageTag: context.preferredLanguageTag
+                ),
+                personEntityID: personEntityID,
+                personContextReference: context.personContextAvailable ? context.personEntityID : nil,
+                interactionAuthority: context.interactionAuthority,
                 at: monotonicNS
             )
         }
@@ -316,7 +382,21 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 }
             }
             let wasDuplexQuarantined = duplexCaptureGate.quarantinesMicrophone(at: monotonicNS)
+            let echoAssessment = duplexVerificationRequired
+                ? echoReferenceMatcher.assess()
+                : nil
+            if let echoAssessment,
+               echoAssessment.relationship != lastEchoRelationship {
+                lastEchoRelationship = echoAssessment.relationship
+                onEvent(.playbackEchoAssessed(
+                    relationship: echoAssessment.relationship,
+                    correlation: echoAssessment.maximumCorrelation
+                ))
+            }
+            let acousticallyIndependent = !duplexVerificationRequired
+                || echoAssessment?.permitsBargeIn == true
             let effectiveDuplexSpeakerVerification = duplexSpeakerVerified
+                && acousticallyIndependent
                 && !discardBufferedEpisode
             duplexCaptureGate.observeParticipantSpeech(
                 active: active,
@@ -417,6 +497,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     }
 
     private func routeAudioChunk(_ captured: CapturedLiveAudio) {
+        echoReferenceMatcher.appendMicrophone(
+            captured.samples,
+            sampleRate: captured.sampleRate
+        )
         if duplexCaptureGate.quarantinesMicrophone(at: captured.captureNS) {
             speakerEpisodeAudio.ingest(
                 captured,
@@ -476,6 +560,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         inactivityGate.close()
         proactiveOpeningAwaitingParticipant = false
         proactiveOpeningDelivered = false
+        pendingHermesReportOfferTaskID = nil
     }
 
     private static func splitCapturedAudio(
@@ -728,11 +813,15 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             "cameraContextAutoInjected": cameraContextAutoInjection,
             "codexSandbox": somaEnvString("SOMA_L2_CODEX_SANDBOX", default: "danger-full-access"),
             "codexAdminOnly": somaEnvBool("SOMA_L2_CODEX_ADMIN_ONLY", default: false),
+            "hermesAgentDelegationEnabled": hermesAgentDelegationEnabled,
         ], reportFailure: false) else {
             failCurrent(reason: "live_voice_start_transport_failed")
             return
         }
         onEvent(.launchRequested(authorization: authorization, personEntityID: personEntityID))
+        if let taskID = pendingHermesReportOfferTaskID {
+            onEvent(.hermesReportOfferStarted(taskID: taskID))
+        }
         queue.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self,
                   generation == launchGeneration,
@@ -894,6 +983,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     _ = closeSession(reason: "participant_input_unconfirmed_before_output")
                     continue
                 }
+                echoReferenceMatcher.reset()
+                lastEchoRelationship = nil
+                outputReferenceReported = false
                 duplexCaptureGate.beginAssistantOutput(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.microphoneCaptureSuppressed)
                 onEvent(.assistantSpeechStarted)
@@ -911,16 +1003,39 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             case "output_speech_ended":
                 duplexCaptureGate.endAssistantOutput(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.assistantSpeechEnded)
+            case "assistant_output_reference":
+                guard let data = event.data,
+                      let sampleRate = event.sampleRate,
+                      let channels = event.numChannels,
+                      let expectedSamples = event.samplesPerChannel,
+                      let samples = Self.decodePCM16(
+                        data,
+                        channels: channels,
+                        expectedSamplesPerChannel: expectedSamples
+                      ) else { continue }
+                if event.resetReference == true {
+                    echoReferenceMatcher.reset()
+                    lastEchoRelationship = nil
+                    outputReferenceReported = false
+                }
+                echoReferenceMatcher.appendReference(
+                    samples,
+                    sampleRate: sampleRate,
+                    channels: channels
+                )
+                if !outputReferenceReported {
+                    outputReferenceReported = true
+                    onEvent(.assistantOutputReferenceReady(
+                        sampleRate: sampleRate,
+                        samples: expectedSamples
+                    ))
+                }
             case "response_completed":
                 // Generation can complete before the remote playback buffer
                 // drains, so microphone capture resumes only when playback
                 // reports output_speech_ended.
                 finishAssistantResponseIfNeeded()
                 onEvent(.responseCompleted)
-                if hermesResultAwaitingConfirmation.isEmpty,
-                   let pending = pendingHermesTasks().first {
-                    _ = sendHermesTaskResult(pending)
-                }
             case "ended":
                 guard active || gate.phase == .starting else { continue }
                 let threadID = event.threadID ?? activeThreadID
@@ -1123,6 +1238,24 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
+    private static func decodePCM16(
+        _ encoded: String,
+        channels: Int,
+        expectedSamplesPerChannel: Int
+    ) -> [Float]? {
+        guard (1...8).contains(channels),
+              (1...65_536).contains(expectedSamplesPerChannel),
+              let data = Data(base64Encoded: encoded),
+              data.count == expectedSamplesPerChannel * channels * 2 else { return nil }
+        var samples: [Float] = []
+        samples.reserveCapacity(expectedSamplesPerChannel * channels)
+        for index in stride(from: 0, to: data.count, by: 2) {
+            let bits = UInt16(data[index]) | (UInt16(data[index + 1]) << 8)
+            samples.append(Float(Int16(bitPattern: bits)) / 32_768)
+        }
+        return samples
+    }
+
     private func helperURL() -> URL? {
         let fileManager = FileManager.default
         if let override = ProcessInfo.processInfo.environment["SOMA_LIVE_VOICE_HELPER"],
@@ -1192,14 +1325,15 @@ func testAppServerLiveVoiceLauncher() -> String {
         case .launchRequested, .inputTransportStarted, .outputPlaybackReady,
              .inputBootstrapReplayed,
              .responseInterrupted, .interruptedAudioCleared, .proactiveOpeningTriggered,
-             .proactiveOpeningExtraOutputSuppressed, .hearingUser,
+             .proactiveOpeningExtraOutputSuppressed, .hermesReportOfferStarted, .hearingUser,
              .visualContextAttached, .visualContextRejected,
              .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
              .hermesTaskResultAccepted, .hermesTaskResultRejected,
              .personContextUnavailable, .embodimentMCPCall, .inputAccepted,
              .transcriptFinalized, .preparingResponse, .responseStarted,
-             .assistantSpeechStarted, .assistantSpeechEnded, .microphoneCaptureSuppressed,
-             .participantBargeInAdmitted, .acousticEchoDiscarded,
+             .assistantSpeechStarted, .assistantSpeechEnded,
+             .assistantOutputReferenceReady, .microphoneCaptureSuppressed,
+             .playbackEchoAssessed, .participantBargeInAdmitted, .acousticEchoDiscarded,
              .responding, .responseCompleted, .ended:
             break
         }

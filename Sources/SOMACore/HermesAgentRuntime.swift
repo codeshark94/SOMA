@@ -4,9 +4,20 @@ import Foundation
 /// SOMA does not modify global Hermes or Codex configuration.
 public struct HermesAgentRuntimeConfiguration: Equatable, Sendable {
     public let executablePath: String
+    /// The primary Hermes profile is the machine-level supervisor. SOMA must
+    /// not inherit a sticky specialist profile selected by another workflow.
+    public let profileName: String
 
-    public init(executablePath: String) {
+    public init(executablePath: String, profileName: String = "default") {
         self.executablePath = executablePath
+        self.profileName = profileName
+    }
+
+    public var loopbackWorkerArguments: [String] {
+        [
+            "--profile", profileName,
+            "serve", "--host", "127.0.0.1", "--port", "0", "--skip-build",
+        ]
     }
 
     public static func discover(
@@ -54,7 +65,8 @@ public struct HermesAgentRuntimeConfiguration: Equatable, Sendable {
             return nil
         }
         return HermesAgentRuntimeConfiguration(
-            executablePath: URL(fileURLWithPath: path).standardizedFileURL.path
+            executablePath: URL(fileURLWithPath: path).standardizedFileURL.path,
+            profileName: "default"
         )
     }
 }

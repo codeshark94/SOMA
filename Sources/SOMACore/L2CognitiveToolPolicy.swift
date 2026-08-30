@@ -150,14 +150,14 @@ public enum L2CognitiveToolPolicy {
     public static let instruction = """
     Cognitive tool initiative: privately maintain one current conversational goal. Before each response, decide whether a permitted SOMA MCP action would materially reduce an uncertainty that blocks a useful answer, ground a deictic or embodied reference, advance that goal, preserve an explicitly stated durable fact, or verify completion. When it would, call the narrowest suitable tool proactively and silently; do not wait for the participant to name the tool or issue a command, do not speak a provisional wait message, and use the returned result before responding. When no tool materially helps, answer directly without a ceremonial call.
 
-    Autonomous read-only perception, memory lookup, and current-state inspection are epistemic actions. Reversible camera orientation, tracking, or reframing may also be initiated when it is necessary for the active conversational goal and remains subject to L0 authority. Durable memory writes require an explicit fact or preference supplied or confirmed by the participant. Identity enrollment requires explicit consent. Ending the conversation and external file, shell, network, service, or system changes still require the participant's explicit request and applicable authority. When the administrator explicitly delegates external work, use delegate_hermes_task once and return its task ID immediately instead of pretending to perform the work in the voice turn. Use get_hermes_task or list_hermes_tasks to retrieve actual progress and results. Continue or cancel the external worker only on an explicit request.
+    Autonomous read-only perception, memory lookup, and current-state inspection are epistemic actions. Reversible camera orientation, tracking, or reframing may also be initiated when it is necessary for the active conversational goal and remains subject to L0 authority. Durable memory writes require an explicit fact or preference supplied or confirmed by the participant. Identity enrollment requires explicit consent. Ending the conversation and external file, shell, network, service, or system changes still require the participant's explicit request and applicable authority. When the administrator explicitly delegates external work, use delegate_hermes_task once and return its task ID immediately instead of pretending to perform the work in the voice turn. Use get_hermes_task or list_hermes_tasks to retrieve actual progress and results. Continue or cancel the external worker only on an explicit request. A controller-supplied pending_hermes_report_task_id authorizes only a yes/no report offer: after a clear answer, call resolve_hermes_report_offer exactly once with that ID and the participant's decision. Never disclose or fetch the result before acceptance.
 
     Every non-read-only SOMA MCP call, and every autonomous read, must include cognitive_intent with one stable goal_episode_id reused across calls serving the same conversational objective, a concise private purpose, expected_information_gain from 0 to 1, only supplied evidence_ids, and authorization_basis. Use autonomous_goal only for read-only perception/memory or reversible goal-bound orientation, tracking, reframing, and expression. Use explicit_statement for a fact or preference the participant just supplied, explicit_consent for identity enrollment, and explicit_request for conversation termination or device configuration the participant explicitly requested. Generate a new goal_episode_id when the conversational objective materially changes. Never expose these fields to the participant. Do not repeat a call when the same goal and semantic request already produced an equivalent result; treat tool failure as evidence and never claim an unverified result.
     """
 
     public static func autonomy(for toolName: String) -> L2ToolAutonomy? {
         switch toolName {
-        case "get_embodiment_state", "list_scene_entities", "get_spatial_map",
+        case "get_robot_body_state", "list_scene_entities", "get_spatial_map",
              "get_view_capture", "list_present_people", "list_identity_registry",
              "get_person_context", "recall_episodes", "list_information_needs":
             .epistemic
@@ -171,7 +171,8 @@ public enum L2CognitiveToolPolicy {
             .explicitRequest
         case "get_hermes_task", "list_hermes_tasks":
             .epistemic
-        case "delegate_hermes_task", "continue_hermes_task", "cancel_hermes_task":
+        case "delegate_hermes_task", "continue_hermes_task", "cancel_hermes_task",
+             "resolve_hermes_report_offer":
             .explicitRequest
         case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
              "track_target", "orient_to", "set_exploration_policy", "capture_view",
@@ -190,7 +191,7 @@ public enum L2CognitiveToolPolicy {
 
     public static func effect(for toolName: String) -> CognitiveActionEffect? {
         switch toolName {
-        case "get_embodiment_state", "list_scene_entities", "get_spatial_map",
+        case "get_robot_body_state", "list_scene_entities", "get_spatial_map",
              "get_view_capture", "list_present_people", "list_identity_registry",
              "get_person_context", "recall_episodes", "list_information_needs":
             .epistemic
@@ -204,7 +205,8 @@ public enum L2CognitiveToolPolicy {
             .conversationControl
         case "get_hermes_task", "list_hermes_tasks":
             .epistemic
-        case "delegate_hermes_task", "continue_hermes_task", "cancel_hermes_task":
+        case "delegate_hermes_task", "continue_hermes_task", "cancel_hermes_task",
+             "resolve_hermes_report_offer":
             .externalWork
         default:
             autonomy(for: toolName) == nil ? nil : .reversibleEmbodiment
@@ -241,7 +243,29 @@ public enum L2CognitiveToolPolicy {
             "get_hermes_task",
             "list_hermes_tasks",
             "cancel_hermes_task",
+            "resolve_hermes_report_offer",
         ].contains(toolName)
+    }
+}
+
+/// Keeps conversational, embodied, and external work in distinct execution
+/// domains. Hermes availability means eligible administrator work is routed to
+/// the durable worker without blocking the live social channel; it does not
+/// turn ordinary conversation into background jobs.
+public enum L2TaskRoutingPolicy {
+    public static let embodimentStateToolDescription = "Read only SOMA's robot-body state: L0 lease, camera/gimbal attention target, and attention policy for this interaction. This is not the host Mac's OS, CPU, memory, filesystem, process, network, or service state."
+
+    public static let hermesDelegationToolDescription = "Delegate an administrator's explicit external job to the local Hermes Agent when it requires host-computer inspection, shell or process work, files or repositories, coding, web or API research, services, or other work that can continue while the voice conversation remains responsive. Returns immediately with a durable task ID; acceptance is not completion. Do not use it for a direct conversational answer or SOMA camera/gimbal state."
+
+    public static func instruction(hermesEnabled: Bool) -> String {
+        guard hermesEnabled else {
+            return "External task routing: Hermes delegation is disabled for this session. Never claim that external work was queued or completed. Continue to use only conversational reasoning and the available SOMA memory and embodiment tools."
+        }
+        return """
+        External task routing: before responding to an administrator's explicit request, classify the requested outcome into exactly one execution domain. A direct answer stays in conversation. SOMA perception, memory, camera, gimbal, and attention use the narrow SOMA tools. Work requiring the host computer, operating-system or resource inspection, shell commands, processes, files, repositories, coding, web or API research, services, or material work that can proceed independently belongs to the Hermes external-worker domain. The administrator does not need to say the word Hermes.
+
+        For an eligible external job, call delegate_hermes_task exactly once before speaking. Do not substitute get_robot_body_state for host-computer status: that tool describes only SOMA's robot body. After the delegation tool returns successfully, acknowledge aloud in one short sentence that the computer supervisor accepted the work and that completion will be reported, then keep listening and converse normally while the worker runs. Do not read the task UUID aloud. Do not block, poll, or send a provisional wait message. Completion is delivered separately and must be reported only from the actual task result. Reuse the same goal_episode_id so one request cannot create duplicate workers.
+        """
     }
 }
 

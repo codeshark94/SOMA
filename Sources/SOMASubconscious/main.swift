@@ -13118,9 +13118,7 @@ private func run(_ options: Options) throws {
             embodimentSocketURL: options.embodimentShadowSocketURL,
             requireVerifiedSpeakerForEveryTurn: controlSettings
                 .realtimeVoiceRequiresEyeContactForEveryTurn,
-            pendingHermesTasks: {
-                hermesAgentCoordinator.pendingCompletedTasks()
-            },
+            hermesAgentDelegationEnabled: controlSettings.hermesAgentDelegationEnabled,
             inactivityTimeoutMilliseconds: UInt64(
                 controlSettings.realtimeVoiceSilenceTimeoutSeconds
             ) * 1_000,
@@ -13237,6 +13235,23 @@ private func run(_ options: Options) throws {
                     state: "proactive_opening_extra_output_suppressed",
                     message: "session_terminated_before_participant_turn"
                 ))
+            case let .hermesReportOfferStarted(taskID):
+                let resolution = hermesAgentCoordinator.handle(.init(
+                    operation: .markReportOffered,
+                    taskID: taskID
+                ))
+                let state: String
+                switch resolution {
+                case .success: state = "report_offer_started"
+                case .failure: state = "report_offer_rejected"
+                }
+                writer.write(RuntimeEvent(
+                    event: "hermes.task",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: state,
+                    message: "task_id=\(taskID.uuidString.lowercased())"
+                ))
             case .hearingUser:
                 l1LiveConversationState.setParticipantSpeaking(true)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.hearingUser)
@@ -13262,7 +13277,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: "embodiment_mcp_ready",
-                    message: "capability_preflight=get_embodiment_state; capture_view_and_identity_tools_available"
+                    message: "capability_preflight=get_robot_body_state; capture_view_and_identity_tools_available"
                 ))
             case .personContextReady:
                 writer.write(RuntimeEvent(
@@ -13371,6 +13386,14 @@ private func run(_ options: Options) throws {
                     active: false,
                     at: eventNS
                 )
+            case let .assistantOutputReferenceReady(sampleRate, samples):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "output_reference_ready",
+                    message: "sample_rate=\(sampleRate); samples=\(samples)"
+                ))
             case .microphoneCaptureSuppressed:
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -13378,6 +13401,18 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "microphone_quarantined",
                     message: "assistant_output_active=true"
+                ))
+            case let .playbackEchoAssessed(relationship, correlation):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "playback_echo_assessed",
+                    message: String(
+                        format: "relationship=%@; correlation=%.3f",
+                        relationship.rawValue,
+                        correlation
+                    )
                 ))
             case let .participantBargeInAdmitted(bufferedMilliseconds):
                 writer.write(RuntimeEvent(
@@ -13487,7 +13522,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=assistant_output_quarantine_plus_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=preplayback_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -14592,6 +14627,39 @@ private func run(_ options: Options) throws {
             } ?? []) + (personPreferenceDirectives.isEmpty
                 ? []
                 : ["Explicit person preferences: \(personPreferenceDirectives)"])
+            if !evidence.active,
+               options.l2LiveVoice,
+               let administrator = recognizedParticipant,
+               administrator.authority == .administrator,
+               let liveVoiceLauncher,
+               liveVoiceLauncher.canStartHermesReportOffer(at: completedNS),
+               let task = hermesAgentCoordinator.pendingReportOffers().first {
+                let sessionCapability = liveSessionCapabilities.issue(
+                    personEntityID: administrator.entityID,
+                    authority: .administrator,
+                    at: completedNS
+                )
+                if let context = speechInteractionContext(
+                    from: belief,
+                    identityReference: interactionIdentityReference,
+                    participant: administrator,
+                    personContextAvailable: true,
+                    sessionCapability: sessionCapability,
+                    personMemoryMission: l1MemoryContext.cachedPersonMemoryMission(
+                        for: administrator.entityID
+                    ),
+                    preferredLanguageTag: preferredLanguageTag,
+                    languageStartInstruction: languageStartInstruction,
+                    memorySummaries: interactionMemorySummaries
+                ) {
+                    liveVoiceLauncher.startHermesReportOffer(
+                        context: context,
+                        task: task,
+                        personEntityID: administrator.entityID,
+                        at: completedNS
+                    )
+                }
+            }
             if evidence.active, evidence.changed, openingAuthorization == nil {
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
