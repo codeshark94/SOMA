@@ -22,6 +22,7 @@ source "$soma_root/scripts/lib/soma-model-contracts.zsh"
 autoload -Uz is-at-least
 
 soma_install_scripts=(
+  "$soma_root/scripts/soma-install-preflight.zsh"
   "$soma_root/scripts/setup-soma.zsh"
   "$soma_root/scripts/bootstrap-soma.zsh"
   "$soma_root/scripts/install-soma-l05-model.zsh"
@@ -71,11 +72,29 @@ for soma_install_script in "${soma_install_scripts[@]}"; do
   fi
 done
 soma_full_plan=$(/bin/zsh "$soma_root/scripts/setup-soma.zsh" --full --plan 2>/dev/null || true)
+soma_custom_plan=$(/bin/zsh "$soma_root/scripts/setup-soma.zsh" --with-l05 --plan 2>/dev/null || true)
+soma_setup_source=$(/bin/cat "$soma_root/scripts/setup-soma.zsh")
+soma_preflight_line=$(print -r -- "$soma_setup_source" \
+  | /usr/bin/grep -nF '"$soma_root/scripts/soma-install-preflight.zsh" --require-camera' \
+  | /usr/bin/head -n 1 \
+  | /usr/bin/cut -d: -f1)
+soma_bootstrap_line=$(print -r -- "$soma_setup_source" \
+  | /usr/bin/grep -nF '"$soma_root/scripts/bootstrap-soma.zsh"' \
+  | /usr/bin/head -n 1 \
+  | /usr/bin/cut -d: -f1)
 if (( soma_install_contract_valid == 1 )) \
     && [[ "$soma_full_plan" == *'installation profile: full'* \
           && "$soma_full_plan" == *'L0.5 environment and pinned model: install'* \
           && "$soma_full_plan" == *'ArcFace identity model: install'* \
-          && "$soma_full_plan" == *'physical motion: enable'* ]]; then
+          && "$soma_full_plan" == *'physical motion: enable'* \
+          && "$soma_full_plan" == *'actions: guided preflight, bootstrap'* \
+          && "$soma_custom_plan" != *'guided preflight'* \
+          && "$soma_setup_source" == *'if (( soma_full )); then
+  "$soma_root/scripts/soma-install-preflight.zsh" --require-camera
+fi'* \
+          && -n "$soma_preflight_line" \
+          && -n "$soma_bootstrap_line" ]] \
+    && (( soma_preflight_line < soma_bootstrap_line )); then
   soma_ok 'idempotent full-install orchestration contract'
 else
   soma_fail 'full-install scripts are missing, non-executable, invalid, or incomplete'

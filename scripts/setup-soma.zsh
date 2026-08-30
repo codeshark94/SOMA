@@ -115,8 +115,16 @@ if (( soma_plan_only )); then
   print -r -- "  Homebrew dependencies: $([[ $soma_skip_brew == 1 ]] && print already-present || print install)"
   print -r -- "  L1 model: $SOMA_DEFAULT_L1_MODEL"
   print -r -- "  signing identity: ensure $SOMA_CODESIGN_IDENTITY_NAME"
-  print -r -- '  actions: bootstrap, local model provisioning, runtime configuration, L1 provisioning, tests, doctor, signed app installation, process verification'
+  if (( soma_full )); then
+    print -r -- '  actions: guided preflight, bootstrap, local model provisioning, runtime configuration, L1 provisioning, tests, doctor, signed app installation, process verification'
+  else
+    print -r -- '  actions: bootstrap, selected model provisioning, runtime configuration, L1 provisioning, tests, doctor, signed app installation, process verification'
+  fi
   exit 0
+fi
+
+if (( soma_full )); then
+  "$soma_root/scripts/soma-install-preflight.zsh" --require-camera
 fi
 
 if (( soma_with_face_identity )); then

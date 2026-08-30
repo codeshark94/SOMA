@@ -294,6 +294,10 @@ run the idempotent full setup command:
 scripts/setup-soma.zsh --full
 ```
 
+The installer first shows a guided readiness report for Xcode, Homebrew,
+Codex Live Voice, the connected camera, and possible OBSBOT Center contention.
+OBSBOT Center is not a dependency and should be closed if present.
+
 `--full` provisions the optional L0.5 semantic helper and ArcFace identity
 model, enables the supported gimbal profiles, creates a machine-local persistent
 code-signing identity when needed, verifies the complete runtime, installs the

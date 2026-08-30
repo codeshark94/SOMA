@@ -37,7 +37,12 @@ dylib's deployment target so it cannot approve an unloadable local build.
 
 ## Clean-Mac installation
 
-Install full Xcode 26.6 build 17F113 and Homebrew first, then run:
+OBSBOT Center is not required; SOMA uses the repository's open UVC/XU driver.
+If OBSBOT Center is installed, quit it before starting SOMA so it cannot retain
+the camera's USB control endpoint.
+
+Install full Xcode 26.6 build 17F113, Homebrew, and a signed-in current Codex
+app first. Connect a Tiny 2 Lite or Tiny 3 Lite, then run:
 
 ```sh
 xcode-select --install
@@ -46,6 +51,11 @@ cd SOMA
 
 scripts/setup-soma.zsh --full
 ```
+
+The full command begins with a compact preflight report. It checks the host,
+exact Xcode build, Homebrew, Codex login and Realtime capability, connected
+camera model, and OBSBOT Center contention. Every blocking row includes its
+single next action; provisioning starts only after the report is ready.
 
 The setup command is safe to rerun. It invokes the locked bootstrap, starts
 Ollama and provisions
