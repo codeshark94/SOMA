@@ -28,6 +28,7 @@ soma_install_scripts=(
   "$soma_root/scripts/install-soma-l05-model.zsh"
   "$soma_root/scripts/install-soma-face-identity-model.zsh"
   "$soma_root/scripts/ensure-soma-signing-identity.zsh"
+  "$soma_root/scripts/generate-soma-brand-assets.zsh"
   "$soma_root/scripts/install-soma-subconscious-app.zsh"
   "$soma_root/Install SOMA.command"
 )
@@ -71,6 +72,26 @@ for soma_install_script in "${soma_install_scripts[@]}"; do
     soma_install_contract_valid=0
   fi
 done
+soma_brand_mark="$soma_root/assets/branding/soma-mark.png"
+soma_menu_brand_mark="$soma_root/Sources/SOMAMenuBar/Resources/SOMALogoMark.png"
+soma_brand_generator="$soma_root/scripts/generate-soma-brand-assets.swift"
+soma_brand_info="$soma_root/Sources/SOMASubconscious/Info.plist"
+if [[ -x "$soma_brand_generator" \
+      && -f "$soma_root/assets/branding/soma-original.png" \
+      && -f "$soma_brand_mark" \
+      && -f "$soma_root/assets/branding/soma-app-icon.png" \
+      && -f "$soma_root/assets/branding/SOMA.icns" \
+      && -f "$soma_menu_brand_mark" \
+      && "$(/usr/bin/shasum -a 256 "$soma_brand_mark" | /usr/bin/awk '{ print $1 }')" \
+        == "$(/usr/bin/shasum -a 256 "$soma_menu_brand_mark" | /usr/bin/awk '{ print $1 }')" \
+      && "$(/usr/bin/plutil -extract CFBundleIconFile raw -o - "$soma_brand_info" 2>/dev/null)" \
+        == 'SOMA.icns' ]] \
+    && /usr/bin/xcrun swiftc -parse "$soma_brand_generator" \
+    && "$soma_root/scripts/generate-soma-brand-assets.zsh" --check; then
+  soma_ok 'canonical SOMA branding and packaged icon assets'
+else
+  soma_fail 'SOMA branding assets are missing, divergent, or not reproducible'
+fi
 soma_full_plan=$(/bin/zsh "$soma_root/scripts/setup-soma.zsh" --full --plan 2>/dev/null || true)
 soma_custom_plan=$(/bin/zsh "$soma_root/scripts/setup-soma.zsh" --with-l05 --plan 2>/dev/null || true)
 soma_setup_source=$(/bin/cat "$soma_root/scripts/setup-soma.zsh")

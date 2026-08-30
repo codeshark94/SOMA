@@ -12,6 +12,8 @@ soma_embodiment_source="$soma_build_root/soma-embodiment"
 soma_child_guardian_source="$soma_build_root/soma-child-guardian"
 soma_subconscious_resources="$soma_build_root/SOMA_SOMASubconscious.bundle"
 soma_vad_resources="$soma_build_root/SOMA_SOMAVADModel.bundle"
+soma_menu_bar_resources="$soma_build_root/SOMA_SOMAMenuBar.bundle"
+soma_app_icon="$soma_root/assets/branding/SOMA.icns"
 soma_native_source="$soma_root/Sources/SOMANativeTracking"
 soma_native_build_root="$soma_root/.build/soma-live/native"
 soma_native_binary="$soma_native_build_root/soma-native-track"
@@ -113,12 +115,16 @@ if [[ ! -x "$soma_native_probe" ]]; then
     print -u2 "missing SOMA native device probe: $soma_native_probe"
     exit 2
 fi
-for soma_resource_bundle in "$soma_subconscious_resources" "$soma_vad_resources"; do
+for soma_resource_bundle in "$soma_subconscious_resources" "$soma_vad_resources" "$soma_menu_bar_resources"; do
   if [[ ! -d "$soma_resource_bundle" ]]; then
     print -u2 "missing SOMA resource bundle: $soma_resource_bundle"
     exit 2
   fi
 done
+if [[ ! -f "$soma_app_icon" ]]; then
+  print -u2 "missing SOMA application icon: $soma_app_icon"
+  exit 2
+fi
 
 mkdir -p "$soma_app_parent"
 soma_install_stage=$(mktemp -d "$soma_app_parent/.soma-install.XXXXXX")
@@ -150,6 +156,15 @@ mkdir -p \
 /usr/bin/ditto \
   "$soma_vad_resources" \
   "$soma_stage_app/Contents/Resources/${soma_vad_resources:t}"
+/usr/bin/ditto \
+  "$soma_menu_bar_resources" \
+  "$soma_stage_app/Contents/Resources/${soma_menu_bar_resources:t}"
+/usr/bin/ditto "$soma_app_icon" "$soma_stage_app/Contents/Resources/SOMA.icns"
+if [[ ! -f "$soma_stage_app/Contents/Resources/${soma_menu_bar_resources:t}/SOMALogoMark.png" \
+      || ! -f "$soma_stage_app/Contents/Resources/SOMA.icns" ]]; then
+  print -u2 'staged SOMA application is missing packaged branding resources'
+  exit 2
+fi
 if /usr/bin/otool -L "$soma_stage_native_helper" "$soma_stage_device_probe" \
     | /usr/bin/grep -Fq 'libdev'; then
   print -u2 'native OBSBOT helper unexpectedly links a proprietary runtime'
@@ -189,6 +204,15 @@ if ! /bin/mv "$soma_stage_app" "$soma_app_root"; then
   exit 2
 fi
 /usr/bin/codesign --verify --deep --strict --verbose=0 "$soma_app_root"
+if ! /usr/bin/cmp -s \
+      "$soma_root/Sources/SOMAMenuBar/Resources/SOMALogoMark.png" \
+      "$soma_app_root/Contents/Resources/${soma_menu_bar_resources:t}/SOMALogoMark.png" \
+    || ! /usr/bin/cmp -s \
+      "$soma_app_icon" \
+      "$soma_app_root/Contents/Resources/SOMA.icns"; then
+  print -u2 'installed SOMA branding resources differ from the staged build'
+  exit 2
+fi
 if find "$soma_app_root" -type f \( -name 'libdev.dylib' -o -name 'soma-open-obsbot-*' \) \
     -print -quit | /usr/bin/grep -q .; then
   print -u2 'the installed application contains a retired OBSBOT runtime'

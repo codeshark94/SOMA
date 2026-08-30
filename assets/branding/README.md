@@ -1,7 +1,14 @@
 # SOMA branding assets
 
-`soma-original.png` is the canonical source illustration for SOMA visual
-assets. Preserve it unchanged when deriving menu-bar and application variants.
+`soma-original.png` is the canonical SOMA identity board. Preserve it unchanged
+when deriving menu-bar and application variants.
 
-`soma-mark.png` is the cropped display mark used by the README. It is derived
-from the canonical source and is not a replacement for it.
+`soma-mark.png` is the transparent monochrome display mark used by the README
+and menu-bar application. `soma-app-icon.png` and `SOMA.icns` carry the matching
+black-tile application icon.
+
+Regenerate every derived asset from the canonical board with:
+
+```sh
+scripts/generate-soma-brand-assets.zsh
+```

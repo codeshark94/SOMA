@@ -480,53 +480,39 @@ private enum SOMASettingsSection: String, CaseIterable, Identifiable {
     }
 }
 
-private struct SOMAMascot {
-    static func image(size: CGFloat, template: Bool) -> NSImage {
-        let image = NSImage(size: NSSize(width: size, height: size))
-        image.lockFocus()
-        defer { image.unlockFocus() }
-        let stroke = max(1.2, size * 0.075)
-        let ink = NSColor.labelColor
-        let head = NSBezierPath(ovalIn: NSRect(x: size * 0.12, y: size * 0.22, width: size * 0.76, height: size * 0.62))
-        head.lineWidth = stroke
-        ink.setStroke()
-        head.stroke()
-
-        let antenna = NSBezierPath()
-        antenna.lineWidth = stroke
-        antenna.lineCapStyle = .round
-        antenna.move(to: NSPoint(x: size * 0.45, y: size * 0.82))
-        antenna.curve(to: NSPoint(x: size * 0.38, y: size * 0.94), controlPoint1: NSPoint(x: size * 0.43, y: size * 0.90), controlPoint2: NSPoint(x: size * 0.40, y: size * 0.94))
-        antenna.move(to: NSPoint(x: size * 0.55, y: size * 0.82))
-        antenna.curve(to: NSPoint(x: size * 0.64, y: size * 0.93), controlPoint1: NSPoint(x: size * 0.58, y: size * 0.90), controlPoint2: NSPoint(x: size * 0.61, y: size * 0.93))
-        antenna.stroke()
-
-        ink.setFill()
-        NSBezierPath(ovalIn: NSRect(x: size * 0.32, y: size * 0.51, width: size * 0.10, height: size * 0.10)).fill()
-        NSBezierPath(ovalIn: NSRect(x: size * 0.58, y: size * 0.51, width: size * 0.10, height: size * 0.10)).fill()
-        if !template {
-            SOMAAccent.nsColor.withAlphaComponent(0.62).setFill()
-            NSBezierPath(ovalIn: NSRect(x: size * 0.24, y: size * 0.40, width: size * 0.12, height: size * 0.07)).fill()
-            NSBezierPath(ovalIn: NSRect(x: size * 0.64, y: size * 0.40, width: size * 0.12, height: size * 0.07)).fill()
+private enum SOMABrand {
+    private static let resourceBundle: Bundle = {
+        let bundleName = "SOMA_SOMAMenuBar.bundle"
+        let installedURL = Bundle.main.resourceURL?.appendingPathComponent(bundleName, isDirectory: true)
+        let adjacentURL = Bundle.main.bundleURL.appendingPathComponent(bundleName, isDirectory: true)
+        for candidate in [installedURL, adjacentURL].compactMap({ $0 }) {
+            if let bundle = Bundle(url: candidate) {
+                return bundle
+            }
         }
-        let smile = NSBezierPath()
-        smile.lineWidth = stroke * 0.78
-        smile.lineCapStyle = .round
-        smile.move(to: NSPoint(x: size * 0.45, y: size * 0.47))
-        smile.curve(to: NSPoint(x: size * 0.55, y: size * 0.47), controlPoint1: NSPoint(x: size * 0.47, y: size * 0.40), controlPoint2: NSPoint(x: size * 0.53, y: size * 0.40))
-        smile.stroke()
-        image.isTemplate = template
+        return Bundle.module
+    }()
+
+    private static let sourceMark: NSImage = {
+        guard let url = resourceBundle.url(forResource: "SOMALogoMark", withExtension: "png"),
+              let image = NSImage(contentsOf: url) else {
+            fatalError("SOMA brand mark is missing from the menu-bar resource bundle")
+        }
+        image.isTemplate = true
+        return image
+    }()
+
+    static func mark(size: CGFloat) -> NSImage {
+        guard let image = sourceMark.copy() as? NSImage else {
+            fatalError("SOMA brand mark could not be copied")
+        }
+        image.size = NSSize(width: size, height: size)
+        image.isTemplate = true
         return image
     }
 
-    static func menuBarImage() -> NSImage {
-        let source = image(size: 20, template: true)
-        let canvas = NSImage(size: NSSize(width: 20, height: 20))
-        canvas.lockFocus()
-        source.draw(in: NSRect(x: 0, y: -1.6, width: 20, height: 20))
-        canvas.unlockFocus()
-        canvas.isTemplate = true
-        return canvas
+    static func menuBarMark() -> NSImage {
+        mark(size: 20)
     }
 }
 
@@ -625,8 +611,11 @@ private struct SOMASettingsView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
-                Image(nsImage: SOMAMascot.image(size: 34, template: false))
-                    .resizable().frame(width: 34, height: 34)
+                Image(nsImage: SOMABrand.mark(size: 34))
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(.primary)
+                    .frame(width: 34, height: 34)
                 Text("SOMA").font(.headline)
             }
             .padding(.horizontal, SOMASettingsSidebarLayout.headerHorizontalInset)
@@ -686,8 +675,11 @@ private struct SOMASettingsView: View {
 
     private var heading: some View {
         HStack(alignment: .center, spacing: 12) {
-            Image(nsImage: SOMAMascot.image(size: 54, template: false))
-                .resizable().frame(width: 54, height: 54)
+            Image(nsImage: SOMABrand.mark(size: 54))
+                .resizable()
+                .renderingMode(.template)
+                .foregroundStyle(.primary)
+                .frame(width: 54, height: 54)
             VStack(alignment: .leading, spacing: 4) {
                 Text(selectedSection.rawValue).font(.system(size: 23, weight: .bold))
                 Text(model.runtime.isLive ? "Live settings for your local companion." : "Settings are ready; SOMA will apply them after launch.")
@@ -1406,7 +1398,8 @@ private final class SOMAStatusMenuHeader: NSView {
 
     init(runtime: SOMARuntimeSnapshot, voice: SOMARealtimeVoice) {
         super.init(frame: NSRect(x: 0, y: 0, width: SOMAStatusMenuLayout.width, height: 50))
-        iconView.image = SOMAMascot.image(size: 34, template: false)
+        iconView.image = SOMABrand.mark(size: 34)
+        iconView.contentTintColor = .labelColor
         iconView.imageScaling = .scaleProportionallyUpOrDown
         iconView.frame = NSRect(x: 16, y: 8, width: 34, height: 34)
         addSubview(iconView)
@@ -1622,7 +1615,7 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
         menu.minimumWidth = SOMAStatusMenuLayout.width
         statusItem.menu = menu
         if let button = statusItem.button {
-            button.image = SOMAMascot.menuBarImage()
+            button.image = SOMABrand.menuBarMark()
             button.imageScaling = .scaleProportionallyDown
             button.imagePosition = .imageOnly
             button.toolTip = "SOMA Control Center"

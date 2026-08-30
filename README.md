@@ -422,5 +422,6 @@ Detailed implementation status and open acceptance work live in
 ## Artwork
 
 [`assets/branding/soma-original.png`](assets/branding/soma-original.png) is
-the canonical source illustration. [`soma-mark.png`](assets/branding/soma-mark.png)
-is the compact display crop used here.
+the canonical identity board. Its derived transparent mark replaces the former
+mascot throughout the README, settings interface, status menu, and macOS menu
+bar; the matching black-tile variant is packaged as the application icon.

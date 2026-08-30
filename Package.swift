@@ -96,7 +96,11 @@ let package = Package(
                 ]),
             ]
         ),
-        .executableTarget(name: "SOMAMenuBar", dependencies: ["SOMACore"]),
+        .executableTarget(
+            name: "SOMAMenuBar",
+            dependencies: ["SOMACore"],
+            resources: [.copy("Resources/SOMALogoMark.png")]
+        ),
         .executableTarget(name: "SOMAChildGuardian"),
         .testTarget(name: "SOMACoreTests", dependencies: ["SOMACore", "SOMAVADModel"]),
     ]
