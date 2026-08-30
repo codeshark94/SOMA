@@ -228,6 +228,95 @@ public struct LiveVoicePlaybackCaptureGate: Sendable {
     public func suppressesMicrophone(at monotonicNS: UInt64) -> Bool {
         assistantOutputActive || monotonicNS < suppressUntilNS
     }
+
+    public mutating func reset() {
+        assistantOutputActive = false
+        suppressUntilNS = 0
+    }
+}
+
+/// Resolves the participant evidence required to interrupt rendered assistant
+/// audio. Direct gaze is an optional policy constraint; independent speaker
+/// evidence remains necessary because ordinary VAD cannot distinguish a
+/// participant from acoustic playback leaking into the camera microphone.
+public enum LiveVoiceDuplexSpeakerPolicy {
+    public static func verifiesParticipant(
+        trackedFaceVisible: Bool,
+        independentSpeakerEvidence: Bool,
+        speechEvidenceQualified: Bool,
+        directContactConfirmed: Bool,
+        speakerAttributionRejected: Bool,
+        requiresDirectGaze: Bool
+    ) -> Bool {
+        !speakerAttributionRejected
+            && trackedFaceVisible
+            && independentSpeakerEvidence
+            && speechEvidenceQualified
+            && (!requiresDirectGaze || directContactConfirmed)
+    }
+}
+
+/// Quarantines microphone audio while remote speech is audible, while allowing
+/// a verified participant to barge in without waiting for playback to finish.
+/// Verification is sticky only for the current VAD episode.
+public struct LiveVoiceDuplexCaptureGate: Sendable {
+    private var playback: LiveVoicePlaybackCaptureGate
+    private var participantSpeechActive = false
+    private var verifiedParticipantSpeech = false
+    private var unverifiedPlaybackEpisodeActive = false
+
+    public init(trailingSuppressionMilliseconds: UInt64 = 500) {
+        playback = LiveVoicePlaybackCaptureGate(
+            trailingSuppressionMilliseconds: trailingSuppressionMilliseconds
+        )
+    }
+
+    public mutating func beginAssistantOutput(at monotonicNS: UInt64) {
+        playback.beginAssistantOutput(at: monotonicNS)
+        if participantSpeechActive, !verifiedParticipantSpeech {
+            unverifiedPlaybackEpisodeActive = true
+        }
+    }
+
+    public mutating func endAssistantOutput(at monotonicNS: UInt64) {
+        playback.endAssistantOutput(at: monotonicNS)
+    }
+
+    public mutating func observeParticipantSpeech(
+        active: Bool,
+        verified: Bool,
+        at monotonicNS: UInt64
+    ) {
+        if active,
+           !participantSpeechActive,
+           playback.suppressesMicrophone(at: monotonicNS) {
+            unverifiedPlaybackEpisodeActive = true
+        }
+        participantSpeechActive = active
+        if !active {
+            verifiedParticipantSpeech = false
+            unverifiedPlaybackEpisodeActive = false
+        } else if verified {
+            verifiedParticipantSpeech = true
+        }
+    }
+
+    public func requiresParticipantVerification(at monotonicNS: UInt64) -> Bool {
+        playback.suppressesMicrophone(at: monotonicNS)
+            || unverifiedPlaybackEpisodeActive
+    }
+
+    public func quarantinesMicrophone(at monotonicNS: UInt64) -> Bool {
+        (playback.suppressesMicrophone(at: monotonicNS) || unverifiedPlaybackEpisodeActive)
+            && !(participantSpeechActive && verifiedParticipantSpeech)
+    }
+
+    public mutating func reset() {
+        playback.reset()
+        participantSpeechActive = false
+        verifiedParticipantSpeech = false
+        unverifiedPlaybackEpisodeActive = false
+    }
 }
 
 public struct LiveVoiceConditionedAudio: Equatable, Sendable {

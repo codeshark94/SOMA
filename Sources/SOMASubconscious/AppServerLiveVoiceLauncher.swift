@@ -28,6 +28,9 @@ enum AppServerLiveVoiceEvent: Sendable {
     case responseStarted(latencyMilliseconds: Double)
     case assistantSpeechStarted
     case assistantSpeechEnded
+    case microphoneCaptureSuppressed
+    case participantBargeInAdmitted(bufferedMilliseconds: Double)
+    case acousticEchoDiscarded
     case responding
     case responseCompleted
     case ended(threadID: String?, personEntityID: UUID?, reason: String)
@@ -119,6 +122,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var initiatingTurn: [BufferedLiveAudio] = []
     private var capturingInitiatingTurn = false
     private var inputLeveler = LiveVoiceInputLeveler()
+    private var duplexCaptureGate = LiveVoiceDuplexCaptureGate()
+    private var duplexEpisodeInProgress = false
+    private var duplexEpisodeAdmitted = false
     private var inputTransportReported = false
     private var active = false
     private var activeTurnAudioAdmitted = false
@@ -217,6 +223,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             let exactOpening = opening.question.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !exactOpening.isEmpty else {
                 gate.fail(at: monotonicNS)
+                resetSessionEphemera(keepingAudioCapacity: false)
                 return
             }
             let directive = "This is a closed-purpose L1-initiated interaction. The supplied objective and completion condition are private conversational orientation, never text to recite or a checklist to expose. L1 has already selected the one natural opening in the participant's preferred language. Deliver that exact opening once, then listen. After each reply, respond to what the participant actually said; let their answer determine the next conversational step. Surface a relevant information need only when it naturally fits the evolving conversation, and stop pursuing the objective once it is answered or declined. Do not dump multiple questions, narrate a plan, replace the opening with a generic greeting or offer of help, or invent another motive. If the purpose cannot be preserved, remain silent."
@@ -280,11 +287,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     func observeVoiceActivity(
         _ active: Bool,
         admitted: Bool = true,
+        duplexSpeakerVerified: Bool = false,
         discardBufferedEpisode: Bool = false,
         onsetCaptureNS: UInt64? = nil,
         assessedThroughCaptureNS: UInt64? = nil,
         preserveDetectorHistoryFromCaptureNS: UInt64? = nil,
-        at _: UInt64
+        at monotonicNS: UInt64
     ) {
         queue.async { [weak self] in
             guard let self, !stopped else { return }
@@ -292,14 +300,46 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             // transport. This preserves a quiet first utterance while the
             // bounded audiovisual attribution window is still pending.
             inputLeveler.observeVoiceActivity(active)
+            let duplexVerificationRequired = self.active
+                && duplexCaptureGate.requiresParticipantVerification(at: monotonicNS)
             if active,
                let onsetCaptureNS,
-               (!self.active || requireVerifiedSpeakerForEveryTurn) {
+               (!self.active || requireVerifiedSpeakerForEveryTurn || duplexVerificationRequired) {
                 speakerEpisodeAudio.begin(
                     at: onsetCaptureNS,
                     splitting: Self.splitCapturedAudio
                 )
                 speakerEpisodeInProgress = true
+                if duplexVerificationRequired {
+                    duplexEpisodeInProgress = true
+                    duplexEpisodeAdmitted = false
+                }
+            }
+            let wasDuplexQuarantined = duplexCaptureGate.quarantinesMicrophone(at: monotonicNS)
+            let effectiveDuplexSpeakerVerification = duplexSpeakerVerified
+                && !discardBufferedEpisode
+            duplexCaptureGate.observeParticipantSpeech(
+                active: active,
+                verified: effectiveDuplexSpeakerVerification,
+                at: monotonicNS
+            )
+            if self.active,
+               active,
+               effectiveDuplexSpeakerVerification,
+               wasDuplexQuarantined,
+               let assessedThroughCaptureNS {
+                let captured = speakerEpisodeAudio.take(
+                    throughCaptureNS: assessedThroughCaptureNS,
+                    splitting: Self.splitCapturedAudio
+                )
+                let durationMilliseconds = Double(captured.reduce(0) { $0 &+ $1.durationNS })
+                    / 1_000_000
+                for chunk in captured.map(makeBufferedAudio) { send(chunk) }
+                duplexEpisodeAdmitted = true
+                activeTurnAudioAdmitted = true
+                onEvent(.participantBargeInAdmitted(
+                    bufferedMilliseconds: durationMilliseconds
+                ))
             }
             if active, admitted {
                 activeTurnAudioAdmitted = true
@@ -315,6 +355,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     speakerEpisodeAudio.end()
                 }
                 speakerEpisodeInProgress = false
+                if duplexEpisodeInProgress, !duplexEpisodeAdmitted {
+                    onEvent(.acousticEchoDiscarded)
+                }
+                duplexEpisodeInProgress = false
+                duplexEpisodeAdmitted = false
                 initiatingTurn.removeAll(keepingCapacity: true)
                 capturingInitiatingTurn = false
                 activeTurnAudioAdmitted = false
@@ -328,6 +373,15 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     speakerEpisodeAudio.end()
                 }
                 speakerEpisodeInProgress = false
+                if duplexEpisodeInProgress, !duplexEpisodeAdmitted {
+                    onEvent(.acousticEchoDiscarded)
+                }
+                duplexEpisodeInProgress = false
+                duplexEpisodeAdmitted = false
+            }
+            if self.active,
+               duplexCaptureGate.quarantinesMicrophone(at: monotonicNS) {
+                return
             }
             if self.active, requireVerifiedSpeakerForEveryTurn {
                 if active, admitted, let assessedThroughCaptureNS {
@@ -363,7 +417,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     }
 
     private func routeAudioChunk(_ captured: CapturedLiveAudio) {
-        if LiveVoiceAudioRoutingPolicy.forwards(
+        if duplexCaptureGate.quarantinesMicrophone(at: captured.captureNS) {
+            speakerEpisodeAudio.ingest(
+                captured,
+                captureNS: captured.captureNS,
+                durationNS: captured.durationNS
+            )
+        } else if LiveVoiceAudioRoutingPolicy.forwards(
             sessionActive: active,
             requiresVerifiedSpeakerForEveryTurn: requireVerifiedSpeakerForEveryTurn,
             currentTurnAdmitted: activeTurnAudioAdmitted
@@ -390,6 +450,32 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             inputPeakDBFS: conditioned.inputPeakDBFS,
             appliedGainDB: conditioned.appliedGainDB
         )
+    }
+
+    private func resetDuplexCaptureState() {
+        duplexCaptureGate.reset()
+        duplexEpisodeInProgress = false
+        duplexEpisodeAdmitted = false
+    }
+
+    private func resetSessionEphemera(keepingAudioCapacity: Bool) {
+        activeTurnAudioAdmitted = false
+        awaitingAssistantResponse = false
+        latestUserTranscriptNS = nil
+        initialTurnValidation.reset()
+        speakerEpisodeAudio.end(keepingCapacity: keepingAudioCapacity)
+        speakerEpisodeInProgress = false
+        initiatingTurn.removeAll(keepingCapacity: keepingAudioCapacity)
+        capturingInitiatingTurn = false
+        inputLeveler.reset()
+        resetDuplexCaptureState()
+        inactivityTimer?.cancel()
+        inactivityTimer = nil
+        initialTranscriptTimer?.cancel()
+        initialTranscriptTimer = nil
+        inactivityGate.close()
+        proactiveOpeningAwaitingParticipant = false
+        proactiveOpeningDelivered = false
     }
 
     private static func splitCapturedAudio(
@@ -435,23 +521,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             if let process, process.isRunning { process.terminate() }
             self.process = nil
             active = false
-            activeTurnAudioAdmitted = false
             activeThreadID = nil
             activePersonEntityID = nil
             activeSessionCapability = nil
-            awaitingAssistantResponse = false
-            latestUserTranscriptNS = nil
-            initialTurnValidation.reset()
-            speakerEpisodeAudio.end(keepingCapacity: false)
-            speakerEpisodeInProgress = false
-            initiatingTurn.removeAll(keepingCapacity: false)
-            capturingInitiatingTurn = false
-            inputLeveler.reset()
-            inactivityTimer?.cancel()
-            inactivityTimer = nil
-            initialTranscriptTimer?.cancel()
-            initialTranscriptTimer = nil
-            inactivityGate.close()
+            resetSessionEphemera(keepingAudioCapacity: false)
             if let lifecycle {
                 onEvent(.failed(
                     threadID: lifecycle.threadID,
@@ -548,6 +621,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
         inputLeveler.reset()
+        resetDuplexCaptureState()
         activeTurnAudioAdmitted = false
         initialTranscriptTimer?.cancel()
         initialTranscriptTimer = nil
@@ -563,9 +637,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 persistentEndpoint = endpoint
             case let .failure(error):
                 gate.fail(at: monotonicNS)
-                initialTranscriptTimer?.cancel()
-                initialTranscriptTimer = nil
-                initialTurnValidation.reset()
+                resetSessionEphemera(keepingAudioCapacity: false)
                 onEvent(.failed(
                     threadID: nil,
                     personEntityID: personEntityID,
@@ -578,9 +650,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
         guard let helperURL = helperURL() else {
             gate.fail(at: monotonicNS)
-            initialTranscriptTimer?.cancel()
-            initialTranscriptTimer = nil
-            initialTurnValidation.reset()
+            resetSessionEphemera(keepingAudioCapacity: false)
             onEvent(.failed(
                 threadID: nil,
                 personEntityID: personEntityID,
@@ -618,10 +688,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 self.activeThreadID = nil
                 self.activePersonEntityID = nil
                 self.activeSessionCapability = nil
-                self.initialTranscriptTimer?.cancel()
-                self.initialTranscriptTimer = nil
-                self.initialTurnValidation.reset()
-                self.inputLeveler.reset()
+                self.resetSessionEphemera(keepingAudioCapacity: false)
                 self.onEvent(.failed(
                     threadID: threadID,
                     personEntityID: personEntityID,
@@ -633,9 +700,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             try process.run()
         } catch {
             gate.fail(at: monotonicNS)
-            initialTranscriptTimer?.cancel()
-            initialTranscriptTimer = nil
-            initialTurnValidation.reset()
+            resetSessionEphemera(keepingAudioCapacity: false)
             onEvent(.failed(
                 threadID: nil,
                 personEntityID: personEntityID,
@@ -829,6 +894,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     _ = closeSession(reason: "participant_input_unconfirmed_before_output")
                     continue
                 }
+                duplexCaptureGate.beginAssistantOutput(at: DispatchTime.now().uptimeNanoseconds)
+                onEvent(.microphoneCaptureSuppressed)
                 onEvent(.assistantSpeechStarted)
                 if let latestUserTranscriptNS {
                     let now = DispatchTime.now().uptimeNanoseconds
@@ -841,8 +908,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     self.latestUserTranscriptNS = nil
                 }
                 onEvent(.responding)
-            case "response_completed", "output_speech_ended":
+            case "output_speech_ended":
+                duplexCaptureGate.endAssistantOutput(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.assistantSpeechEnded)
+            case "response_completed":
+                // Generation can complete before the remote playback buffer
+                // drains, so microphone capture resumes only when playback
+                // reports output_speech_ended.
                 finishAssistantResponseIfNeeded()
                 onEvent(.responseCompleted)
                 if hermesResultAwaitingConfirmation.isEmpty,
@@ -854,22 +926,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 let threadID = event.threadID ?? activeThreadID
                 let personEntityID = activePersonEntityID
                 active = false
-                activeTurnAudioAdmitted = false
                 gate.observeEnded()
-                inactivityTimer?.cancel()
-                inactivityTimer = nil
-                initialTranscriptTimer?.cancel()
-                initialTranscriptTimer = nil
-                inactivityGate.close()
                 process = nil
                 input = nil
                 activeThreadID = nil
                 activePersonEntityID = nil
                 activeSessionCapability = nil
-                awaitingAssistantResponse = false
-                latestUserTranscriptNS = nil
-                initialTurnValidation.reset()
-                inputLeveler.reset()
+                resetSessionEphemera(keepingAudioCapacity: false)
                 onEvent(.ended(
                     threadID: threadID,
                     personEntityID: personEntityID,
@@ -888,13 +951,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let personEntityID = activePersonEntityID
         generation &+= 1
         active = false
-        activeTurnAudioAdmitted = false
         gate.fail(at: DispatchTime.now().uptimeNanoseconds)
-        inactivityTimer?.cancel()
-        inactivityTimer = nil
-        initialTranscriptTimer?.cancel()
-        initialTranscriptTimer = nil
-        inactivityGate.close()
         _ = send(["type": "stop"], reportFailure: false)
         if let process, process.isRunning { process.terminate() }
         self.process = nil
@@ -902,14 +959,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeThreadID = nil
         activePersonEntityID = nil
         activeSessionCapability = nil
-        awaitingAssistantResponse = false
-        latestUserTranscriptNS = nil
-        initialTurnValidation.reset()
-        speakerEpisodeAudio.end(keepingCapacity: false)
-        speakerEpisodeInProgress = false
-        initiatingTurn.removeAll(keepingCapacity: false)
-        capturingInitiatingTurn = false
-        inputLeveler.reset()
+        resetSessionEphemera(keepingAudioCapacity: false)
         onEvent(.failed(
             threadID: threadID,
             personEntityID: personEntityID,
@@ -995,13 +1045,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let personEntityID = activePersonEntityID
         generation &+= 1
         active = false
-        activeTurnAudioAdmitted = false
         gate.observeEnded()
-        inactivityGate.close()
-        inactivityTimer?.cancel()
-        inactivityTimer = nil
-        initialTranscriptTimer?.cancel()
-        initialTranscriptTimer = nil
         _ = send(["type": "stop"], reportFailure: false)
         input = nil
         if let process, process.isRunning { process.terminate() }
@@ -1009,14 +1053,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeThreadID = nil
         activePersonEntityID = nil
         activeSessionCapability = nil
-        awaitingAssistantResponse = false
-        latestUserTranscriptNS = nil
-        initialTurnValidation.reset()
-        speakerEpisodeAudio.end(keepingCapacity: false)
-        speakerEpisodeInProgress = false
-        initiatingTurn.removeAll(keepingCapacity: false)
-        capturingInitiatingTurn = false
-        inputLeveler.reset()
+        resetSessionEphemera(keepingAudioCapacity: false)
         onEvent(.ended(
             threadID: threadID,
             personEntityID: personEntityID,
@@ -1161,7 +1198,9 @@ func testAppServerLiveVoiceLauncher() -> String {
              .hermesTaskResultAccepted, .hermesTaskResultRejected,
              .personContextUnavailable, .embodimentMCPCall, .inputAccepted,
              .transcriptFinalized, .preparingResponse, .responseStarted,
-             .assistantSpeechStarted, .assistantSpeechEnded, .responding, .responseCompleted, .ended:
+             .assistantSpeechStarted, .assistantSpeechEnded, .microphoneCaptureSuppressed,
+             .participantBargeInAdmitted, .acousticEchoDiscarded,
+             .responding, .responseCompleted, .ended:
             break
         }
     }

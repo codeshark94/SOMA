@@ -10393,6 +10393,7 @@ private final class LiveVoiceSpeakerEpisodeRuntime: @unchecked Sendable {
         directContactObservedNS: UInt64? = nil,
         directContactContradictedNS: UInt64? = nil,
         speakerEvidenceObservedNS: UInt64? = nil,
+        voiceWindowObservedNS: UInt64? = nil,
         episodeOnsetNS: UInt64? = nil,
         at monotonicNS: UInt64
     ) -> LiveVoiceSpeakerEpisodeObservation {
@@ -10406,6 +10407,7 @@ private final class LiveVoiceSpeakerEpisodeRuntime: @unchecked Sendable {
             directContactObservedNS: directContactObservedNS,
             directContactContradictedNS: directContactContradictedNS,
             speakerEvidenceObservedNS: speakerEvidenceObservedNS,
+            voiceWindowObservedNS: voiceWindowObservedNS,
             episodeOnsetNS: episodeOnsetNS,
             at: monotonicNS
         )
@@ -13369,6 +13371,30 @@ private func run(_ options: Options) throws {
                     active: false,
                     at: eventNS
                 )
+            case .microphoneCaptureSuppressed:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "microphone_quarantined",
+                    message: "assistant_output_active=true"
+                ))
+            case let .participantBargeInAdmitted(bufferedMilliseconds):
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "barge_in_admitted",
+                    message: String(format: "verified_audio_ms=%.1f", bufferedMilliseconds)
+                ))
+            case .acousticEchoDiscarded:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "playback_echo_discarded",
+                    message: "participant_evidence=false"
+                ))
             case .responding:
                 l1LiveConversationState.setParticipantSpeaking(false)
                 conversationContact.recordConversationActivity(at: eventNS)
@@ -13461,7 +13487,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=assistant_output_quarantine_plus_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -14504,6 +14530,7 @@ private func run(_ options: Options) throws {
                 directContactObservedNS: speakerSnapshot.directContactObservedNS,
                 directContactContradictedNS: speakerSnapshot.directContactContradictedNS,
                 speakerEvidenceObservedNS: speakerSnapshot.speakerEvidenceObservedNS,
+                voiceWindowObservedNS: evidence.windowEndNS,
                 episodeOnsetNS: isVoiceOnset ? resolvedVoiceOnsetNS : nil,
                 at: completedNS
             )
@@ -14571,7 +14598,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: completedNS,
                     source: "l2_live_voice",
                     state: "opening_suppressed",
-                    message: "new_conversation_evidence_unconfirmed; tracked_face=\(visualAdmission); direct_gaze=\(speakerSnapshot.evidence.directGaze); speaker_class=\(speakerSnapshot.assessment.classification.rawValue); speaker_episode=\(speakerEpisode.state.rawValue)"
+                    message: "new_conversation_evidence_unconfirmed; tracked_face=\(visualAdmission); direct_gaze=\(speakerSnapshot.evidence.directGaze); speaker_class=\(speakerSnapshot.assessment.classification.rawValue); speaker_episode=\(speakerEpisode.state.rawValue); speech_qualified=\(speakerEpisode.speechEvidence.qualified); strong_windows=\(speakerEpisode.speechEvidence.strongWindowCount); supporting_windows=\(speakerEpisode.speechEvidence.supportingWindowCount)"
                 ))
             }
             if let openingAuthorization,
@@ -14622,12 +14649,21 @@ private func run(_ options: Options) throws {
                 .realtimeVoiceRequiresEyeContactForEveryTurn
                 && evidence.active
                 && speakerEpisode.state == .confirmed
-            if evidence.changed
+            let shouldTraceSpeakerTransition = evidence.changed
                 || speakerEpisode.didTransition
                 || openingAuthorization != nil
-                || strictConfirmedWindow {
+                || strictConfirmedWindow
+            if shouldTraceSpeakerTransition || evidence.active {
                 let strictTurnAdmission = !controlSettings
                     .realtimeVoiceRequiresEyeContactForEveryTurn || confirmedTrackedSpeaker
+                let duplexSpeakerVerified = LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+                    trackedFaceVisible: visualAdmission,
+                    independentSpeakerEvidence: speakerEpisode.speakerEvidenceObserved,
+                    speechEvidenceQualified: speakerEpisode.speechEvidence.qualified,
+                    directContactConfirmed: confirmedTrackedSpeaker,
+                    speakerAttributionRejected: speakerEpisode.state == .rejected,
+                    requiresDirectGaze: controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn
+                )
                 liveVoiceLauncher?.observeVoiceActivity(
                     evidence.active,
                     admitted: strictTurnAdmission && (
@@ -14635,6 +14671,7 @@ private func run(_ options: Options) throws {
                             ? confirmedTrackedSpeaker
                             : speakerSnapshot.assessment.admitsAudio
                     ),
+                    duplexSpeakerVerified: duplexSpeakerVerified,
                     discardBufferedEpisode: !evidence.active && (
                         speakerEpisode.endedState == .pending
                             || speakerEpisode.endedState == .rejected
@@ -14650,18 +14687,21 @@ private func run(_ options: Options) throws {
                         : nil,
                     at: completedNS
                 )
-                if evidence.active {
+                if evidence.active, shouldTraceSpeakerTransition {
                     writer.write(RuntimeEvent(
                         event: "human.interaction",
                         monotonicNS: completedNS,
                         source: "audio_visual_speaker",
                         state: speakerSnapshot.assessment.classification.rawValue,
                         message: String(
-                            format: "probability=%.3f; episode=%@; direct_contact=%@; speaker_evidence=%@; direct_gaze=%@; mouth_motion=%@; mouth_samples=%d; direction_match=%@; strict_every_turn=%@",
+                            format: "probability=%.3f; episode=%@; direct_contact=%@; speaker_evidence=%@; speech_qualified=%@; strong_windows=%d; supporting_windows=%d; direct_gaze=%@; mouth_motion=%@; mouth_samples=%d; direction_match=%@; strict_every_turn=%@",
                             speakerSnapshot.assessment.probability,
                             speakerEpisode.state.rawValue,
                             speakerEpisode.directContactObserved ? "true" : "false",
                             speakerEpisode.speakerEvidenceObserved ? "true" : "false",
+                            speakerEpisode.speechEvidence.qualified ? "true" : "false",
+                            speakerEpisode.speechEvidence.strongWindowCount,
+                            speakerEpisode.speechEvidence.supportingWindowCount,
                             speakerSnapshot.evidence.directGaze ? "true" : "false",
                             speakerSnapshot.evidence.mouthMotion.map { String(format: "%.3f", $0) } ?? "na",
                             speakerSnapshot.evidence.mouthSampleCount,

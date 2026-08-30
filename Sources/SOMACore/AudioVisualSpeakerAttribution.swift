@@ -127,11 +127,122 @@ public enum LiveVoiceSpeakerEpisodeState: String, Equatable, Sendable {
     case rejected
 }
 
+/// Temporal speech evidence required before a new participant episode can be
+/// promoted into a Live Voice session. A single classifier window is never
+/// sufficient, even when its confidence is high.
+public struct LiveVoiceOpeningSpeechConfiguration: Equatable, Sendable {
+    public let strongConfidence: Double
+    public let supportingConfidence: Double
+    public let requiredStrongWindows: Int
+    public let requiredSupportingWindows: Int
+    public let maximumWindowGapMilliseconds: UInt64
+
+    public init(
+        strongConfidence: Double = 0.80,
+        supportingConfidence: Double = 0.68,
+        requiredStrongWindows: Int = 2,
+        requiredSupportingWindows: Int = 3,
+        maximumWindowGapMilliseconds: UInt64 = 650
+    ) {
+        precondition((0...1).contains(strongConfidence))
+        precondition((0...1).contains(supportingConfidence))
+        precondition(supportingConfidence <= strongConfidence)
+        precondition(requiredStrongWindows >= 1)
+        precondition(requiredSupportingWindows >= requiredStrongWindows)
+        precondition(maximumWindowGapMilliseconds > 0)
+        precondition(maximumWindowGapMilliseconds <= UInt64.max / 1_000_000)
+        self.strongConfidence = strongConfidence
+        self.supportingConfidence = supportingConfidence
+        self.requiredStrongWindows = requiredStrongWindows
+        self.requiredSupportingWindows = requiredSupportingWindows
+        self.maximumWindowGapMilliseconds = maximumWindowGapMilliseconds
+    }
+}
+
+public struct LiveVoiceOpeningSpeechEvidence: Equatable, Sendable {
+    public let qualified: Bool
+    public let strongWindowCount: Int
+    public let supportingWindowCount: Int
+}
+
+public struct LiveVoiceOpeningSpeechAccumulator: Sendable {
+    public let configuration: LiveVoiceOpeningSpeechConfiguration
+
+    private var strongWindowCount = 0
+    private var supportingWindowCount = 0
+    private var lastWindowNS: UInt64?
+    private var qualified = false
+
+    public init(configuration: LiveVoiceOpeningSpeechConfiguration = .init()) {
+        self.configuration = configuration
+    }
+
+    public mutating func observe(
+        active: Bool,
+        confidence rawConfidence: Double,
+        at monotonicNS: UInt64
+    ) -> LiveVoiceOpeningSpeechEvidence {
+        guard active else {
+            reset()
+            return snapshot
+        }
+        guard !qualified else { return snapshot }
+
+        let confidence = min(max(rawConfidence, 0), 1)
+        let continuesSequence: Bool
+        if let lastWindowNS,
+           monotonicNS > lastWindowNS,
+           monotonicNS - lastWindowNS <= configuration.maximumWindowGapMilliseconds * 1_000_000 {
+            continuesSequence = true
+        } else {
+            continuesSequence = false
+        }
+        if !continuesSequence {
+            strongWindowCount = 0
+            supportingWindowCount = 0
+        }
+
+        guard confidence >= configuration.supportingConfidence else {
+            strongWindowCount = 0
+            supportingWindowCount = 0
+            lastWindowNS = monotonicNS
+            return snapshot
+        }
+
+        supportingWindowCount += 1
+        if confidence >= configuration.strongConfidence {
+            strongWindowCount += 1
+        } else {
+            strongWindowCount = 0
+        }
+        lastWindowNS = monotonicNS
+        qualified = strongWindowCount >= configuration.requiredStrongWindows
+            || supportingWindowCount >= configuration.requiredSupportingWindows
+        return snapshot
+    }
+
+    public mutating func reset() {
+        strongWindowCount = 0
+        supportingWindowCount = 0
+        lastWindowNS = nil
+        qualified = false
+    }
+
+    public var snapshot: LiveVoiceOpeningSpeechEvidence {
+        .init(
+            qualified: qualified,
+            strongWindowCount: strongWindowCount,
+            supportingWindowCount: supportingWindowCount
+        )
+    }
+}
+
 public struct LiveVoiceSpeakerEpisodeObservation: Equatable, Sendable {
     public let state: LiveVoiceSpeakerEpisodeState
     public let didTransition: Bool
     public let directContactObserved: Bool
     public let speakerEvidenceObserved: Bool
+    public let speechEvidence: LiveVoiceOpeningSpeechEvidence
     public let maximumVoiceConfidence: Double
     public let endedState: LiveVoiceSpeakerEpisodeState?
 }
@@ -156,11 +267,13 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
     private var lastSpeakerEvidenceNS: UInt64?
     private var confirmedAtNS: UInt64?
     private var maximumVoiceConfidence = 0.0
+    private var openingSpeechEvidence: LiveVoiceOpeningSpeechAccumulator
 
     public init(
         maximumResolutionMilliseconds: UInt64 = 3_000,
         maximumEvidenceSkewMilliseconds: UInt64 = 750,
-        maximumContactLeadMilliseconds: UInt64 = 250
+        maximumContactLeadMilliseconds: UInt64 = 250,
+        openingSpeechConfiguration: LiveVoiceOpeningSpeechConfiguration = .init()
     ) {
         precondition(maximumResolutionMilliseconds > 0)
         precondition(maximumResolutionMilliseconds <= UInt64.max / 1_000_000)
@@ -171,6 +284,9 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         maximumResolutionNS = maximumResolutionMilliseconds * 1_000_000
         maximumEvidenceSkewNS = maximumEvidenceSkewMilliseconds * 1_000_000
         maximumContactLeadNS = maximumContactLeadMilliseconds * 1_000_000
+        openingSpeechEvidence = LiveVoiceOpeningSpeechAccumulator(
+            configuration: openingSpeechConfiguration
+        )
     }
 
     public mutating func observe(
@@ -181,6 +297,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         directContactObservedNS: UInt64? = nil,
         directContactContradictedNS: UInt64? = nil,
         speakerEvidenceObservedNS: UInt64? = nil,
+        voiceWindowObservedNS: UInt64? = nil,
         episodeOnsetNS: UInt64? = nil,
         at monotonicNS: UInt64
     ) -> LiveVoiceSpeakerEpisodeObservation {
@@ -198,10 +315,19 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             lastSpeakerEvidenceNS = nil
             confirmedAtNS = nil
             maximumVoiceConfidence = 0
+            openingSpeechEvidence.reset()
             return observation(didTransition: transitioned, endedState: endedState)
         }
 
         maximumVoiceConfidence = max(maximumVoiceConfidence, evidence.voiceConfidence)
+        let voiceEvidenceNS = voiceWindowObservedNS.flatMap {
+            $0 <= monotonicNS ? $0 : nil
+        } ?? monotonicNS
+        _ = openingSpeechEvidence.observe(
+            active: true,
+            confidence: evidence.voiceConfidence,
+            at: voiceEvidenceNS
+        )
         if !episodeActive {
             episodeActive = true
             onsetNS = episodeOnsetNS ?? monotonicNS
@@ -337,7 +463,8 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             return .rejected
         }
         guard let lastDirectContactNS,
-              let lastSpeakerEvidenceNS else {
+              let lastSpeakerEvidenceNS,
+              openingSpeechEvidence.snapshot.qualified else {
             return .pending
         }
         let skew = lastDirectContactNS >= lastSpeakerEvidenceNS
@@ -425,6 +552,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             didTransition: didTransition,
             directContactObserved: directContactObserved,
             speakerEvidenceObserved: speakerEvidenceObserved,
+            speechEvidence: openingSpeechEvidence.snapshot,
             maximumVoiceConfidence: maximumVoiceConfidence,
             endedState: endedState
         )

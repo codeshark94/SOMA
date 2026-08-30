@@ -330,6 +330,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var realtimeSessionInitialized = false
     private var activeEmitted = false
     private var inputSpeechInProgress = false
+    private var assistantOutputActive = false
     private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
     private var observedRealtimeEventTypes: Set<String> = []
@@ -490,9 +491,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         case "output_playback_ready":
             emitter.emit("output_playback_ready")
         case "output_speech_started":
-            emitter.emit("output_speech_started")
+            observeAssistantOutputStarted()
         case "output_speech_ended":
-            emitter.emit("output_speech_ended")
+            observeAssistantOutputEnded()
         case "realtime_event":
             handleRealtimeDataChannel(body["payload"] as? String ?? "")
         case "closed":
@@ -971,7 +972,16 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             emitter.emit("response_interrupted")
             return
         }
+        if type == "output_audio_buffer.started" || type.contains("response.output_audio.delta") {
+            observeAssistantOutputStarted()
+            return
+        }
+        if type == "output_audio_buffer.stopped" {
+            observeAssistantOutputEnded()
+            return
+        }
         if type == "output_audio_buffer.cleared" || type.contains("conversation.item.truncated") {
+            observeAssistantOutputEnded()
             emitter.emit("interrupted_audio_cleared", fields: ["type": String(type.prefix(128))])
             return
         }
@@ -1002,6 +1012,18 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         setCognitiveTurn(active: true)
         inputSpeechInProgress = true
         emitter.emit("input_speech_started")
+    }
+
+    private func observeAssistantOutputStarted() {
+        guard !assistantOutputActive else { return }
+        assistantOutputActive = true
+        emitter.emit("output_speech_started")
+    }
+
+    private func observeAssistantOutputEnded() {
+        guard assistantOutputActive else { return }
+        assistantOutputActive = false
+        emitter.emit("output_speech_ended")
     }
 
     private func setCognitiveTurn(active: Bool) {
@@ -1118,6 +1140,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private func stop(reason: String, emitEnded: Bool = true) {
         guard !stopping else { return }
         stopping = true
+        observeAssistantOutputEnded()
         setCognitiveTurn(active: false)
         if let threadID {
             connection.request(method: "thread/realtime/stop", params: ["threadId": threadID]) { _ in }
