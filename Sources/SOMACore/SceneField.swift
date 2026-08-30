@@ -34,7 +34,7 @@ public enum OBSBOTTiny2LiteOptics {
     public static let wideHorizontalDegrees = 67.2
     public static let nominalWideModeDegrees = 86.0
 
-    /// libdev exposes generic 86/78/65 mode names, while Tiny 2 Lite's optical
+    /// Firmware exposes generic 86/78/65 mode names, while Tiny 2 Lite's optical
     /// specification gives the wide horizontal angle as 67.2 degrees. Preserve
     /// the generic modes' tangent-space crop ratios without treating their
     /// labels as this camera's physical angles.
@@ -50,7 +50,7 @@ public enum OBSBOTTiny3LiteOptics {
     public static let wideHorizontalDegrees = 72.0
 
     public static func horizontalDegrees(forFOVMode modeDegrees: Double) -> Double? {
-        OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forSDKMode: modeDegrees)
+        OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forNominalMode: modeDegrees)
     }
 }
 
@@ -73,7 +73,7 @@ public struct GimbalRelativeBearing: Codable, Equatable, Sendable {
     }
 }
 
-/// A measured physical Tiny 2 Lite attitude, in the SDK's pitch/pan axes.
+/// A measured physical gimbal attitude in the device's pitch/pan axes.
 public struct GimbalPose: Codable, Equatable, Sendable {
     public let pitchDegrees: Double
     public let panDegrees: Double
@@ -147,9 +147,9 @@ public struct GimbalKinematicEnvelope: Codable, Equatable, Sendable {
     }
 }
 
-/// Maps image offsets into the SDK attitude coordinates. This is separate
-/// from a velocity-command calibration: a positive SDK speed need not increase
-/// the SDK-reported angle on the same axis.
+/// Maps image offsets into device-attitude coordinates. This is separate
+/// from a velocity-command calibration: a positive speed need not increase
+/// the reported angle on the same axis.
 public struct GimbalPoseProjection: Sendable {
     public let panImageSign: Double
     public let pitchImageSign: Double
@@ -771,10 +771,10 @@ public struct SceneField: Sendable {
             let idealRay = cameraProjectionModel.actualToIdeal(actualRay)
             let panSign = poseProjection.panImageSign >= 0 ? 1.0 : -1.0
             let pitchSign = poseProjection.pitchImageSign >= 0 ? 1.0 : -1.0
-            // `panImageSign` measures how an image point moves when the SDK
+            // `panImageSign` measures how an image point moves when the device
             // attitude increases. Camera yaw has the inverse horizontal
             // relation: panning the camera right moves a fixed world point
-            // left in its image. Bearings remain in SDK-attitude coordinates
+            // left in its image. Bearings remain in device-attitude coordinates
             // because motor routing consumes them directly.
             let cameraAzimuth = -cameraPose.panDegrees * panSign * .pi / 180
             let cameraElevation = cameraPose.pitchDegrees * pitchSign * .pi / 180
@@ -847,7 +847,7 @@ public struct SceneField: Sendable {
             return false
         }
         // A current human rectangle is sufficient for image-space closed-loop
-        // tracking during a brief SDK-attitude reporting gap. The physical
+        // tracking during a brief device-attitude reporting gap. The physical
         // boundary still applies whenever a fresh pose is available. Retained
         // offscreen records remain session-map evidence only at L0.
         if track.kind == .human && !track.trackingBoundary.isPoseAligned {

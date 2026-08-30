@@ -110,9 +110,10 @@ public struct ConversationContactGate: Sendable {
         )
     }
 
-    /// Evaluates a voice-activity episode exactly once, at its onset. Direct
-    /// visual contact that begins later cannot retroactively turn ambient
-    /// audio into a user-initiated conversation.
+    /// Evaluates a voice-activity episode from its first admitted sample. An
+    /// upstream audiovisual gate may hold raw VAD samples while it aligns
+    /// contact and speaker evidence; once admitted, this gate emits at most one
+    /// opening authorization for the episode.
     public mutating func observeVoiceActivity(
         active: Bool,
         at monotonicNS: UInt64,
@@ -131,9 +132,9 @@ public struct ConversationContactGate: Sendable {
             openingVoiceEvidence.reset()
             return .activeConversation
         }
-        // Gaze and speech must coexist throughout the opening evidence, not
-        // merely overlap for one callback. Once an episode begins without
-        // current direct contact it cannot be upgraded by a later gaze sample.
+        // A caller that admits an episode without verified contact consumes
+        // that episode. Multimodal alignment must therefore happen upstream,
+        // before the first admitted sample reaches this interaction boundary.
         guard directContact else {
             speechEpisodeActive = true
             openingVoiceEvidence.reset()
@@ -244,8 +245,8 @@ public struct L0FaceFixationAdmission: Sendable {
 }
 
 /// Coarse visual admission for a detected voice. The current verified face is
-/// still insufficient by itself: the contact gate separately requires direct
-/// gaze at the onset of a new speech episode.
+/// still insufficient by itself: audiovisual attribution separately requires
+/// direct gaze and speaker evidence from the same tracked-face episode.
 public enum LiveConversationVisualAdmission {
     public static func permitsNewSession(for belief: BeliefSnapshot) -> Bool {
         guard belief.targetStatus == .tracked,

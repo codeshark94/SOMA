@@ -768,7 +768,7 @@ public struct SpatialCoverageField: Sendable {
         return difference
     }
 
-    /// Coverage cells live in SDK motor coordinates because the route planner
+    /// Coverage cells live in device motor coordinates because the route planner
     /// consumes them directly. Image projection lives in a conventional
     /// right/up visual sphere, so convert the stored bearing exactly once.
     private func canonicalBearing(

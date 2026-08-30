@@ -10,6 +10,22 @@ import SOMAOpenCV
 import SOMAVADModel
 @preconcurrency import Vision
 
+private let somaSubconsciousResourceBundle: Bundle = {
+    let bundleName = "SOMA_SOMASubconscious.bundle"
+    let candidates = [
+        Bundle.main.resourceURL?.appendingPathComponent(bundleName),
+        Bundle.main.bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent(bundleName, isDirectory: true),
+        Bundle.main.bundleURL.appendingPathComponent(bundleName, isDirectory: true),
+    ]
+    for case let candidate? in candidates {
+        if let bundle = Bundle(url: candidate) { return bundle }
+    }
+    return Bundle.module
+}()
+
 // MARK: - SOMA .env layer configuration helpers
 /// Reads a boolean from a `SOMA_*` / `OLLAMA_*` environment variable that the
 /// Control Center manages through `~/Library/Application Support/SOMA/.env`.
@@ -737,6 +753,7 @@ private struct Options {
     let tdoaCalibrationOutputURL: URL?
     let allowCameraMotion: Bool
     let nativeGimbalHelperURL: URL?
+    let nativeGimbalShutdownHelperURL: URL?
     let gimbalOutputURL: URL?
     let gimbalTraceRotationPolicy: JSONLRotationPolicy?
     let allowNativeHumanTracking: Bool
@@ -777,6 +794,7 @@ private struct Options {
         var tdoaCalibrationOutputURL: URL?
         var allowCameraMotion = false
         var nativeGimbalHelperURL: URL?
+        var nativeGimbalShutdownHelperURL: URL?
         var gimbalOutputURL: URL?
         var gimbalTraceMaximumMegabytes: Int?
         var gimbalTraceRetainedFiles: Int?
@@ -884,6 +902,12 @@ private struct Options {
                     throw RuntimeError.invalidArgument("--native-gimbal-helper requires an executable path")
                 }
                 nativeGimbalHelperURL = URL(fileURLWithPath: arguments[index])
+            case "--native-gimbal-shutdown-helper":
+                index += 1
+                guard index < arguments.count else {
+                    throw RuntimeError.invalidArgument("--native-gimbal-shutdown-helper requires an executable path")
+                }
+                nativeGimbalShutdownHelperURL = URL(fileURLWithPath: arguments[index])
             case "--gimbal-output":
                 index += 1
                 guard index < arguments.count else {
@@ -1067,7 +1091,9 @@ private struct Options {
         let wantsExternalControl = allowExternalGimbalControl || allowAutonomousScan
             || allowEmbodimentMotorControl || panoramaStripScan
             || externalGimbalCalibrationURL != nil || externalGimbalCalibrationOutputURL != nil
-        let wantsActuation = allowCameraMotion || nativeGimbalHelperURL != nil || gimbalOutputURL != nil || wantsExternalControl || allowNativeHumanTracking
+        let wantsActuation = allowCameraMotion || nativeGimbalHelperURL != nil
+            || nativeGimbalShutdownHelperURL != nil || gimbalOutputURL != nil
+            || wantsExternalControl || allowNativeHumanTracking
         if wantsActuation {
             guard allowCameraMotion, let nativeGimbalHelperURL, let gimbalOutputURL else {
                 throw RuntimeError.invalidArgument("Camera motion requires --allow-camera-motion, --native-gimbal-helper, and --gimbal-output together")
@@ -1081,6 +1107,10 @@ private struct Options {
             }
             guard FileManager.default.isExecutableFile(atPath: nativeGimbalHelperURL.path) else {
                 throw RuntimeError.invalidArgument("Native gimbal helper is not executable: \(nativeGimbalHelperURL.path)")
+            }
+            if let nativeGimbalShutdownHelperURL,
+               !FileManager.default.isExecutableFile(atPath: nativeGimbalShutdownHelperURL.path) {
+                throw RuntimeError.invalidArgument("Native gimbal shutdown helper is not executable: \(nativeGimbalShutdownHelperURL.path)")
             }
             guard !FileManager.default.fileExists(atPath: gimbalOutputURL.path) else {
                 throw RuntimeError.invalidArgument("Gimbal trace already exists: \(gimbalOutputURL.path)")
@@ -1207,6 +1237,7 @@ private struct Options {
             tdoaCalibrationOutputURL: tdoaCalibrationOutputURL,
             allowCameraMotion: allowCameraMotion,
             nativeGimbalHelperURL: nativeGimbalHelperURL,
+            nativeGimbalShutdownHelperURL: nativeGimbalShutdownHelperURL,
             gimbalOutputURL: gimbalOutputURL,
             gimbalTraceRotationPolicy: gimbalTraceRotationPolicy,
             allowNativeHumanTracking: allowNativeHumanTracking,
@@ -1594,10 +1625,10 @@ private final class ConversationContactRuntime: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         // Directed-contact history remains L1 social context. It cannot
-        // authorize a new conversation on its own: the current L0 fixation
-        // must already have preempted coverage motion and verified the face at
-        // the beginning of this speech episode. An already open conversation
-        // keeps its own inactivity lease.
+        // authorize a new conversation on its own: either the current L0
+        // fixation or the bounded same-face audiovisual episode must verify
+        // direct contact. An already open conversation keeps its own
+        // inactivity lease.
         let directContact = l0FixationAdmission.permitsNewSession(at: monotonicNS)
             || audioVisualDirectContact
         return gate.observeVoiceActivity(
@@ -3280,7 +3311,7 @@ private final class GimbalPoseStore: @unchecked Sendable {
 
     func updateFieldOfViewMode(_ degrees: Double) -> Double? {
         lock.lock()
-        let horizontal = deviceCapabilities?.horizontalFieldOfViewDegrees(forSDKMode: degrees)
+        let horizontal = deviceCapabilities?.horizontalFieldOfViewDegrees(forNominalMode: degrees)
         guard let horizontal else {
             lock.unlock()
             return nil
@@ -3376,7 +3407,7 @@ private final class GimbalPoseStore: @unchecked Sendable {
     func captureAlignedPose(at captureNS: UInt64) -> CaptureAlignedPoseResolution {
         lock.lock()
         defer { lock.unlock() }
-        // The native helper asks for attitude at 20 ms cadence, but the SDK can
+        // The native helper asks for attitude at 20 ms cadence, but the device can
         // return no sample during an AI-tracking transaction and create a gap
         // near its 100 ms polling ceiling. Panorama may wait and interpolate a
         // measured bracket; live tracking retains the strict 50 ms path above.
@@ -3465,7 +3496,7 @@ private final class GimbalPoseStore: @unchecked Sendable {
             pitchDegreesPerSecond: (latest.pitchDegrees - prior.pitchDegrees) / elapsed,
             panDegreesPerSecond: (latest.panDegrees - prior.panDegrees) / elapsed
         )
-        // Reject malformed SDK attitude jumps rather than presenting an
+        // Reject malformed device-attitude jumps rather than presenting an
         // implausible instantaneous rate as a braking measurement.
         guard feedback.pitchDegreesPerSecond.isFinite,
               feedback.panDegreesPerSecond.isFinite,
@@ -3477,7 +3508,7 @@ private final class GimbalPoseStore: @unchecked Sendable {
     }
 
     /// The most recent pose regardless of age. Used by bounded expressions so a
-    /// stale attitude sample (e.g. during an SDK AI-tracking transaction) does
+    /// stale attitude sample (e.g. during a firmware tracking transaction) does
     /// not stall a bow/nod that should complete on a fixed timer.
     func lastKnown() -> GimbalPose? {
         lock.lock()
@@ -3485,7 +3516,7 @@ private final class GimbalPoseStore: @unchecked Sendable {
         return recent.last
     }
 
-    /// Returns logical SDK-attitude samples for one bounded motor lease. These
+    /// Returns logical device-attitude samples for one bounded motor lease. These
     /// poses share the spatial frame used by panorama and exploration.
     func trajectory(from startNS: UInt64, through endNS: UInt64) -> [GimbalPose] {
         lock.lock()
@@ -3753,6 +3784,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private let process: Process
     private let input: FileHandle
     private let readyInput: FileHandle
+    private let shutdownHelperURL: URL?
+    private let shutdownOutputURL: URL
+    private let shutdownTraceRotationPolicy: JSONLRotationPolicy?
     private let exited = DispatchSemaphore(value: 0)
     private let nativeHumanTrackingEnabled: Bool
     private let ledSettings: SOMALEDSettings
@@ -3768,7 +3802,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var state: State = .running
     private var gate = NativeHumanTrackingGate()
     private var nativeCommandID: String?
-    /// SDK acknowledgement only means the device accepted a mode switch. It
+    /// Transport acknowledgement only means the device accepted a mode switch. It
     /// becomes a motor owner after its response has been observed.
     private var nativeTrackingActive = false
     private var nativeTrackingFunctionallyVerified = false
@@ -3839,7 +3873,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var poseWaitStopIssued = false
     private var poseStreamDegradedReported = false
     // The calibration expresses an expected axis sign. During exploration the
-    // SDK attitude is the authority: one non-moving pan pulse reverses the
+    // Device attitude is the authority: one non-moving pan pulse reverses the
     // next pulse; both directions failing requires a physical re-home.
     private var explorationPanPolarity = 1.0
     private var panStallRecovery = PanStallRecovery()
@@ -4045,6 +4079,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     init(
         helperURL: URL,
+        shutdownHelperURL: URL? = nil,
         outputURL: URL,
         traceRotationPolicy: JSONLRotationPolicy?,
         duration: TimeInterval,
@@ -4064,6 +4099,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         writer: JSONLWriter
     ) throws {
         self.writer = writer
+        self.shutdownHelperURL = shutdownHelperURL
+        shutdownOutputURL = outputURL
+        shutdownTraceRotationPolicy = traceRotationPolicy
         self.nativeHumanTrackingEnabled = nativeHumanTrackingEnabled
         self.ledSettings = ledSettings
         self.calibrationOutputURL = calibrationOutputURL
@@ -4173,7 +4211,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               let panText = values["pan"], let pan = Double(panText),
               let sampleText = values["monotonic_ns"], let sampleNS = UInt64(sampleText) else { return }
         let receivedNS = monotonicNanoseconds()
-        // The SDK helper and DispatchTime can use monotonic clocks with
+        // The native helper and DispatchTime can use monotonic clocks with
         // different sleep epochs. The local scalar pipe's receive timestamp
         // is therefore the shared clock for capture alignment; helper reports
         // arrive every 20 ms, below the 50 ms image-pose freshness window.
@@ -4186,7 +4224,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: receivedNS,
             source: "gimbal_pose",
             state: "available",
-            message: "sdk_attitude_feedback"
+            message: "native_attitude_feedback"
         ))
     }
 
@@ -4430,7 +4468,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             guard let state = values["state"] else { return }
             let commandID = values["command_id"].map(String.init)
             let outcome = values["outcome"].map(String.init)
-            if state == "active" {
+            if state == "accepted" {
                 nativeTrackingActive = true
                 nativeTrackingFunctionallyVerified = false
                 nativeTrackingStartPending = false
@@ -4772,8 +4810,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     func stop() {
-        queue.sync {
-            if case .stopped = state { return }
+        let shouldStop: Bool = queue.sync {
+            if case .stopped = state { return false }
             let stopNS = monotonicNanoseconds()
             onL0FaceFixation(nil, false, stopNS)
             if calibrationOutputURL != nil {
@@ -4801,7 +4839,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // process so the next launch begins from an unowned motor state.
             disableFirmwareSoundFollowing(at: stopNS, reason: "runtime_stopping")
             let commandID = nextCommandID(prefix: "shutdown")
-            send("shutdown \(commandID)")
+            send(shutdownHelperURL == nil
+                ? "shutdown \(commandID)"
+                : "manual_stop \(commandID)")
             writer.write(CameraIntentEvent(
                 monotonicNS: monotonicNanoseconds(),
                 owner: .manual,
@@ -4818,16 +4858,56 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             cancelExternalStop()
             cancelScan()
             state = .stopped
+            return true
         }
-        guard process.isRunning else { return }
-        // The helper parks Tiny 3 through the same maximum-speed stabilised
-        // pose interface used by external tracking, verifies arrival, then
-        // sleeps the device. Its bounded arrival check is four seconds; keep
-        // enough margin for command transport and the sleep acknowledgement
-        // without turning a failed park into a long shutdown stall.
-        if exited.wait(timeout: .now() + 7) == .timedOut {
-            process.terminate()
-            _ = exited.wait(timeout: .now() + 3)
+        guard shouldStop else { return }
+        if process.isRunning {
+            if exited.wait(timeout: .now() + 7) == .timedOut {
+                process.terminate()
+                _ = exited.wait(timeout: .now() + 3)
+            }
+        }
+        runLifecycleShutdownIfNeeded()
+    }
+
+    private func runLifecycleShutdownIfNeeded() {
+        guard let shutdownHelperURL else { return }
+        let lifecycle = Process()
+        lifecycle.executableURL = shutdownHelperURL
+        var arguments = [
+            "--allow-camera-motion",
+            "--park-sleep",
+            "--output", shutdownOutputURL.path,
+        ]
+        if let shutdownTraceRotationPolicy {
+            arguments += [
+                "--trace-max-megabytes", String(shutdownTraceRotationPolicy.maximumBytes / 1_048_576),
+                "--trace-retained-files", String(shutdownTraceRotationPolicy.retainedFiles),
+            ]
+        }
+        lifecycle.arguments = arguments
+        lifecycle.standardOutput = FileHandle.nullDevice
+        lifecycle.standardError = FileHandle.nullDevice
+        do {
+            try lifecycle.run()
+            lifecycle.waitUntilExit()
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "attention_gimbal_bridge",
+                state: lifecycle.terminationStatus == 0
+                    ? "lifecycle_shutdown_completed"
+                    : "lifecycle_shutdown_failed",
+                message: "termination_status=\(lifecycle.terminationStatus); verified_park_sleep=\(lifecycle.terminationStatus == 0)"
+            ))
+        } catch {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "attention_gimbal_bridge",
+                state: "lifecycle_shutdown_failed",
+                message: String(error.localizedDescription.prefix(192))
+            ))
         }
     }
 
@@ -5155,7 +5235,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             let currentPose = poseStore.current()
             let currentVelocity = poseStore.currentVelocity()
             // External velocity is a physical closed loop. A face rectangle
-            // without its capture-time bearing or a current SDK attitude is
+            // without its capture-time bearing or a current device attitude is
             // awareness, not enough state to steer the gimbal: image-space
             // fallback here was the source of full-speed starts before the
             // pose loop could establish its absolute target.
@@ -5960,7 +6040,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNS,
             source: "native_tracking",
             state: "functional_verification_started",
-            message: "deadline_ms=\(nativeTrackingLiveness.acquisitionTimeoutMilliseconds); sdk_ack_is_not_a_lock"
+            message: "deadline_ms=\(nativeTrackingLiveness.acquisitionTimeoutMilliseconds); transport_acceptance_is_not_a_lock"
         ))
         queue.asyncAfter(
             deadline: .now() + .milliseconds(nativeTrackingLiveness.acquisitionTimeoutMilliseconds)
@@ -7409,14 +7489,14 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         // Bounded expressions (bow/nod/greeting) complete on a fixed timer, so
         // they may use the last known pose even if the attitude sample is stale
-        // (e.g. during an SDK AI-tracking transaction). Other modes need a fresh
+        // (e.g. during a firmware tracking transaction). Other modes need a fresh
         // pose to avoid driving on outdated geometry.
         let pose: GimbalPose?
         if case .expression = cognitiveMotionMode {
             pose = poseStore.lastKnown()
         } else {
             // 600ms window: the native attitude reporter emits at ~70-90ms
-            // cadence with occasional gaps during SDK mode switches.
+            // cadence with occasional gaps during firmware mode switches.
             pose = poseStore.current(maximumAgeNS: 600_000_000)
         }
         guard let pose else {
@@ -7756,7 +7836,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let startedNS = waypointStartedNS ?? monotonicNS
         let minimumWaypointNS: UInt64 = kind == .greeting ? 70_000_000 : 120_000_000
         let arrivalToleranceDegrees = kind == .greeting ? 0.75 : 1.8
-        // Advance on arrival OR on a time fallback. Some gimbal SDKs do not
+        // Advance on arrival OR on a time fallback. Some gimbal transports do not
         // reflect commanded movement in the attitude feedback, so the pose
         // distance never converges; without this fallback the expression would
         // hold until the lease expires and never report completion.
@@ -8342,7 +8422,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         let desired: (pitch: Double, pan: Double, state: String)
             // The native helper reports attitude on a dedicated thread at a
-            // ~70-90ms cadence (synchronous SDK round-trip), with occasional
+            // ~70-90ms cadence (synchronous device round-trip), with occasional
             // multi-hundred-ms gaps while the bridge loop is inside a mode
             // switch. A 600ms window absorbs those gaps; the gimbal moves
             // slowly enough that a pose up to 600ms old is still safe for
@@ -8993,7 +9073,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             ))
             return
         }
-        guard let nextRendering = indicatorRendering(next) else {
+        guard let nextRendering = indicatorRendering(next, at: monotonicNS) else {
             guard next != activeIndicatorState || indicatorIlluminated else { return }
             if indicatorIlluminated, let previousRendering = activeIndicatorRendering {
                 send(indicatorClearCommand(
@@ -9039,7 +9119,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             monotonicNS: monotonicNS,
             source: "social_indicator",
             state: next.rawValue,
-            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); transport=\(nextRendering.usesFirmwareDefault ? "firmware_default" : nextRendering.directColor == nil ? "firmware_state" : "semantic_direct_color"); pulse_enabled=\(nextRendering.pulseEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextSignal.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); command_submitted=\(!nextRendering.usesFirmwareDefault)"
+            message: "human_meaning=\(next.humanMeaning); visual=\(indicatorInputs.visualState.rawValue); interaction=\(indicatorInputs.interactionState.rawValue); transport=\(nextRendering.usesFirmwareDefault ? "firmware_default" : nextRendering.directColor == nil ? "firmware_state" : "semantic_direct_color"); pulse_enabled=\(nextRendering.pulseEnabled); color=\(nextSignal.color.rawValue); pattern=\(nextRendering.pattern.rawValue); brightness=\(ledSettings.brightness); policy=\(ledSettings.responseMode.rawValue); command_submitted=\(!nextRendering.usesFirmwareDefault)"
         ))
     }
 
@@ -9052,7 +9132,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
               indicatorIlluminated,
               next == activeIndicatorState,
               let activeIndicatorRendering,
-              activeIndicatorRendering == indicatorRendering(next) else {
+              activeIndicatorRendering == indicatorRendering(next, at: monotonicNS) else {
             refreshIndicator(at: monotonicNS)
             return
         }
@@ -9064,9 +9144,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
     }
 
-    private func indicatorRendering(_ state: SubconsciousIndicatorState) -> SOMALEDDeviceRendering? {
+    private func indicatorRendering(
+        _ state: SubconsciousIndicatorState,
+        at monotonicNS: UInt64
+    ) -> SOMALEDDeviceRendering? {
         guard let deviceContract else { return nil }
-        return ledSettings.deviceRendering(for: state, on: deviceContract)
+        let verifiedEyeContact = indicatorInputs.visualState == .eyeContact
+            && eyeContactIndicatorLease.isActive(at: monotonicNS)
+        return ledSettings.deviceRendering(
+            for: state,
+            on: deviceContract,
+            eyeContactActive: verifiedEyeContact
+        )
     }
 
     /// Face and gaze evidence arrive on different cadence paths from native
@@ -9632,7 +9721,10 @@ private final class ANEObjectDetector: @unchecked Sendable {
         self.confidenceThreshold = confidenceThreshold
         self.personConfidenceThreshold = personConfidenceThreshold
         let modelURL: URL
-        if let compiledURL = Bundle.module.url(forResource: "YOLO11n", withExtension: "mlpackage") {
+        if let compiledURL = somaSubconsciousResourceBundle.url(
+            forResource: "YOLO11n",
+            withExtension: "mlpackage"
+        ) {
             modelURL = compiledURL
         } else {
             throw RuntimeError.configuration("Bundled Core ML object detector is missing")
@@ -9790,7 +9882,10 @@ private final class ANEFaceDetector: @unchecked Sendable {
     private let confidenceThreshold: Double
 
     init() throws {
-        guard let modelURL = Bundle.module.url(forResource: "BlazeFaceShortRange", withExtension: "mlpackage") else {
+        guard let modelURL = somaSubconsciousResourceBundle.url(
+            forResource: "BlazeFaceShortRange",
+            withExtension: "mlpackage"
+        ) else {
             throw RuntimeError.configuration("Bundled Core ML face detector is missing")
         }
         let configuration = MLModelConfiguration()
@@ -10059,13 +10154,22 @@ private struct SystemFaceEvidence: Sendable {
 
 private struct VisualSpeakerFrameEvidence: Sendable {
     let rect: SOMACore.NormalizedRect
-    let directGaze: Bool
+    let gazeState: SOMACore.VisualGazeEvidence
     let mouthAperture: Double?
 }
 
 private struct VisualSpeakerAttributionSnapshot: Sendable {
     let evidence: AudioVisualSpeakerEvidence
     let assessment: AudioVisualSpeakerAssessment
+    let directContactObservedNS: UInt64?
+    let directContactContradictedNS: UInt64?
+    let speakerEvidenceObservedNS: UInt64?
+}
+
+private struct VisualSpeakerGazeUpdate: Sendable {
+    let targetID: String
+    let state: SOMACore.VisualGazeEvidence
+    let observedNS: UInt64
 }
 
 private final class RecentAcousticOnsetStore: @unchecked Sendable {
@@ -10123,7 +10227,7 @@ private final class RecentAcousticOnsetStore: @unchecked Sendable {
 private final class VisualSpeakerAttributionStore: @unchecked Sendable {
     private struct Sample {
         let rect: SOMACore.NormalizedRect
-        let directGaze: Bool
+        let gazeState: SOMACore.VisualGazeEvidence
         let mouthAperture: Double?
         let observedNS: UInt64
     }
@@ -10135,10 +10239,10 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
     }
 
     private struct Episode {
-        let targetRect: SOMACore.NormalizedRect
+        let targetID: String
         let onsetNS: UInt64
-        let directGazeAtOnset: Bool
         let baselineMouthAperture: Double?
+        var targetRect: SOMACore.NormalizedRect
     }
 
     private let lock = NSLock()
@@ -10146,19 +10250,40 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
     private var direction: DirectionSample?
     private var episode: Episode?
     private let retentionNS: UInt64 = 1_200_000_000
+    // The verifier runs at up to 12 Hz. Three capture intervals absorb normal
+    // scheduling jitter without letting an older gaze state authorize a new
+    // acoustic episode.
+    private let maximumGazeAgeAtOnsetNS: UInt64 = 250_000_000
 
-    func record(_ faces: [VisualSpeakerFrameEvidence], at monotonicNS: UInt64) {
+    func record(
+        _ faces: [VisualSpeakerFrameEvidence],
+        at monotonicNS: UInt64
+    ) -> VisualSpeakerGazeUpdate? {
         lock.lock()
+        defer { lock.unlock() }
         prune(at: monotonicNS)
         samples.append(contentsOf: faces.map {
             Sample(
                 rect: $0.rect,
-                directGaze: $0.directGaze,
+                gazeState: $0.gazeState,
                 mouthAperture: $0.mouthAperture,
                 observedNS: monotonicNS
             )
         })
-        lock.unlock()
+        guard let episode,
+              let current = faces
+                .filter({ Self.matches($0.rect, episode.targetRect) })
+                .max(by: {
+                    Self.overlap($0.rect, episode.targetRect)
+                        < Self.overlap($1.rect, episode.targetRect)
+                }) else {
+            return nil
+        }
+        return VisualSpeakerGazeUpdate(
+            targetID: episode.targetID,
+            state: current.gazeState,
+            observedNS: monotonicNS
+        )
     }
 
     func record(direction: AudioDirection, confidence: Double, at monotonicNS: UInt64) {
@@ -10172,6 +10297,7 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
     }
 
     func beginEpisode(
+        targetID: String?,
         targetRect: SOMACore.NormalizedRect?,
         voiceConfidence: Double,
         at onsetNS: UInt64
@@ -10179,7 +10305,7 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         prune(at: onsetNS)
-        guard let targetRect else {
+        guard let targetID, let targetRect else {
             episode = nil
             let evidence = AudioVisualSpeakerEvidence(
                 faceVisible: false,
@@ -10189,23 +10315,29 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
                 directionMatchesFace: nil,
                 voiceConfidence: voiceConfidence
             )
-            return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+            return .init(
+                evidence: evidence,
+                assessment: AudioVisualSpeakerAttribution.assess(evidence),
+                directContactObservedNS: nil,
+                directContactContradictedNS: nil,
+                speakerEvidenceObservedNS: nil
+            )
         }
         let onsetFaceSamples = samples.filter {
             onsetNS >= $0.observedNS
-                && onsetNS - $0.observedNS <= 700_000_000
+                && onsetNS - $0.observedNS <= maximumGazeAgeAtOnsetNS
                 && Self.matches($0.rect, targetRect)
         }
         let latestFaceSample = onsetFaceSamples.max { $0.observedNS < $1.observedNS }
         let directGaze = latestFaceSample.map {
-            $0.directGaze
-                && onsetNS - $0.observedNS <= 250_000_000
+            $0.gazeState == .direct
+                && onsetNS - $0.observedNS <= maximumGazeAgeAtOnsetNS
         } ?? false
         episode = Episode(
-            targetRect: targetRect,
+            targetID: targetID,
             onsetNS: onsetNS,
-            directGazeAtOnset: directGaze,
-            baselineMouthAperture: latestFaceSample?.mouthAperture
+            baselineMouthAperture: latestFaceSample?.mouthAperture,
+            targetRect: targetRect
         )
         let evidence = AudioVisualSpeakerEvidence(
             faceVisible: latestFaceSample != nil,
@@ -10215,10 +10347,19 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
             directionMatchesFace: nil,
             voiceConfidence: voiceConfidence
         )
-        return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+        return .init(
+            evidence: evidence,
+            assessment: AudioVisualSpeakerAttribution.assess(evidence),
+            directContactObservedNS: directGaze ? latestFaceSample?.observedNS : nil,
+            directContactContradictedNS: latestFaceSample?.gazeState == .averted
+                ? latestFaceSample?.observedNS
+                : nil,
+            speakerEvidenceObservedNS: nil
+        )
     }
 
     func assessCurrentEpisode(
+        targetID: String?,
         targetRect: SOMACore.NormalizedRect?,
         voiceConfidence: Double,
         at monotonicNS: UInt64
@@ -10227,8 +10368,8 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
         defer { lock.unlock() }
         prune(at: monotonicNS)
         guard let episode,
+              targetID == episode.targetID,
               let targetRect,
-              Self.matches(episode.targetRect, targetRect),
               monotonicNS >= episode.onsetNS else {
             let evidence = AudioVisualSpeakerEvidence(
                 faceVisible: false,
@@ -10238,8 +10379,15 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
                 directionMatchesFace: nil,
                 voiceConfidence: voiceConfidence
             )
-            return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+            return .init(
+                evidence: evidence,
+                assessment: AudioVisualSpeakerAttribution.assess(evidence),
+                directContactObservedNS: nil,
+                directContactContradictedNS: nil,
+                speakerEvidenceObservedNS: nil
+            )
         }
+        self.episode?.targetRect = targetRect
         let postOnsetSamples = samples.filter {
             $0.observedNS > episode.onsetNS
                 && $0.observedNS <= monotonicNS
@@ -10252,6 +10400,7 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
             postOnsetApertures: postOnsetApertures
         )
         let directionMatchesFace: Bool?
+        let directionEvidenceNS: UInt64?
         if let direction,
            direction.confidence >= 0.45,
            AudioVisualEpisodeEvidence.belongsToCurrentEpisode(
@@ -10270,18 +10419,44 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
                 expected = .center
             }
             directionMatchesFace = direction.direction == expected
+            directionEvidenceNS = directionMatchesFace == true
+                ? direction.observedNS
+                : nil
         } else {
             directionMatchesFace = nil
+            directionEvidenceNS = nil
         }
+        let latestGaze = postOnsetSamples.max { $0.observedNS < $1.observedNS }
+        let latestDirectGaze = latestGaze?.gazeState == .direct
+        let latestContradiction = latestGaze?.gazeState == .averted ? latestGaze : nil
+        let latestMouthEvidenceNS = mouthMotion.map { motion in
+            motion >= 0.18 && apertures.count >= 3
+                ? postOnsetSamples.compactMap { sample in
+                    sample.mouthAperture == nil ? nil : sample.observedNS
+                }.max()
+                : nil
+        } ?? nil
+        let speakerEvidenceObservedNS = [directionEvidenceNS, latestMouthEvidenceNS]
+            .compactMap { $0 }
+            .max()
         let evidence = AudioVisualSpeakerEvidence(
             faceVisible: !postOnsetSamples.isEmpty,
-            directGaze: episode.directGazeAtOnset,
+            directGaze: latestDirectGaze,
             mouthMotion: mouthMotion,
             mouthSampleCount: apertures.count,
             directionMatchesFace: directionMatchesFace,
             voiceConfidence: voiceConfidence
         )
-        return .init(evidence: evidence, assessment: AudioVisualSpeakerAttribution.assess(evidence))
+        return .init(
+            evidence: evidence,
+            assessment: AudioVisualSpeakerAttribution.assess(evidence),
+            // Contact authorizes the opening only when captured at or before
+            // acoustic onset. Post-onset gaze still enriches attribution but
+            // cannot retroactively create the opening condition.
+            directContactObservedNS: nil,
+            directContactContradictedNS: latestContradiction?.observedNS,
+            speakerEvidenceObservedNS: speakerEvidenceObservedNS
+        )
     }
 
     func endEpisode() {
@@ -10314,6 +10489,19 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
         if union > 0, intersection / union >= 0.10 { return true }
         return hypot(lhs.centerX - rhs.centerX, lhs.centerY - rhs.centerY) <= 0.14
     }
+
+    private static func overlap(
+        _ lhs: SOMACore.NormalizedRect,
+        _ rhs: SOMACore.NormalizedRect
+    ) -> Double {
+        let x1 = max(lhs.x, rhs.x)
+        let y1 = max(lhs.y, rhs.y)
+        let x2 = min(lhs.x + lhs.width, rhs.x + rhs.width)
+        let y2 = min(lhs.y + lhs.height, rhs.y + rhs.height)
+        let intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        let union = lhs.width * lhs.height + rhs.width * rhs.height - intersection
+        return union > 0 ? intersection / union : 0
+    }
 }
 
 private final class LiveVoiceSpeakerEpisodeRuntime: @unchecked Sendable {
@@ -10325,6 +10513,9 @@ private final class LiveVoiceSpeakerEpisodeRuntime: @unchecked Sendable {
         trackedFaceID: String?,
         evidence: AudioVisualSpeakerEvidence,
         assessment: AudioVisualSpeakerAssessment,
+        directContactObservedNS: UInt64? = nil,
+        directContactContradictedNS: UInt64? = nil,
+        speakerEvidenceObservedNS: UInt64? = nil,
         episodeOnsetNS: UInt64? = nil,
         at monotonicNS: UInt64
     ) -> LiveVoiceSpeakerEpisodeObservation {
@@ -10335,7 +10526,27 @@ private final class LiveVoiceSpeakerEpisodeRuntime: @unchecked Sendable {
             trackedFaceID: trackedFaceID,
             evidence: evidence,
             assessment: assessment,
+            directContactObservedNS: directContactObservedNS,
+            directContactContradictedNS: directContactContradictedNS,
+            speakerEvidenceObservedNS: speakerEvidenceObservedNS,
             episodeOnsetNS: episodeOnsetNS,
+            at: monotonicNS
+        )
+    }
+
+
+    func observeGaze(
+        _ state: SOMACore.VisualGazeEvidence,
+        trackedFaceID: String,
+        observedNS: UInt64,
+        at monotonicNS: UInt64
+    ) -> LiveVoiceSpeakerEpisodeObservation {
+        lock.lock()
+        defer { lock.unlock() }
+        return gate.observeGaze(
+            state,
+            trackedFaceID: trackedFaceID,
+            observedNS: observedNS,
             at: monotonicNS
         )
     }
@@ -11616,7 +11827,7 @@ private final class VisionWorker: @unchecked Sendable {
                     stabilizedFaces.map {
                         VisualSpeakerFrameEvidence(
                             rect: $0.rect,
-                            directGaze: $0.gazeState == .direct,
+                            gazeState: $0.gazeState,
                             mouthAperture: $0.mouthAperture
                         )
                     },
@@ -12676,7 +12887,7 @@ private func run(_ options: Options) throws {
                 }
                 if contract.capabilities.requiresMeasuredAttitudeFrame,
                    !calibration.hasMeasuredAttitudeAxes {
-                    throw RuntimeError.invalidArgument("\(contract.profileID) requires measured image, SDK-attitude, and velocity axis signs")
+                    throw RuntimeError.invalidArgument("\(contract.profileID) requires measured image, device-attitude, and velocity axis signs")
                 }
             }
             externalGimbalCalibration = calibration
@@ -12841,6 +13052,7 @@ private func run(_ options: Options) throws {
             && somaEnvBool("SOMA_L0_EXPLORE_ENABLED", default: controlSettings.autonomousExplorationEnabled)
         attentionGimbalBridge = try AttentionGimbalBridge(
             helperURL: helperURL,
+            shutdownHelperURL: options.nativeGimbalShutdownHelperURL,
             outputURL: gimbalOutputURL,
             traceRotationPolicy: options.gimbalTraceRotationPolicy,
             duration: options.duration,
@@ -14081,6 +14293,7 @@ private func run(_ options: Options) throws {
     let publisher = BeliefPublisher(writer: writer) { belief, reason in
         attentionGimbalBridge?.ingest(belief, reason: reason)
     }
+    let liveVoiceSpeakerEpisode = LiveVoiceSpeakerEpisodeRuntime()
     let visionWorker = VisionWorker(
         worldModel: worldModel,
         publisher: publisher,
@@ -14213,7 +14426,27 @@ private func run(_ options: Options) throws {
             }
         },
         onVisualSpeakerEvidence: { faces, monotonicNS in
-            visualSpeakerAttribution.record(faces, at: monotonicNS)
+            guard let update = visualSpeakerAttribution.record(faces, at: monotonicNS) else {
+                return
+            }
+            let observation = liveVoiceSpeakerEpisode.observeGaze(
+                update.state,
+                trackedFaceID: update.targetID,
+                observedNS: update.observedNS,
+                at: monotonicNanoseconds()
+            )
+            if observation.didTransition, observation.state == .rejected {
+                liveVoiceLauncher?.revokeProvisionalParticipantOpening(
+                    reason: "visual_contact_revoked_before_opening_confirmation"
+                )
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "l2_live_voice",
+                    state: "opening_revoked",
+                    message: "latest_gaze=averted; gaze_capture_ns=\(update.observedNS)"
+                ))
+            }
         },
         onFatalVisionFailure: {
             complete.signal()
@@ -14270,7 +14503,6 @@ private func run(_ options: Options) throws {
     // Tiny 3 front end without turning ambient room noise into a session.
     let voiceVADThreshold = somaEnvDouble("SOMA_L0_VAD_THRESHOLD", default: 0.35)
     let voiceEvidenceTelemetry = VoiceEvidenceTelemetry()
-    let liveVoiceSpeakerEpisode = LiveVoiceSpeakerEpisodeRuntime()
     let voiceWorker = try AudioVADWorker(
         activationThreshold: voiceVADThreshold,
         onEvidence: { evidence, frame, completedNS in
@@ -14316,11 +14548,13 @@ private func run(_ options: Options) throws {
                 : evidence.windowStartNS
             let speakerSnapshot = isVoiceOnset
                 ? visualSpeakerAttribution.beginEpisode(
+                    targetID: visualAdmission ? belief.target?.id : nil,
                     targetRect: belief.target?.rect,
                     voiceConfidence: evidence.probability,
                     at: resolvedVoiceOnsetNS
                 )
                 : visualSpeakerAttribution.assessCurrentEpisode(
+                    targetID: visualAdmission ? belief.target?.id : nil,
                     targetRect: belief.target?.rect,
                     voiceConfidence: evidence.probability,
                     at: completedNS
@@ -14330,14 +14564,21 @@ private func run(_ options: Options) throws {
                 trackedFaceID: visualAdmission ? belief.target?.id : nil,
                 evidence: speakerSnapshot.evidence,
                 assessment: speakerSnapshot.assessment,
+                directContactObservedNS: speakerSnapshot.directContactObservedNS,
+                directContactContradictedNS: speakerSnapshot.directContactContradictedNS,
+                speakerEvidenceObservedNS: speakerSnapshot.speakerEvidenceObservedNS,
                 episodeOnsetNS: isVoiceOnset ? resolvedVoiceOnsetNS : nil,
                 at: completedNS
             )
+            if speakerEpisode.didTransition, speakerEpisode.state == .rejected {
+                liveVoiceLauncher?.revokeProvisionalParticipantOpening(
+                    reason: "speaker_attribution_revoked_before_participant_input"
+                )
+            }
             let confirmedTrackedSpeaker = speakerEpisode.state == .confirmed
-            // Gaze is frozen by the speaker-episode gate at acoustic onset.
-            // The contact gate is invoked only after the slower lip/DOA
-            // evidence confirms that same tracked face, so an ambiguous onset
-            // is buffered rather than permanently consumed.
+            // Visual contact and the independent lip/DOA cue may arrive on
+            // different detector cadences. The episode gate binds both to the
+            // same continuously tracked face before contact is authorized.
             let contactAuthorization: ConversationOpeningAuthorization?
             if !evidence.active {
                 contactAuthorization = conversationContact.observeVoiceActivity(
@@ -14350,7 +14591,7 @@ private func run(_ options: Options) throws {
                     active: true,
                     at: completedNS,
                     confidence: speakerEpisode.maximumVoiceConfidence,
-                    audioVisualDirectContact: speakerEpisode.directContactAtOnset
+                    audioVisualDirectContact: speakerEpisode.directContactObserved
                 )
             } else {
                 contactAuthorization = nil
@@ -14479,10 +14720,11 @@ private func run(_ options: Options) throws {
                         source: "audio_visual_speaker",
                         state: speakerSnapshot.assessment.classification.rawValue,
                         message: String(
-                            format: "probability=%.3f; episode=%@; direct_at_onset=%@; direct_gaze=%@; mouth_motion=%@; mouth_samples=%d; direction_match=%@; strict_every_turn=%@",
+                            format: "probability=%.3f; episode=%@; direct_contact=%@; speaker_evidence=%@; direct_gaze=%@; mouth_motion=%@; mouth_samples=%d; direction_match=%@; strict_every_turn=%@",
                             speakerSnapshot.assessment.probability,
                             speakerEpisode.state.rawValue,
-                            speakerEpisode.directContactAtOnset ? "true" : "false",
+                            speakerEpisode.directContactObserved ? "true" : "false",
+                            speakerEpisode.speakerEvidenceObserved ? "true" : "false",
                             speakerSnapshot.evidence.directGaze ? "true" : "false",
                             speakerSnapshot.evidence.mouthMotion.map { String(format: "%.3f", $0) } ?? "na",
                             speakerSnapshot.evidence.mouthSampleCount,
@@ -15493,7 +15735,7 @@ private func hostAlignedPresentationTimestamp(
 private func monotonicNanoseconds() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
 private func printUsage() {
-    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--soma-settings /absolute/settings.json] [--guided-scenario] [--tdoa-calibration calibration.json | --tdoa-calibrate calibration.json --duration 45] [--output trace.jsonl [--trace-max-megabytes MB --trace-retained-files count] [--important-output important.jsonl --important-max-megabytes MB --important-retained-files count]] [--diagnostic-snapshot frame.jpg | --face-lock-diagnostics jpeg-directory] [--panorama-output /absolute/panorama.jpg [--panorama-place-memory /absolute/place-memory.json] [--camera-geometry-calibration /absolute/calibration.json] [--capture-camera-geometry /absolute/new-directory | --panorama-strip-scan]] [--l2-live-voice | --local-speech-recognition locale [--l2-codex-bridge /absolute/soma-codex-bridge]] [--l1-auxiliary-vlm-python python --l1-auxiliary-vlm-worker worker.py --l1-auxiliary-vlm-model local-model-directory] [--embodiment-shadow-socket /absolute/path.sock [--allow-embodiment-motor-control --embodiment-view-directory /absolute/private-directory]] [--allow-camera-motion --native-gimbal-helper /path/to/soma-native-track --gimbal-output actuator.jsonl [--gimbal-trace-max-megabytes MB --gimbal-trace-retained-files count] --duration 0=continuous|positive-seconds] [--allow-external-gimbal-control --external-gimbal-calibration calibration.json [--allow-autonomous-scan] | --calibrate-external-gimbal calibration.json --duration 12..30] [--allow-native-human-tracking]")
+    print("Usage: soma-subconscious --video-id <OBSBOT video ID> --audio-id <OBSBOT audio ID> [--duration seconds] [--soma-settings /absolute/settings.json] [--guided-scenario] [--tdoa-calibration calibration.json | --tdoa-calibrate calibration.json --duration 45] [--output trace.jsonl [--trace-max-megabytes MB --trace-retained-files count] [--important-output important.jsonl --important-max-megabytes MB --important-retained-files count]] [--diagnostic-snapshot frame.jpg | --face-lock-diagnostics jpeg-directory] [--panorama-output /absolute/panorama.jpg [--panorama-place-memory /absolute/place-memory.json] [--camera-geometry-calibration /absolute/calibration.json] [--capture-camera-geometry /absolute/new-directory | --panorama-strip-scan]] [--l2-live-voice | --local-speech-recognition locale [--l2-codex-bridge /absolute/soma-codex-bridge]] [--l1-auxiliary-vlm-python python --l1-auxiliary-vlm-worker worker.py --l1-auxiliary-vlm-model local-model-directory] [--embodiment-shadow-socket /absolute/path.sock [--allow-embodiment-motor-control --embodiment-view-directory /absolute/private-directory]] [--allow-camera-motion --native-gimbal-helper /path/to/soma-native-track [--native-gimbal-shutdown-helper /path/to/soma-native-track] --gimbal-output actuator.jsonl [--gimbal-trace-max-megabytes MB --gimbal-trace-retained-files count] --duration 0=continuous|positive-seconds] [--allow-external-gimbal-control --external-gimbal-calibration calibration.json [--allow-autonomous-scan] | --calibrate-external-gimbal calibration.json --duration 12..30] [--allow-native-human-tracking]")
     print("       soma-subconscious --speech-recognition-status [locale]")
     print("       soma-subconscious --speech-recognition-file <locale> <absolute-audio-path>")
     print("       soma-subconscious --speech-synthesis-test <locale> <text>")

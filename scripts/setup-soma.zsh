@@ -4,12 +4,10 @@ set -euo pipefail
 soma_script_dir=${0:A:h}
 soma_root=${soma_script_dir:h}
 soma_lock="$soma_root/config/soma-dependencies.env"
-soma_sdk_archive=''
 soma_with_l05=0
 soma_enable_motion=0
 soma_plan_only=0
 soma_tool_path='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
-soma_sdk_request_url='https://www.obsbot.com/sdk'
 soma_env_stage=''
 
 function soma_cleanup() {
@@ -23,16 +21,11 @@ function soma_cleanup() {
 trap soma_cleanup EXIT
 
 function soma_usage() {
-  print -r -- 'Usage: scripts/setup-soma.zsh [--sdk-archive /path/libdev_v2.1.0_8.zip] [--with-l05] [--enable-motion] [--plan]'
+  print -r -- 'Usage: scripts/setup-soma.zsh [--with-l05] [--enable-motion] [--plan]'
 }
 
 while (( $# > 0 )); do
   case "$1" in
-    --sdk-archive)
-      (( $# >= 2 )) || { soma_usage >&2; exit 64; }
-      soma_sdk_archive=${2:A}
-      shift 2
-      ;;
     --with-l05)
       soma_with_l05=1
       shift
@@ -68,29 +61,7 @@ function soma_find_ollama() {
   print -r -- "$soma_candidate"
 }
 
-soma_sdk_root="$soma_root/Reference/SDK/$SOMA_OBSBOT_SDK_DIRECTORY"
-soma_sdk_library="$soma_sdk_root/macos/arm64-release/libdev.dylib"
-if [[ -z "$soma_sdk_archive" && ! -f "$soma_sdk_library" ]]; then
-  soma_download_candidate="$HOME/Downloads/$SOMA_OBSBOT_SDK_DIRECTORY.zip"
-  if [[ -f "$soma_download_candidate" ]]; then
-    soma_sdk_archive="$soma_download_candidate"
-  fi
-fi
-
-if [[ -n "$soma_sdk_archive" && ! -f "$soma_sdk_archive" ]]; then
-  print -u2 -r -- "OBSBOT SDK archive not found: $soma_sdk_archive"
-  exit 2
-fi
-if [[ ! -f "$soma_sdk_library" && -z "$soma_sdk_archive" && $soma_plan_only == 0 ]]; then
-  print -u2 -r -- "Request the OBSBOT SDK at $soma_sdk_request_url, then place $SOMA_OBSBOT_SDK_DIRECTORY.zip in $HOME/Downloads."
-  /usr/bin/open "$soma_sdk_request_url" >/dev/null 2>&1 || true
-  exit 2
-fi
-
 soma_bootstrap_arguments=()
-if [[ -n "$soma_sdk_archive" ]]; then
-  soma_bootstrap_arguments+=(--sdk-archive "$soma_sdk_archive")
-fi
 if (( soma_with_l05 )); then
   soma_bootstrap_arguments+=(--with-l05)
 fi
@@ -114,11 +85,7 @@ fi
 if (( soma_plan_only )); then
   print -r -- 'SOMA setup plan'
   print -r -- "  repository: $soma_root"
-  if [[ -f "$soma_sdk_library" || -n "$soma_sdk_archive" ]]; then
-    print -r -- "  SDK: ${soma_sdk_archive:-$soma_sdk_root}"
-  else
-    print -r -- "  SDK: required from $soma_sdk_request_url"
-  fi
+  print -r -- '  OBSBOT control: built-in open UVC/XU driver'
   print -r -- "  L0.5 environment: $([[ $soma_with_l05 == 1 ]] && print install || print preserve)"
   print -r -- "  physical motion: $([[ $soma_enable_motion == 1 ]] && print enable || print preserve)"
   print -r -- "  Homebrew dependencies: $([[ $soma_skip_brew == 1 ]] && print already-present || print install)"
@@ -149,8 +116,8 @@ if (( soma_enable_motion )); then
   soma_env_stage=''
 fi
 
-if ! /usr/bin/codesign --dryrun --force --sign "$SOMA_CODESIGN_IDENTITY_NAME" \
-    --timestamp=none "$soma_sdk_library" >/dev/null 2>&1; then
+if ! /usr/bin/security find-identity -v -p codesigning \
+    | /usr/bin/grep -Fq "$SOMA_CODESIGN_IDENTITY_NAME"; then
   print -u2 -r -- "Create the '$SOMA_CODESIGN_IDENTITY_NAME' Code Signing certificate in Keychain Access, then rerun this command."
   /usr/bin/open -a 'Keychain Access' >/dev/null 2>&1 || true
   exit 3

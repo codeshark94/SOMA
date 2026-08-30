@@ -36,6 +36,12 @@ function soma_stop() {
     print -r -- 'SOMA is already stopped.'
     return
   fi
+  # KeepAlive is required for unattended crash recovery, but an intentional
+  # stop must revoke restart authority before the runtime exits. Otherwise
+  # launchd can start a fresh camera owner in the interval between the
+  # graceful park/sleep acknowledgement and bootout, immediately waking the
+  # device that was just put to sleep.
+  /bin/launchctl disable "$soma_target" >/dev/null 2>&1 || true
   local graceful_shutdown=false
   if [[ -x "$soma_runtime_control" && -S "$soma_runtime_socket" ]]; then
     # The endpoint becomes available after the perception runtime has bound

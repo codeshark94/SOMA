@@ -2,7 +2,7 @@ import Foundation
 import SOMACore
 
 /// In-process endpoint for L1's semantic embodiment tools. It shares the L2
-/// MCP request model but has no access to velocity, SDK, or image transport.
+/// MCP request model but has no access to velocity, device packets, or image transport.
 /// The handler is installed only after the L0 motor adapter exists.
 final class L1EmbodimentToolRelay: @unchecked Sendable {
     typealias Submitter = @Sendable (CognitiveEmbodimentRequest) -> EmbodimentShadowDecision?

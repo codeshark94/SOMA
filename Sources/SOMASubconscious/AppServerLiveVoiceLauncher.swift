@@ -102,6 +102,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var gate = LiveVoiceLaunchGate()
     private var inactivityGate = LiveVoiceSessionInactivityGate()
     private var inactivityTimer: DispatchWorkItem?
+    private var initialTranscriptTimer: DispatchWorkItem?
     private var process: Process?
     private var input: FileHandle?
     private var outputBuffer = Data()
@@ -126,6 +127,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var openingVisualContextAttached = false
     private var awaitingAssistantResponse = false
     private var latestUserTranscriptNS: UInt64?
+    private var initialTurnValidation: LiveVoiceInitialTurnValidation
     private var proactiveOpeningAwaitingParticipant = false
     private var proactiveOpeningDelivered = false
 
@@ -136,6 +138,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         embodimentSocketURL: URL? = nil,
         requireVerifiedSpeakerForEveryTurn: Bool = false,
         inactivityTimeoutMilliseconds: UInt64 = 60_000,
+        initialParticipantTranscriptTimeoutMilliseconds: UInt64 = 3_500,
         persistentAppServer: PersistentAppServerBroker? = nil,
         persistentSessionAuthorizer: (@Sendable (
             String,
@@ -153,6 +156,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.requireVerifiedSpeakerForEveryTurn = requireVerifiedSpeakerForEveryTurn
         inactivityGate = LiveVoiceSessionInactivityGate(
             timeoutMilliseconds: inactivityTimeoutMilliseconds
+        )
+        initialTurnValidation = LiveVoiceInitialTurnValidation(
+            transcriptTimeoutMilliseconds: initialParticipantTranscriptTimeoutMilliseconds
         )
         self.persistentAppServer = persistentAppServer
         self.persistentSessionAuthorizer = persistentSessionAuthorizer
@@ -218,6 +224,22 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
             )
+        }
+    }
+
+    /// Cancels only a participant-contact opening whose visual authorization
+    /// was disproved before any usable participant input reached the realtime
+    /// session. Once input is confirmed, gaze is no longer a session-lifetime
+    /// requirement. L1-authorized proactive openings are unaffected.
+    func revokeProvisionalParticipantOpening(reason: String) {
+        queue.async { [weak self] in
+            guard let self,
+                  !stopped,
+                  initialTurnValidation.shouldCloseWhenContactIsRevoked,
+                  active || gate.phase == .starting else {
+                return
+            }
+            _ = closeSession(reason: String(reason.prefix(128)))
         }
     }
 
@@ -411,6 +433,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             activeSessionCapability = nil
             awaitingAssistantResponse = false
             latestUserTranscriptNS = nil
+            initialTurnValidation.reset()
             speakerEpisodeAudio.end(keepingCapacity: false)
             speakerEpisodeInProgress = false
             initiatingTurn.removeAll(keepingCapacity: false)
@@ -418,6 +441,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             inputLeveler.reset()
             inactivityTimer?.cancel()
             inactivityTimer = nil
+            initialTranscriptTimer?.cancel()
+            initialTranscriptTimer = nil
             inactivityGate.close()
             if let lifecycle {
                 onEvent(.failed(
@@ -485,6 +510,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         latestUserTranscriptNS = nil
         inputLeveler.reset()
         activeTurnAudioAdmitted = false
+        initialTranscriptTimer?.cancel()
+        initialTranscriptTimer = nil
+        initialTurnValidation.begin(
+            origin: proactiveOpeningText?.isEmpty == false ? .proactive : .participantContact
+        )
         proactiveOpeningAwaitingParticipant = proactiveOpeningText?.isEmpty == false
         proactiveOpeningDelivered = false
         let persistentEndpoint: URL?
@@ -494,6 +524,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 persistentEndpoint = endpoint
             case let .failure(error):
                 gate.fail(at: monotonicNS)
+                initialTranscriptTimer?.cancel()
+                initialTranscriptTimer = nil
+                initialTurnValidation.reset()
                 onEvent(.failed(
                     threadID: nil,
                     personEntityID: personEntityID,
@@ -506,6 +539,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
         guard let helperURL = helperURL() else {
             gate.fail(at: monotonicNS)
+            initialTranscriptTimer?.cancel()
+            initialTranscriptTimer = nil
+            initialTurnValidation.reset()
             onEvent(.failed(
                 threadID: nil,
                 personEntityID: personEntityID,
@@ -542,9 +578,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 let personEntityID = self.activePersonEntityID
                 self.activeThreadID = nil
                 self.activePersonEntityID = nil
-            self.activeSessionCapability = nil
-            self.inputLeveler.reset()
-            self.onEvent(.failed(
+                self.activeSessionCapability = nil
+                self.initialTranscriptTimer?.cancel()
+                self.initialTranscriptTimer = nil
+                self.initialTurnValidation.reset()
+                self.inputLeveler.reset()
+                self.onEvent(.failed(
                     threadID: threadID,
                     personEntityID: personEntityID,
                     reason: "live_voice_helper_exited_\(process.terminationStatus)"
@@ -555,6 +594,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             try process.run()
         } catch {
             gate.fail(at: monotonicNS)
+            initialTranscriptTimer?.cancel()
+            initialTranscriptTimer = nil
+            initialTurnValidation.reset()
             onEvent(.failed(
                 threadID: nil,
                 personEntityID: personEntityID,
@@ -613,7 +655,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 }
                 activeThreadID = event.threadID
                 gate.observeActive()
-                armInactivityTimeout(at: DispatchTime.now().uptimeNanoseconds)
+                let activeNS = DispatchTime.now().uptimeNanoseconds
+                armInactivityTimeout(at: activeNS)
+                armInitialTranscriptTimeout(at: activeNS)
                 let buffered = initiatingTurn
                 if !requireVerifiedSpeakerForEveryTurn || !speakerEpisodeInProgress {
                     speakerEpisodeAudio.end()
@@ -634,9 +678,20 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         maximumGainDB: maximumGainDB
                     ))
                 }
-                for chunk in buffered { send(chunk) }
+                var submittedOpeningAudio = false
+                for chunk in buffered {
+                    submittedOpeningAudio = send(chunk) || submittedOpeningAudio
+                }
+                if submittedOpeningAudio {
+                    initialTurnValidation.observeInitialAudioSubmitted()
+                }
                 onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
             case "audio_input_progress":
+                initialTurnValidation.observeInitialAudioTransportProgress()
+                if initialTurnValidation.permitsAssistantResponse {
+                    initialTranscriptTimer?.cancel()
+                    initialTranscriptTimer = nil
+                }
                 guard !inputTransportReported else { continue }
                 inputTransportReported = true
                 onEvent(.inputTransportStarted)
@@ -679,6 +734,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     error: error?.isEmpty == false ? String(error!.prefix(192)) : nil
                 ))
             case "input_transcript_ready":
+                if (event.characters ?? 0) > 0 {
+                    confirmInitialParticipantInput()
+                }
                 onEvent(.inputAccepted(characters: max(0, event.characters ?? 0)))
             case "transcript_finalized":
                 guard let rawRole = event.role,
@@ -695,6 +753,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         proactiveOpeningDelivered = true
                     }
                 } else {
+                    confirmInitialParticipantInput()
                     proactiveOpeningAwaitingParticipant = false
                     let now = DispatchTime.now().uptimeNanoseconds
                     awaitingAssistantResponse = true
@@ -708,8 +767,16 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     text: String(text.prefix(8_192))
                 ))
             case "response_preparing":
+                if !initialTurnValidation.permitsAssistantResponse {
+                    _ = closeSession(reason: "participant_input_unconfirmed_before_response")
+                    continue
+                }
                 onEvent(.preparingResponse)
             case "output_speech_started":
+                if !initialTurnValidation.permitsAssistantResponse {
+                    _ = closeSession(reason: "participant_input_unconfirmed_before_output")
+                    continue
+                }
                 onEvent(.assistantSpeechStarted)
                 if let latestUserTranscriptNS {
                     let now = DispatchTime.now().uptimeNanoseconds
@@ -735,6 +802,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 gate.observeEnded()
                 inactivityTimer?.cancel()
                 inactivityTimer = nil
+                initialTranscriptTimer?.cancel()
+                initialTranscriptTimer = nil
                 inactivityGate.close()
                 process = nil
                 input = nil
@@ -743,6 +812,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 activeSessionCapability = nil
                 awaitingAssistantResponse = false
                 latestUserTranscriptNS = nil
+                initialTurnValidation.reset()
                 inputLeveler.reset()
                 onEvent(.ended(
                     threadID: threadID,
@@ -760,11 +830,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private func failCurrent(reason: String) {
         let threadID = activeThreadID
         let personEntityID = activePersonEntityID
+        generation &+= 1
         active = false
         activeTurnAudioAdmitted = false
         gate.fail(at: DispatchTime.now().uptimeNanoseconds)
         inactivityTimer?.cancel()
         inactivityTimer = nil
+        initialTranscriptTimer?.cancel()
+        initialTranscriptTimer = nil
         inactivityGate.close()
         _ = send(["type": "stop"], reportFailure: false)
         if let process, process.isRunning { process.terminate() }
@@ -775,12 +848,47 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeSessionCapability = nil
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
+        initialTurnValidation.reset()
+        speakerEpisodeAudio.end(keepingCapacity: false)
+        speakerEpisodeInProgress = false
+        initiatingTurn.removeAll(keepingCapacity: false)
+        capturingInitiatingTurn = false
         inputLeveler.reset()
         onEvent(.failed(
             threadID: threadID,
             personEntityID: personEntityID,
             reason: String(reason.prefix(192))
         ))
+    }
+
+    private func confirmInitialParticipantInput() {
+        initialTurnValidation.confirmParticipantInput()
+        initialTranscriptTimer?.cancel()
+        initialTranscriptTimer = nil
+    }
+
+    private func armInitialTranscriptTimeout(at monotonicNS: UInt64) {
+        initialTranscriptTimer?.cancel()
+        initialTranscriptTimer = nil
+        guard let deadline = initialTurnValidation.observeTransportActive(at: monotonicNS) else {
+            return
+        }
+        let remainingNS = deadline > monotonicNS ? deadline - monotonicNS : 0
+        let work = DispatchWorkItem { [weak self] in
+            self?.closeForMissingInitialTranscript(at: DispatchTime.now().uptimeNanoseconds)
+        }
+        initialTranscriptTimer = work
+        queue.asyncAfter(
+            deadline: .now() + .nanoseconds(Int(min(remainingNS, UInt64(Int.max)))),
+            execute: work
+        )
+    }
+
+    private func closeForMissingInitialTranscript(at monotonicNS: UInt64) {
+        guard initialTurnValidation.shouldCloseForMissingTranscript(at: monotonicNS) else {
+            return
+        }
+        _ = closeSession(reason: "initial_participant_transcript_timeout")
     }
 
     private func recordUserActivity(at monotonicNS: UInt64) {
@@ -821,14 +929,23 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     @discardableResult
     private func closeActiveSession(reason: String) -> Bool {
         guard active else { return false }
+        return closeSession(reason: reason)
+    }
+
+    @discardableResult
+    private func closeSession(reason: String) -> Bool {
+        guard active || gate.phase == .starting else { return false }
         let threadID = activeThreadID
         let personEntityID = activePersonEntityID
+        generation &+= 1
         active = false
         activeTurnAudioAdmitted = false
         gate.observeEnded()
         inactivityGate.close()
         inactivityTimer?.cancel()
         inactivityTimer = nil
+        initialTranscriptTimer?.cancel()
+        initialTranscriptTimer = nil
         _ = send(["type": "stop"], reportFailure: false)
         input = nil
         if let process, process.isRunning { process.terminate() }
@@ -838,6 +955,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeSessionCapability = nil
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
+        initialTurnValidation.reset()
+        speakerEpisodeAudio.end(keepingCapacity: false)
+        speakerEpisodeInProgress = false
+        initiatingTurn.removeAll(keepingCapacity: false)
+        capturingInitiatingTurn = false
         inputLeveler.reset()
         onEvent(.ended(
             threadID: threadID,
@@ -847,8 +969,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         return true
     }
 
-    private func send(_ chunk: BufferedLiveAudio) {
-        _ = send([
+    @discardableResult
+    private func send(_ chunk: BufferedLiveAudio) -> Bool {
+        send([
             "type": "append_audio",
             "data": chunk.data,
             "sampleRate": chunk.sampleRate,

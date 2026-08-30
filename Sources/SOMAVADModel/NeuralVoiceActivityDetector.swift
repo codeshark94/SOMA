@@ -1,6 +1,22 @@
 import CoreML
 import Foundation
 
+private let somaVADResourceBundle: Bundle = {
+    let bundleName = "SOMA_SOMAVADModel.bundle"
+    let candidates = [
+        Bundle.main.resourceURL?.appendingPathComponent(bundleName),
+        Bundle.main.bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent(bundleName, isDirectory: true),
+        Bundle.main.bundleURL.appendingPathComponent(bundleName, isDirectory: true),
+    ]
+    for case let candidate? in candidates {
+        if let bundle = Bundle(url: candidate) { return bundle }
+    }
+    return Bundle.module
+}()
+
 public enum NeuralVoiceActivityError: LocalizedError {
     case missingModel
     case unsupportedSampleRate(Double)
@@ -66,7 +82,10 @@ public final class NeuralVoiceActivityDetector: @unchecked Sendable {
     public init(activationThreshold: Double = NeuralVoiceActivityDetector.defaultActivationThreshold) throws {
         precondition((0...1).contains(activationThreshold))
         self.activationThreshold = activationThreshold
-        guard let modelURL = Bundle.module.url(forResource: "SileroVAD256ms", withExtension: "mlmodelc") else {
+        guard let modelURL = somaVADResourceBundle.url(
+            forResource: "SileroVAD256ms",
+            withExtension: "mlmodelc"
+        ) else {
             throw NeuralVoiceActivityError.missingModel
         }
         let configuration = MLModelConfiguration()

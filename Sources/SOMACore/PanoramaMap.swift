@@ -390,7 +390,7 @@ public struct PanoramaSourceCoordinate: Equatable, Sendable {
 
 /// Shared gnomonic projection used by the panorama compositor and its tests.
 /// The output bearing is a conventional visual sphere: azimuth increases to
-/// the right and elevation increases upward. SDK attitude axes are converted
+/// the right and elevation increases upward. Device attitude axes are converted
 /// to that canonical frame exactly once before projection. The returned pixel
 /// coordinate uses the source buffer's top-left origin.
 public enum SphericalPanoramaProjection {

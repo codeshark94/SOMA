@@ -56,7 +56,7 @@ function soma_check_minimum_version() {
 if [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]]; then
   soma_ok 'Apple Silicon macOS'
 else
-  soma_fail 'Apple Silicon macOS is required by the OBSBOT SDK integration'
+  soma_fail 'Apple Silicon macOS is required by the native SOMA runtime'
 fi
 
 soma_macos_version=$(/usr/bin/sw_vers -productVersion 2>/dev/null || true)
@@ -123,11 +123,31 @@ else
   soma_fail 'bundled Core ML files differ from config/bundled-models.sha256'
 fi
 
+soma_cmake=${SOMA_CMAKE:-$(command -v cmake 2>/dev/null || true)}
+if [[ -n "$soma_cmake" && -x "$soma_cmake" ]]; then
+  soma_native_check_root="$soma_root/.build/soma-doctor-native"
+  if "$soma_cmake" -S "$soma_root/Sources/SOMANativeTracking" -B "$soma_native_check_root" \
+      -DCMAKE_BUILD_TYPE=Release >/dev/null \
+      && "$soma_cmake" --build "$soma_native_check_root" --parallel >/dev/null \
+      && [[ -x "$soma_native_check_root/soma-native-track" \
+            && -x "$soma_native_check_root/soma-obsbot-probe" ]] \
+      && "$soma_cmake" --build "$soma_native_check_root" --target test >/dev/null \
+      && ! /usr/bin/otool -L \
+          "$soma_native_check_root/soma-native-track" \
+          "$soma_native_check_root/soma-obsbot-probe" \
+          | /usr/bin/grep -Fq 'libdev'; then
+    soma_ok 'open OBSBOT UVC/XU helpers and profile protocol tests (no proprietary runtime linkage)'
+  else
+    soma_fail 'open OBSBOT UVC/XU helper build or linkage validation failed'
+  fi
+else
+  soma_fail 'CMake is unavailable; run brew bundle or set SOMA_CMAKE'
+fi
+
 if [[ "$soma_mode" == "--runtime" ]]; then
   soma_check_minimum_version 'full-runtime macOS' "$soma_macos_version" "$SOMA_MIN_RUNTIME_MACOS_VERSION"
   soma_requested_codesign_identity=${SOMA_CODESIGN_IDENTITY:-$SOMA_CODESIGN_IDENTITY_NAME}
 
-  soma_cmake=${SOMA_CMAKE:-$(command -v cmake 2>/dev/null || true)}
   if [[ -n "$soma_cmake" && -x "$soma_cmake" ]]; then
     soma_cmake_version=$("$soma_cmake" --version 2>/dev/null | sed -nE '1s/.* ([0-9]+(\.[0-9]+){1,2}).*/\1/p')
     soma_check_minimum_version 'CMake' "$soma_cmake_version" "$SOMA_MIN_CMAKE_VERSION"
@@ -135,40 +155,8 @@ if [[ "$soma_mode" == "--runtime" ]]; then
     soma_fail 'CMake is unavailable; run brew bundle or set SOMA_CMAKE'
   fi
 
-  soma_sdk_root=${SOMA_OBSBOT_SDK_ROOT:-"$soma_root/Reference/SDK/$SOMA_OBSBOT_SDK_DIRECTORY"}
-  soma_sdk_library=''
-  for soma_candidate in \
-    "$soma_sdk_root/macos/arm64-release/libdev.dylib" \
-    "$soma_sdk_root/macos/macos/arm64-release/libdev.dylib"; do
-    if [[ -f "$soma_candidate" ]]; then
-      soma_sdk_library="$soma_candidate"
-      break
-    fi
-  done
-  soma_sdk_quarantined=0
-  if [[ -n "$soma_sdk_library" ]] \
-      && /usr/bin/xattr -p com.apple.quarantine "$soma_sdk_library" >/dev/null 2>&1; then
-    soma_sdk_quarantined=1
-  fi
-  if [[ -n "$soma_sdk_library" \
-        && "$(shasum -a 256 "$soma_sdk_library" | awk '{print $1}')" == "$SOMA_OBSBOT_SDK_DYLIB_SHA256" \
-        && -f "$soma_sdk_root/include/dev/dev.hpp" \
-        && "$(shasum -a 256 "$soma_sdk_root/include/dev/dev.hpp" | awk '{print $1}')" == "$SOMA_OBSBOT_SDK_DEV_HPP_SHA256" \
-        && -f "$soma_sdk_root/include/dev/devs.hpp" \
-        && "$(shasum -a 256 "$soma_sdk_root/include/dev/devs.hpp" | awk '{print $1}')" == "$SOMA_OBSBOT_SDK_DEVS_HPP_SHA256" \
-        && -f "$soma_sdk_root/include/util/comm.hpp" \
-        && "$(shasum -a 256 "$soma_sdk_root/include/util/comm.hpp" | awk '{print $1}')" == "$SOMA_OBSBOT_SDK_COMM_HPP_SHA256" \
-        && "$(file "$soma_sdk_library")" == *arm64* ]] \
-      && (( soma_sdk_quarantined == 0 )) \
-      && /usr/bin/codesign --verify --strict "$soma_sdk_library" >/dev/null 2>&1; then
-    soma_ok "OBSBOT SDK $SOMA_OBSBOT_SDK_DIRECTORY at $soma_sdk_root"
-  else
-    soma_fail 'OBSBOT SDK is missing or differs from the dependency lock; rerun bootstrap with --sdk-archive'
-  fi
-
-  if [[ -n "$soma_sdk_library" ]] \
-      && /usr/bin/codesign --dryrun --force --sign "$soma_requested_codesign_identity" \
-        --timestamp=none "$soma_sdk_library" >/dev/null 2>&1; then
+  if /usr/bin/security find-identity -v -p codesigning \
+      | /usr/bin/grep -Fq \"$soma_requested_codesign_identity\"; then
     soma_ok "persistent local code-signing identity $soma_requested_codesign_identity"
   else
     soma_fail "missing usable code-signing identity: $soma_requested_codesign_identity"

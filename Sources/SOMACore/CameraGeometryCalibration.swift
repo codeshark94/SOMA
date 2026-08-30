@@ -9,7 +9,7 @@ public struct CameraProjectionModel: Codable, Equatable, Sendable {
     public let principalXNormalized: Double
     public let principalYNormalized: Double
     /// Row-major rotation mapping an actual camera ray into the ideal camera
-    /// frame implied by the SDK yaw/pitch axes.
+    /// frame implied by the device yaw/pitch axes.
     public let cameraToIdealRotation: [Double]
     /// Brown-Conrady radial terms in normalized camera coordinates. Optional
     /// preserves compatibility with schema-1 pinhole calibrations.

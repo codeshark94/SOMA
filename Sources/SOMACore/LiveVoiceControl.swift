@@ -59,6 +59,106 @@ public struct LiveVoiceLaunchGate: Equatable, Sendable {
     }
 }
 
+public enum LiveVoiceOpeningOrigin: Equatable, Sendable {
+    case participantContact
+    case proactive
+}
+
+/// Keeps the initial participant-contact authorization provisional until the
+/// realtime transport confirms usable participant input. Proactive openings
+/// have their own L1 authorization and are deliberately outside this rule.
+public struct LiveVoiceInitialTurnValidation: Equatable, Sendable {
+    public let transcriptTimeoutMilliseconds: UInt64
+    public private(set) var origin: LiveVoiceOpeningOrigin?
+    public private(set) var participantInputConfirmed = false
+    public private(set) var transcriptDeadlineNS: UInt64?
+    public private(set) var initialAudioSubmitted = false
+    public private(set) var initialAudioTransportConfirmed = false
+
+    public init(transcriptTimeoutMilliseconds: UInt64 = 3_500) {
+        precondition(transcriptTimeoutMilliseconds > 0)
+        self.transcriptTimeoutMilliseconds = transcriptTimeoutMilliseconds
+    }
+
+    public mutating func begin(origin: LiveVoiceOpeningOrigin) {
+        self.origin = origin
+        participantInputConfirmed = false
+        transcriptDeadlineNS = nil
+        initialAudioSubmitted = false
+        initialAudioTransportConfirmed = false
+    }
+
+    @discardableResult
+    public mutating func observeTransportActive(at monotonicNS: UInt64) -> UInt64? {
+        guard origin == .participantContact,
+              !participantInputConfirmed else {
+            transcriptDeadlineNS = nil
+            return nil
+        }
+        let delta = transcriptTimeoutMilliseconds.multipliedReportingOverflow(by: 1_000_000)
+        let deadline = monotonicNS.addingReportingOverflow(delta.partialValue)
+        transcriptDeadlineNS = delta.overflow || deadline.overflow
+            ? UInt64.max
+            : deadline.partialValue
+        return transcriptDeadlineNS
+    }
+
+    public mutating func confirmParticipantInput() {
+        guard origin == .participantContact else { return }
+        participantInputConfirmed = true
+        transcriptDeadlineNS = nil
+    }
+
+    /// A transcript is not guaranteed to precede response creation in the
+    /// realtime protocol. The first turn is also confirmed when a locally
+    /// admitted opening utterance has both been submitted and acknowledged by
+    /// the browser audio transport. Neither signal alone is sufficient: this
+    /// preserves the guard against empty or ambient-only session launches.
+    public mutating func observeInitialAudioSubmitted() {
+        guard origin == .participantContact else { return }
+        initialAudioSubmitted = true
+        confirmTransportedInitialAudioIfComplete()
+    }
+
+    public mutating func observeInitialAudioTransportProgress() {
+        guard origin == .participantContact else { return }
+        initialAudioTransportConfirmed = true
+        confirmTransportedInitialAudioIfComplete()
+    }
+
+    public var isUnconfirmedParticipantOpening: Bool {
+        origin == .participantContact && !participantInputConfirmed
+    }
+
+    public var shouldCloseWhenContactIsRevoked: Bool {
+        isUnconfirmedParticipantOpening
+    }
+
+    public var permitsAssistantResponse: Bool {
+        !isUnconfirmedParticipantOpening
+    }
+
+    public func shouldCloseForMissingTranscript(at monotonicNS: UInt64) -> Bool {
+        guard isUnconfirmedParticipantOpening,
+              let transcriptDeadlineNS else { return false }
+        return monotonicNS >= transcriptDeadlineNS
+    }
+
+    public mutating func reset() {
+        origin = nil
+        participantInputConfirmed = false
+        transcriptDeadlineNS = nil
+        initialAudioSubmitted = false
+        initialAudioTransportConfirmed = false
+    }
+
+    private mutating func confirmTransportedInitialAudioIfComplete() {
+        guard initialAudioSubmitted, initialAudioTransportConfirmed else { return }
+        participantInputConfirmed = true
+        transcriptDeadlineNS = nil
+    }
+}
+
 /// Owns the local lifetime of one active Live voice session. Only confirmed
 /// user activity renews this lease; assistant speech must not keep an idle
 /// microphone session alive indefinitely.

@@ -61,7 +61,7 @@ and choose when to speak, stay quiet, look again, or express readiness.
 
 ## The body: OBSBOT Tiny
 
-SOMA recognizes connected OBSBOT hardware from the vendor SDK product type,
+SOMA recognizes connected OBSBOT hardware from exact USB VID/PID identity,
 not from a UVC display name. It was developed around the
 [OBSBOT Tiny 2 Lite](https://www.obsbot.com/obsbot-tiny-2-lite-4k-webcam), and
 also has a guarded profile for the
@@ -75,18 +75,19 @@ treated as sensorimotor bodies rather than passive webcams:
 | 2-axis gimbal | Fixation, re-acquisition, active exploration, and compact nonverbal expressions |
 | Firmware LED feedback | A nearby person can see the state the connected model can physically express |
 
-The camera's vendor SDK is used only by a separately enabled local bridge. It
-does not become a direct model tool or a free-form velocity interface.
+The camera is controlled by a separately enabled open macOS UVC/XU bridge. The
+raw transport does not become a direct model tool or a free-form velocity
+interface.
 The [device adapter contract](docs/OBSBOT_DEVICE_ADAPTER.md) carries the
 connected product's verified control surface from that bridge to the launcher
 and runtime. An unfamiliar OBSBOT remains a perception-and-conversation body
 until it has both an adapter and a matching calibration; replacing hardware
 does not silently borrow another camera's motor or LED assumptions.
 
-| SDK profile | Available without new calibration | Intentionally withheld |
+| Device profile | Available without new calibration | Intentionally withheld |
 | --- | --- | --- |
 | `tiny_2_lite` | Video, USB audio, calibrated gimbal control, firmware indicator palette | — |
-| `tiny_3_lite` | Video, USB audio, selectable microphone modes, profile-calibrated L0 gimbal control, native human-track policy, firmware status LED, and Live Voice | Tiny 2 motor calibration and a host-readable sound bearing |
+| `tiny_3_lite` | Video, USB audio, selectable microphone modes, profile-calibrated L0 gimbal control, native human tracking, firmware status LED, and Live Voice | Tiny 2 motor calibration, host-readable sound bearing, and camera-tuning controls not yet migrated to the open bridge |
 
 This is a physical boundary, not a feature downgrade: calibration signs,
 motion envelopes, sound-localization semantics, and LED state IDs are
@@ -102,11 +103,11 @@ layers are connected, but they are not interchangeable.
 
 | Layer | Time scale | What it does | What it may control |
 | --- | --- | --- | --- |
-| **L0 · subconscious** | Video/audio cadence | Captures sensor evidence, follows a verified face, keeps target continuity, estimates voice activity, maintains spatial coverage, and executes the final motor policy | The only path to SDK motion, stabilization, limits, watchdogs, and immediate stops |
+| **L0 · subconscious** | Video/audio cadence | Captures sensor evidence, follows a verified face, keeps target continuity, estimates voice activity, maintains spatial coverage, and executes the final motor policy | The only path to physical motion, stabilization, limits, watchdogs, and immediate stops |
 | **L0.5 · local semantic helper** | Sparse asynchronous inference and temporal evidence integration | Produces evidence deltas for L1 without blocking L0; it does not call the language model directly | No independent motor, speech, identity, memory, or wake authority |
 | **L1a · persistent thought stream** | Event-driven plus an adaptive stochastic clock | Maintains hypotheses, curiosity, goal-linked thought episodes, self-correction, and a probabilistically selected foreground thought in one persistent mental workspace | May form an abstract intention and request bounded visual evidence; cannot speak or move hardware |
 | **L1b · executive judgment** | Only when an L1a intention creates action pressure | Chooses one currently available social or attention action against a frozen workspace revision | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through existing leased MCP/L0 goals |
-| **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and goal-directed tool use when grounded information is needed | The same semantic embodiment interface as L1; never raw SDK velocity |
+| **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, and goal-directed tool use when grounded information is needed | The same semantic embodiment interface as L1; never raw device velocity |
 
 L2 may inspect perception or memory and may request reversible attention actions
 without waiting for a literal tool command when that action advances the current
@@ -233,7 +234,7 @@ whole attention policy while keeping the physical executor local.
 
 Every mutating request includes an owner, evidence references, a priority, and
 a bounded lease. L0 rejects stale or ambiguous targets, expires finished goals,
-and resolves competing requests before anything reaches the vendor SDK.
+and resolves competing requests before anything reaches the USB control plane.
 
 ## Presence is a communication channel
 
@@ -253,7 +254,8 @@ arbitrary 24-bit color. Tiny 3 Lite uses its firmware status machine: persistent
 `57` is blue human presence and contact cadence, and state `16` provides the
 yellow active-conversation presentation. The bridge restores `3 + 54` whenever
 a temporary state ends. Its experimental direct-RGB packet route was invalid
-and has been removed.
+and has been removed. During an active voice session, yellow remains the session
+colour; verified eye contact changes only its cadence from steady to blink.
 
 ## Privacy and physical boundaries
 
@@ -261,7 +263,7 @@ SOMA is designed around the fact that a socially responsive camera is sensitive
 by default.
 
 - Scalar runtime traces do not contain raw camera frames, PCM, biometric
-  templates, or direct SDK payloads.
+  templates, or direct device-control payloads.
 - Face templates and raw conversation turns are encrypted local records; they
   are not placed in L1 prompts or normal diagnostic traces.
 - Visual capture for a reasoning turn is bounded and short-lived rather than a
@@ -282,32 +284,34 @@ SOMA's Swift package has no remote SwiftPM dependencies. A full runtime uses:
   or newer for the full runtime installed by the current Brewfile
 - Xcode command-line tools with a Swift 6 toolchain
 - Homebrew OpenCV 5 for the Swift/C++ vision bridge
-- CMake and the OBSBOT `libdev_v2.1.0_8` SDK for the native gimbal/LED bridge
+- CMake for the native open UVC/XU gimbal, tracking, audio, and LED bridge
 - Ollama with the configured L1 model
 - A compatible signed-in Codex installation when L2 Live Voice is enabled
 
-For a clean Mac, obtain `libdev_v2.1.0_8.zip` through the
-[official OBSBOT SDK application](https://www.obsbot.com/sdk), place it in
-`~/Downloads`, and run the idempotent setup command:
+On a clean Apple Silicon Mac, clone the repository and run the idempotent setup
+command:
 
 ```sh
 scripts/setup-soma.zsh --enable-motion
 ```
 
-Use `--sdk-archive /absolute/path/to/libdev_v2.1.0_8.zip` when the archive is
-elsewhere, and `--with-l05` to provision the optional local semantic helper.
+Use `--with-l05` to provision the optional local semantic helper.
 `--enable-motion` activates the bundled Tiny 2 Lite and Tiny 3 Lite gimbal
 profiles; without it, an existing motion setting is preserved and a fresh
 installation remains perception-only.
 The command reuses the lower-level bootstrap, doctor, test, signing, and
 LaunchAgent installation boundaries rather than duplicating them.
 
-The proprietary OBSBOT SDK is intentionally not stored in Git: the supplied
-archive contains no public redistribution grant and OBSBOT distributes it
-through an account application. Bootstrap verifies its exact archive and
-stages it locally; `soma-doctor` verifies tool
-versions, bundled-model hashes, the SDK signature and hashes, Ollama/model
-availability, conditional Codex support, and optional MLX/ArcFace assets. See
+At runtime the launcher probes the exact USB product before granting physical
+authority. Tiny 2 Lite and Tiny 3 Lite share one open macOS IOKit UVC/XU
+control process, while their packet layouts, motion limits, tracking modes,
+indicator pulse transports, and audio capabilities remain isolated in device
+profiles. The installed bundle neither contains nor links a proprietary OBSBOT
+library.
+
+`soma-doctor` verifies tool versions, bundled-model hashes, the native helper
+build, Ollama/model availability, conditional Codex support, and optional
+MLX/ArcFace assets. See
 [`DEPENDENCIES.md`](DEPENDENCIES.md) for the full clean-Mac procedure and
 supported overrides.
 
@@ -357,8 +361,8 @@ enabling physical camera control.
 scripts/setup-soma.zsh --enable-motion
 ```
 
-The setup command finds the supported SDK in `~/Downloads`, installs locked
-dependencies, provisions the L1 model, runs the full verification suite, then
+The setup command installs locked dependencies, provisions the L1 model, runs
+the full verification suite, then
 rebuilds the Swift and native helpers, signs a local app bundle,
 writes `com.soma.menu-bar` and `com.soma.reactive-l0` LaunchAgents, and starts or
 restarts them. macOS may then request Camera, Microphone, Speech Recognition,
@@ -375,7 +379,7 @@ and the connected device has a valid calibration. Use `scripts/soma.zsh stop`,
 | --- | --- |
 | [`Sources/SOMACore`](Sources/SOMACore) | Cognition contracts, memory, identity, semantic embodiment leases, attention, and spatial models |
 | [`Sources/SOMASubconscious`](Sources/SOMASubconscious) | L0 capture/perception runtime, panorama worker, L1 situation stream, and local safety integration |
-| [`Sources/SOMANativeTracking`](Sources/SOMANativeTracking) | Explicitly gated OBSBOT SDK bridge |
+| [`Sources/SOMANativeTracking`](Sources/SOMANativeTracking) | Product-gated open macOS UVC/XU control, native tracking, audio, and indicator bridge |
 | [`Sources/SOMAEmbodimentMCP`](Sources/SOMAEmbodimentMCP) | MCP server for embodiment and person-context operations |
 | [`Sources/SOMALiveVoice`](Sources/SOMALiveVoice) | Account-backed Codex app-server Live Voice helper |
 | [`Sources/SOMAMenuBar`](Sources/SOMAMenuBar) | Native local settings, status, and diagnostics interface |

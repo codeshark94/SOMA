@@ -98,15 +98,15 @@ if [[ ! -x "$soma_binary" ]]; then
   print -u2 -r -- "SOMA application is not installed. Run $soma_root/scripts/install-soma-subconscious-app.zsh first."
   exit 64
 fi
-if [[ ! -x "$soma_native_helper" || ! -x "$soma_device_probe" || ! -x "$soma_child_guardian" || ! -x "$soma_calibration_selector" ]]; then
+if [[ ! -x "$soma_native_helper" || ! -x "$soma_device_probe" \
+      || ! -x "$soma_child_guardian" || ! -x "$soma_calibration_selector" ]]; then
   print -u2 -r -- 'SOMA native device helpers are unavailable.'
   exit 64
 fi
 
-# Device identity and available controls must come from the SDK adapter, not
-# from a UVC display name. Keep the complete contract so the runtime and
-# launcher make the same authority decision.
-soma_device_probe_output=$("$soma_device_probe" 2>>"$soma_launcher_log" || true)
+soma_selected_native_helper="$soma_native_helper"
+soma_control_backend=open_uvc_xu
+soma_device_probe_output=$("$soma_device_probe" --contract 2>>"$soma_launcher_log" || true)
 print -r -- "$soma_device_probe_output" >>"$soma_launcher_log"
 soma_device_contract=$(print -r -- "$soma_device_probe_output" | /usr/bin/sed -n 's/^SOMA_OBSBOT_CAPABILITY //p' | /usr/bin/tail -n 1)
 soma_device_profile=$(print -r -- "$soma_device_contract" | /usr/bin/sed -n 's/.* profile=\([^ ]*\).*/\1/p')
@@ -116,6 +116,7 @@ if [[ -z "$soma_device_contract" ]]; then
 fi
 export SOMA_OBSBOT_CAPABILITY_CONTRACT="$soma_device_contract"
 print -r -- "SOMA device profile: $soma_device_profile"
+print -r -- "SOMA control backend: $soma_control_backend"
 
 # Derive the L1 /api/chat endpoint from the configured host unless it was set
 # explicitly (SOMA_L1_OLLAMA_ENDPOINT already resolves in the binary too).
@@ -176,7 +177,7 @@ if [[ "${SOMA_ENABLE_MOTION:-0}" == "1" ]]; then
       --embodiment-shadow-socket "$soma_runtime_root/ipc/embodiment-shadow.sock"
       --embodiment-view-directory "$soma_runtime_root/views"
       --allow-camera-motion
-      --native-gimbal-helper "$soma_native_helper"
+      --native-gimbal-helper "$soma_selected_native_helper"
       --gimbal-output "$soma_runtime_root/actuator/gimbal.jsonl"
       --gimbal-trace-max-megabytes 32
       --gimbal-trace-retained-files 4
@@ -184,6 +185,7 @@ if [[ "${SOMA_ENABLE_MOTION:-0}" == "1" ]]; then
       --external-gimbal-calibration "$soma_external_calibration"
       --allow-autonomous-scan
     )
+    soma_motion_args+=(--native-gimbal-shutdown-helper "$soma_native_helper")
     if [[ "$soma_native_human_tracking" == "true" ]]; then
       soma_motion_args+=(--allow-native-human-tracking)
     fi

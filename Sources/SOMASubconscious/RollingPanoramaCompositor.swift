@@ -399,7 +399,7 @@ final class RollingPanoramaCompositor: @unchecked Sendable {
             alignmentQuality = 0.55 + 0.45 * (alignment.estimate?.confidence ?? 0)
         } else if alignment.attempted {
             // A failed still-frame registration is rejected above. During a
-            // moving strip the capture-aligned SDK attitude remains usable,
+            // moving strip the capture-aligned device attitude remains usable,
             // but receives a bounded quality penalty rather than inventing a
             // visual correction.
             alignmentQuality = 0.85

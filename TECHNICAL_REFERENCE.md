@@ -4,7 +4,7 @@
 layer. It verifies that the OBSBOT Tiny 2 Lite video and microphone streams can
 be captured continuously before perception or camera actuation is introduced.
 
-It does not invoke the supplied OBSBOT SDK or OSC control surface, move the
+It does not invoke the open OBSBOT control transport or OSC control surface, move the
 gimbal, select a tracking mode, record raw audio/video, alter macOS's default
 input device, or call an LLM or network service.
 
@@ -32,13 +32,13 @@ primary interactive route is Codex app-server's account-authenticated GPT-Live
 WebRTC session. L0 supplies the eye-contact-plus-voice opening decision and its
 already captured PCM stream; the installed Codex runtime owns Live session,
 natural turn taking, spoken output, and ChatGPT-account authentication.
-Neither L1 nor L2 drives the camera SDK directly; both use the leased embodiment
+Neither L1 nor L2 drives the camera transport directly; both use the leased embodiment
 MCP contract described in that document.
 
 That MCP is not a weak suggestion channel. L1 and L2 share leased goals
 for semantic labels, per-target probabilistic attention priors, target tracking,
 orientation, exploration regions and directional distributions, view capture,
-and social motion. L0 retains SDK timing, stabilization, watchdogs, joint-limit
+and social motion. L0 retains USB-control timing, stabilization, watchdogs, joint-limit
 handling, and immediate physical vetoes. The versioned request types exist in
 `Sources/SOMACore/CognitiveEmbodiment.swift`. A local stdio MCP process now
 forwards those requests over a current-user Unix socket to the running L0
@@ -420,7 +420,7 @@ joint reachability, and the native helper watchdog all converge on the same L0
 stop path.
 
 `capture_view` is a one-shot active-sensing operation rather than an alias for
-orientation. L0 uses the native stabilized absolute-position path, refreshes it
+orientation. L0 closes position feedback against the live stabilized UVC pose, refreshes it
 within the helper watchdog interval, enters a 2-degree alignment window, leaves
 only beyond 4.5 degrees, and requires 180 ms of settled pose before accepting
 the next exposure-aligned frame. The frame is centre-cropped to the requested
@@ -725,29 +725,29 @@ localization or reaction quality.
 ## Camera-control boundary
 
 The separate `Sources/SOMANativeTracking/soma-native-track` helper is the only
-SDK control path. It accepts movement only with `--allow-camera-motion`, an
+physical control path. It uses macOS IOKit UVC/XU requests and accepts movement
+only with `--allow-camera-motion`, an
 explicit `--duration`, and an `--output` trace path. `--duration 0` keeps the
 reactive session running until explicitly stopped; positive durations remain
 available for bounded trials. Its local pipe
 can request either Tiny 2 Lite native human tracking or direct low-speed gimbal
 control, but never concurrently. Once the device control endpoint has been
-discovered, it always requests `AiWorkModeNone` plus
-`aiSetGimbalStop()` on normal exit, interruption, a rejected start, or an
-unconfirmed start. A local cleanup guard also attempts that stop path during an
-unexpected post-discovery exception. An interruption before discovery records
-`discovery_interrupted`; it has no device endpoint to stop. Its JSONL contains
+discovered, it releases the native tracking mode and writes a zero-velocity
+setpoint on normal exit, interruption, a rejected start, or watchdog expiry.
+Its JSONL contains
 only command and acknowledgement owner/state, result codes, bounded diagnostic
 messages, monotonic timestamps, and a `command_id` pairing a command with its
 acknowledgement—never raw media.
 
-Build it against a supplied macOS arm64 vendor SDK, then confirm discovery
-without moving the camera:
+Build it directly from the repository, then confirm discovery without moving
+the camera:
 
 ```sh
 cmake -S Sources/SOMANativeTracking -B /tmp/soma-native-track \
-  -DOBSBOT_SDK_ROOT=/absolute/path/to/libdev_v2.1.0_8
+  -DCMAKE_BUILD_TYPE=Release
 cmake --build /tmp/soma-native-track
-/tmp/soma-native-track/soma-native-track --list
+/tmp/soma-native-track/soma-obsbot-probe --contract
+/tmp/soma-native-track/soma-obsbot-probe --read-attitude
 ```
 
 Only an explicitly consented trial may add `--allow-camera-motion --duration
@@ -778,8 +778,8 @@ remain first-class targets for an L1 thought, question, or memory lookup.
 count, stability, corroborating-source count, and `action_eligible` flag for
 every active candidate. With the direct gimbal bridge it also projects each
 candidate into gimbal-relative `azimuth_degrees` and `elevation_degrees` from
-the SDK-reported attitude and current 86/78/65 FOV mode label. These generic
-libdev labels are not treated as Tiny 2 Lite physical angles. The specification
+the measured UVC attitude and active optical geometry. Generic firmware FOV
+labels are not treated as Tiny 2 Lite physical angles. The specification
 profile is only the fallback; the persistent runtime loads the current
 provisional normalized pinhole and camera-to-gimbal rotation from
 [`camera-geometry-tiny2lite-20260815.json`](artifacts/subconscious/camera-geometry-tiny2lite-20260815.json).
@@ -842,16 +842,16 @@ a new waypoint is selected inside a 10° look-ahead radius and blends into the
 current velocity instead of hitting the exact centre and inserting a stop/rest
 pulse. Waypoint timeout scales with angular travel instead of cutting
 a distant route at a fixed duration. The helper discards superseded direct-motion commands while an
-SDK call is in flight, so delayed commands cannot accumulate behind perception.
+USB control request is in flight, so delayed commands cannot accumulate behind perception.
 An unexpected attitude outside the planned envelope receives an inward velocity
-curve; the SDK's absolute centre operation is reserved for a measured
+curve; the device recenter operation is reserved for a measured
 two-direction stall. The JSONL trace remains scalar. When `--panorama-output`
 is supplied, a separate utility-priority compositor also maintains exactly one
 rolling 1024×256 JPEG and one metadata JSON; it does not append raw frames.
 Each process publishes an empty session map before admitting frames, so a
 human-occluded startup cannot expose the previous process's panorama as current.
 The equirectangular raster has a fixed world convention—azimuth increases from
-left to right and elevation from bottom to top. The OBSBOT SDK attitude is
+left to right and elevation from bottom to top. The stabilized UVC attitude is
 converted once into canonical visual yaw/elevation before projection; its
 image-axis signs are not applied again to individual source rays. Source
 sampling uses a coupled 3D yaw/pitch camera basis rather than two independent
@@ -861,7 +861,7 @@ The panorama path admits at most 4 frames/s into a one-slot mailbox and may wait
 125 ms for the attitude sample after exposure. It interpolates only between
 measured packets no farther than 120 ms from exposure and with a bracket no
 wider than 200 ms; unbracketed or wider poses are dropped rather than projected
-from stale pre-motion state. These bounds cover the SDK's observed native-AI
+from stale pre-motion state. These bounds cover the device's observed native-AI
 sampling gaps without permitting extrapolation. The real-time face detector
 and motor controller keep their strict timestamps and never wait for this
 branch. People are masked from the background composite; non-human detections
@@ -1015,8 +1015,10 @@ correction. With the native adapter enabled, that provisional lease may start
 only a bounded external correction; only independent verification may start
 native tracking and promote the face to the persistent lock.
 Each native acquisition selects the Tiny-series `AiVTrackMotion` tracking mode;
-the helper records both the SDK setter result and the mode read back from
-`AiStatus` in the `human_normal_active` acknowledgement.
+the open helper records transport acceptance as `human_mode_submitted`, then
+the independent `NativeTrackingLiveness` path requires measured target
+centering or pose progress before the runtime marks the native loop
+functionally verified.
 Native tracking is stopped before an external recovery path starts, so the two
 servos never race.
 Direct external fixation remains a separately opt-in calibration experiment: an

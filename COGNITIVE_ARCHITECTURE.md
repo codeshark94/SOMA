@@ -11,9 +11,9 @@ not imply that a language model is part of the real-time control loop.
 
 | Layer | Primary implementation | Responsibility | Authority |
 | --- | --- | --- | --- |
-| L0 subconscious | Local Core ML, temporal fusion, and deterministic control | Continuous perception, target continuity, VAD, spatial coverage, immediate motor control, and interaction-readiness evidence | Sole executor of hard real-time SDK commands and physical vetoes; supplies autonomous behaviour when no cognitive lease is active |
+| L0 subconscious | Local Core ML, temporal fusion, and deterministic control | Continuous perception, target continuity, VAD, spatial coverage, immediate motor control, and interaction-readiness evidence | Sole executor of hard real-time device commands and physical vetoes; supplies autonomous behaviour when no cognitive lease is active |
 | L1a persistent thought stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Evidence-grounded hypothesis maintenance, memory association, curiosity, self-correction, intentions, and foreground-thought competition | May request bounded visual context and form an abstract intention; cannot speak or control the gimbal |
-| L1b executive judgment | A separate call to the same `gemma4:31b-cloud` route | Decides whether one current intention should become one currently permitted social or attention action | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends SDK velocity directly |
+| L1b executive judgment | A separate call to the same `gemma4:31b-cloud` route | Decides whether one current intention should become one currently permitted social or attention action | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends device velocity directly |
 | L2 human interaction and executive reasoning | Codex account session with app-server GPT-Live WebRTC; explicit local fallback | Conversation, high-order reasoning, tool use, coding, and user-requested work | Opens directly from authorized L0 contact evidence, or from an L1-approved proactive opening; neither route waits on the other. It receives scoped text context, may pull image context through Codex/MCP, and uses leased embodiment goals when observation or expression is needed |
 
 The fast 31B cloud route is the primary L1 stream and may run frequently while
@@ -425,7 +425,7 @@ event corpus is labelled and shadow-mode latency and wake behaviour pass.
 
 L1 and L2 share one local `soma-embodiment` MCP server. They have broad
 semantic control authority, while the existing L0 owner arbiter remains the
-sole path to physical SDK commands. This is not an advisory-only boundary:
+sole path to physical device commands. This is not an advisory-only boundary:
 cognitive layers can change what is labelled, attended, tracked, viewed, and
 explored, as well as the direction and movement character. L0 translates those
 goals into continuously corrected motion and retains only physical-limit,
@@ -482,7 +482,7 @@ stdio transport, current-user Unix socket, and L0 executor are now implemented.
 The semantic arbiter validates target ownership, requires target registration
 before tracking, applies one active motor lease, rejects equal/lower-priority
 foreign owners, permits higher-priority preemption, expires owned state, and
-releases it as a unit. It still has no SDK dependency. A separately enabled L0
+releases it as a unit. It still has no device-transport dependency. A separately enabled L0
 adapter consumes only accepted decisions and uses the existing gimbal owner
 queue, pose feedback, spherical route planner, joint envelope, and watchdog.
 Snapshots report `physical_actuation_enabled` explicitly; default runs remain
@@ -564,12 +564,11 @@ levels `0...3`, and named states including normal work, tracking, network error,
 pairing, and upgrade states. Steady/blink actions exist; marquee and queue
 actions report unsupported on this hardware.
 
-The supplied and installed `libdev` evidence exposes:
+The open native bridge exposes:
 
-- `sysMgSetIndicatorStateR(uint8_t state_id)`;
-- `sysMgClearIndicatorStateR(uint8_t state_id)`;
-- `sysMgSetLedBrightnessR(uint8_t)` and `sysMgGetLedBrightnessR(uint8_t&)`;
-- `sysMgSetLedEnabledR(bool)` and `sysMgGetLedEnabledR(bool&)`.
+- firmware state selection and clearing;
+- four brightness levels;
+- indicator enable and disable.
 
 `cameraSetLedCtrlU(bool)` is a separate Tiny 2-series UVC camera-control
 function. It is not used by the status renderer: on the connected firmware it
@@ -580,11 +579,11 @@ success for LED enabled state and brightness, with brightness level `3`.
 The Tally Light API returned unsupported and is not the RGB status indicator.
 The resulting capability contract is `rgb_palette=true`,
 `arbitrary_rgb=false`, four brightness levels, firmware-defined state patterns,
-and Tally unavailable. An SDK acknowledgement confirms a requested palette
-state only; physical colour/pattern verification remains a camera-side check.
+and Tally unavailable. A successful USB transfer confirms transport acceptance
+only; physical colour and pattern verification remains a camera-side check.
 
-The MCP contract uses human-facing interaction meanings rather than assuming
-colours or exposing raw implementation status:
+The MCP contract uses human-facing interaction meanings rather than exposing
+raw device state IDs:
 
 - `available`
 - `attention_requested`
@@ -594,39 +593,35 @@ colours or exposing raw implementation status:
 - `do_not_disturb`
 - `fault`
 
-The native boundary now exposes `setIndicatorState(state_id)`,
+The native boundary exposes `setIndicatorState(state_id)`,
 `clearIndicatorState(state_id)`, `setLedBrightness(0...3)`, and
 `setLedEnabled(bool)`. It does not expose RGB triplets. Social state names map to
-the allowlisted non-error firmware IDs `16` target-lost, `17` target-lock,
-`18` gesture-recognizing, `54` normal-work, and `57` tracking-work. The L0
+the physically characterized firmware IDs `16` target-lost, `54` normal-work,
+and `57` tracking-work. The L0
 priority is `speaking > working > listening > contact_ready > human_detected > exploring`.
 Firmware palette state communicates the current interaction state to a nearby
-person: ordinary human presence is the blue steady tracking state (`57`), while
-the green target-ready palette state (`54`) signals that SOMA is ready for an
-interaction. The other semantic states use their corresponding steady firmware
-palette entries; SOMA does not synthesize unsupported host-timed cadences. State
+person: green normal-work (`54`) is exploration, blue tracking-work (`57`) is
+human presence, and a cadence over blue is contact readiness. Yellow (`16`) is
+an active voice session. Device-specific brightness or enable modulation creates
+the host cadence without changing the semantic colour. State
 replacement is generation-bound, so a stale request cannot revive a previous
 state.
-On every transition the bridge sets the new state and clears the previous
-SOMA-owned state. Its native session remembers the prior enabled/brightness
-values, clears all SOMA-owned IDs, and restores any changed global setting on
-normal shutdown, signal, input closure, or exceptional return. Existing
-firmware status priority remains authoritative; SOMA never clears an unrelated
-system state. The connected camera reports its baseline LED setting as disabled,
-so the persistent L0 session enables it after native bridge readiness and the
-helper restores disabled on exit. Exact hue is firmware-defined until the allowlist is visually
-characterized on the connected camera.
+On every transition the bridge clears only SOMA-owned presentation states and
+submits the new one. It does not claim to read or restore an unknown pre-session
+brightness or enabled value. Tiny 3 establishes `SYSTEM_READY(3) +
+NORMAL_WORKMODE(54)` as its explicit SOMA baseline; all physical state changes
+remain subordinate to firmware error, upgrade, and privacy priority.
 
 LED signals are secondary and redundant with speech and gimbal behaviour. They
 must respect quiet/privacy preferences and must not override firmware status or
 claim that the microphone is muted when only a cosmetic light changed.
 
-Tiny 3 Lite exposes a narrower verified contract. Exploration, human presence,
-and eye contact leave its firmware-owned blue animation untouched because
-states `54` and `57` acknowledge host requests without producing distinct
-physical presentations. Conversation uses the verified yellow state `16`. The experimental private
-three-byte RGB command is not a valid device capability and is absent from the
-adapter and bridge.
+Tiny 3 Lite exposes a firmware palette rather than arbitrary RGB. Physical
+validation maps `3 + 54` to steady green exploration, `3 + 57` to steady blue
+human presence, a host cadence over `57` to contact readiness, and `16` to the
+yellow conversation presentation. The experimental private three-byte RGB
+command is not a valid device capability and is absent from the adapter and
+bridge.
 
 ## Panoramic spatial memory
 
@@ -639,7 +634,7 @@ newest admitted frame, waits for a following measured attitude, interpolates
 the exposure pose, and rejects an unbracketed frame. A single
 `GimbalKinematicEnvelope` defines live tracking and autonomous camera-centre
 limits, so the image and scalar maps describe the same reachable space.
-The raster itself uses a calibration-independent world orientation. The SDK
+The raster itself uses a calibration-independent world orientation. The device
 attitude axes are converted once to canonical visual yaw/elevation before a
 full 3D camera basis couples yaw and pitch during source projection;
 independently warping the two axes is not considered a valid spherical panorama.
@@ -788,7 +783,7 @@ Official implementation references:
 | C6 Leased embodiment actions | Implemented and physically validated | Target ownership, registration-before-tracking, priority preemption, independently scheduled expiry, owner release, explicit-scene permanence, probabilistic descriptor ambiguity, orient/grounded-track/policy-explore/active-view/social-expression execution, transient image return, labelled target reacquisition, and native stop/watchdog pass |
 | C7 Panoramic spatial memory | Learned fixed-base place memory and active mapping implemented; robustness evaluation pending | Capture-aligned spherical projection, bounded image registration, best-observation pixels, versioned Feature Print revisits, bounded cross-session persistence, information-gain reachable view planning, MCP map projection, static/dynamic separation and familiar-space evaluation |
 | C8 L0-to-L2 interaction bridge | Account-authenticated app-server GPT-Live WebRTC handshake implemented; physical conversation validation pending | Locally validated direct-contact opening, bot-pulse exception, V3 WebRTC session, one-second PCM pre-roll, purpose/context injection, duplicate-launch suppression, scalar audit, and an explicit local CLI/ASR/TTS fallback |
-| C9 LED signalling | Firmware ABI and native L0 state wiring implemented; MCP tool and visual hue characterization pending | `rgb_palette=true`, `arbitrary_rgb=false`, allowlisted state set/clear, green contact-ready and blue human-presence palette states, brightness/enabled access, shutdown restore, semantic priority trace, and physical SDK acknowledgements |
+| C9 LED signalling | Firmware ABI and native L0 state wiring implemented; MCP tool and visual hue characterization pending | `rgb_palette=true`, `arbitrary_rgb=false`, allowlisted state set/clear, green contact-ready and blue human-presence palette states, brightness/enabled access, shutdown restore, semantic priority trace, and physical device acknowledgements |
 | C10 End-to-end social evaluation | Planned | Labelled explicit-contact, curiosity, dialogue, task, opt-out, memory-correction, and embodiment scenarios |
 
 The physical intent adapter and its end-to-end target/view gates are complete.
@@ -802,5 +797,5 @@ labelled viewpoint, lighting, and change-evaluation corpus before its
 familiarity can influence anything beyond no-target exploration. C3 still needs
 deployment labels before it schedules L1 or opens L2 interaction automatically. C8 barge-in, the C9 semantic MCP surface, and C10 remain subsequent
 work. Every cognitive layer
-receives the same semantic surface, while SDK calls stay behind the L0 arbiter
+receives the same semantic surface, while device calls stay behind the L0 arbiter
 and each stage remains independently disableable.

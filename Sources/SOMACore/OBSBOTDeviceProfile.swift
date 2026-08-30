@@ -1,7 +1,7 @@
 import Foundation
 
 /// Stable identity for the OBSBOT hardware profiles SOMA can use. The native
-/// helper reports this value from the SDK product type; it is never inferred
+/// helper reports this value from exact USB identity; it is never inferred
 /// from a display name or a USB channel count.
 public enum OBSBOTDeviceProfile: String, Codable, CaseIterable, Sendable {
     case tiny2Lite = "tiny_2_lite"
@@ -14,16 +14,16 @@ public enum OBSBOTDeviceProfile: String, Codable, CaseIterable, Sendable {
         }
     }
 
-    /// SDK FOV values are nominal diagonal crop modes. Convert them through
+    /// Firmware FOV values are nominal diagonal crop modes. Convert them through
     /// the profile's physical wide-angle specification before spatial mapping.
-    public func horizontalFieldOfViewDegrees(forSDKMode mode: Double) -> Double? {
+    public func horizontalFieldOfViewDegrees(forNominalMode mode: Double) -> Double? {
         let nominalWideHorizontalFieldOfViewDegrees = switch self {
         case .tiny2Lite: 67.2
         case .tiny3Lite: 72.0
         }
         return OBSBOTDeviceCapabilities.horizontalFieldOfViewDegrees(
             nominalWide: nominalWideHorizontalFieldOfViewDegrees,
-            forSDKMode: mode
+            forNominalMode: mode
         )
     }
 }
@@ -35,8 +35,8 @@ public struct OBSBOTDeviceCapabilities: Codable, Equatable, Sendable {
     public let supportsDirectIndicatorRGB: Bool
     public let supportsIndicatorEnableAndBrightness: Bool
     public let supportsSelectableAudioModes: Bool
-    /// The SDK can enable firmware sound-source tracking. It does not expose
-    /// a raw source-bearing callback through the public host interface.
+    /// The open bridge can enable firmware sound-source tracking. The device
+    /// does not expose a raw source-bearing callback through this interface.
     public let supportsDeviceSoundLocalization: Bool
     public let requiresMeasuredAttitudeFrame: Bool
     public let maximumPanDegreesPerSecond: Double
@@ -69,16 +69,16 @@ public struct OBSBOTDeviceCapabilities: Codable, Equatable, Sendable {
         self.nominalWideHorizontalFieldOfViewDegrees = nominalWideHorizontalFieldOfViewDegrees
     }
 
-    public func horizontalFieldOfViewDegrees(forSDKMode mode: Double) -> Double? {
+    public func horizontalFieldOfViewDegrees(forNominalMode mode: Double) -> Double? {
         Self.horizontalFieldOfViewDegrees(
             nominalWide: nominalWideHorizontalFieldOfViewDegrees,
-            forSDKMode: mode
+            forNominalMode: mode
         )
     }
 
     static func horizontalFieldOfViewDegrees(
         nominalWide: Double,
-        forSDKMode mode: Double
+        forNominalMode mode: Double
     ) -> Double? {
         guard [65.0, 78.0, 86.0].contains(mode),
               nominalWide.isFinite,

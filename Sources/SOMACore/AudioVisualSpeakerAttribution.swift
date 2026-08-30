@@ -130,28 +130,47 @@ public enum LiveVoiceSpeakerEpisodeState: String, Equatable, Sendable {
 public struct LiveVoiceSpeakerEpisodeObservation: Equatable, Sendable {
     public let state: LiveVoiceSpeakerEpisodeState
     public let didTransition: Bool
-    public let directContactAtOnset: Bool
+    public let directContactObserved: Bool
+    public let speakerEvidenceObserved: Bool
     public let maximumVoiceConfidence: Double
     public let endedState: LiveVoiceSpeakerEpisodeState?
 }
 
-/// Freezes the visual half of an interaction at acoustic onset, then gives the
-/// slower lip-motion and directional evidence a short bounded window to catch
-/// up. A gaze acquired after onset can never upgrade ambient sound, and a face
-/// switch cannot complete another person's pending turn.
+/// Joins onset-time visual contact with independent speaker evidence for one
+/// continuously tracked face. The visual result may be delivered later, but
+/// its capture must precede the acoustic onset; a face switch, contradiction,
+/// or expired episode prevents evidence from different people or moments from
+/// being combined.
 public struct LiveVoiceSpeakerEpisodeGate: Sendable {
     private let maximumResolutionNS: UInt64
+    private let maximumEvidenceSkewNS: UInt64
+    private let maximumContactLeadNS: UInt64
     private var episodeActive = false
     private var state: LiveVoiceSpeakerEpisodeState = .idle
     private var onsetNS: UInt64 = 0
     private var targetID: String?
-    private var directContactAtOnset = false
+    private var directContactObserved = false
+    private var speakerEvidenceObserved = false
+    private var lastDirectContactNS: UInt64?
+    private var lastContactContradictionNS: UInt64?
+    private var lastSpeakerEvidenceNS: UInt64?
+    private var confirmedAtNS: UInt64?
     private var maximumVoiceConfidence = 0.0
 
-    public init(maximumResolutionMilliseconds: UInt64 = 750) {
+    public init(
+        maximumResolutionMilliseconds: UInt64 = 3_000,
+        maximumEvidenceSkewMilliseconds: UInt64 = 750,
+        maximumContactLeadMilliseconds: UInt64 = 250
+    ) {
         precondition(maximumResolutionMilliseconds > 0)
         precondition(maximumResolutionMilliseconds <= UInt64.max / 1_000_000)
+        precondition(maximumEvidenceSkewMilliseconds > 0)
+        precondition(maximumEvidenceSkewMilliseconds <= UInt64.max / 1_000_000)
+        precondition(maximumContactLeadMilliseconds > 0)
+        precondition(maximumContactLeadMilliseconds <= UInt64.max / 1_000_000)
         maximumResolutionNS = maximumResolutionMilliseconds * 1_000_000
+        maximumEvidenceSkewNS = maximumEvidenceSkewMilliseconds * 1_000_000
+        maximumContactLeadNS = maximumContactLeadMilliseconds * 1_000_000
     }
 
     public mutating func observe(
@@ -159,6 +178,9 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         trackedFaceID: String?,
         evidence: AudioVisualSpeakerEvidence,
         assessment: AudioVisualSpeakerAssessment,
+        directContactObservedNS: UInt64? = nil,
+        directContactContradictedNS: UInt64? = nil,
+        speakerEvidenceObservedNS: UInt64? = nil,
         episodeOnsetNS: UInt64? = nil,
         at monotonicNS: UInt64
     ) -> LiveVoiceSpeakerEpisodeObservation {
@@ -169,7 +191,12 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             state = .idle
             onsetNS = 0
             targetID = nil
-            directContactAtOnset = false
+            directContactObserved = false
+            speakerEvidenceObserved = false
+            lastDirectContactNS = nil
+            lastContactContradictionNS = nil
+            lastSpeakerEvidenceNS = nil
+            confirmedAtNS = nil
             maximumVoiceConfidence = 0
             return observation(didTransition: transitioned, endedState: endedState)
         }
@@ -179,15 +206,23 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             episodeActive = true
             onsetNS = episodeOnsetNS ?? monotonicNS
             targetID = trackedFaceID
-            directContactAtOnset = trackedFaceID != nil
-                && evidence.faceVisible
-                && evidence.directGaze
-            if monotonicNS >= onsetNS,
-               monotonicNS - onsetNS >= maximumResolutionNS {
+            guard targetID != nil else {
                 state = .rejected
-            } else {
-                state = directContactAtOnset ? resolvedState(for: assessment) : .rejected
+                return observation(didTransition: true)
             }
+            accumulate(
+                evidence: evidence,
+                assessment: assessment,
+                directContactObservedNS: directContactObservedNS,
+                directContactContradictedNS: directContactContradictedNS,
+                speakerEvidenceObservedNS: speakerEvidenceObservedNS,
+                at: monotonicNS
+            )
+            state = resolvedState(
+                assessment: assessment,
+                at: monotonicNS
+            )
+            if state == .confirmed { confirmedAtNS = monotonicNS }
             return observation(didTransition: true)
         }
 
@@ -197,6 +232,12 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
                 state = .rejected
                 return observation(didTransition: true)
             }
+            if invalidatesConfirmedContact(directContactContradictedNS) {
+                state = .rejected
+                directContactObserved = false
+                lastDirectContactNS = nil
+                return observation(didTransition: true)
+            }
             return observation(didTransition: false)
         }
         guard state == .pending else { return observation(didTransition: false) }
@@ -204,27 +245,175 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             state = .rejected
             return observation(didTransition: true)
         }
-        if monotonicNS >= onsetNS,
-           monotonicNS - onsetNS >= maximumResolutionNS {
-            state = .rejected
-            return observation(didTransition: true)
-        }
-        let resolved = resolvedState(for: assessment)
+        accumulate(
+            evidence: evidence,
+            assessment: assessment,
+            directContactObservedNS: directContactObservedNS,
+            directContactContradictedNS: directContactContradictedNS,
+            speakerEvidenceObservedNS: speakerEvidenceObservedNS,
+            at: monotonicNS
+        )
+        let resolved = resolvedState(
+            assessment: assessment,
+            at: monotonicNS
+        )
         if resolved != .pending {
             state = resolved
+            if resolved == .confirmed { confirmedAtNS = monotonicNS }
             return observation(didTransition: true)
         }
         return observation(didTransition: false)
     }
 
-    private func resolvedState(
-        for assessment: AudioVisualSpeakerAssessment
-    ) -> LiveVoiceSpeakerEpisodeState {
-        switch assessment.classification {
-        case .likelySpeaker: .confirmed
-        case .likelyBackground: .rejected
-        case .ambiguous: .pending
+    /// Applies a gaze result as soon as the visual worker publishes it. A
+    /// result captured before confirmation is part of that confirmation even
+    /// when its asynchronous callback arrives slightly later. Looking away
+    /// after a valid opening does not revoke the established conversation.
+    public mutating func observeGaze(
+        _ gaze: VisualGazeEvidence,
+        trackedFaceID: String,
+        observedNS: UInt64,
+        at monotonicNS: UInt64
+    ) -> LiveVoiceSpeakerEpisodeObservation {
+        guard episodeActive,
+              trackedFaceID == targetID,
+              observedNS <= monotonicNS else {
+            return observation(didTransition: false)
         }
+        if gaze == .direct,
+           state == .pending,
+           isValidOnsetContact(observedNS),
+           lastContactContradictionNS.map({ observedNS > $0 }) ?? true {
+            directContactObserved = true
+            lastDirectContactNS = observedNS
+            let resolved = resolvedAccumulatedState(at: monotonicNS)
+            if resolved == .confirmed {
+                state = .confirmed
+                confirmedAtNS = monotonicNS
+                return observation(didTransition: true)
+            }
+            return observation(didTransition: false)
+        }
+        guard gaze == .averted else {
+            return observation(didTransition: false)
+        }
+        if lastContactContradictionNS.map({ observedNS > $0 }) ?? true {
+            lastContactContradictionNS = observedNS
+        }
+        if state == .confirmed {
+            guard invalidatesConfirmedContact(observedNS) else {
+                return observation(didTransition: false)
+            }
+            state = .rejected
+            directContactObserved = false
+            lastDirectContactNS = nil
+            return observation(didTransition: true)
+        }
+        guard state == .pending,
+              let lastDirectContactNS,
+              observedNS >= lastDirectContactNS else {
+            return observation(didTransition: false)
+        }
+        directContactObserved = false
+        self.lastDirectContactNS = nil
+        return observation(didTransition: false)
+    }
+
+    private func resolvedState(
+        assessment: AudioVisualSpeakerAssessment,
+        at monotonicNS: UInt64
+    ) -> LiveVoiceSpeakerEpisodeState {
+        if assessment.classification == .likelyBackground {
+            return .rejected
+        }
+        return resolvedAccumulatedState(at: monotonicNS)
+    }
+
+    private func resolvedAccumulatedState(
+        at monotonicNS: UInt64
+    ) -> LiveVoiceSpeakerEpisodeState {
+        if monotonicNS >= onsetNS,
+           monotonicNS - onsetNS >= maximumResolutionNS {
+            return .rejected
+        }
+        guard let lastDirectContactNS,
+              let lastSpeakerEvidenceNS else {
+            return .pending
+        }
+        let skew = lastDirectContactNS >= lastSpeakerEvidenceNS
+            ? lastDirectContactNS - lastSpeakerEvidenceNS
+            : lastSpeakerEvidenceNS - lastDirectContactNS
+        return skew <= maximumEvidenceSkewNS ? .confirmed : .pending
+    }
+
+    private mutating func accumulate(
+        evidence: AudioVisualSpeakerEvidence,
+        assessment: AudioVisualSpeakerAssessment,
+        directContactObservedNS: UInt64?,
+        directContactContradictedNS: UInt64?,
+        speakerEvidenceObservedNS: UInt64?,
+        at monotonicNS: UInt64
+    ) {
+        if let contradictedNS = validObservationTimeIfPresent(
+            directContactContradictedNS,
+            noLaterThan: monotonicNS
+        ) {
+            if lastContactContradictionNS.map({ contradictedNS > $0 }) ?? true {
+                lastContactContradictionNS = contradictedNS
+            }
+            if lastDirectContactNS.map({ contradictedNS >= $0 }) ?? false {
+                directContactObserved = false
+                lastDirectContactNS = nil
+            }
+        }
+        if evidence.faceVisible && evidence.directGaze {
+            let contactNS = validObservationTime(
+                directContactObservedNS,
+                fallback: monotonicNS
+            )
+            if isValidOnsetContact(contactNS),
+               lastContactContradictionNS.map({ contactNS > $0 }) ?? true {
+                directContactObserved = true
+                lastDirectContactNS = contactNS
+            }
+        }
+        if assessment.classification == .likelySpeaker {
+            speakerEvidenceObserved = true
+            lastSpeakerEvidenceNS = validObservationTime(
+                speakerEvidenceObservedNS,
+                fallback: monotonicNS
+            )
+        }
+    }
+
+    private func validObservationTime(
+        _ observedNS: UInt64?,
+        fallback monotonicNS: UInt64
+    ) -> UInt64 {
+        guard let observedNS, observedNS <= monotonicNS else { return monotonicNS }
+        return observedNS
+    }
+
+    private func validObservationTimeIfPresent(
+        _ observedNS: UInt64?,
+        noLaterThan monotonicNS: UInt64
+    ) -> UInt64? {
+        guard let observedNS, observedNS <= monotonicNS else { return nil }
+        return observedNS
+    }
+
+    private func invalidatesConfirmedContact(_ contradictedNS: UInt64?) -> Bool {
+        guard let contradictedNS,
+              let confirmedAtNS,
+              contradictedNS <= confirmedAtNS,
+              lastDirectContactNS.map({ contradictedNS >= $0 }) ?? true else {
+            return false
+        }
+        return true
+    }
+
+    private func isValidOnsetContact(_ observedNS: UInt64) -> Bool {
+        onsetNS >= observedNS && onsetNS - observedNS <= maximumContactLeadNS
     }
 
     private func observation(
@@ -234,7 +423,8 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         .init(
             state: state,
             didTransition: didTransition,
-            directContactAtOnset: directContactAtOnset,
+            directContactObserved: directContactObserved,
+            speakerEvidenceObserved: speakerEvidenceObserved,
             maximumVoiceConfidence: maximumVoiceConfidence,
             endedState: endedState
         )

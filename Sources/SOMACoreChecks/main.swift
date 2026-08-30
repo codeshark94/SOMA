@@ -163,12 +163,56 @@ let tiny3Contract = OBSBOTDeviceContract.parse(
 )!
 let contactReadyRendering = SOMALEDSettings().deviceRendering(for: .contactReady, on: tiny3Contract)
 let humanDetectedRendering = SOMALEDSettings().deviceRendering(for: .humanDetected, on: tiny3Contract)
+let tiny2OpenContract = OBSBOTDeviceContract(
+    profileID: OBSBOTDeviceProfile.tiny2Lite.rawValue,
+    productType: 3,
+    firmware: "open_uvc_xu",
+    supportsNativeBridge: true,
+    supportsNativeHumanTracking: true,
+    capabilities: OBSBOTDeviceCapabilities(
+        supportsCalibratedMotorControl: true,
+        supportsBoundedCalibrationPulses: false,
+        supportsFirmwareIndicatorPalette: true,
+        supportsDirectIndicatorRGB: false,
+        supportsIndicatorEnableAndBrightness: true,
+        supportsSelectableAudioModes: false,
+        supportsDeviceSoundLocalization: false,
+        requiresMeasuredAttitudeFrame: false,
+        maximumPanDegreesPerSecond: 180,
+        maximumPitchDegreesPerSecond: 90,
+        nominalWideHorizontalFieldOfViewDegrees: 67.2
+    ),
+    indicatorStateIDs: [.yellow: 16, .green: 54, .blue: 57],
+    indicatorPulseTransport: .brightnessDimming,
+    nativeTrackingTransport: .legacyHumanMode
+)
 require(
     contactReadyRendering == SOMALEDDeviceRendering(stateID: 57, pattern: .blink)
         && humanDetectedRendering == SOMALEDDeviceRendering(stateID: 57, pattern: .steady)
         && SOMALEDSettings().deviceRendering(for: .conversation, on: tiny3Contract)
             == SOMALEDDeviceRendering(stateID: 16, pattern: .steady),
     "Tiny 3 LED contract did not expose its physically validated presentations"
+)
+require(
+    SOMALEDSettings().deviceRendering(
+        for: .conversation,
+        on: tiny3Contract,
+        eyeContactActive: true
+    ) == SOMALEDDeviceRendering(stateID: 16, pattern: .blink)
+        && SOMALEDSettings().deviceRendering(
+            for: .conversation,
+            on: tiny3Contract,
+            eyeContactActive: false
+        ) == SOMALEDDeviceRendering(stateID: 16, pattern: .steady),
+    "conversation eye contact did not modulate cadence without changing the session colour"
+)
+require(
+    SOMALEDSettings().deviceRendering(
+        for: .conversation,
+        on: tiny2OpenContract,
+        eyeContactActive: true
+    ) == SOMALEDDeviceRendering(stateID: 16, pattern: .blink),
+    "Tiny 2 open bridge did not preserve yellow while exposing conversation eye contact"
 )
 require(
     SubconsciousIndicatorState.contactReady.humanMeaning == "ready_speak_now"
@@ -1792,7 +1836,7 @@ require(
     abs((obsbotCanonicalCenter?.normalizedX ?? 0) - 0.5) < 0.000_001
         && abs((obsbotCanonicalCenter?.normalizedY ?? 0) - 0.5) < 0.000_001
         && (obsbotCanonicalTop?.normalizedY ?? 1) < 0.5,
-    "OBSBOT SDK attitude was not converted once into the upright canonical sphere"
+    "OBSBOT stabilized attitude was not converted once into the upright canonical sphere"
 )
 let panoramaUpperLeft = SphericalPanoramaProjection.outputBearing(
     column: 0,
@@ -2057,7 +2101,7 @@ require(
         && calibratedCoverageCells.first {
             $0.bearing.azimuthDegrees == -36 && $0.bearing.elevationDegrees == 0
         }?.observationCount == 0,
-    "coverage atlas ignored calibrated principal point or SDK motor-axis signs"
+    "coverage atlas ignored calibrated principal point or device motor-axis signs"
 )
 require(abs(unexploredDirection!.bearing.elevationDegrees) <= 39, "coverage atlas exceeded its reachable vertical field")
 let sampledCoverageDirection = coverageField.sampleNextDirection(
@@ -2180,7 +2224,7 @@ var nearFaceGate = ExternalGimbalAttentionGate(calibration: externalCalibration,
 var farFaceGate = ExternalGimbalAttentionGate(calibration: externalCalibration, autonomousScanEnabled: false)
 require(nearFaceGate.update(nearFaceBelief) == .none, "a centred face did not stop the pan axis")
 if case let .velocity(_, farPan) = farFaceGate.update(farFaceBelief) {
-    require(abs(farPan) <= 36, "face servo exceeded its live SDK-speed cap")
+    require(abs(farPan) <= 36, "face servo exceeded its live device-speed cap")
 } else {
     require(false, "far face did not emit a tracking velocity")
 }
@@ -2242,7 +2286,7 @@ switch dynamicFaceGate.update(dynamicInitialBelief) {
 case let .velocity(_, pan):
     initialPan = pan
     require(initialPan >= 8, "face servo did not respond strongly enough to an off-centre face")
-    require(initialPan <= 36, "face servo started above its live SDK-speed cap")
+    require(initialPan <= 36, "face servo started above its live device-speed cap")
 default:
     require(false, "off-centre face did not begin a correction")
     initialPan = 0
@@ -2329,7 +2373,7 @@ let nearbyDifferentScene = PredictiveWorldModel().ingestVisual(
     at: start + 580_000_000
 )
 if case let .velocity(_, handoffPan) = sceneHandoffGate.update(nearbyDifferentScene) {
-    require(abs(handoffPan) <= 60, "nearby face scene-id churn bypassed the live SDK-speed cap")
+    require(abs(handoffPan) <= 60, "nearby face scene-id churn bypassed the live device-speed cap")
 } else {
     require(false, "nearby face scene-id churn lost the active correction")
 }

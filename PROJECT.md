@@ -41,15 +41,15 @@ needed.
 - The real-time loop must not wait for an LLM, cloud call, transcription, or
   L1/L2 response.
 - OBSBOT built-in AI tracking and external gimbal control are mutually
-  exclusive camera-control states. The SDK specifies that AI owns the gimbal
-  while enabled; external control must first disable AI.
+  exclusive camera-control states. Firmware tracking owns the gimbal while
+  enabled; external control must first disable it.
 - The subconscious layer may prepare an interaction but cannot speak, send a
   message, or execute a user request. Those actions belong to L1 or L2.
 - Every perception and actuator event carries a monotonic timestamp so actual
   capture-to-command and capture-to-event latency can be measured before an
   SLO is fixed.
 
-## Hardware facts established from the supplied references
+## Hardware facts established from device references
 
 - Target device: OBSBOT Tiny 2 Lite, an AI-powered USB PTZ webcam with a
   two-axis brushless gimbal and dual microphones.
@@ -63,16 +63,16 @@ needed.
 
 ## Control surface
 
-- The supplied macOS ARM SDK identifies `ObsbotProdTiny2Lite`, supports device
-  discovery/status callbacks, AI mode selection, absolute zoom, sleep/wake,
-  and direct gimbal position/speed commands.
+- The open macOS bridge identifies Tiny 2 Lite by USB `3564:fef9` and exposes
+  measured pose, AI mode selection, absolute zoom, sleep/wake, and direct
+  gimbal velocity through validated UVC/XU requests.
 - The supplied OSC definition exposes device selection, wake/sleep, gimbal
   stop/directional/absolute control, zoom, AI lock, AI mode, tracking-mode,
   and tracking-status queries. OSC is a useful integration boundary after the
   baseline loop works.
-- The SDK's normal and fast status callbacks are observability channels, not
-  the source of visual target coordinates. Video perception remains the source
-  of truth for an external control loop.
+- Device attitude readback is an observability channel, not the source of
+  visual target coordinates. Video perception remains the source of truth for
+  an external control loop.
 
 ## First implementation decision
 
@@ -92,9 +92,9 @@ the option to choose the better tracking controller from evidence.
 ## References reviewed
 
 - `Reference/OBSBOTTiny2LiteUserManual_ENv1.1.pdf`
-- `Reference/SDK/libdev_v2.1.0_8/include/dev/dev.hpp`
-- `Reference/SDK/libdev_v2.1.0_8/include/dev/devs.hpp`
-- `Reference/SDK/libdev_v2.1.0_8/OBSBOT_Sample/main.cpp`
+- `Reference/OBSBOT_Tiny 3 Lite 사용설명서_KR_v1.0.pdf`
+- `Sources/SOMANativeTracking/OpenOBSBOTUVCTransport.cpp`
+- `Sources/SOMANativeTracking/OpenOBSBOTContract.hpp`
 - `Reference/OSC/obsbot_center_osc_definition20250314.xlsx`
 - `Reference/OSC/OBSBOT Webcam Sample-TCP.tosc`
 - `Reference/OSC/OBSBOT Webcam Sample-UDP.tosc`

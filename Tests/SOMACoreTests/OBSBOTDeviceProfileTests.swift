@@ -35,15 +35,15 @@ final class OBSBOTDeviceProfileTests: XCTestCase {
 
     func testTiny3LiteFOVUsesItsOwnWideOpticsProfile() {
         XCTAssertEqual(
-            OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forSDKMode: 86) ?? 0,
+            OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forNominalMode: 86) ?? 0,
             72,
             accuracy: 0.001
         )
         XCTAssertNotEqual(
-            OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forSDKMode: 78),
+            OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forNominalMode: 78),
             OBSBOTTiny2LiteOptics.horizontalDegrees(forFOVMode: 78)
         )
-        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forSDKMode: 70))
+        XCTAssertNil(OBSBOTDeviceProfile.tiny3Lite.horizontalFieldOfViewDegrees(forNominalMode: 70))
     }
 
     func testTiny3LiteMapsOnlyRetainedMicrophoneModesToFirmware() {

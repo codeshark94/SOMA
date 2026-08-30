@@ -4,7 +4,7 @@ import Foundation
 /// the camera firmware has oriented its microphone head toward a sound.
 ///
 /// The firmware does not expose its instantaneous DOA bearing.  It does expose
-/// the resulting motor motion through the SDK attitude stream, so the final
+/// the resulting motor motion through the device-attitude stream, so the final
 /// stable pose is the observable output of that closed-loop reflex.
 public struct FirmwareSoundSourceEstimate: Equatable, Sendable {
     public let bearing: GimbalRelativeBearing
@@ -52,7 +52,7 @@ public enum FirmwareSoundSourceEstimator {
         }
     }
 
-    /// Infers a source bearing from measured SDK attitudes that follow a
+    /// Infers a source bearing from measured device attitudes that follow a
     /// confirmed firmware sound-following activation.  The tail median rejects
     /// a single delayed poll without fabricating a source when no measured
     /// trajectory is available.

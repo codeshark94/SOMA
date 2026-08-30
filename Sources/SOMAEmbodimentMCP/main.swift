@@ -348,7 +348,7 @@ private final class EmbodimentMCPServer {
                 "protocolVersion": supportedProtocolVersion,
                 "capabilities": ["tools": ["listChanged": false]],
                 "serverInfo": ["name": "soma-embodiment", "version": "0.3.0"],
-                "instructions": "Leased semantic embodiment control routed to the local SOMA L0 arbiter. Text tool results are interaction context. capture_view returns both an MCP image content block and a short-lived local resource link when a settled frame is ready. Inspect physical_actuation_enabled before assuming a goal can move hardware; L0 always retains route, stabilization, watchdog, and SDK authority."
+                "instructions": "Leased semantic embodiment control routed to the local SOMA L0 arbiter. Text tool results are interaction context. capture_view returns both an MCP image content block and a short-lived local resource link when a settled frame is ready. Inspect physical_actuation_enabled before assuming a goal can move hardware; L0 always retains route, stabilization, watchdog, and device authority."
             ], id: id)
         case "notifications/initialized", "notifications/cancelled":
             return

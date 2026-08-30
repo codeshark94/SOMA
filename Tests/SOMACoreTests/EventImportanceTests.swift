@@ -830,7 +830,7 @@ final class EventImportanceTests: XCTestCase {
         )
     }
 
-    func testSpeakerEpisodeFreezesGazeAndAcceptsLaterCorroborationForSameFace() {
+    func testSpeakerEpisodeCombinesContactAndLaterSpeakerEvidenceForSameFace() {
         var gate = LiveVoiceSpeakerEpisodeGate(maximumResolutionMilliseconds: 750)
         let onset = gate.observe(
             active: true,
@@ -847,7 +847,8 @@ final class EventImportanceTests: XCTestCase {
             at: 1_000_000_000
         )
         XCTAssertEqual(onset.state, .pending)
-        XCTAssertTrue(onset.directContactAtOnset)
+        XCTAssertTrue(onset.directContactObserved)
+        XCTAssertFalse(onset.speakerEvidenceObserved)
 
         let confirmed = gate.observe(
             active: true,
@@ -865,10 +866,12 @@ final class EventImportanceTests: XCTestCase {
         )
         XCTAssertEqual(confirmed.state, .confirmed)
         XCTAssertTrue(confirmed.didTransition)
+        XCTAssertTrue(confirmed.directContactObserved)
+        XCTAssertTrue(confirmed.speakerEvidenceObserved)
         XCTAssertEqual(confirmed.maximumVoiceConfidence, 0.8, accuracy: 0.0001)
     }
 
-    func testSpeakerEpisodeCannotAcquireGazeLaterOrSwitchFaces() {
+    func testSpeakerEpisodeDoesNotAcquireContactAfterAcousticOnset() {
         var lateGaze = LiveVoiceSpeakerEpisodeGate()
         XCTAssertEqual(lateGaze.observe(
             active: true,
@@ -883,8 +886,84 @@ final class EventImportanceTests: XCTestCase {
             ),
             assessment: .init(classification: .ambiguous, probability: 0.45),
             at: 2_000_000_000
+        ).state, .pending)
+        let speakerFirst = lateGaze.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: false,
+                mouthMotion: 1,
+                mouthSampleCount: 6,
+                directionMatchesFace: true,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .likelySpeaker, probability: 0.75),
+            at: 2_200_000_000
+        )
+        XCTAssertEqual(speakerFirst.state, .pending)
+        XCTAssertFalse(speakerFirst.directContactObserved)
+        XCTAssertTrue(speakerFirst.speakerEvidenceObserved)
+        let contactLater = lateGaze.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: true,
+                mouthMotion: 1,
+                mouthSampleCount: 6,
+                directionMatchesFace: true,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.57),
+            at: 2_700_000_000
+        )
+        XCTAssertEqual(contactLater.state, .pending)
+        XCTAssertFalse(contactLater.directContactObserved)
+        XCTAssertTrue(contactLater.speakerEvidenceObserved)
+    }
+
+    func testSpeakerEpisodeAcceptsDelayedDeliveryOfPreOnsetContact() {
+        var gate = LiveVoiceSpeakerEpisodeGate(maximumResolutionMilliseconds: 3_000)
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: false,
+                mouthMotion: 0.9,
+                mouthSampleCount: 6,
+                directionMatchesFace: true,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .likelySpeaker, probability: 0.9),
+            at: 10_000_000_000
+        ).state, .pending)
+        XCTAssertEqual(gate.observeGaze(
+            .direct,
+            trackedFaceID: "face-a",
+            observedNS: 9_900_000_000,
+            at: 12_700_000_000
+        ).state, .confirmed)
+    }
+
+    func testSpeakerEpisodeWithoutFaceAtOnsetCannotAcquireAnotherPersonLater() {
+        var gate = LiveVoiceSpeakerEpisodeGate()
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: nil,
+            evidence: .init(
+                faceVisible: false,
+                directGaze: false,
+                mouthMotion: nil,
+                mouthSampleCount: 0,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.45),
+            at: 20_000_000_000
         ).state, .rejected)
-        XCTAssertEqual(lateGaze.observe(
+        XCTAssertEqual(gate.observe(
             active: true,
             trackedFaceID: "face-a",
             evidence: .init(
@@ -896,8 +975,86 @@ final class EventImportanceTests: XCTestCase {
                 voiceConfidence: 0.9
             ),
             assessment: .init(classification: .likelySpeaker, probability: 1),
-            at: 2_200_000_000
+            at: 20_500_000_000
         ).state, .rejected)
+    }
+
+    func testSpeakerEpisodeDoesNotFuseTemporallyUnrelatedModalities() {
+        var gate = LiveVoiceSpeakerEpisodeGate(
+            maximumResolutionMilliseconds: 3_000,
+            maximumEvidenceSkewMilliseconds: 750
+        )
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: false,
+                mouthMotion: 1,
+                mouthSampleCount: 5,
+                directionMatchesFace: true,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .likelySpeaker, probability: 0.75),
+            at: 1_000_000_000
+        ).state, .pending)
+        let unrelatedContact = gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: true,
+                mouthMotion: 0,
+                mouthSampleCount: 6,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.4),
+            at: 2_000_000_000
+        )
+        XCTAssertEqual(unrelatedContact.state, .pending)
+        XCTAssertFalse(unrelatedContact.directContactObserved)
+        XCTAssertTrue(unrelatedContact.speakerEvidenceObserved)
+    }
+
+    func testSpeakerEpisodeUsesCaptureTimesInsteadOfCallbackTimeForFusion() {
+        var gate = LiveVoiceSpeakerEpisodeGate(
+            maximumResolutionMilliseconds: 3_000,
+            maximumEvidenceSkewMilliseconds: 750
+        )
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: false,
+                mouthMotion: 1,
+                mouthSampleCount: 5,
+                directionMatchesFace: true,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .likelySpeaker, probability: 0.75),
+            speakerEvidenceObservedNS: 1_000_000_000,
+            at: 1_100_000_000
+        ).state, .pending)
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: true,
+                mouthMotion: 0,
+                mouthSampleCount: 6,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.4),
+            directContactObservedNS: 2_000_000_000,
+            at: 2_050_000_000
+        ).state, .pending)
+    }
+
+    func testSpeakerEpisodeRejectsFaceSwitchAndExpiredEvidence() {
 
         var switchedFace = LiveVoiceSpeakerEpisodeGate()
         XCTAssertEqual(switchedFace.observe(
@@ -960,6 +1117,55 @@ final class EventImportanceTests: XCTestCase {
         ).state, .rejected)
     }
 
+    func testSpeakerEpisodeNeverCombinesContactWithoutIndependentSpeakerCue() {
+        var gate = LiveVoiceSpeakerEpisodeGate(maximumResolutionMilliseconds: 3_000)
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: false,
+                mouthMotion: nil,
+                mouthSampleCount: 0,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.95
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.24),
+            at: 5_000_000_000
+        ).state, .pending)
+        let gazeDuringNoise = gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: true,
+                mouthMotion: 0,
+                mouthSampleCount: 5,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.95
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.35),
+            at: 5_600_000_000
+        )
+        XCTAssertEqual(gazeDuringNoise.state, .pending)
+        XCTAssertFalse(gazeDuringNoise.directContactObserved)
+        XCTAssertFalse(gazeDuringNoise.speakerEvidenceObserved)
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: true,
+                mouthMotion: 0,
+                mouthSampleCount: 8,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.95
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.35),
+            at: 8_000_000_000
+        ).state, .rejected)
+    }
+
     func testSpeakerEpisodeDeadlineUsesAcousticOnsetInsteadOfDelayedVADCallback() {
         let evidence = AudioVisualSpeakerEvidence(
             faceVisible: true,
@@ -980,6 +1186,7 @@ final class EventImportanceTests: XCTestCase {
             trackedFaceID: "face-a",
             evidence: evidence,
             assessment: assessment,
+            directContactObservedNS: 1_000_000_000,
             episodeOnsetNS: 1_000_000_000,
             at: 1_700_000_000
         ).state, .confirmed)
@@ -990,6 +1197,7 @@ final class EventImportanceTests: XCTestCase {
             trackedFaceID: "face-a",
             evidence: evidence,
             assessment: assessment,
+            directContactObservedNS: 2_000_000_000,
             episodeOnsetNS: 2_000_000_000,
             at: 2_800_000_000
         ).state, .rejected)
@@ -1042,6 +1250,102 @@ final class EventImportanceTests: XCTestCase {
             assessment: .init(classification: .likelyBackground, probability: 0.2),
             at: 2_100
         ).state, .rejected)
+    }
+
+    func testNewerAvertedGazeInvalidatesContactBeforeSpeakerConfirmation() {
+        var gate = LiveVoiceSpeakerEpisodeGate()
+        XCTAssertEqual(gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: true,
+                mouthMotion: nil,
+                mouthSampleCount: 1,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.8
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.55),
+            directContactObservedNS: 1_000_000_000,
+            at: 1_050_000_000
+        ).state, .pending)
+
+        let averted = gate.observeGaze(
+            .averted,
+            trackedFaceID: "face-a",
+            observedNS: 1_100_000_000,
+            at: 1_150_000_000
+        )
+        XCTAssertEqual(averted.state, .pending)
+        XCTAssertFalse(averted.directContactObserved)
+
+        let speaker = gate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: false,
+                mouthMotion: 1,
+                mouthSampleCount: 6,
+                directionMatchesFace: true,
+                voiceConfidence: 0.9
+            ),
+            assessment: .init(classification: .likelySpeaker, probability: 0.8),
+            speakerEvidenceObservedNS: 1_200_000_000,
+            at: 1_250_000_000
+        )
+        XCTAssertEqual(speaker.state, .pending)
+        XCTAssertFalse(speaker.directContactObserved)
+        XCTAssertTrue(speaker.speakerEvidenceObserved)
+    }
+
+    func testDelayedPreConfirmationAversionRevokesButLaterLookAwayDoesNot() {
+        let evidence = AudioVisualSpeakerEvidence(
+            faceVisible: true,
+            directGaze: true,
+            mouthMotion: 1,
+            mouthSampleCount: 5,
+            directionMatchesFace: true,
+            voiceConfidence: 0.9
+        )
+        let assessment = AudioVisualSpeakerAssessment(
+            classification: .likelySpeaker,
+            probability: 0.95
+        )
+
+        var delayedContradiction = LiveVoiceSpeakerEpisodeGate()
+        XCTAssertEqual(delayedContradiction.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: evidence,
+            assessment: assessment,
+            directContactObservedNS: 2_000_000_000,
+            speakerEvidenceObservedNS: 2_100_000_000,
+            at: 2_200_000_000
+        ).state, .confirmed)
+        XCTAssertEqual(delayedContradiction.observeGaze(
+            .averted,
+            trackedFaceID: "face-a",
+            observedNS: 2_150_000_000,
+            at: 2_250_000_000
+        ).state, .rejected)
+
+        var establishedConversation = LiveVoiceSpeakerEpisodeGate()
+        XCTAssertEqual(establishedConversation.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: evidence,
+            assessment: assessment,
+            directContactObservedNS: 3_000_000_000,
+            speakerEvidenceObservedNS: 3_100_000_000,
+            at: 3_200_000_000
+        ).state, .confirmed)
+        XCTAssertEqual(establishedConversation.observeGaze(
+            .averted,
+            trackedFaceID: "face-a",
+            observedNS: 3_250_000_000,
+            at: 3_300_000_000
+        ).state, .confirmed)
     }
 
     func testStrictLiveVoiceAudioRoutingRequiresCurrentTurnAdmission() {
@@ -1368,6 +1672,60 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(gate.beginLaunch(at: start + 6_000_000_000))
         gate.observeEnded()
         XCTAssertTrue(gate.beginLaunch(at: start + 6_000_000_000))
+    }
+
+    func testInitialTurnValidationRevokesOnlyUnconfirmedParticipantOpenings() {
+        var validation = LiveVoiceInitialTurnValidation(transcriptTimeoutMilliseconds: 3_500)
+        validation.begin(origin: .participantContact)
+        XCTAssertTrue(validation.shouldCloseWhenContactIsRevoked)
+        XCTAssertFalse(validation.permitsAssistantResponse)
+        XCTAssertEqual(
+            validation.observeTransportActive(at: 1_000_000_000),
+            4_500_000_000
+        )
+        XCTAssertFalse(validation.shouldCloseForMissingTranscript(at: 4_499_999_999))
+        XCTAssertTrue(validation.shouldCloseForMissingTranscript(at: 4_500_000_000))
+        validation.confirmParticipantInput()
+        XCTAssertFalse(validation.shouldCloseWhenContactIsRevoked)
+        XCTAssertTrue(validation.permitsAssistantResponse)
+        XCTAssertNil(validation.transcriptDeadlineNS)
+        XCTAssertFalse(validation.shouldCloseForMissingTranscript(at: UInt64.max))
+
+        validation.begin(origin: .proactive)
+        XCTAssertFalse(validation.shouldCloseWhenContactIsRevoked)
+        XCTAssertTrue(validation.permitsAssistantResponse)
+        XCTAssertNil(validation.observeTransportActive(at: 10_000_000_000))
+        validation.reset()
+        XCTAssertNil(validation.origin)
+    }
+
+    func testInitialTurnValidationAcceptsOnlySubmittedAndTransportedOpeningAudio() {
+        var validation = LiveVoiceInitialTurnValidation(transcriptTimeoutMilliseconds: 3_500)
+        validation.begin(origin: .participantContact)
+        _ = validation.observeTransportActive(at: 1_000_000_000)
+
+        validation.observeInitialAudioSubmitted()
+        XCTAssertFalse(validation.permitsAssistantResponse)
+        XCTAssertNotNil(validation.transcriptDeadlineNS)
+
+        validation.observeInitialAudioTransportProgress()
+        XCTAssertTrue(validation.permitsAssistantResponse)
+        XCTAssertNil(validation.transcriptDeadlineNS)
+        XCTAssertFalse(validation.shouldCloseWhenContactIsRevoked)
+        XCTAssertFalse(validation.shouldCloseForMissingTranscript(at: UInt64.max))
+
+        validation.begin(origin: .participantContact)
+        validation.observeInitialAudioTransportProgress()
+        XCTAssertFalse(validation.permitsAssistantResponse)
+        validation.observeInitialAudioSubmitted()
+        XCTAssertTrue(validation.permitsAssistantResponse)
+
+        validation.begin(origin: .proactive)
+        validation.observeInitialAudioSubmitted()
+        validation.observeInitialAudioTransportProgress()
+        XCTAssertFalse(validation.initialAudioSubmitted)
+        XCTAssertFalse(validation.initialAudioTransportConfirmed)
+        XCTAssertTrue(validation.permitsAssistantResponse)
     }
 
     private func decision(

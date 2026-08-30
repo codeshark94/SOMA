@@ -1,76 +1,81 @@
-# OBSBOT device adapter contract
+# OBSBOT open-device contract
 
-SOMA separates camera perception from product-specific physical control. A
-new UVC camera can therefore provide video, audio, local vision, memory, and
-conversation before its gimbal transport is supported.
+SOMA separates perception and cognition from product-specific physical
+control. The native helper uses macOS IOKit to issue UVC camera-terminal and
+extension-unit requests directly; no OBSBOT SDK or redistributed vendor binary
+is required.
 
 `soma-obsbot-probe` and `soma-native-track` emit the same versioned
 `SOMA_OBSBOT_CAPABILITY` line. The launcher passes that exact line to the
-runtime as `SOMA_OBSBOT_CAPABILITY_CONTRACT`; it does not infer hardware from
-the camera display name.
+runtime as `SOMA_OBSBOT_CAPABILITY_CONTRACT`; it does not infer hardware from a
+camera display name.
 
 The boundary has one direction:
 
 1. L0, L1, L2, settings, and MCP issue semantic requests.
-2. `OBSBOTDeviceContract` advertises only connected-device capabilities.
-3. `OBSBOTDeviceAdapter` translates supported requests to product SDK calls.
-4. The native bridge serializes device ownership, restores temporary state,
-   and reports the result.
+2. `OBSBOTDeviceContract` advertises only capabilities of the detected USB
+   product.
+3. `OpenOBSBOTProtocol` owns product identity, opcodes, receivers, payload
+   widths, and axis encoding; native protocol tests prevent cross-profile
+   packet leakage.
+4. `OpenOBSBOTUVCTransport` submits those typed requests through the product's
+   validated UVC/XU controls.
+5. `soma-native-track` serializes ownership, applies watchdog stops, reconciles
+   temporary indicator state, and reports outcomes.
 
-No cognitive or UI layer owns product IDs, SDK mode numbers, LED state IDs,
-or private packet layouts.
+No cognitive or UI layer owns product IDs, transport opcodes, LED state IDs,
+or packet layouts.
+
+## Supported products
+
+| Product | USB identity | Native control dependency |
+| --- | --- | --- |
+| Tiny 2 Lite | `3564:fef9` | macOS IOKit UVC/XU |
+| Tiny 3 Lite | `3564:ff04` | macOS IOKit UVC/XU |
+| unknown | unmatched | perception and conversation only |
+
+The probe opens the matching USB control endpoint before advertising a
+contract. Zero devices fails closed. More than one supported device also fails
+closed until explicit USB-path binding is implemented, preventing commands
+from being sent to an arbitrary camera.
 
 ## Authority levels
 
 | Contract state | Enabled behaviour |
 | --- | --- |
 | no valid contract | perception and conversation only |
-| `profile=unknown`, `native_bridge=false` | perception and conversation only, with an adapter-required diagnostic |
-| `native_bridge=true` without a matching calibration | native observation and LED/audio capabilities only; no external gimbal movement |
-| `native_bridge=true` with a matching calibration | L0 tracking, exploration, and higher-layer motion leases within the adapter limits |
+| valid contract without matching calibration | device observation and supported LED/audio controls; no autonomous direct gimbal movement |
+| valid contract with matching calibration | L0 tracking, exploration, and higher-layer motion leases within profile limits |
 
 The motion gate checks both `native_bridge` and a calibration whose
-`deviceIdentifier` matches the adapter identifier. A product name alone never
+`deviceIdentifier` matches the detected profile. A product name alone never
 grants gimbal authority.
 
-## Adding a product adapter
+## Profile differences
 
-1. Add the SDK product type and its transport implementation in
-   `Sources/SOMANativeTracking/OBSBOTDeviceAdapter.cpp`. The contract must
-   declare only capabilities verified on hardware.
-2. Run the read-only probe. It records the adapter identifier, firmware,
-   serial, and supported control surface without changing camera state.
-3. Create gimbal and geometry calibrations that carry the same identifier.
-   For an unfamiliar optical system, pass its measured nominal wide FOV to
-   `scripts/soma-camera-geometry-calibrate.zsh`. The wrapper selects the
-   managed Python environment and verifies its OpenCV/SciPy dependencies.
-4. Validate LED, native tracking, stop, pose, and external velocity behavior
-   on the physical device before enabling motion in the service.
+| Capability | Tiny 2 Lite | Tiny 3 Lite |
+| --- | --- | --- |
+| native human tracking | selector-6 human mode | human-to-portrait transition plus selected human ROI |
+| direct velocity | float V3 command | centidegree-per-second V3 command |
+| recenter | measured-pose closed loop | firmware recenter command with measured settle verification |
+| indicator | states `54`, `57`, `16`; brightness-dimmed pulse | persistent state `3` plus states `54`, `57`, `16`; enable-toggled pulse |
+| audio modes | not exposed | omni, stereo, front, bidirectional, music |
+| firmware sound following | unavailable | supported |
 
-The bridge remains the only owner of vendor SDK commands. L0, L1, and L2 issue
-semantic requests; the adapter contracts and calibration decide whether a
-specific device can execute them.
+Direct arbitrary RGB is not part of either contract. Cognitive code requests a
+semantic presentation; only the native profile maps it to a firmware state.
 
-## Product modules
+## Adding a product
 
-| Module | Native tracking | Direct motion | Indicator | Audio extensions |
-| --- | --- | --- | --- | --- |
-| `Tiny2LiteAdapter` | legacy human-mode transport | Tiny 2 gimbal APIs | physically validated `54` green, `57` blue, `16` yellow; brightness-dimmed host pulse | unavailable unless later validated |
-| `Tiny3LiteAdapter` | selected-human portrait transport | Tiny 3 gimbal APIs | firmware status machine with persistent ready baseline; enable-toggled host pulse | validated capture modes, gain, and firmware sound following |
-| `UnknownAdapter` | unavailable | unavailable | unavailable | unavailable |
+1. Add the exact VID/PID and typed packet codec in `OpenOBSBOTProtocol`, plus a
+   profile contract in `OpenOBSBOTContract`.
+2. Implement product-specific commands behind the existing semantic methods.
+3. Add protocol regression cases and run CTest before any physical request.
+4. Run `soma-obsbot-probe --contract` and `--read-attitude` without motion.
+5. Create matching gimbal and camera-geometry calibrations.
+6. Validate indicator, native tracking acquisition/release, stop, pose,
+   bounded velocity, recenter, and sleep on the physical device.
 
-The adapter rejects unsupported commands before a vendor call. An ACK from an
-unretained or visually unverified setting is not enough to add that setting to
-the contract.
-
-Tiny 3 Lite requires `SYSTEM_READY(3)` to remain present while semantic work
-states change. Its verified mapping is normal work `54` for steady green,
-tracking work `57` for steady blue, and target-lost `16` for steady yellow.
-The native indicator session establishes `3 + 54` at startup and restores that
-baseline whenever a temporary presentation is cleared or the bridge exits.
-Direct RGB is not part of the contract.
-
-`indicator_pulse_transport` is a device capability rather than a UI policy.
-Tiny 2 Lite retains its selected firmware state while brightness is temporarily
-set to zero. Tiny 3 Lite instead uses the validated LED-enable transition.
-The bridge never substitutes one transport for another when a camera changes.
+An accepted USB write is transport evidence, not physical acceptance. A new
+profile remains incomplete until its visible movement and indicator behaviour
+are observed on hardware.

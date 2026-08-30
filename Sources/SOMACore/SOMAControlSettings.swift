@@ -148,7 +148,7 @@ public enum SOMALEDFirmwarePreset: String, CaseIterable, Codable, Sendable {
     }
 
     /// The native bridge validates this small fixed set before it ever reaches
-    /// the device SDK. The firmware maps each entry to its own RGB palette.
+    /// the device transport. The firmware maps each entry to its own RGB palette.
     public var firmwareStateID: Int {
         switch self {
         case .targetLost: 16
@@ -335,14 +335,20 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         return Self.defaultSignal(for: canonical)
     }
 
-    /// The indicator cadence denotes the visual interaction state. A voice
-    /// session changes the state to conversation, but must not manufacture an
-    /// eye-contact blink after visual contact has ended.
+    /// Conversation owns the indicator colour while verified eye contact owns
+    /// its cadence. This keeps the session affordance stable (for example,
+    /// yellow) while still exposing whether the camera currently sees direct
+    /// visual contact.
     public func deviceRendering(
         for state: SubconsciousIndicatorState,
-        on contract: OBSBOTDeviceContract
+        on contract: OBSBOTDeviceContract,
+        eyeContactActive: Bool = false
     ) -> SOMALEDDeviceRendering? {
-        signal(for: state).deviceRendering(for: contract)
+        var presentation = signal(for: state)
+        if state.configurationState == .conversation && eyeContactActive {
+            presentation.pattern = .blink
+        }
+        return presentation.deviceRendering(for: contract)
     }
 
     private static func normalized(

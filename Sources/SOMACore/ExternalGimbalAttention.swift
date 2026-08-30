@@ -15,17 +15,17 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
     /// Legacy semantic profile retained for existing calibrations and their
     /// product-specific pose rules.
     public let deviceProfile: OBSBOTDeviceProfile?
-    /// Image displacement per positive SDK-attitude axis. These are observed
+    /// Image displacement per positive device-attitude axis. These are observed
     /// alongside the velocity-pulse signs and make pose-space planning
     /// profile-specific instead of inheriting another camera's convention.
     public let posePanImageSign: Double?
     public let posePitchImageSign: Double?
-    /// SDK-attitude response to a positive direct-speed pulse. This is
+    /// Device-attitude response to a positive direct-speed pulse. This is
     /// independent from how the image moves and is the only sign valid for
     /// routing toward an attitude-space waypoint.
     public let velocityPanPoseSign: Double?
     public let velocityPitchPoseSign: Double?
-    /// Raw SDK attitude reported immediately before the calibration pulses.
+    /// Raw device attitude reported immediately before the calibration pulses.
     /// Some OBSBOT products report an unwrapped attitude, so all spatial
     /// planning is performed relative to this measured home pose.
     public let homePanDegrees: Double?
@@ -141,7 +141,7 @@ public struct ExternalGimbalCalibration: Codable, Equatable, Sendable {
     }
 
     /// Profile-stable axis relationships measured from physical pulses. The
-    /// session-specific attitude origin is established from live SDK feedback
+    /// session-specific attitude origin is established from live device feedback
     /// when the native bridge starts and therefore is not part of a portable
     /// device-profile calibration.
     public var hasMeasuredAttitudeAxes: Bool {

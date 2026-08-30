@@ -9,7 +9,7 @@ public enum OBSBOTIndicatorPulseTransport: Int, Sendable {
 
 /// Runtime hardware contract emitted by the native OBSBOT adapter.
 ///
-/// Product-specific SDK transport stays inside the native adapter.  Swift
+/// Product-specific USB transport stays inside the native adapter. Swift
 /// receives this narrow, versioned contract and enables only the operations
 /// the connected device explicitly declares.
 public struct OBSBOTDeviceContract: Equatable, Sendable {

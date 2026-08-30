@@ -43,6 +43,27 @@ final class OBSBOTDeviceContractTests: XCTestCase {
         XCTAssertEqual(settings.deviceRendering(for: .conversation, on: contract), .init(stateID: 16, pattern: .steady))
     }
 
+    func testConversationEyeContactChangesCadenceWithoutChangingSessionColor() {
+        for contract in [tiny2LiteTestContract(), tiny3LiteTestContract()] {
+            XCTAssertEqual(
+                SOMALEDSettings().deviceRendering(
+                    for: .conversation,
+                    on: contract,
+                    eyeContactActive: false
+                ),
+                .init(stateID: 16, pattern: .steady)
+            )
+            XCTAssertEqual(
+                SOMALEDSettings().deviceRendering(
+                    for: .conversation,
+                    on: contract,
+                    eyeContactActive: true
+                ),
+                .init(stateID: 16, pattern: .blink)
+            )
+        }
+    }
+
     func testIndicatorPulseTransportIsDeclaredByEachDeviceAdapter() {
         XCTAssertEqual(tiny2LiteTestContract().indicatorPulseTransport, .brightnessDimming)
         XCTAssertEqual(tiny3LiteTestContract().indicatorPulseTransport, .enableToggle)

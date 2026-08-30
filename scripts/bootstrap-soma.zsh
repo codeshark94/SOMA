@@ -4,19 +4,12 @@ set -euo pipefail
 soma_script_dir=${0:A:h}
 soma_root=${soma_script_dir:h}
 soma_lock="$soma_root/config/soma-dependencies.env"
-soma_sdk_archive=''
 soma_skip_brew=0
 soma_with_l05=0
-soma_sdk_work_root=''
 soma_l05_stage=''
 soma_l05_parent=''
 
 function soma_cleanup() {
-  if [[ -n "$soma_sdk_work_root" \
-        && -d "$soma_sdk_work_root" \
-        && "$soma_sdk_work_root" == /private/tmp/soma-sdk.* ]]; then
-    /bin/rm -rf -- "$soma_sdk_work_root"
-  fi
   if [[ -n "$soma_l05_stage" \
         && -n "$soma_l05_parent" \
         && -d "$soma_l05_stage" \
@@ -28,16 +21,11 @@ function soma_cleanup() {
 trap soma_cleanup EXIT
 
 function soma_usage() {
-  print -u2 -r -- 'Usage: scripts/bootstrap-soma.zsh [--sdk-archive /path/libdev_v2.1.0_8.zip] [--with-l05] [--skip-brew]'
+  print -u2 -r -- 'Usage: scripts/bootstrap-soma.zsh [--with-l05] [--skip-brew]'
 }
 
 while (( $# > 0 )); do
   case "$1" in
-    --sdk-archive)
-      (( $# >= 2 )) || { soma_usage; exit 64; }
-      soma_sdk_archive=${2:A}
-      shift 2
-      ;;
     --with-l05)
       soma_with_l05=1
       shift
@@ -75,58 +63,6 @@ if (( ! soma_skip_brew )); then
     exit 2
   fi
   "$soma_brew" bundle install --no-upgrade --file "$soma_root/Brewfile"
-fi
-
-if [[ -n "$soma_sdk_archive" ]]; then
-  [[ -f "$soma_sdk_archive" ]] || { print -u2 -r -- "SDK archive not found: $soma_sdk_archive"; exit 2; }
-  soma_archive_hash=$(shasum -a 256 "$soma_sdk_archive" | awk '{print $1}')
-  if [[ "$soma_archive_hash" != "$SOMA_OBSBOT_SDK_ARCHIVE_SHA256" ]]; then
-    print -u2 -r -- 'OBSBOT SDK archive hash does not match the supported libdev_v2.1.0_8 package.'
-    exit 2
-  fi
-
-  soma_sdk_work_root=$(mktemp -d /private/tmp/soma-sdk.XXXXXX)
-  /usr/bin/ditto -x -k "$soma_sdk_archive" "$soma_sdk_work_root"
-  soma_sdk_source="$soma_sdk_work_root/$SOMA_OBSBOT_SDK_DIRECTORY"
-  soma_sdk_destination="$soma_root/Reference/SDK/$SOMA_OBSBOT_SDK_DIRECTORY"
-  [[ -d "$soma_sdk_source" ]] || { print -u2 -r -- 'OBSBOT SDK archive has an unexpected layout.'; exit 2; }
-
-  function soma_verify_sdk_file() {
-    local soma_path="$1"
-    local soma_expected="$2"
-    [[ -f "$soma_path" ]] || return 1
-    [[ "$(shasum -a 256 "$soma_path" | awk '{print $1}')" == "$soma_expected" ]]
-  }
-
-  soma_verify_sdk_file "$soma_sdk_source/macos/arm64-release/libdev.dylib" "$SOMA_OBSBOT_SDK_DYLIB_SHA256" \
-    && soma_verify_sdk_file "$soma_sdk_source/include/dev/dev.hpp" "$SOMA_OBSBOT_SDK_DEV_HPP_SHA256" \
-    && soma_verify_sdk_file "$soma_sdk_source/include/dev/devs.hpp" "$SOMA_OBSBOT_SDK_DEVS_HPP_SHA256" \
-    && soma_verify_sdk_file "$soma_sdk_source/include/util/comm.hpp" "$SOMA_OBSBOT_SDK_COMM_HPP_SHA256" \
-    || { print -u2 -r -- 'OBSBOT SDK contents do not match the dependency lock.'; exit 2; }
-  /usr/bin/codesign --verify --strict "$soma_sdk_source/macos/arm64-release/libdev.dylib" >/dev/null 2>&1 \
-    || { print -u2 -r -- 'OBSBOT SDK library signature is invalid.'; exit 2; }
-
-  if [[ -e "$soma_sdk_destination" ]]; then
-    soma_verify_sdk_file "$soma_sdk_destination/macos/arm64-release/libdev.dylib" "$SOMA_OBSBOT_SDK_DYLIB_SHA256" \
-      && soma_verify_sdk_file "$soma_sdk_destination/include/dev/dev.hpp" "$SOMA_OBSBOT_SDK_DEV_HPP_SHA256" \
-      && soma_verify_sdk_file "$soma_sdk_destination/include/dev/devs.hpp" "$SOMA_OBSBOT_SDK_DEVS_HPP_SHA256" \
-      && soma_verify_sdk_file "$soma_sdk_destination/include/util/comm.hpp" "$SOMA_OBSBOT_SDK_COMM_HPP_SHA256" \
-      || { print -u2 -r -- "existing SDK differs; inspect it before replacing: $soma_sdk_destination"; exit 2; }
-    print -r -- "OBSBOT SDK already staged at $soma_sdk_destination"
-  else
-    mkdir -p "${soma_sdk_destination:h}"
-    /usr/bin/ditto "$soma_sdk_source" "$soma_sdk_destination"
-    print -r -- "Staged OBSBOT SDK at $soma_sdk_destination"
-  fi
-
-  soma_staged_library="$soma_sdk_destination/macos/arm64-release/libdev.dylib"
-  if /usr/bin/xattr -p com.apple.quarantine "$soma_staged_library" >/dev/null 2>&1; then
-    /usr/bin/xattr -d com.apple.quarantine "$soma_staged_library"
-  fi
-  if /usr/bin/xattr -p com.apple.quarantine "$soma_staged_library" >/dev/null 2>&1; then
-    print -u2 -r -- 'verified OBSBOT SDK library remains quarantined and cannot be loaded.'
-    exit 2
-  fi
 fi
 
 soma_support_root="$HOME/Library/Application Support/SOMA"

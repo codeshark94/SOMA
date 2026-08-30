@@ -220,7 +220,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertLessThan(
             composition?.azimuthDegrees ?? .infinity,
             0,
-            "A left composition point must command the SDK attitude that moves a fixed subject left in image space"
+            "A left composition point must command the device attitude that moves a fixed subject left in image space"
         )
 
         var field = SceneField()
@@ -245,7 +245,7 @@ final class PredictiveWorldModelTests: XCTestCase {
         XCTAssertGreaterThan(
             candidate?.bearing?.azimuthDegrees ?? -.infinity,
             0,
-            "A subject left of centre requires an increasing SDK pan attitude when positive attitude moves image points right"
+            "A subject left of centre requires an increasing device pan attitude when positive attitude moves image points right"
         )
 
         var verticalField = SceneField()

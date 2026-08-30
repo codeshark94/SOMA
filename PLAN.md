@@ -42,7 +42,7 @@ interpretation of a sentence and cannot trigger speech or an external action.
 | P1 - event and trace contract | Small versioned event schema plus a bounded local trace writer. | A replay of a fixed short capture preserves event ordering and computes capture-to-event latency; no event needs an LLM response. |
 | P2 - perception loop | Latest-frame person/face/hand detection, a persistent scene field, posterior target selection, temporal tracker, and audio VAD. | A credible face holds social attention through a detector gap; an observed non-face candidate remains scene attention without acquiring motor authority; coverage exploration resumes only after confirmed visual absence. |
 | P3 - interaction preparation | State estimator combining target continuity, voice activity, visible gesture, and idle time into readiness and intent-hint events. | The system emits evidence and confidence only; it emits no text, speech, command execution, or ungrounded semantic intent. |
-| P3.5 - L1 visual auxiliary | A persistent local MLX-VLM helper interprets sparse keyframes for L1 without blocking L0. | One-in-flight/latest-one-pending inference transport; scalar semantic output; no independent layer or SDK authority. |
+| P3.5 - L1 visual auxiliary | A persistent local MLX-VLM helper interprets sparse keyframes for L1 without blocking L0. | One-in-flight/latest-one-pending inference transport; scalar semantic output; no independent layer or device authority. |
 | P4 - native tracking evaluation | Controlled comparison of the Tiny 2 Lite's native human/group/hand tracking modes. | Logs show start, lock/loss, stop, and camera state for each mode. Native tracking remains disabled by default after the test. |
 | P5 - actuator state machine | One-owner camera arbiter, manual stop, native-AI control, and optional external pan/tilt/zoom control. | AI and direct control cannot overlap; disconnect, failed acknowledgement, or explicit stop enters `fault` or `manual` and sends zero-speed/stop as applicable. |
 | P6 - end-to-end evaluation | Repeatable, consented scenarios and a baseline report. | Compare native and external paths for latency, target retention, overshoot, recovery after loss, and false readiness events. Choose one control owner for the next milestone. |
@@ -60,7 +60,7 @@ The next coding task is P0 only. It is deliberately read-only.
 4. Produce a short JSONL trace containing health events only.
 5. Run a 60-second unattended capture, inspect the trace, and stop cleanly.
 
-P0 explicitly excludes object detection, VAD, OSC, SDK camera commands,
+P0 explicitly excludes object detection, VAD, OSC, camera-control commands,
 recording user media, and changing any system input setting.
 
 ## Event contract for P1
@@ -230,7 +230,7 @@ opposite-side routes stay inside finite joint space instead of crossing the
 angular seam. A 10° look-ahead transition changes direction before the exact
 guide centre, so normal routes neither plan a joint boundary nor insert a hard
 stop/rest. The waypoint deadline scales with angular travel. The native helper
-coalesces superseded direct-motion commands while the synchronous SDK call is
+coalesces superseded direct-motion commands while the synchronous USB request is
 in flight. Normal exploration continues from the current world-relative pose;
 re-centering is reserved for measured external displacement or a
 two-direction pan stall. This replaces a fixed scan order with scalar spatial
@@ -256,7 +256,7 @@ while the remaining background may contribute; an unmasked detector gap is
 rejected for 750 ms. Per-pixel quality selection replaces the former
 accumulating average: frames below the stable projection threshold are rejected,
 and an existing pixel changes only for a materially better observation. Its
-standard world equirectangular raster converts the OBSBOT SDK attitude once
+standard world equirectangular raster converts the stabilized UVC attitude once
 into canonical visual axes, and source rays use a coupled 3D yaw/pitch basis
 rather than separable planar offsets. Consecutive overlapping background views
 receive a utility-queue translational registration pass only after the motion
@@ -314,8 +314,8 @@ No latency number is promised before P0 supplies the host-and-device baseline.
 ## Decisions deferred intentionally
 
 - Implementation language and inference runtime: choose after P0 identifies
-  the capture path and P1 measures its overhead. The supplied C++ SDK remains
-  available for direct control; OSC is an alternative integration boundary.
+  the capture path and P1 measures its overhead. The open UVC/XU bridge is the
+  direct-control boundary; OSC remains an optional integration boundary.
 - Wake word, ASR, speaker identification, and semantic intent: L1 work, not
   a prerequisite for subconscious v0.
 - Speaker direction from the dual microphone array: runtime code may emit only
@@ -480,7 +480,7 @@ Meanwhile the primary 31B situational stream consumes a bounded
 `SituationFrame`, C2 memory projection, and C6 embodiment MCP and prepares the
 richer interaction context in parallel. It requests transient views only for
 visual disambiguation, proposes rather than directly commits memory, and uses a
-leased embodiment action rather than SDK access. Extend the labelled L0 corpus
+leased embodiment action rather than transport access. Extend the labelled L0 corpus
 with interaction-relevant audio/visual cues, people, ordinary objects, empty
 wall, reflections, and occlusion so false interaction wakes and missed contacts
 remain measurable.
@@ -573,7 +573,7 @@ motion request.
 
 ## P4/P5 actuator control status
 
-The SDK control boundary is implemented separately from `soma-subconscious`.
+The open device-control boundary is implemented separately from `soma-subconscious`.
 `soma-native-track` requires an explicit motion flag, duration, and output
 trace path. Its local bridge records command/acknowledgement events with a
 correlation `command_id` and serializes native AI and direct external control.
@@ -593,7 +593,7 @@ ms after the command was sent, and `manual_active` (mode 0) appeared
 245.91 ms after the stop command. The active interval measured 10.07 s because
 the stop loop polls at 100 ms. All five trace events have result code 0 and
 monotonic timestamps. This clears the basic P4 control handshake gate. It does
-not yet establish visual lock/loss behavior, control latency beyond SDK
+not yet establish visual lock/loss behavior, control latency beyond device
 acknowledgement, target retention, or natural nonverbal movement quality.
 
 `artifacts/subconscious/p4-native-human-correlated-20260813.jsonl` repeats a
@@ -607,7 +607,7 @@ start even if a human is visible. A calibrated external owner, enabled only by
 `--allow-external-gimbal-control --external-gimbal-calibration`, defaults to
 eligible face fixation with completed-observation renewals only. Predictions, audio,
 and periodic snapshots never renew an actuator lease. The responsive controller
-uses up to the documented SDK limits of 180°/s pan and 90°/s pitch, has a 350 ms
+uses the validated Tiny 2 limits of 180°/s pan and 90°/s pitch, has a 350 ms
 bridge hard-stop and a 700 ms helper watchdog; a vision miss forces an external
 servo stop, while acknowledged native tracking is kept alive independently of
 app-detector cadence through short gaps. Continuous social loss for 1.2 seconds
@@ -633,7 +633,7 @@ manual shutdown. Measured screen-to-gimbal axis signs, target-retention error,
 overshoot, and scan comfort still require a controlled physical evaluation
 before external motion is enabled with a real calibration file. The later
 `p7-reactive-fast-20260814` run supplied hardware evidence: 55 visual fixation
-requests and 55 accepted external SDK commands, reaching 44.4°/s pan and 31.5°/s
+requests and 55 accepted external device commands, reaching 44.4°/s pan and 31.5°/s
 pitch. `--calibrate-external-gimbal` is the controlled physical protocol: it needs
 a stable visual target and sends only one +pan 18°/s and one +pitch 25°/s / 180 ms
 pulse, each admitted only by a completed visual observation and followed by a

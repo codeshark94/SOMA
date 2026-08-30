@@ -4,5 +4,7 @@
   "panSign": 1,
   "pitchSign": -1,
   "maximumPanDegreesPerSecond": 180,
-  "maximumPitchDegreesPerSecond": 90
+  "maximumPitchDegreesPerSecond": 90,
+  "velocityPanPoseSign": 1,
+  "velocityPitchPoseSign": 1
 }

@@ -2,7 +2,7 @@ import Foundation
 
 /// A motor intent accepted by the cognitive lease arbiter. These values stay
 /// semantic: the L0 runtime still owns pose feedback, route planning, command
-/// rates, watchdogs, and the SDK transport.
+/// rates, watchdogs, and the physical device transport.
 public enum EmbodimentMotorIntent: Equatable, Sendable {
     case orient(
         requestID: String,
@@ -116,7 +116,7 @@ public enum EmbodimentMotorIntent: Equatable, Sendable {
 }
 
 /// Converts accepted cognitive requests into semantic L0 motor intents. It
-/// deliberately has no SDK or timer dependency so ownership, grounding, and
+/// deliberately has no device-transport or timer dependency so ownership, grounding, and
 /// expiry rules can be verified independently of hardware.
 public struct EmbodimentMotorCoordinator: Sendable {
     private var activeRequest: CognitiveEmbodimentRequest?
