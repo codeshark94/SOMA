@@ -1317,15 +1317,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private static func codexURL() -> URL? {
-        if let override = ProcessInfo.processInfo.environment["SOMA_CODEX_BINARY"],
-           FileManager.default.isExecutableFile(atPath: override) {
-            return URL(fileURLWithPath: override)
-        }
-        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") else {
-            return nil
-        }
-        let url = appURL.appendingPathComponent("Contents/Resources/codex")
-        return FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
+        SOMACodexLocator.locate()?.executableURL
     }
 
     private static func validCameraImageDataURI(_ value: String) -> Bool {

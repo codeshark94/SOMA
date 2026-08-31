@@ -85,6 +85,7 @@ private struct IdentityObservation: Equatable {
     let subject: String
     let state: String
     let confidence: Double
+    let label: String?
 }
 
 private struct SOMARuntimeSnapshot: Equatable {
@@ -137,7 +138,8 @@ private struct SOMARuntimeSnapshot: Equatable {
                 identity = IdentityObservation(
                     subject: subject,
                     state: state,
-                    confidence: event["confidence"] as? Double ?? 0
+                    confidence: event["confidence"] as? Double ?? 0,
+                    label: event["label"] as? String
                 )
                 if state == "known_recognized",
                    subject == settings.administrator?.entityID.uuidString.lowercased() {
@@ -145,7 +147,7 @@ private struct SOMARuntimeSnapshot: Equatable {
                 }
             }
             if isLive, eventName == "administrator.identity",
-               event["state"] as? String == "verified" {
+               ["verified", "verified_presence"].contains(event["state"] as? String ?? "") {
                 administratorVerified = true
             }
             if event["source"] as? String == "social_indicator", indicatorState == nil {
@@ -185,7 +187,8 @@ private struct SOMARuntimeSnapshot: Equatable {
         return IdentityObservation(
             subject: subject,
             state: state,
-            confidence: object["confidence"] as? Double ?? 0
+            confidence: object["confidence"] as? Double ?? 0,
+            label: object["label"] as? String
         )
     }
 
@@ -244,6 +247,8 @@ private final class SOMAControlModel: ObservableObject {
     // (or Touch ID) unlocks them, so changing or removing the owner is not a
     // silent, unauthenticated action.
     @Published var administratorProfileUnlocked = false
+    @Published var administratorDraftName = ""
+    @Published var administratorDraftAddress = ""
 
     private let store: SOMAControlSettingsStore
     private let envStore: SOMAEnvStore
@@ -262,6 +267,8 @@ private final class SOMAControlModel: ObservableObject {
             envSettings = .init()
             message = message ?? error.localizedDescription
         }
+        administratorDraftName = settings.administrator?.displayName ?? ""
+        administratorDraftAddress = settings.administrator?.preferredAddress ?? ""
         refresh()
         _ = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -457,6 +464,16 @@ private final class SOMAControlModel: ObservableObject {
     }
 
     func enrollLatestFace() async {
+        let enrollmentName = (
+            settings.administrator?.displayName ?? administratorDraftName
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !enrollmentName.isEmpty else {
+            message = "Enter the administrator display name before enrolling the face."
+            return
+        }
+        let enrollmentAddress = (
+            settings.administrator?.preferredAddress ?? administratorDraftAddress
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
         guard let handle = latestAnonymousFace else {
             message = "Stand in view until SOMA shows a recognized local face."
             return
@@ -491,16 +508,22 @@ private final class SOMAControlModel: ObservableObject {
                 return (false, result.output.isEmpty ? "Could not enroll this face." : result.output)
             }
             let references = Int(parseValue("references", from: result.output) ?? "?") ?? 0
-            let name = settings.administrator?.displayName ?? "Administrator"
-            let address = settings.administrator?.preferredAddress
             settings.administrator = SOMAAdministratorIdentity(
                 entityID: entityID,
-                displayName: name,
-                preferredAddress: address
+                displayName: enrollmentName,
+                preferredAddress: enrollmentAddress.isEmpty ? nil : enrollmentAddress
             )
             do {
                 try store.save(settings)
-                return (true, "Enrolled with \(references) samples. Restart SOMA to load the profile.")
+                let restart = startSOMA(restart: true)
+                refresh()
+                if restart.status == 0 {
+                    message = "Administrator enrolled and SOMA is restarting."
+                    return (true, "Enrolled with \(references) samples. SOMA is loading the profile.")
+                }
+                let detail = restart.output.isEmpty ? "service restart failed" : restart.output
+                message = "Administrator enrolled, but SOMA could not restart: \(detail)"
+                return (true, "Enrolled with \(references) samples. Restart SOMA manually to load it.")
             } catch {
                 return (false, error.localizedDescription)
             }
@@ -533,6 +556,8 @@ private final class SOMAControlModel: ObservableObject {
             return
         }
         settings.administrator = nil
+        administratorDraftName = administrator.displayName
+        administratorDraftAddress = administrator.preferredAddress ?? ""
         do {
             try store.save(settings)
             message = "Administrator enrollment removed. Restart SOMA to clear the active profile."
@@ -1044,11 +1069,23 @@ private struct SOMASettingsView: View {
                     )
                 }
                 HStack {
+                    Text("Camera height")
+                    Spacer()
+                    Picker("Camera height", selection: l0CameraVerticalPlacementBinding) {
+                        ForEach(SOMACameraVerticalPlacement.allCases, id: \.self) { placement in
+                            Text(placement.displayName).tag(placement)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
+                }
+                HStack {
                     Text("Object detection confidence")
                     Spacer()
                     Stepper("≥ \(String(format: "%.2f", model.envSettings.l0YoloConfidenceThreshold))", value: l0YoloConfidenceBinding, in: 0.1...0.95, step: 0.05)
                 }
-                Text("Contact lifetime controls how long a verified gaze remains current; lower is stricter. Lower pupil scaling requires more centered eyes. Object confidence filters weak scene labels.")
+                Text("Contact lifetime controls how long a verified gaze remains current; lower is stricter. Camera height shifts the expected vertical eye ray without making downward phone gaze valid. Lower pupil scaling requires more centered eyes. Object confidence filters weak scene labels.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             SettingsCard(title: "L1 — Conscious stream", subtitle: "Adaptive reflection, memory horizon, and curiosity.") {
@@ -1140,8 +1177,13 @@ private struct SOMASettingsView: View {
                 if model.settings.administrator == nil {
                     Label("No administrator face enrolled", systemImage: "person.crop.circle.badge.exclamationmark")
                         .foregroundStyle(.secondary)
+                    TextField("Display name", text: $model.administratorDraftName)
+                    TextField("Preferred address", text: $model.administratorDraftAddress)
                     Button("Enroll face currently in view") { Task { await model.enrollLatestFace() } }
-                        .disabled(model.latestAnonymousFace == nil)
+                        .disabled(
+                            model.latestAnonymousFace == nil
+                                || model.administratorDraftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
                     if model.latestAnonymousFace == nil {
                         Text("Keep your face visible until Identity changes from waiting to a recognized local face.")
                             .font(.caption).foregroundStyle(.secondary)
@@ -1241,7 +1283,10 @@ private struct SOMASettingsView: View {
     }
 
     private var identityState: String {
-        if model.runtime.administratorVerified { return "administrator verified" }
+        if model.runtime.administratorVerified {
+            return model.runtime.identity?.label ?? model.settings.administrator?.preferredAddress
+                ?? model.settings.administrator?.displayName ?? "administrator verified"
+        }
         return model.runtime.identity?.state.replacingOccurrences(of: "_", with: " ") ?? "waiting"
     }
 
@@ -1352,6 +1397,7 @@ private struct SOMASettingsView: View {
                 guard var administrator = model.settings.administrator else { return }
                 administrator.displayName = String(value.prefix(96))
                 model.settings.administrator = administrator
+                model.administratorDraftName = administrator.displayName
             }
         )
     }
@@ -1364,6 +1410,7 @@ private struct SOMASettingsView: View {
                 let normalized = String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(96))
                 administrator.preferredAddress = normalized.isEmpty ? nil : normalized
                 model.settings.administrator = administrator
+                model.administratorDraftAddress = administrator.preferredAddress ?? ""
             }
         )
     }
@@ -1495,6 +1542,13 @@ private struct SOMASettingsView: View {
         Binding(
             get: { model.envSettings.l0EyeContactPupilThreshold },
             set: { model.envSettings.l0EyeContactPupilThreshold = min(max($0, 0.5), 2.0) }
+        )
+    }
+
+    private var l0CameraVerticalPlacementBinding: Binding<SOMACameraVerticalPlacement> {
+        Binding(
+            get: { model.envSettings.l0CameraVerticalPlacement },
+            set: { model.envSettings.l0CameraVerticalPlacement = $0 }
         )
     }
 
@@ -1961,7 +2015,10 @@ private final class SOMAStatusBar: NSObject, NSApplicationDelegate, NSMenuDelega
         addSection("LIVE ACTIVITY", to: menu)
         addStatus("Vision", state: model.runtime.sources["face_neural_engine"] ?? "waiting", active: model.runtime.sourceIsOperational("face_neural_engine"), to: menu)
         addStatus("Voice", state: model.settings.realtimeVoiceEnabled ? (model.runtime.sources["l2_live_voice"] ?? "armed") : "off", active: model.settings.realtimeVoiceEnabled && model.runtime.sourceIsOperational("l2_live_voice"), to: menu)
-        let identityText = model.runtime.administratorVerified ? "administrator verified" : (model.runtime.identity?.state ?? "waiting")
+        let identityText = model.runtime.administratorVerified
+            ? (model.runtime.identity?.label ?? model.settings.administrator?.preferredAddress
+                ?? model.settings.administrator?.displayName ?? "administrator verified")
+            : (model.runtime.identity?.state ?? "waiting")
         addStatus("Identity", state: identityText, active: model.runtime.isLive && model.runtime.identity != nil, to: menu)
         addStatus("Embodiment", state: model.runtime.sources["attention_gimbal_bridge"] ?? "waiting", active: model.runtime.sourceIsOperational("attention_gimbal_bridge"), to: menu)
         addDivider(to: menu)

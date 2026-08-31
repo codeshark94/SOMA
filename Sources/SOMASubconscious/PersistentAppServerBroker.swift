@@ -1,4 +1,5 @@
 import Foundation
+import SOMACore
 
 private final class PersistentAppServerReadiness: @unchecked Sendable {
     private let lock = NSLock()
@@ -66,9 +67,10 @@ final class PersistentAppServerBroker: @unchecked Sendable {
         process?.stop()
         process = nil
         endpoint = nil
-        guard let executable = Self.codexURL() else {
+        guard let installation = SOMACodexLocator.locate() else {
             return .failure(BrokerError.codexNotFound)
         }
+        let executable = installation.executableURL
 
         guard let guardianURL = ParentBoundProcess.installedGuardianURL() else {
             return .failure(BrokerError.launchFailed("child_guardian_unavailable"))
@@ -100,7 +102,10 @@ final class PersistentAppServerBroker: @unchecked Sendable {
                 if Self.isReady(endpoint) {
                     self.process = guardianProcess
                     self.endpoint = endpoint
-                    onHealth("ready", "transport=dedicated_persistent_app_server; realtime_active=false; model_turn_active=false")
+                    onHealth(
+                        "ready",
+                        "transport=dedicated_persistent_app_server; realtime_active=false; model_turn_active=false; codex_source=\(installation.source.rawValue); codex_path=\(executable.path)"
+                    )
                     return .success(endpoint)
                 }
                 if !guardianProcess.isRunning { break }
@@ -129,29 +134,6 @@ final class PersistentAppServerBroker: @unchecked Sendable {
         }.resume()
         _ = semaphore.wait(timeout: .now() + 0.15)
         return readiness.get()
-    }
-
-    private static func codexURL() -> URL? {
-        if let override = ProcessInfo.processInfo.environment["SOMA_CODEX_BINARY"],
-           FileManager.default.isExecutableFile(atPath: override) {
-            return URL(fileURLWithPath: override)
-        }
-        let applicationCandidates = [
-            "/Applications/Codex.app/Contents/Resources/codex",
-            "/Applications/ChatGPT.app/Contents/Resources/codex",
-        ]
-        for path in applicationCandidates where FileManager.default.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        for component in path.split(separator: ":") {
-            let candidate = URL(fileURLWithPath: String(component), isDirectory: true)
-                .appendingPathComponent("codex")
-            if FileManager.default.isExecutableFile(atPath: candidate.path) {
-                return candidate
-            }
-        }
-        return nil
     }
 
 }

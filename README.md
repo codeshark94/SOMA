@@ -195,6 +195,18 @@ and result fingerprint return to the mental workspace. That closes the
 perception–thought–action loop without duplicating successful equivalent calls
 or persisting raw tool payloads.
 
+The host display is a separate sensor from the OBSBOT camera. After an explicit
+administrator request, L2 can acquire one short-lived main-display image and
+perform a bounded foreground UI action, one pointer, scroll, text, or
+supported-key action per call. These are
+two high-level MCP tools rather than separate mouse and keyboard tool families.
+They require the current administrator capability and a fresh participant turn;
+screen pixels and typed text are not written to the cognitive trace. Multi-step
+computer work, shell access, files, repositories, services, and research remain
+Hermes tasks so the live conversation does not become an unbounded desktop
+automation loop. This channel remains available when gimbal motion is disabled;
+physical camera authority is negotiated separately.
+
 Hermes is the worker for external jobs that can proceed independently of the
 spoken exchange. When delegation is enabled, L2 separates direct conversation
 and SOMA embodiment from explicit administrator work involving the host Mac,
@@ -256,9 +268,13 @@ whole attention policy while keeping the physical executor local.
 | A fresh `capture_view` image or selected panorama data | Shape exploration regions, direction distributions, dwell, and tempo |
 | Hardware capability report | Set a verified camera observation control or native human-track response policy |
 
-Every mutating request includes an owner, evidence references, a priority, and
-a bounded lease. L0 rejects stale or ambiguous targets, expires finished goals,
-and resolves competing requests before anything reaches the USB control plane.
+The public model supplies semantic intent, not its own authority. The trusted
+local MCP gateway derives the L2 owner, evidence references, fixed priority,
+and bounded lease from the active cognitive goal before forwarding a request.
+This keeps repeated authorization fields out of the model-facing tool schemas
+and prevents the model from self-assigning motor priority. L0 then rejects stale
+or ambiguous targets, expires finished goals, and resolves competing requests
+before anything reaches the USB control plane.
 
 ## Presence is a communication channel
 
@@ -323,6 +339,10 @@ scripts/setup-soma.zsh --full
 The installer first shows a guided readiness report for Xcode, Homebrew,
 Codex Live Voice, the connected camera, and possible OBSBOT Center contention.
 OBSBOT Center is not a dependency and should be closed if present.
+Codex discovery does not depend on the application display name: SOMA checks an
+explicit `SOMA_CODEX_BINARY`, the executable `PATH`, common CLI locations, and
+installed application bundles that embed `Contents/Resources/codex`. This covers
+both Codex- and ChatGPT-named desktop installations.
 
 `--full` provisions the optional L0.5 semantic helper and ArcFace identity
 model, enables the supported gimbal profiles, creates a machine-local persistent
@@ -404,11 +424,20 @@ full verification suite, then
 rebuilds the Swift and native helpers, signs a local app bundle,
 writes `com.soma.menu-bar` and `com.soma.reactive-l0` LaunchAgents, and starts or
 restarts them. macOS may then request Camera, Microphone, Speech Recognition,
-and Accessibility permissions. The installed runtime is intended for a local
+Accessibility, and Screen Recording permissions. Screen Recording is used only
+for an explicitly requested host-screen observation; Accessibility is used for
+an explicitly requested pointer or keyboard action. The installed runtime is intended for a local
 macOS user with the connected camera and—when Live Voice is enabled—a signed-in
 Codex installation. Motion stays disabled until `.env` explicitly enables it
 and the connected device has a valid calibration. Use `scripts/soma.zsh stop`,
 `start`, `restart`, or `status` for subsequent service control.
+
+Administrator enrollment captures the display name and face together, persists
+their shared entity ID, and restarts L0 so the encrypted profile is loaded
+immediately. If the lens is mounted above or below the participant's eyes, set
+**Camera height** under **L0 — Perception & attention** before judging eye-contact
+accuracy; the correction shifts the expected vertical eye ray while preserving
+the downward-gaze rejection boundary.
 </details>
 
 ## Repository map
@@ -418,7 +447,7 @@ and the connected device has a valid calibration. Use `scripts/soma.zsh stop`,
 | [`Sources/SOMACore`](Sources/SOMACore) | Cognition contracts, memory, identity, semantic embodiment leases, attention, and spatial models |
 | [`Sources/SOMASubconscious`](Sources/SOMASubconscious) | L0 capture/perception runtime, panorama worker, L1 situation stream, and local safety integration |
 | [`Sources/SOMANativeTracking`](Sources/SOMANativeTracking) | Product-gated open macOS UVC/XU control, native tracking, audio, and indicator bridge |
-| [`Sources/SOMAEmbodimentMCP`](Sources/SOMAEmbodimentMCP) | MCP server for embodiment and person-context operations |
+| [`Sources/SOMAEmbodimentMCP`](Sources/SOMAEmbodimentMCP) | MCP gateway for embodiment, person context, bounded host-screen observation, and immediate host input |
 | [`Sources/SOMALiveVoice`](Sources/SOMALiveVoice) | Account-backed Codex app-server Live Voice helper |
 | [`Sources/SOMAMenuBar`](Sources/SOMAMenuBar) | Native local settings, status, and diagnostics interface |
 | [`Tests/SOMACoreTests`](Tests/SOMACoreTests) | Contract and regression tests for cognition, memory, embodiment, and spatial behavior |
