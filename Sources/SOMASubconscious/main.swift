@@ -4727,18 +4727,21 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func refreshCommunicationIndicatorInputs() {
-        // A connected Live Voice session is already a social commitment. It
-        // keeps one unambiguous session presentation while the user pauses or
-        // the assistant prepares a reply; speech activity only changes the
-        // conversational turn, not the visible readiness state.
+        // A connected Live Voice session is already a social commitment. A
+        // verified participant turn temporarily refines that state so receipt
+        // is visible without waiting for transcription or model output.
         let liveVoiceSessionOpen = liveVoicePresentation != .inactive
         let conversationActive = liveVoiceSessionOpen
             || localSpeechListening
             || localSpeechSpeaking
         let preparingReply = !liveVoiceSessionOpen && localSpeechWorking
-        indicatorInputs.interactionState = conversationActive
-            ? .conversation
-            : (preparingReply ? .preparingReply : .idle)
+        if liveVoicePresentation == .hearingUser {
+            indicatorInputs.interactionState = .hearingUser
+        } else {
+            indicatorInputs.interactionState = conversationActive
+                ? .conversation
+                : (preparingReply ? .preparingReply : .idle)
+        }
     }
 
     func ingestCoverage(
@@ -9185,6 +9188,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// so an older human/exploring refresh cannot replace a live eye-contact
     /// presentation.
     private func resolvedIndicatorPresentation(at monotonicNS: UInt64) -> SubconsciousIndicatorState {
+        if indicatorInputs.interactionState == .hearingUser {
+            return .listening
+        }
         if indicatorInputs.interactionState == .conversation {
             return .conversation
         }
@@ -10534,7 +10540,15 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
 
 private final class LiveVoiceSpeakerEpisodeRuntime: @unchecked Sendable {
     private let lock = NSLock()
-    private var gate = LiveVoiceSpeakerEpisodeGate()
+    private var gate: LiveVoiceSpeakerEpisodeGate
+
+    init(voiceActivationThreshold: Double) {
+        gate = LiveVoiceSpeakerEpisodeGate(
+            openingSpeechConfiguration: .alignedWithDetectorThreshold(
+                voiceActivationThreshold
+            )
+        )
+    }
 
     func observe(
         active: Bool,
@@ -13338,7 +13352,11 @@ private func run(_ options: Options) throws {
             case let .launchRequested(authorization, _):
                 l1LiveConversationState.begin()
                 liveCameraFrameRelay?.setEnabled(true)
-                attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
+                attentionGimbalBridge?.ingestLiveVoicePresentation(
+                    authorization == ConversationOpeningAuthorization.voiceActivity.rawValue
+                        ? .hearingUser
+                        : .ready
+                )
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
                     monotonicNS: eventNS,
@@ -13350,7 +13368,6 @@ private func run(_ options: Options) throws {
                 l1LiveConversationState.begin()
                 if let threadID { l1LiveToolSupervisor.begin(threadID: threadID) }
                 conversationContact.markConversationOpened(at: eventNS)
-                attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 if let personEntityID {
                     Task {
                         await l1MemoryContext.recordSocialContact(
@@ -13494,6 +13511,13 @@ private func run(_ options: Options) throws {
             case .hearingUser:
                 l1LiveConversationState.setParticipantSpeaking(true)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.hearingUser)
+                writer.write(RuntimeEvent(
+                    event: "human.interaction",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "hearing_user",
+                    message: "participant_audio_received=true; transcript_pending=true"
+                ))
             case .visualContextAttached:
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
@@ -13577,6 +13601,22 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "input_transcript_ready",
                     message: "characters=\(min(characters, 65_535)); transcript_trace=false; local_archive=on_final"
+                ))
+            case let .realtimeEventType(type):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "realtime_event_type",
+                    message: "type=\(type)"
+                ))
+            case let .inputTranscriptionFailed(reason):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "input_transcription_failed",
+                    message: reason
                 ))
             case let .transcriptPartial(threadID, text):
                 if let threadID {
@@ -14606,7 +14646,10 @@ private func run(_ options: Options) throws {
     let publisher = BeliefPublisher(writer: writer) { belief, reason in
         attentionGimbalBridge?.ingest(belief, reason: reason)
     }
-    let liveVoiceSpeakerEpisode = LiveVoiceSpeakerEpisodeRuntime()
+    let voiceVADThreshold = somaEnvDouble("SOMA_L0_VAD_THRESHOLD", default: 0.35)
+    let liveVoiceSpeakerEpisode = LiveVoiceSpeakerEpisodeRuntime(
+        voiceActivationThreshold: voiceVADThreshold
+    )
     let visionWorker = VisionWorker(
         worldModel: worldModel,
         publisher: publisher,
@@ -14825,7 +14868,6 @@ private func run(_ options: Options) throws {
     // A live voice opening is additionally gated by fresh directed visual
     // contact. This lets the microphone onset be calibrated to the actual
     // Tiny 3 front end without turning ambient room noise into a session.
-    let voiceVADThreshold = somaEnvDouble("SOMA_L0_VAD_THRESHOLD", default: 0.35)
     let voiceEvidenceTelemetry = VoiceEvidenceTelemetry()
     let voiceWorker = try AudioVADWorker(
         activationThreshold: voiceVADThreshold,
@@ -15055,7 +15097,9 @@ private func run(_ options: Options) throws {
                     independentSpeakerEvidence: speakerEpisode.speakerEvidenceObserved,
                     speechEvidenceQualified: speakerEpisode.speechEvidence.qualified,
                     directContactConfirmed: confirmedTrackedSpeaker,
-                    speakerAttributionRejected: speakerEpisode.state == .rejected,
+                    speakerAttributionRejected: speakerEpisode.hardSpeakerRejection
+                        || (controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn
+                            && speakerEpisode.state == .rejected),
                     requiresDirectGaze: controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn
                 )
                 liveVoiceLauncher?.observeVoiceActivity(

@@ -289,6 +289,20 @@ public enum L1LiveEpistemicReflexRouter {
         let transcript = request.latestUserTranscript
         let foldedTranscript = fold(transcript)
         guard !foldedTranscript.isEmpty else { return nil }
+        if request.availableTools.contains("capture_view"),
+           !request.toolsAlreadyCalled.contains("capture_view"),
+           isExplicitCurrentViewRequest(foldedTranscript) {
+            return L1LiveToolAdvice(
+                cycleID: request.cycleID,
+                threadID: request.threadID,
+                turnID: request.turnID,
+                action: .recommendTool,
+                toolName: "capture_view",
+                groundingQuote: transcript,
+                confidence: 1,
+                rationale: "The participant explicitly requested current camera evidence."
+            )
+        }
         for route in routes {
             guard request.availableTools.contains(route.tool),
                   !request.toolsAlreadyCalled.contains(route.tool),
@@ -318,25 +332,39 @@ public enum L1LiveEpistemicReflexRouter {
         return nil
     }
 
+    /// This route is deliberately narrower than general visual language. It
+    /// admits only an explicit request for what the robot camera sees now, so
+    /// words such as "look" in an unrelated conversational turn cannot move or
+    /// sample the camera. Reframing remains an L2-authored MCP action.
+    private static func isExplicitCurrentViewRequest(_ transcript: String) -> Bool {
+        let exactRequests = [
+            "whatdoyousee", "whatcanyousee", "whatsoncamera", "whatisoncamera",
+            "canyouseeme", "doyouseeme", "howdoilook", "whoishere", "whoiswithme",
+            "카메라에뭐보여", "카메라뭐보여", "지금뭐보여", "뭐가보여", "누가보여",
+            "나보여", "내가보여", "나볼수있", "나를볼수있", "날볼수있",
+            "저볼수있", "저를볼수있", "내모습", "어떻게보여", "누가있어",
+            "你看到了什么", "摄像头里有什么", "你能看到我吗", "誰が見える", "何が見える",
+            "カメラに何が映って", "私が見える",
+        ]
+        if exactRequests.contains(where: transcript.contains) { return true }
+
+        let selfSubjects = [
+            "iam", "im", "me", "myself",
+            "내가", "나는", "난", "내모습", "나지금",
+            "我在", "我现在", "私は", "私が",
+        ]
+        let observedActivityRequests = [
+            "whatamidoing", "whatdoilooklike",
+            "뭐하고있", "뭘하고있", "무엇을하고있",
+            "做什么", "在干什么", "何をしている", "何してる",
+        ]
+        return selfSubjects.contains(where: transcript.contains)
+            && observedActivityRequests.contains(where: transcript.contains)
+    }
+
     private static func fold(_ value: String) -> String {
         value
             .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
             .filter { !$0.isWhitespace && !$0.isPunctuation }
-    }
-}
-
-/// The only L1 recommendations that the Live Voice host may execute directly.
-/// These tools are bounded current-state reads. Every other recommendation
-/// remains advisory so L2 retains authority over side effects and open-ended
-/// queries.
-public enum L1LiveDirectReadOnlyToolPolicy {
-    public static let toolNames: Set<String> = [
-        "get_activity_overview",
-        "get_robot_body_state",
-        "list_hermes_tasks",
-    ]
-
-    public static func permits(_ toolName: String) -> Bool {
-        toolNames.contains(toolName)
     }
 }

@@ -64,6 +64,72 @@ public enum LiveVoiceOpeningOrigin: Equatable, Sendable {
     case proactive
 }
 
+/// Classifies server-side realtime events that prove participant audio reached
+/// the conversation backend. Transcript text may arrive later on the canonical
+/// App Server notification stream, so admission must not depend on the data
+/// channel event carrying a particular text payload shape.
+public enum LiveVoiceRealtimeEventSemantics {
+    public static func confirmsParticipantInput(type: String) -> Bool {
+        switch type {
+        case "input_audio_buffer.speech_started",
+             "input_speech_started",
+             "conversation.item.input_audio_transcription.delta",
+             "conversation.item.input_audio_transcription.completed",
+             "input_transcript.delta",
+             "input_transcript.added",
+             "input_transcript.completed":
+            true
+        default:
+            false
+        }
+    }
+}
+
+/// Realtime snapshots their available tools and startup instructions when the
+/// session begins. The bounded capability barrier prevents the first spoken
+/// turn from racing ahead with an "initializing" view of embodiment.
+public enum LiveVoiceEmbodimentStartupPolicy {
+    public static let verificationTimeoutMilliseconds: UInt64 = 5_000
+
+    public static func permitsRealtimeStart(
+        webViewReady: Bool,
+        threadReady: Bool,
+        capabilityVerificationFinished: Bool,
+        realtimeAlreadyStarted: Bool
+    ) -> Bool {
+        webViewReady
+            && threadReady
+            && capabilityVerificationFinished
+            && !realtimeAlreadyStarted
+    }
+}
+
+public enum LiveVoiceHandoffResponseDisposition: Equatable, Sendable {
+    case noResponse
+    case appendFinalSpeech
+    case retainExistingRealtimeResponse
+    case externalDelegationOwnsResponse
+}
+
+/// Gives every participant turn one audible response owner. Backing Codex
+/// results are spoken only when Realtime has remained silent; task delegation
+/// acknowledgements retain their dedicated controller path.
+public enum LiveVoiceHandoffResponsePolicy {
+    public static func disposition(
+        hasAgentMessage: Bool,
+        realtimeResponseSpoken: Bool,
+        successfulExternalDelegation: Bool
+    ) -> LiveVoiceHandoffResponseDisposition {
+        if successfulExternalDelegation {
+            return .externalDelegationOwnsResponse
+        }
+        guard hasAgentMessage else { return .noResponse }
+        return realtimeResponseSpoken
+            ? .retainExistingRealtimeResponse
+            : .appendFinalSpeech
+    }
+}
+
 /// Keeps the initial participant-contact authorization provisional until the
 /// realtime transport confirms usable participant input. Proactive openings
 /// have their own L1 authorization and are deliberately outside this rule.
@@ -74,6 +140,7 @@ public struct LiveVoiceInitialTurnValidation: Equatable, Sendable {
     public private(set) var transcriptDeadlineNS: UInt64?
     public private(set) var initialAudioSubmitted = false
     public private(set) var initialAudioTransportConfirmed = false
+    public private(set) var serverSpeechDetected = false
 
     public init(transcriptTimeoutMilliseconds: UInt64 = 3_500) {
         precondition(transcriptTimeoutMilliseconds > 0)
@@ -86,6 +153,7 @@ public struct LiveVoiceInitialTurnValidation: Equatable, Sendable {
         transcriptDeadlineNS = nil
         initialAudioSubmitted = false
         initialAudioTransportConfirmed = false
+        serverSpeechDetected = false
     }
 
     @discardableResult
@@ -109,21 +177,25 @@ public struct LiveVoiceInitialTurnValidation: Equatable, Sendable {
         transcriptDeadlineNS = nil
     }
 
-    /// A transcript is not guaranteed to precede response creation in the
-    /// realtime protocol. The first turn is also confirmed when a locally
-    /// admitted opening utterance has both been submitted and acknowledged by
-    /// the browser audio transport. Neither signal alone is sufficient: this
-    /// preserves the guard against empty or ambient-only session launches.
+    /// Confirms that the remote realtime transport, rather than only the
+    /// local AudioWorklet, detected participant speech. Local PCM progress is
+    /// a transport health signal and cannot establish a conversational turn.
+    public mutating func observeServerSpeechDetected() {
+        guard origin == .participantContact else { return }
+        serverSpeechDetected = true
+        confirmParticipantInput()
+    }
+
+    /// Tracks local transport health without treating it as evidence that the
+    /// realtime service heard or understood a participant.
     public mutating func observeInitialAudioSubmitted() {
         guard origin == .participantContact else { return }
         initialAudioSubmitted = true
-        confirmTransportedInitialAudioIfComplete()
     }
 
     public mutating func observeInitialAudioTransportProgress() {
         guard origin == .participantContact else { return }
         initialAudioTransportConfirmed = true
-        confirmTransportedInitialAudioIfComplete()
     }
 
     public var isUnconfirmedParticipantOpening: Bool {
@@ -150,12 +222,7 @@ public struct LiveVoiceInitialTurnValidation: Equatable, Sendable {
         transcriptDeadlineNS = nil
         initialAudioSubmitted = false
         initialAudioTransportConfirmed = false
-    }
-
-    private mutating func confirmTransportedInitialAudioIfComplete() {
-        guard initialAudioSubmitted, initialAudioTransportConfirmed else { return }
-        participantInputConfirmed = true
-        transcriptDeadlineNS = nil
+        serverSpeechDetected = false
     }
 }
 

@@ -965,6 +965,21 @@ final class EventImportanceTests: XCTestCase {
         ).qualified)
     }
 
+    func testOpeningSpeechThresholdCanShareTheNeuralDetectorBoundary() {
+        var evidence = LiveVoiceOpeningSpeechAccumulator(
+            configuration: .alignedWithDetectorThreshold(0.35)
+        )
+
+        let admitted = evidence.observe(
+            active: true,
+            confidence: 0.423,
+            at: 1_000_000_000
+        )
+
+        XCTAssertTrue(admitted.qualified)
+        XCTAssertEqual(admitted.strongWindowCount, 1)
+    }
+
     func testSpeakerEpisodeCannotConfirmFromIncidentalMouthMotionAndWeakVAD() {
         var gate = LiveVoiceSpeakerEpisodeGate()
         let start: UInt64 = 3_000_000_000
@@ -1728,7 +1743,7 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertTrue(admitted.becameAdmitted)
     }
 
-    func testAcousticBargeInRevokesWhenPlaybackCorrelationReturns() {
+    func testAcousticBargeInStaysAdmittedUntilTheVerifiedSpeechEpisodeEnds() {
         var gate = LiveVoiceAcousticBargeInGate(requiredIndependentMilliseconds: 100)
         _ = gate.observe(
             speechActive: true,
@@ -1744,14 +1759,23 @@ final class EventImportanceTests: XCTestCase {
         )
         XCTAssertTrue(admitted.admitted)
 
-        let revoked = gate.observe(
+        let retained = gate.observe(
             speechActive: true,
             speakerVerified: true,
             relationship: .ambiguous,
             at: 2_120_000_000
         )
-        XCTAssertFalse(revoked.admitted)
-        XCTAssertTrue(revoked.becameRevoked)
+        XCTAssertTrue(retained.admitted)
+        XCTAssertFalse(retained.becameRevoked)
+
+        let ended = gate.observe(
+            speechActive: false,
+            speakerVerified: false,
+            relationship: .echoDominated,
+            at: 2_200_000_000
+        )
+        XCTAssertFalse(ended.admitted)
+        XCTAssertTrue(ended.becameRevoked)
     }
 
     func testAcousticBargeInDoesNotAccumulateAcrossAmbiguousPlayback() {
@@ -1775,6 +1799,49 @@ final class EventImportanceTests: XCTestCase {
             at: 3_250_000_000
         )
         XCTAssertFalse(restarted.admitted)
+    }
+
+    func testAcousticBargeInSynchronizesRecentEvidenceWithLateSpeakerVerification() {
+        var gate = LiveVoiceAcousticBargeInGate(
+            requiredIndependentMilliseconds: 500,
+            evidenceSynchronizationMilliseconds: 350
+        )
+        let acousticEvidence = gate.observe(
+            speechActive: true,
+            speakerVerified: false,
+            relationship: .acousticallyIndependent,
+            at: 4_000_000_000
+        )
+        XCTAssertFalse(acousticEvidence.admitted)
+
+        let synchronized = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 4_250_000_000
+        )
+        XCTAssertTrue(synchronized.admitted)
+        XCTAssertTrue(synchronized.becameAdmitted)
+    }
+
+    func testAcousticBargeInRejectsStaleEvidenceWhenSpeakerVerificationArrives() {
+        var gate = LiveVoiceAcousticBargeInGate(
+            requiredIndependentMilliseconds: 500,
+            evidenceSynchronizationMilliseconds: 350
+        )
+        _ = gate.observe(
+            speechActive: true,
+            speakerVerified: false,
+            relationship: .acousticallyIndependent,
+            at: 5_000_000_000
+        )
+        let stale = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 5_351_000_000
+        )
+        XCTAssertFalse(stale.admitted)
     }
 
     func testBargeInRequiresANewSpeechOnsetAfterAssistantOutputBegins() {
@@ -1912,6 +1979,16 @@ final class EventImportanceTests: XCTestCase {
         )
     }
 
+    func testOnlyRenderedWebRTCAudioOwnsSpeakerPresentation() {
+        let upstream = LiveVoicePlaybackOwnershipPolicy.disposition(for: .appServer)
+        let rendered = LiveVoicePlaybackOwnershipPolicy.disposition(for: .webRTCPlayback)
+
+        XCTAssertFalse(upstream.rendersToSpeaker)
+        XCTAssertTrue(upstream.mayFeedEchoReference)
+        XCTAssertTrue(rendered.rendersToSpeaker)
+        XCTAssertTrue(rendered.mayFeedEchoReference)
+    }
+
     private func deterministicAudio(count: Int, seed: UInt64) -> [Float] {
         var state = seed
         return (0..<count).map { index in
@@ -1955,6 +2032,7 @@ final class EventImportanceTests: XCTestCase {
             at: 1_260_000_000
         )
         XCTAssertEqual(contradicted.state, .rejected)
+        XCTAssertTrue(contradicted.hardSpeakerRejection)
         XCTAssertTrue(contradicted.speakerEvidenceObserved)
         XCTAssertTrue(contradicted.speechEvidence.qualified)
         XCTAssertFalse(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
@@ -1962,7 +2040,44 @@ final class EventImportanceTests: XCTestCase {
             independentSpeakerEvidence: contradicted.speakerEvidenceObserved,
             speechEvidenceQualified: contradicted.speechEvidence.qualified,
             directContactConfirmed: false,
-            speakerAttributionRejected: contradicted.state == .rejected,
+            speakerAttributionRejected: contradicted.hardSpeakerRejection,
+            requiresDirectGaze: false
+        ))
+    }
+
+    func testGazeOptionalDuplexDoesNotTreatContactTimeoutAsSpeakerRejection() {
+        var episode = LiveVoiceSpeakerEpisodeGate(maximumResolutionMilliseconds: 300)
+        let evidence = AudioVisualSpeakerEvidence(
+            faceVisible: true,
+            directGaze: false,
+            mouthMotion: 0.9,
+            mouthSampleCount: 6,
+            directionMatchesFace: true,
+            voiceConfidence: 0.95
+        )
+        _ = episode.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: evidence,
+            assessment: .init(classification: .likelySpeaker, probability: 0.95),
+            at: 3_000_000_000
+        )
+        let timedOut = episode.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: evidence,
+            assessment: .init(classification: .likelySpeaker, probability: 0.95),
+            at: 3_301_000_000
+        )
+
+        XCTAssertEqual(timedOut.state, .rejected)
+        XCTAssertFalse(timedOut.hardSpeakerRejection)
+        XCTAssertTrue(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+            trackedFaceVisible: true,
+            independentSpeakerEvidence: timedOut.speakerEvidenceObserved,
+            speechEvidenceQualified: timedOut.speechEvidence.qualified,
+            directContactConfirmed: false,
+            speakerAttributionRejected: timedOut.hardSpeakerRejection,
             requiresDirectGaze: false
         ))
     }
@@ -2108,6 +2223,9 @@ final class EventImportanceTests: XCTestCase {
         inputs.interactionState = .conversation
         XCTAssertEqual(inputs.resolvedState, .conversation)
         XCTAssertEqual(inputs.visualPresentationState, .conversation)
+        inputs.interactionState = .hearingUser
+        XCTAssertEqual(inputs.resolvedState, .listening)
+        XCTAssertEqual(inputs.visualPresentationState, .listening)
         inputs.interactionState = .preparingReply
         XCTAssertEqual(inputs.resolvedState, .working)
         XCTAssertEqual(inputs.visualPresentationState, .contactReady)
@@ -2143,6 +2261,10 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(
             SOMALEDSettings().deviceRendering(for: .conversation, on: contract),
             SOMALEDDeviceRendering(stateID: 16, pattern: .steady)
+        )
+        XCTAssertEqual(
+            SOMALEDSettings().deviceRendering(for: .listening, on: contract),
+            SOMALEDDeviceRendering(stateID: 16, pattern: .doubleBlink)
         )
     }
 
@@ -2285,7 +2407,7 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertNil(validation.origin)
     }
 
-    func testInitialTurnValidationAcceptsOnlySubmittedAndTransportedOpeningAudio() {
+    func testInitialTurnValidationRequiresRemoteSpeechEvidence() {
         var validation = LiveVoiceInitialTurnValidation(transcriptTimeoutMilliseconds: 3_500)
         validation.begin(origin: .participantContact)
         _ = validation.observeTransportActive(at: 1_000_000_000)
@@ -2295,16 +2417,20 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertNotNil(validation.transcriptDeadlineNS)
 
         validation.observeInitialAudioTransportProgress()
+        XCTAssertFalse(validation.permitsAssistantResponse)
+        XCTAssertNotNil(validation.transcriptDeadlineNS)
+
+        validation.observeServerSpeechDetected()
         XCTAssertTrue(validation.permitsAssistantResponse)
+        XCTAssertTrue(validation.serverSpeechDetected)
         XCTAssertNil(validation.transcriptDeadlineNS)
         XCTAssertFalse(validation.shouldCloseWhenContactIsRevoked)
-        XCTAssertFalse(validation.shouldCloseForMissingTranscript(at: UInt64.max))
 
         validation.begin(origin: .participantContact)
         validation.observeInitialAudioTransportProgress()
         XCTAssertFalse(validation.permitsAssistantResponse)
         validation.observeInitialAudioSubmitted()
-        XCTAssertTrue(validation.permitsAssistantResponse)
+        XCTAssertFalse(validation.permitsAssistantResponse)
 
         validation.begin(origin: .proactive)
         validation.observeInitialAudioSubmitted()

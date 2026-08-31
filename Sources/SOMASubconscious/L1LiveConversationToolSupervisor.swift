@@ -49,7 +49,7 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
         self.onAdvice = onAdvice
         onHealth(
             "configured",
-            "backend=primary_l1_31b; protocol=ollama_native_tool_calls; scheduling=live_tool_before_executive_event_periodic; execution=bounded_read_only_direct_or_advisory"
+            "backend=primary_l1_31b; protocol=ollama_native_tool_calls; scheduling=live_tool_before_executive_event_periodic; execution=advisory_only_l2_owned"
         )
     }
 
@@ -90,10 +90,13 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
                 speculativeAdvice = nil
                 currentTranscript = finalTranscript
                 archiveCurrentTurnIfNeeded()
-                if !inferenceInFlight {
-                    generation &+= 1
-                    submitCurrentTurn(generation: generation)
-                }
+                // A deterministic current-state route must not wait behind a
+                // speculative model call launched from an incomplete partial.
+                // Invalidate that result and classify the authoritative final
+                // transcript immediately.
+                generation &+= 1
+                inferenceInFlight = false
+                submitCurrentTurn(generation: generation)
                 return
             }
             archiveCurrentTurnIfNeeded()

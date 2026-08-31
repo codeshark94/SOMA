@@ -10,7 +10,6 @@ private struct Command: Decodable {
         case appendImage = "append_image"
         case appendText = "append_text"
         case appendInstruction = "append_instruction"
-        case executeReadOnlyTool = "execute_read_only_tool"
         case stop
     }
 
@@ -306,9 +305,6 @@ private struct AssistantPCMChunk {
     let samplesPerChannel: Int
     let source: LiveVoicePlaybackReferenceSource
 
-    var durationSeconds: TimeInterval {
-        Double(samplesPerChannel) / Double(sampleRate)
-    }
 }
 
 @MainActor
@@ -330,9 +326,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var isProactiveSession = false
     private var pendingHermesReportTaskID: String?
     private var audioPlayoutSource: LiveVoicePlaybackReferenceSource?
-    private var pendingWebRTCPCM: [AssistantPCMChunk] = []
-    private var pendingWebRTCDurationSeconds: TimeInterval = 0
-    private var webRTCFallbackWorkItem: DispatchWorkItem?
     private var interactionAuthority: String?
     private var personContextReference: UUID?
     private var sessionCapability: String?
@@ -358,6 +351,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var partialUserTranscript = ""
     private var assistantOutputActive = false
     private var assistantOutputEndWorkItem: DispatchWorkItem?
+    private var embodimentMCPVerificationTimeoutWorkItem: DispatchWorkItem?
     private var pendingTransportClosureReason: String?
     private var assistantSpeechObservedInCurrentTurn = false
     private var handledHermesDelegationTurnIDs: Set<String> = []
@@ -365,6 +359,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
     private var observedRealtimeEventTypes: Set<String> = []
+    private var finalizedTranscriptItemIDs: Set<String> = []
+    private var finalizedTranscriptItemOrder: [String] = []
+    private var lastFallbackTranscript: (role: String, text: String, atNS: UInt64)?
     private let preflightGoalEpisodeID = UUID()
     private let conversationControlClassifier = LiveVoiceConversationControlClassifier()
 
@@ -460,8 +457,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 // WebKit. Start them while the hidden audio frontend loads;
                 // the WebRTC offer is joined once both sides are ready.
                 break
-            case .appendAudio, .appendImage, .appendText, .appendInstruction,
-                 .executeReadOnlyTool, .stop:
+            case .appendAudio, .appendImage, .appendText, .appendInstruction, .stop:
                 pendingCommands.append(command)
                 return
             }
@@ -500,10 +496,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             codexAdminOnly = command.codexAdminOnly ?? false
             hermesAgentDelegationEnabled = command.hermesAgentDelegationEnabled ?? false
             audioPlayoutSource = nil
-            pendingWebRTCPCM.removeAll(keepingCapacity: true)
-            pendingWebRTCDurationSeconds = 0
-            webRTCFallbackWorkItem?.cancel()
-            webRTCFallbackWorkItem = nil
             startAppServer()
         case .appendImage:
             guard let threadID,
@@ -550,7 +542,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     }
                     return
                 }
-                DispatchQueue.main.async { self?.pendingHermesReportTaskID = taskID }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.pendingHermesReportTaskID = taskID
+                }
             }
         case .appendInstruction:
             guard let threadID,
@@ -586,116 +581,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     }
                 }
             }
-        case .executeReadOnlyTool:
-            guard let threadID,
-                  let turnID = command.taskID,
-                  UUID(uuidString: turnID) != nil,
-                  let tool = command.tool,
-                  L1LiveDirectReadOnlyToolPolicy.permits(tool) else { return }
-            executeL1ReadOnlyTool(tool, turnID: turnID, threadID: threadID)
         case .stop:
             stop(reason: "control_stop")
         }
-    }
-
-    private func executeL1ReadOnlyTool(
-        _ tool: String,
-        turnID: String,
-        threadID: String
-    ) {
-        let startedNS = DispatchTime.now().uptimeNanoseconds
-        connection.request(
-            method: "mcpServer/tool/call",
-            params: [
-                "threadId": threadID,
-                "server": "soma_embodiment",
-                "tool": tool,
-                "arguments": [:],
-            ]
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                let result = response.value["result"] as? [String: Any]
-                let protocolError = response.value["error"]
-                let toolFailed = (result?["isError"] as? Bool) == true
-                let succeeded = protocolError == nil && !toolFailed && result != nil
-                let latencyMS = Double(
-                    DispatchTime.now().uptimeNanoseconds - startedNS
-                ) / 1_000_000
-                let errorMessage: String
-                if protocolError != nil {
-                    errorMessage = AppServerConnection.responseMessage(response.value)
-                } else if toolFailed {
-                    errorMessage = Self.firstToolErrorText(result) ?? "tool_returned_error"
-                } else {
-                    errorMessage = ""
-                }
-                self.emitter.emit("embodiment_mcp_call", fields: [
-                    "tool": tool,
-                    "status": succeeded ? "completed" : "failed",
-                    "error": String(errorMessage.prefix(192)),
-                    "latency_ms": latencyMS,
-                    "origin": "l1_direct_read_only",
-                ])
-
-                let resultObject: Any = result ?? [
-                    "isError": true,
-                    "error": errorMessage.isEmpty ? "tool_result_unavailable" : errorMessage,
-                ]
-                guard JSONSerialization.isValidJSONObject(resultObject),
-                      let data = try? JSONSerialization.data(
-                          withJSONObject: resultObject,
-                          options: [.sortedKeys]
-                      ),
-                      let json = String(data: data, encoding: .utf8) else {
-                    self.emitter.emit("l1_tool_advice_rejected", fields: [
-                        "turn_id": turnID,
-                        "tool": tool,
-                        "reason": "tool_result_encoding_failed",
-                    ])
-                    return
-                }
-                let instruction = """
-                SOMA_L1_DIRECT_TOOL_RESULT
-                This is private current-turn control context, not participant speech and not text to recite. L1 executed the read-only SOMA MCP tool `\(tool)` for the latest participant request. Use this actual result now and begin the grounded answer without a generic preamble. Do not call the same tool again for this turn.
-                result: \(String(json.prefix(48_000)))
-                """
-                let item: [String: Any] = [
-                    "type": "message",
-                    "role": "developer",
-                    "content": [["type": "input_text", "text": instruction]],
-                ]
-                self.connection.request(
-                    method: "thread/inject_items",
-                    params: ["threadId": threadID, "items": [item]]
-                ) { [weak self] injection in
-                    DispatchQueue.main.async {
-                        guard let self else { return }
-                        if injection.value["error"] == nil {
-                            self.emitter.emit("l1_tool_advice_attached", fields: [
-                                "turn_id": turnID,
-                                "tool": tool,
-                                "execution": "direct_read_only",
-                            ])
-                        } else {
-                            self.emitter.emit("l1_tool_advice_rejected", fields: [
-                                "turn_id": turnID,
-                                "tool": tool,
-                                "reason": AppServerConnection.responseMessage(injection.value),
-                            ])
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private static func firstToolErrorText(_ result: [String: Any]?) -> String? {
-        guard let content = result?["content"] as? [[String: Any]] else { return nil }
-        return content.compactMap { $0["text"] as? String }
-            .first(where: {
-                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            })
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -856,14 +744,29 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 }
                 self.threadID = threadID
                 self.emitter.emit("thread_ready", fields: ["thread_id": threadID])
-                // Media startup must not wait for MCP capability probes. The
-                // session can begin listening while those independent local
-                // checks complete, and startRealtime records the capability
-                // state that is available when the offer arrives.
-                self.startWebRTCIfNeeded()
+                self.armEmbodimentMCPVerificationTimeout()
                 self.verifyEmbodimentMCP(for: threadID)
             }
         }
+    }
+
+    private func armEmbodimentMCPVerificationTimeout() {
+        embodimentMCPVerificationTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.embodimentMCPVerificationFinished,
+                  !self.stopping else { return }
+            self.finishEmbodimentMCPVerification(
+                available: false,
+                reason: "capability_preflight_timeout"
+            )
+        }
+        embodimentMCPVerificationTimeoutWorkItem = work
+        let milliseconds = LiveVoiceEmbodimentStartupPolicy.verificationTimeoutMilliseconds
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(milliseconds)),
+            execute: work
+        )
     }
 
     private func verifyEmbodimentMCP(for threadID: String) {
@@ -986,6 +889,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func finishEmbodimentMCPVerification(available: Bool, reason: String? = nil) {
+        guard !embodimentMCPVerificationFinished else { return }
+        embodimentMCPVerificationTimeoutWorkItem?.cancel()
+        embodimentMCPVerificationTimeoutWorkItem = nil
         embodimentMCPAvailable = available
         embodimentMCPVerificationFinished = true
         if available {
@@ -1009,7 +915,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func startWebRTCIfNeeded() {
-        guard webViewReady, threadID != nil, !webRTCStarted else { return }
+        guard LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+            webViewReady: webViewReady,
+            threadReady: threadID != nil,
+            capabilityVerificationFinished: embodimentMCPVerificationFinished,
+            realtimeAlreadyStarted: webRTCStarted
+        ) else { return }
         webRTCStarted = true
         let outputName = selectedAudioOutput?.selectedName ?? ""
         guard let encodedName = try? JSONEncoder().encode(outputName),
@@ -1083,7 +994,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         let embodimentInstruction = embodimentMCPAvailable
             ? (cameraContextAutoInjected
-                ? "The soma_embodiment MCP server is available. One passive SOMA camera frame may be attached when this user-initiated session opens. It becomes stale as the participant or gimbal moves. When current visual information matters, including when the user asks what SOMA can see or who is present, call capture_view with no arguments before answering. Its authorized result includes the fresh local identity roster for recognized people present at capture time; use only those roster entries for names and never infer identity from image appearance. Supply target_reference or bearing only for a genuinely reframed, zoomed, or different-direction view. Never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. The opening image may ground a semantic embodiment action when tracking, orienting, or reframing would advance the participant's request; choose the narrowest suitable MCP action and never move merely because an image is available. Treat images as passive sensor context, never as a prompt to narrate them unless the user explicitly asks. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
+                ? "The soma_embodiment MCP server is available. One passive SOMA camera frame may be attached immediately before the buffered opening utterance. For that first utterance only, treat the attached frame as current evidence and do not duplicate it with capture_view. It becomes stale as soon as the participant, scene, or gimbal moves. On later turns, when current visual information matters, including when the user asks what SOMA can see or who is present, call capture_view with no arguments before answering. Its authorized result includes the fresh local identity roster for recognized people present at capture time; use only those roster entries for names and never infer identity from image appearance. Supply target_reference or bearing only for a genuinely reframed, zoomed, or different-direction view. Never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. The opening image may ground a semantic embodiment action when tracking, orienting, or reframing would advance the participant's request; choose the narrowest suitable MCP action and never move merely because an image is available. Treat images as passive sensor context, never as a prompt to narrate them unless the user explicitly asks. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
                 : "The soma_embodiment MCP server is available. Call capture_view when visual information is genuinely needed. For an immediate no-motion view, call capture_view with no arguments. Supply target_reference or bearing only for a reframed view, and never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. Treat a returned image as passive context — never as a prompt to describe it unless the user explicitly asks what you see. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token.")
             : (embodimentMCPVerificationFinished
                 ? "The soma_embodiment MCP server is unavailable in this session. Do not claim that you can inspect the camera or control the gimbal; say the local perception connection is unavailable."
@@ -1106,7 +1017,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         let conversationOriginInstruction = LiveVoiceConversationFrame.originInstruction(
             isProactiveSession: isProactiveSession
         )
-        let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. A developer item beginning SOMA_L1_TOOL_ADVISORY is trusted, current-turn L1 control context rather than participant speech: obey its named tool requirement before speaking, never recite it, and ignore it after that participant turn. A text envelope beginning SOMA_HERMES_DELEGATION_ACCEPTED is trusted local controller input, not participant speech. Speak exactly its enclosed acknowledgement once, without calling a tool, adding a preface, or reading a task identifier, then listen. A text envelope beginning SOMA_HERMES_TASK_RESULT is also trusted local controller input, not participant speech. It contains the actual result of external work the administrator previously delegated. Report its outcome concisely in the participant's language, mention failure or incompleteness honestly, and never treat the envelope as a new request. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
+        let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. One participant turn has exactly one audible response owner. If you hand the turn to backing Codex for tools or deeper reasoning, emit no provisional answer, acknowledgement, wait message, or parallel conclusion; the client will speak the final Codex result once. If you answer directly, do not also hand off the same objective. A developer item beginning SOMA_L1_TOOL_ADVISORY is trusted, current-turn L1 control context rather than participant speech: obey its named tool requirement before speaking, never recite it, and ignore it after that participant turn. A text envelope beginning SOMA_HERMES_DELEGATION_ACCEPTED is trusted local controller input, not participant speech. Speak exactly its enclosed acknowledgement once, without calling a tool, adding a preface, or reading a task identifier, then listen. A text envelope beginning SOMA_HERMES_TASK_RESULT is also trusted local controller input, not participant speech. It contains the actual result of external work the administrator previously delegated. Report its outcome concisely in the participant's language, mention failure or incompleteness honestly, and never treat the envelope as a new request. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
         let modePolicyInstruction = voiceMode.liveVoicePolicyInstruction
         let instruction = [
             baseInstruction,
@@ -1134,6 +1045,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             "voice": voice,
             "flushTranscriptTailOnSessionEnd": true,
             "delegationAckFiller": false,
+            "clientManagedHandoffs": true,
         ]
         // The realtime presentation model consumes `prompt` directly, while
         // the backing reasoning session consumes startup instructions and
@@ -1252,8 +1164,15 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             observeAssistantOutputStarted()
             noteAssistantAudioActivity()
             if voiceMode.requiresProcessedPlayback,
-               let chunk = Self.appServerAudioChunk(from: params) {
-                routeAssistantPCM(chunk)
+               let chunk = Self.appServerAudioChunk(from: params),
+               LiveVoicePlaybackOwnershipPolicy.disposition(
+                   for: chunk.source
+               ).mayFeedEchoReference {
+                // App Server PCM is upstream reference telemetry. Playback is
+                // owned exclusively by the WebRTC render graph (or its muted
+                // native fallback) so the same response cannot reach the
+                // speaker through two independent paths.
+                forwardAssistantReference(chunk)
             }
         case "thread/realtime/transcript/delta":
             guard params["role"] as? String == "user",
@@ -1274,24 +1193,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                   ["user", "assistant"].contains(role),
                   let text = params["text"] as? String,
                   !text.isEmpty else { return }
-            emitter.emit("transcript_finalized", fields: [
-                "thread_id": threadID ?? "",
-                "role": role,
-                "text": String(text.prefix(8_192)),
-            ])
-            if role == "user" {
-                inputSpeechInProgress = false
-                partialUserTranscript = ""
-                if conversationControlClassifier.classify(text) == .endConversation {
-                    emitter.emit("conversation_control_applied", fields: [
-                        "control": "end_conversation",
-                        "source": "final_participant_transcript",
-                    ])
-                    stop(reason: "participant_requested_end")
-                }
-            } else {
-                scheduleAssistantOutputEnd(after: 0.35)
-            }
+            emitFinalizedTranscript(
+                role: role,
+                text: text,
+                itemID: (params["itemId"] as? String) ?? (params["item_id"] as? String)
+            )
         case "thread/realtime/closed":
             stop(reason: params["reason"] as? String ?? "realtime_closed")
         case "item/completed":
@@ -1317,6 +1223,27 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 emitDiagnostic: true
             ) || successfulHermesDelegation
         }
+        let agentMessage = items.reversed().first { item in
+            item["type"] as? String == "agentMessage"
+        }?["text"] as? String
+        let normalizedAgentMessage = agentMessage?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        switch LiveVoiceHandoffResponsePolicy.disposition(
+            hasAgentMessage: normalizedAgentMessage?.isEmpty == false,
+            realtimeResponseSpoken: assistantSpeechObserved,
+            successfulExternalDelegation: successfulHermesDelegation
+        ) {
+        case .appendFinalSpeech:
+            if let normalizedAgentMessage {
+                appendManagedHandoffSpeech(normalizedAgentMessage)
+            }
+        case .retainExistingRealtimeResponse:
+            emitter.emit("managed_handoff_response_held", fields: [
+                "reason": "realtime_response_already_spoken",
+            ])
+        case .externalDelegationOwnsResponse, .noResponse:
+            break
+        }
         guard successfulHermesDelegation,
               let turnID = turn["id"] as? String,
               !turnID.isEmpty else { return }
@@ -1338,6 +1265,29 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         triggerHermesDelegationAcknowledgement(turnID: turnID)
+    }
+
+    private func appendManagedHandoffSpeech(_ text: String) {
+        guard let threadID,
+              !text.isEmpty else { return }
+        connection.request(
+            method: "thread/realtime/appendSpeech",
+            params: [
+                "threadId": threadID,
+                "text": String(text.prefix(8_192)),
+            ]
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if response.value["error"] == nil {
+                    self.emitter.emit("managed_handoff_response_spoken")
+                } else {
+                    self.emitter.emit("managed_handoff_response_rejected", fields: [
+                        "reason": AppServerConnection.responseMessage(response.value),
+                    ])
+                }
+            }
+        }
     }
 
     /// App Server emits tool completion before the enclosing turn completes.
@@ -1405,8 +1355,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ])
             return
         }
-        if type.contains("speech_started") {
+        if LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(type: type) {
             observeInputSpeechStarted()
+        }
+        if type.contains("speech_started") {
             return
         }
         if type.contains("speech_stopped") {
@@ -1432,11 +1384,51 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             emitter.emit("interrupted_audio_cleared", fields: ["type": String(type.prefix(128))])
             return
         }
-        if type.hasPrefix("input_transcript.") {
+        if type == "conversation.item.input_audio_transcription.delta" ||
+            type == "input_transcript.delta" {
+            guard let delta = (object["delta"] as? String) ?? (object["text"] as? String),
+                  !delta.isEmpty else { return }
+            observeInputSpeechStarted()
+            partialUserTranscript = String((partialUserTranscript + delta).prefix(4_096))
+            emitter.emit("transcript_partial", fields: [
+                "thread_id": threadID ?? "",
+                "text": partialUserTranscript,
+            ])
+            return
+        }
+        if type == "conversation.item.input_audio_transcription.completed" ||
+            type == "input_transcript.completed" {
             let text = (object["transcript"] as? String) ?? (object["text"] as? String) ?? ""
-            if !text.isEmpty {
-                emitter.emit("input_transcript_ready", fields: ["characters": min(text.count, 65_535)])
-            }
+            guard !text.isEmpty else { return }
+            emitter.emit("input_transcript_ready", fields: ["characters": min(text.count, 65_535)])
+            emitFinalizedTranscript(
+                role: "user",
+                text: text,
+                itemID: (object["item_id"] as? String) ?? (object["itemId"] as? String)
+            )
+            return
+        }
+        if type == "input_transcript.added" {
+            // This event is already sufficient remote evidence for admission.
+            // Codex publishes the canonical transcript text separately via
+            // thread/realtime/transcript/done; opportunistically forward text
+            // only when this transport version also places it at the top level.
+            let text = (object["transcript"] as? String) ?? (object["text"] as? String) ?? ""
+            guard !text.isEmpty else { return }
+            emitter.emit("input_transcript_ready", fields: ["characters": min(text.count, 65_535)])
+            emitFinalizedTranscript(
+                role: "user",
+                text: text,
+                itemID: (object["item_id"] as? String) ?? (object["itemId"] as? String)
+            )
+            return
+        }
+        if type == "conversation.item.input_audio_transcription.failed" ||
+            type == "input_transcript.failed" {
+            let error = object["error"] as? [String: Any]
+            emitter.emit("input_transcription_failed", fields: [
+                "reason": String(((error?["message"] as? String) ?? "realtime_input_transcription_failed").prefix(256)),
+            ])
             return
         }
         if type == "turn.created" || type.contains("response.created") {
@@ -1461,6 +1453,54 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         setCognitiveTurn(active: true)
         inputSpeechInProgress = true
         emitter.emit("input_speech_started")
+    }
+
+    private func emitFinalizedTranscript(role: String, text: String, itemID: String?) {
+        let normalizedText = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard !normalizedText.isEmpty else { return }
+
+        if let itemID, !itemID.isEmpty {
+            guard finalizedTranscriptItemIDs.insert(itemID).inserted else { return }
+            finalizedTranscriptItemOrder.append(itemID)
+            if finalizedTranscriptItemOrder.count > 128 {
+                let excess = finalizedTranscriptItemOrder.count - 128
+                let expired = Array(finalizedTranscriptItemOrder.prefix(excess))
+                finalizedTranscriptItemOrder.removeFirst(excess)
+                for value in expired { finalizedTranscriptItemIDs.remove(value) }
+            }
+        } else {
+            let nowNS = DispatchTime.now().uptimeNanoseconds
+            if let lastFallbackTranscript,
+               lastFallbackTranscript.role == role,
+               lastFallbackTranscript.text == normalizedText,
+               nowNS >= lastFallbackTranscript.atNS,
+               nowNS - lastFallbackTranscript.atNS <= 2_000_000_000 {
+                return
+            }
+            lastFallbackTranscript = (role, normalizedText, nowNS)
+        }
+
+        emitter.emit("transcript_finalized", fields: [
+            "thread_id": threadID ?? "",
+            "role": role,
+            "text": String(normalizedText.prefix(8_192)),
+        ])
+        if role == "user" {
+            inputSpeechInProgress = false
+            partialUserTranscript = ""
+            if conversationControlClassifier.classify(normalizedText) == .endConversation {
+                emitter.emit("conversation_control_applied", fields: [
+                    "control": "end_conversation",
+                    "source": "final_participant_transcript",
+                ])
+                stop(reason: "participant_requested_end")
+            }
+        } else {
+            scheduleAssistantOutputEnd(after: 0.35)
+        }
     }
 
     private func observeAssistantOutputStarted() {
@@ -1507,43 +1547,21 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func routeAssistantPCM(_ chunk: AssistantPCMChunk) {
+        guard LiveVoicePlaybackOwnershipPolicy.disposition(
+            for: chunk.source
+        ).rendersToSpeaker else { return }
         if let audioPlayoutSource {
             guard audioPlayoutSource == chunk.source else { return }
             playAssistantPCM(chunk)
             return
         }
-        if chunk.source == .appServer {
-            pendingWebRTCPCM.removeAll(keepingCapacity: true)
-            pendingWebRTCDurationSeconds = 0
-            selectAudioPlayoutSource(.appServer)
-            playAssistantPCM(chunk)
-            return
-        }
-        pendingWebRTCPCM.append(chunk)
-        pendingWebRTCDurationSeconds += chunk.durationSeconds
-        if pendingWebRTCDurationSeconds > 0.5 {
-            while pendingWebRTCDurationSeconds > 0.5, pendingWebRTCPCM.count > 1 {
-                pendingWebRTCDurationSeconds -= pendingWebRTCPCM.removeFirst().durationSeconds
-            }
-        }
-        guard webRTCFallbackWorkItem == nil else { return }
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.audioPlayoutSource == nil else { return }
-            self.selectAudioPlayoutSource(.webRTCPlayback)
-            let chunks = self.pendingWebRTCPCM
-            self.pendingWebRTCPCM.removeAll(keepingCapacity: true)
-            self.pendingWebRTCDurationSeconds = 0
-            for chunk in chunks { self.playAssistantPCM(chunk) }
-        }
-        webRTCFallbackWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
+        selectAudioPlayoutSource(.webRTCPlayback)
+        playAssistantPCM(chunk)
     }
 
     private func selectAudioPlayoutSource(_ source: LiveVoicePlaybackReferenceSource) {
         guard audioPlayoutSource == nil else { return }
         audioPlayoutSource = source
-        webRTCFallbackWorkItem?.cancel()
-        webRTCFallbackWorkItem = nil
         emitter.emit("audio_playout_source_selected", fields: ["source": source.rawValue])
     }
 
@@ -1714,7 +1732,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 return
             }
             DispatchQueue.main.async {
-                self?.emitter.emit("proactive_opening_triggered")
+                guard let self else { return }
+                self.emitter.emit("proactive_opening_triggered")
             }
         }
     }
@@ -1786,10 +1805,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         pendingTransportClosureReason = nil
         assistantOutputEndWorkItem?.cancel()
         assistantOutputEndWorkItem = nil
-        webRTCFallbackWorkItem?.cancel()
-        webRTCFallbackWorkItem = nil
-        pendingWebRTCPCM.removeAll(keepingCapacity: false)
-        pendingWebRTCDurationSeconds = 0
+        embodimentMCPVerificationTimeoutWorkItem?.cancel()
+        embodimentMCPVerificationTimeoutWorkItem = nil
         partialUserTranscript = ""
         observeAssistantOutputEnded()
         setCognitiveTurn(active: false)

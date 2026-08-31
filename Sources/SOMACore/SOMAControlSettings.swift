@@ -477,7 +477,12 @@ public struct SOMALEDSettings: Codable, Equatable, Sendable {
         eyeContactActive: Bool = false
     ) -> SOMALEDDeviceRendering? {
         var presentation = signal(for: state)
-        if state.configurationState == .conversation && eyeContactActive {
+        if state == .listening {
+            // Receiving a participant turn must be visible before transcript
+            // or model output exists. A double pulse is distinct from both
+            // the steady session light and the slower eye-contact cadence.
+            presentation.pattern = .doubleBlink
+        } else if state.configurationState == .conversation && eyeContactActive {
             presentation.pattern = .blink
         }
         return presentation.deviceRendering(for: contract)

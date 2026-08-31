@@ -41,20 +41,30 @@ public struct LiveVoiceAcousticBargeInObservation: Equatable, Sendable {
     }
 }
 
-/// Requires acoustic independence to remain stable before microphone audio can
-/// interrupt assistant playback. A single early correlation estimate is not
-/// authoritative because the loudspeaker reference and room echo arrive on
-/// different buffers. Independence is therefore provisional until it persists,
-/// and any later loss of independence revokes the admission for that episode.
+/// Fuses acoustic independence with the later-arriving audiovisual speaker
+/// decision for one VAD episode. Acoustic and mouth-motion evidence are
+/// produced on different windows, so valid acoustic evidence must survive
+/// until the corresponding speaker decision arrives. Once admitted, the
+/// episode remains admitted until speech or speaker verification ends; packet
+/// level correlation changes must not chop an utterance into fragments.
 public struct LiveVoiceAcousticBargeInGate: Sendable {
     private let requiredIndependentNS: UInt64
+    private let evidenceSynchronizationNS: UInt64
     private var independentSinceNS: UInt64?
+    private var mostRecentIndependentNS: UInt64?
+    private var speakerWasVerified = false
     private var admitted = false
 
-    public init(requiredIndependentMilliseconds: UInt64 = 500) {
+    public init(
+        requiredIndependentMilliseconds: UInt64 = 500,
+        evidenceSynchronizationMilliseconds: UInt64 = 350
+    ) {
         precondition(requiredIndependentMilliseconds > 0)
         precondition(requiredIndependentMilliseconds <= UInt64.max / 1_000_000)
+        precondition(evidenceSynchronizationMilliseconds > 0)
+        precondition(evidenceSynchronizationMilliseconds <= UInt64.max / 1_000_000)
         requiredIndependentNS = requiredIndependentMilliseconds * 1_000_000
+        evidenceSynchronizationNS = evidenceSynchronizationMilliseconds * 1_000_000
     }
 
     public mutating func observe(
@@ -64,7 +74,7 @@ public struct LiveVoiceAcousticBargeInGate: Sendable {
         at monotonicNS: UInt64
     ) -> LiveVoiceAcousticBargeInObservation {
         let wasAdmitted = admitted
-        guard speechActive, speakerVerified else {
+        guard speechActive else {
             reset()
             return .init(
                 admitted: false,
@@ -73,23 +83,53 @@ public struct LiveVoiceAcousticBargeInGate: Sendable {
             )
         }
 
-        guard relationship == .acousticallyIndependent else {
-            independentSinceNS = nil
-            admitted = false
+        if admitted {
+            guard speakerVerified else {
+                reset()
+                return .init(
+                    admitted: false,
+                    becameAdmitted: false,
+                    becameRevoked: true
+                )
+            }
+            speakerWasVerified = true
             return .init(
-                admitted: false,
+                admitted: true,
                 becameAdmitted: false,
-                becameRevoked: wasAdmitted
+                becameRevoked: false
             )
         }
 
-        if independentSinceNS == nil {
-            independentSinceNS = monotonicNS
+        let speakerJustVerified = speakerVerified && !speakerWasVerified
+        let priorIndependentNS = mostRecentIndependentNS
+        if relationship == .acousticallyIndependent {
+            if independentSinceNS == nil {
+                independentSinceNS = monotonicNS
+            }
+            mostRecentIndependentNS = monotonicNS
+        } else {
+            independentSinceNS = nil
         }
-        if let independentSinceNS,
-           monotonicNS >= independentSinceNS,
-           monotonicNS - independentSinceNS >= requiredIndependentNS {
-            admitted = true
+        speakerWasVerified = speakerVerified
+
+        if speakerVerified, relationship == .acousticallyIndependent {
+            let sustainedIndependence: Bool
+            if let independentSinceNS,
+               monotonicNS >= independentSinceNS {
+                sustainedIndependence = monotonicNS - independentSinceNS >= requiredIndependentNS
+            } else {
+                sustainedIndependence = false
+            }
+            let synchronizedLateVerification: Bool
+            if speakerJustVerified,
+               let priorIndependentNS,
+               monotonicNS >= priorIndependentNS {
+                synchronizedLateVerification = monotonicNS - priorIndependentNS
+                    <= evidenceSynchronizationNS
+            } else {
+                synchronizedLateVerification = false
+            }
+            admitted = sustainedIndependence || synchronizedLateVerification
         }
         return .init(
             admitted: admitted,
@@ -100,6 +140,8 @@ public struct LiveVoiceAcousticBargeInGate: Sendable {
 
     public mutating func reset() {
         independentSinceNS = nil
+        mostRecentIndependentNS = nil
+        speakerWasVerified = false
         admitted = false
     }
 }
@@ -145,6 +187,32 @@ public struct LiveVoiceBargeInEpisodeBoundary: Equatable, Sendable {
 public enum LiveVoicePlaybackReferenceSource: String, Sendable {
     case appServer = "app_server"
     case webRTCPlayback = "webrtc_playback"
+}
+
+public struct LiveVoicePlaybackDisposition: Equatable, Sendable {
+    public let rendersToSpeaker: Bool
+    public let mayFeedEchoReference: Bool
+
+    public init(rendersToSpeaker: Bool, mayFeedEchoReference: Bool) {
+        self.rendersToSpeaker = rendersToSpeaker
+        self.mayFeedEchoReference = mayFeedEchoReference
+    }
+}
+
+/// The decoded WebRTC stream is the sole presentation owner. App Server PCM
+/// represents the same response upstream and is retained only as diagnostic
+/// echo-reference telemetry; it must never become a second speaker path.
+public enum LiveVoicePlaybackOwnershipPolicy {
+    public static func disposition(
+        for source: LiveVoicePlaybackReferenceSource
+    ) -> LiveVoicePlaybackDisposition {
+        switch source {
+        case .webRTCPlayback:
+            .init(rendersToSpeaker: true, mayFeedEchoReference: true)
+        case .appServer:
+            .init(rendersToSpeaker: false, mayFeedEchoReference: true)
+        }
+    }
 }
 
 public struct LiveVoicePlaybackReferenceDecision: Equatable, Sendable {

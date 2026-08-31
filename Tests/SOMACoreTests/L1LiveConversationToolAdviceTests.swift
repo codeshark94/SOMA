@@ -48,13 +48,46 @@ import Testing
         #expect(L1LiveEpistemicReflexRouter.route(request) == nil)
     }
 
-    @Test func directExecutionPolicyIsRestrictedToBoundedReadOnlyStatusTools() {
-        #expect(L1LiveDirectReadOnlyToolPolicy.permits("get_activity_overview"))
-        #expect(L1LiveDirectReadOnlyToolPolicy.permits("get_robot_body_state"))
-        #expect(L1LiveDirectReadOnlyToolPolicy.permits("list_hermes_tasks"))
-        #expect(!L1LiveDirectReadOnlyToolPolicy.permits("capture_view"))
-        #expect(!L1LiveDirectReadOnlyToolPolicy.permits("delegate_hermes_task"))
-        #expect(!L1LiveDirectReadOnlyToolPolicy.permits("end_conversation"))
+    @Test func currentAppearanceQuestionUsesImmediateCameraRoute() throws {
+        let request = L1LiveToolAdviceRequest(
+            threadID: "thread-current-view",
+            latestUserTranscript: "지금 내가 뭐 하고 있냐고?",
+            availableTools: ["capture_view", "get_activity_overview"]
+        )
+
+        let advice = try #require(L1LiveEpistemicReflexRouter.route(request))
+        #expect(advice.toolName == "capture_view")
+        #expect(advice.groundingQuote == request.latestUserTranscript)
+    }
+
+    @Test func explicitCameraQuestionUsesImmediateCameraRouteAcrossLanguages() throws {
+        for transcript in [
+            "카메라에 지금 뭐 보여?", "지금 나 볼 수 있어", "Can you see me?",
+            "你能看到我吗？", "カメラに何が映ってる？",
+        ] {
+            let request = L1LiveToolAdviceRequest(
+                threadID: "thread-current-view",
+                latestUserTranscript: transcript,
+                availableTools: ["capture_view"]
+            )
+            #expect(try #require(L1LiveEpistemicReflexRouter.route(request)).toolName == "capture_view")
+        }
+    }
+
+    @Test func robotStatusAndUnrelatedVisualLanguageDoNotCaptureCamera() throws {
+        let status = L1LiveToolAdviceRequest(
+            threadID: "thread-status",
+            latestUserTranscript: "What are you doing?",
+            availableTools: ["capture_view", "get_activity_overview"]
+        )
+        #expect(try #require(L1LiveEpistemicReflexRouter.route(status)).toolName == "get_activity_overview")
+
+        let unrelated = L1LiveToolAdviceRequest(
+            threadID: "thread-unrelated",
+            latestUserTranscript: "Look, I think the plan is fine.",
+            availableTools: ["capture_view"]
+        )
+        #expect(L1LiveEpistemicReflexRouter.route(unrelated) == nil)
     }
 
     @Test func acceptsGroundedAvailableToolRecommendation() throws {

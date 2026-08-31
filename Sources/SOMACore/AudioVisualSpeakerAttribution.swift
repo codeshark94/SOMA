@@ -190,6 +190,21 @@ public struct LiveVoiceOpeningSpeechConfiguration: Equatable, Sendable {
         self.requiredSupportingWindows = requiredSupportingWindows
         self.maximumWindowGapMilliseconds = maximumWindowGapMilliseconds
     }
+
+    /// Uses the neural detector's admission threshold as the single speech
+    /// confidence boundary. Face continuity, directed contact, and independent
+    /// mouth-motion evidence remain separate requirements at the episode gate.
+    public static func alignedWithDetectorThreshold(
+        _ activationThreshold: Double
+    ) -> Self {
+        precondition((0...1).contains(activationThreshold))
+        return .init(
+            strongConfidence: activationThreshold,
+            supportingConfidence: activationThreshold,
+            requiredStrongWindows: 1,
+            requiredSupportingWindows: 1
+        )
+    }
 }
 
 public struct LiveVoiceOpeningSpeechEvidence: Equatable, Sendable {
@@ -273,6 +288,7 @@ public struct LiveVoiceOpeningSpeechAccumulator: Sendable {
 public struct LiveVoiceSpeakerEpisodeObservation: Equatable, Sendable {
     public let state: LiveVoiceSpeakerEpisodeState
     public let didTransition: Bool
+    public let hardSpeakerRejection: Bool
     public let directContactObserved: Bool
     public let speakerEvidenceObserved: Bool
     public let speechEvidence: LiveVoiceOpeningSpeechEvidence
@@ -299,6 +315,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
     private var lastContactContradictionNS: UInt64?
     private var lastSpeakerEvidenceNS: UInt64?
     private var confirmedAtNS: UInt64?
+    private var hardSpeakerRejection = false
     private var maximumVoiceConfidence = 0.0
     private var openingSpeechEvidence: LiveVoiceOpeningSpeechAccumulator
 
@@ -347,6 +364,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             lastContactContradictionNS = nil
             lastSpeakerEvidenceNS = nil
             confirmedAtNS = nil
+            hardSpeakerRejection = false
             maximumVoiceConfidence = 0
             openingSpeechEvidence.reset()
             return observation(didTransition: transitioned, endedState: endedState)
@@ -367,6 +385,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             targetID = trackedFaceID
             guard targetID != nil else {
                 state = .rejected
+                hardSpeakerRejection = true
                 return observation(didTransition: true)
             }
             accumulate(
@@ -386,13 +405,19 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         }
 
         if state == .confirmed {
-            guard trackedFaceID == targetID,
-                  assessment.classification != .likelyBackground else {
+            guard trackedFaceID == targetID else {
                 state = .rejected
+                hardSpeakerRejection = true
+                return observation(didTransition: true)
+            }
+            guard assessment.classification != .likelyBackground else {
+                state = .rejected
+                hardSpeakerRejection = true
                 return observation(didTransition: true)
             }
             if invalidatesConfirmedContact(directContactContradictedNS) {
                 state = .rejected
+                hardSpeakerRejection = true
                 directContactObserved = false
                 lastDirectContactNS = nil
                 return observation(didTransition: true)
@@ -402,6 +427,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         guard state == .pending else { return observation(didTransition: false) }
         guard trackedFaceID == targetID else {
             state = .rejected
+            hardSpeakerRejection = true
             return observation(didTransition: true)
         }
         accumulate(
@@ -464,6 +490,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
                 return observation(didTransition: false)
             }
             state = .rejected
+            hardSpeakerRejection = true
             directContactObserved = false
             lastDirectContactNS = nil
             return observation(didTransition: true)
@@ -478,11 +505,12 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         return observation(didTransition: false)
     }
 
-    private func resolvedState(
+    private mutating func resolvedState(
         assessment: AudioVisualSpeakerAssessment,
         at monotonicNS: UInt64
     ) -> LiveVoiceSpeakerEpisodeState {
         if assessment.classification == .likelyBackground {
+            hardSpeakerRejection = true
             return .rejected
         }
         return resolvedAccumulatedState(at: monotonicNS)
@@ -583,6 +611,7 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         .init(
             state: state,
             didTransition: didTransition,
+            hardSpeakerRejection: hardSpeakerRejection,
             directContactObserved: directContactObserved,
             speakerEvidenceObserved: speakerEvidenceObserved,
             speechEvidence: openingSpeechEvidence.snapshot,

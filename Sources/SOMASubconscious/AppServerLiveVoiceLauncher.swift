@@ -36,6 +36,8 @@ enum AppServerLiveVoiceEvent: Sendable {
     case l1ToolAdviceAttached(tool: String)
     case l1ToolAdviceRejected(tool: String, reason: String)
     case inputAccepted(characters: Int)
+    case realtimeEventType(type: String)
+    case inputTranscriptionFailed(reason: String)
     case transcriptPartial(threadID: String?, text: String)
     case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
     case preparingResponse
@@ -78,6 +80,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let arrivalGapMilliseconds: Double?
     let queuedDurationMilliseconds: Double?
     let underruns: Int?
+    let type: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -104,6 +107,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case arrivalGapMilliseconds = "arrival_gap_ms"
         case queuedDurationMilliseconds = "queued_ms"
         case underruns
+        case type
     }
 }
 
@@ -777,7 +781,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             guard active,
                   activeThreadID == advice.threadID,
                   awaitingAssistantResponse,
-                  !assistantOutputStartedForTurn,
                   latestUserTranscript == transcript,
                   advice.action == .recommendTool,
                   let tool = advice.toolName,
@@ -785,13 +788,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 return false
             }
             let quote = advice.groundingQuote ?? ""
-            if L1LiveDirectReadOnlyToolPolicy.permits(tool) {
-                return send([
-                    "type": "execute_read_only_tool",
-                    "taskID": advice.turnID.uuidString.lowercased(),
-                    "tool": tool,
-                ])
-            }
+            guard !assistantOutputStartedForTurn else { return false }
             let instruction = """
             SOMA_L1_TOOL_ADVISORY
             This is private current-turn control context, not participant speech and not text to recite. L1 independently determined that the latest participant turn requires the SOMA MCP tool `\(tool)` before a grounded answer. The grounding phrase was: "\(quote)". If this exact tool has not already completed for the current turn, call it now, silently, and use its actual result before speaking. Do not substitute a verbal promise, inferred result, or another tool. If the call fails or is unavailable, report that concrete failure briefly. This advisory expires with the current participant turn.
@@ -1100,7 +1097,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 // the durable record, but an overlapping answer must not be
                 // mistaken for unsolicited extra model speech.
                 proactiveOpeningAwaitingParticipant = false
+                confirmInitialParticipantInput()
                 onEvent(.hearingUser)
+            case "realtime_event_type":
+                onEvent(.realtimeEventType(type: String((event.type ?? "unknown").prefix(128))))
+            case "input_transcription_failed":
+                onEvent(.inputTranscriptionFailed(
+                    reason: String((event.reason ?? "realtime_input_transcription_failed").prefix(192))
+                ))
             case "visual_context_attached":
                 onEvent(.visualContextAttached)
             case "visual_context_rejected":
@@ -1587,7 +1591,8 @@ func testAppServerLiveVoiceLauncher() -> String {
              .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
              .hermesTaskResultAccepted, .hermesTaskResultRejected,
              .personContextUnavailable, .embodimentMCPCall,
-             .l1ToolAdviceAttached, .l1ToolAdviceRejected, .inputAccepted,
+             .l1ToolAdviceAttached, .l1ToolAdviceRejected,
+             .inputAccepted, .realtimeEventType, .inputTranscriptionFailed,
              .transcriptPartial, .transcriptFinalized, .preparingResponse, .responseStarted,
              .assistantSpeechStarted, .assistantSpeechEnded,
              .assistantOutputReferenceReady, .microphoneCaptureSuppressed,

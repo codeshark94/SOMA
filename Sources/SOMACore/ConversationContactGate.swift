@@ -454,7 +454,8 @@ public extension SubconsciousIndicatorState {
         case .exploring: return "not_ready_looking_for_contact"
         case .humanDetected: return "person_visible"
         case .contactReady: return "ready_speak_now"
-        case .conversation, .working, .listening, .speaking: return "conversation_active"
+        case .listening: return "participant_speech_received"
+        case .conversation, .working, .speaking: return "conversation_active"
         }
     }
 }
@@ -468,6 +469,7 @@ public enum SubconsciousIndicatorVisualState: String, Equatable, Sendable {
 public enum SubconsciousIndicatorInteractionState: String, Equatable, Sendable {
     case idle
     case conversation
+    case hearingUser = "hearing_user"
     case preparingReply = "preparing_reply"
 }
 
@@ -557,6 +559,8 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
         switch interactionState {
         case .preparingReply:
             return .working
+        case .hearingUser:
+            return .listening
         case .conversation:
             return .conversation
         case .idle:
@@ -572,6 +576,9 @@ public struct SubconsciousIndicatorInputs: Equatable, Sendable {
         // A live conversation is the sole interaction state that overrides
         // the visual layer. Preparing a response must not make the person
         // lose the visible-contact signal.
+        if interactionState == .hearingUser {
+            return .listening
+        }
         if interactionState == .conversation {
             return .conversation
         }

@@ -34,4 +34,69 @@ struct LiveVoiceConversationControlTests {
         #expect(classifier.classify("What happens at the end of the story?") == nil)
         #expect(classifier.classify("") == nil)
     }
+
+    @Test
+    func serverParticipantEvidenceDoesNotDependOnTranscriptPayloadShape() {
+        #expect(LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(
+            type: "input_audio_buffer.speech_started"
+        ))
+        #expect(LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(
+            type: "input_transcript.added"
+        ))
+        #expect(LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(
+            type: "thread/realtime/transcript/done"
+        ) == false)
+        #expect(LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(
+            type: "input_transcript.failed"
+        ) == false)
+        #expect(LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(
+            type: "turn.created"
+        ) == false)
+    }
+
+    @Test
+    func realtimeWaitsForBoundedEmbodimentCapabilitySnapshot() {
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+            webViewReady: true,
+            threadReady: true,
+            capabilityVerificationFinished: false,
+            realtimeAlreadyStarted: false
+        ) == false)
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+            webViewReady: true,
+            threadReady: true,
+            capabilityVerificationFinished: true,
+            realtimeAlreadyStarted: false
+        ))
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+            webViewReady: true,
+            threadReady: true,
+            capabilityVerificationFinished: true,
+            realtimeAlreadyStarted: true
+        ) == false)
+    }
+
+    @Test
+    func oneParticipantTurnHasOneAudibleResponseOwner() {
+        #expect(LiveVoiceHandoffResponsePolicy.disposition(
+            hasAgentMessage: true,
+            realtimeResponseSpoken: false,
+            successfulExternalDelegation: false
+        ) == .appendFinalSpeech)
+        #expect(LiveVoiceHandoffResponsePolicy.disposition(
+            hasAgentMessage: true,
+            realtimeResponseSpoken: true,
+            successfulExternalDelegation: false
+        ) == .retainExistingRealtimeResponse)
+        #expect(LiveVoiceHandoffResponsePolicy.disposition(
+            hasAgentMessage: true,
+            realtimeResponseSpoken: false,
+            successfulExternalDelegation: true
+        ) == .externalDelegationOwnsResponse)
+        #expect(LiveVoiceHandoffResponsePolicy.disposition(
+            hasAgentMessage: false,
+            realtimeResponseSpoken: false,
+            successfulExternalDelegation: false
+        ) == .noResponse)
+    }
 }
