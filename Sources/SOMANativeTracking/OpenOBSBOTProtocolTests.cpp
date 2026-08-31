@@ -1,5 +1,6 @@
 #include "OpenOBSBOTProtocol.hpp"
 #include "OpenOBSBOTContract.hpp"
+#include "OpenOBSBOTRecovery.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -101,9 +102,117 @@ int main() {
     assert(readI16LE(tiny3Target->payload, 0) == 3);
     assert(readI16LE(tiny3Target->payload, 2) == 0);
     assert(readI16LE(tiny3Target->payload, 4) == 99);
+    assert(!isValidHumanTarget(
+        OBSBOTOpenDeviceProfile::tiny3Lite,
+        std::numeric_limits<float>::quiet_NaN(),
+        0.1f,
+        0.5f,
+        0.7f
+    ));
+    assert(!isValidHumanTarget(
+        OBSBOTOpenDeviceProfile::tiny3Lite,
+        0.8f,
+        0.1f,
+        0.5f,
+        0.7f
+    ));
 
     const auto tiny3Clear = clearTiny3HumanTarget();
     assert(tiny3Clear.command == 0x0684 && tiny3Clear.payload.size() == 24);
     assert(readI16LE(tiny3Clear.payload, 0) == -1);
+
+    using RecoveryPolicy = soma::OpenOBSBOTRecoveryPolicy;
+    using ControlState = soma::OpenOBSBOTControlState;
+    const RecoveryPolicy::TimePoint recoveryEpoch {};
+    RecoveryPolicy recovery;
+    recovery.noteHealthy(recoveryEpoch);
+    recovery.noteFailure(-101, recoveryEpoch);
+    auto completionTime = recoveryEpoch + std::chrono::milliseconds(110);
+    int closeCount = 0;
+    auto attempt = soma::attemptOpenOBSBOTRecovery(
+        recovery,
+        []() { return int32_t {0}; },
+        []() { return int32_t {0}; },
+        []() { return int32_t {0}; },
+        [&]() { ++closeCount; },
+        [&]() { return completionTime; },
+        recoveryEpoch + std::chrono::milliseconds(100)
+    );
+    assert(attempt.endpointValidated());
+    auto recoverySnapshot = recovery.snapshot(1, completionTime);
+    assert(recoverySnapshot.state == ControlState::restoring);
+    assert(recoverySnapshot.consecutiveFailures == 1);
+    assert(recovery.commitRecovery(completionTime));
+    assert(recovery.snapshot(2, completionTime).state == ControlState::healthy);
+    assert(recovery.snapshot(2, completionTime).consecutiveFailures == 0);
+    assert(closeCount == 0);
+
+    RecoveryPolicy failingRecovery;
+    failingRecovery.noteHealthy(recoveryEpoch);
+    failingRecovery.noteFailure(-101, recoveryEpoch);
+    completionTime = recoveryEpoch + std::chrono::milliseconds(250);
+    attempt = soma::attemptOpenOBSBOTRecovery(
+        failingRecovery,
+        []() { return int32_t {0}; },
+        []() { return int32_t {0}; },
+        []() { return int32_t {-202}; },
+        [&]() { ++closeCount; },
+        [&]() { return completionTime; },
+        recoveryEpoch + std::chrono::milliseconds(100)
+    );
+    assert(attempt.outcome == soma::OpenOBSBOTRecoveryAttemptOutcome::writeProbeFailed);
+    recoverySnapshot = failingRecovery.snapshot(1, completionTime);
+    assert(recoverySnapshot.state == ControlState::degraded);
+    assert(recoverySnapshot.lastIOReturn == -202);
+    assert(recoverySnapshot.consecutiveFailures == 2);
+    assert(recoverySnapshot.retryAfterMilliseconds == 250);
+    assert(!failingRecovery.beginRecovery(
+        recoveryEpoch + std::chrono::milliseconds(499)
+    ));
+
+    completionTime = recoveryEpoch + std::chrono::milliseconds(510);
+    attempt = soma::attemptOpenOBSBOTRecovery(
+        failingRecovery,
+        []() { return int32_t {0}; },
+        []() { return int32_t {0}; },
+        []() { return int32_t {0}; },
+        [&]() { ++closeCount; },
+        [&]() { return completionTime; },
+        recoveryEpoch + std::chrono::milliseconds(500)
+    );
+    assert(attempt.endpointValidated());
+    assert(failingRecovery.snapshot(2, completionTime).state == ControlState::restoring);
+    assert(failingRecovery.snapshot(2, completionTime).consecutiveFailures == 2);
+    failingRecovery.noteFailure(-303, recoveryEpoch + std::chrono::milliseconds(520));
+    recoverySnapshot = failingRecovery.snapshot(
+        2,
+        recoveryEpoch + std::chrono::milliseconds(520)
+    );
+    assert(recoverySnapshot.state == ControlState::degraded);
+    assert(recoverySnapshot.consecutiveFailures == 3);
+    assert(recoverySnapshot.retryAfterMilliseconds == 500);
+
+    completionTime = recoveryEpoch + std::chrono::milliseconds(1030);
+    attempt = soma::attemptOpenOBSBOTRecovery(
+        failingRecovery,
+        []() { return int32_t {0}; },
+        []() { return int32_t {0}; },
+        []() { return int32_t {0}; },
+        [&]() { ++closeCount; },
+        [&]() { return completionTime; },
+        recoveryEpoch + std::chrono::milliseconds(1020)
+    );
+    assert(attempt.endpointValidated());
+    assert(failingRecovery.snapshot(3, completionTime).consecutiveFailures == 3);
+    assert(failingRecovery.commitRecovery(completionTime));
+    assert(failingRecovery.snapshot(3, completionTime).state == ControlState::healthy);
+    assert(failingRecovery.snapshot(3, completionTime).consecutiveFailures == 0);
+    const auto intentDeadline = recoveryEpoch + std::chrono::seconds(5);
+    assert(soma::openOBSBOTIntentIsFresh(
+        intentDeadline,
+        recoveryEpoch + std::chrono::milliseconds(4999)
+    ));
+    assert(!soma::openOBSBOTIntentIsFresh(intentDeadline, intentDeadline));
+    assert(RecoveryPolicy::retryDelay(20) == std::chrono::seconds(5));
     return 0;
 }

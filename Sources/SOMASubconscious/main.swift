@@ -4239,6 +4239,22 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     }
 
     private func consumeHelperDiagnostic(_ line: String) {
+        if line.hasPrefix("SOMA_CONTROL_TRANSPORT ") {
+            let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
+                let pair = part.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { return }
+                result[String(pair[0])] = pair[1]
+            }
+            let state = values["state"].map(String.init) ?? "degraded"
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "obsbot_control_transport",
+                state: state,
+                message: String(line.dropFirst("SOMA_CONTROL_TRANSPORT ".count))
+            ))
+            return
+        }
         if line.hasPrefix("SOMA_GIMBAL_HEALTH ") {
             let values = line.split(separator: " ").dropFirst().reduce(into: [String: Substring]()) { result, part in
                 let pair = part.split(separator: "=", maxSplits: 1)

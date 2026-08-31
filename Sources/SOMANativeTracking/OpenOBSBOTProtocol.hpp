@@ -130,6 +130,20 @@ inline std::array<uint8_t, 60> trackingModeControl(
     return control;
 }
 
+inline bool isValidHumanTarget(
+    OBSBOTOpenDeviceProfile profile,
+    float x,
+    float y,
+    float width,
+    float height
+) noexcept {
+    return profile == OBSBOTOpenDeviceProfile::tiny3Lite
+        && std::isfinite(x) && std::isfinite(y)
+        && std::isfinite(width) && std::isfinite(height)
+        && x >= 0 && y >= 0 && width > 0 && height > 0
+        && x + width <= 1 && y + height <= 1;
+}
+
 inline std::optional<OpenOBSBOTFramedCommand> selectHumanTarget(
     OBSBOTOpenDeviceProfile profile,
     float x,
@@ -137,11 +151,7 @@ inline std::optional<OpenOBSBOTFramedCommand> selectHumanTarget(
     float width,
     float height
 ) {
-    if (profile != OBSBOTOpenDeviceProfile::tiny3Lite
-        || !std::isfinite(x) || !std::isfinite(y)
-        || !std::isfinite(width) || !std::isfinite(height)
-        || x < 0 || y < 0 || width <= 0 || height <= 0
-        || x + width > 1 || y + height > 1) {
+    if (!isValidHumanTarget(profile, x, y, width, height)) {
         return std::nullopt;
     }
     std::vector<uint8_t> payload;

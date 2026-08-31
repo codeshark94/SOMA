@@ -96,6 +96,29 @@ std::string usbSerial(io_service_t device) {
     return converted ? std::string(buffer) : std::string();
 }
 
+uint32_t usbLocationID(io_service_t device) noexcept {
+    CFTypeRef raw = IORegistryEntryCreateCFProperty(
+        device,
+        CFSTR("locationID"),
+        kCFAllocatorDefault,
+        0
+    );
+    if (!raw || CFGetTypeID(raw) != CFNumberGetTypeID()) {
+        if (raw) CFRelease(raw);
+        return 0;
+    }
+    int64_t value = 0;
+    const bool converted = CFNumberGetValue(
+        static_cast<CFNumberRef>(raw),
+        kCFNumberSInt64Type,
+        &value
+    );
+    CFRelease(raw);
+    return converted && value > 0 && value <= UINT32_MAX
+        ? static_cast<uint32_t>(value)
+        : 0;
+}
+
 size_t connectedDeviceCount(OBSBOTOpenDeviceProfile profile) noexcept {
     CFMutableDictionaryRef matching = deviceMatchingDictionary(
         open_obsbot_protocol::vendorID,
@@ -208,53 +231,88 @@ struct OpenOBSBOTUVCTransport::Storage {
     uint16_t sequence = 1;
     OBSBOTOpenDeviceProfile profile = OBSBOTOpenDeviceProfile::tiny2Lite;
     std::string serial;
+    uint32_t locationID = 0;
+    OpenOBSBOTRecoveryPolicy recovery;
+    uint64_t generation = 0;
+    bool configured = false;
 };
 
 OpenOBSBOTUVCTransport::OpenOBSBOTUVCTransport() : storage_(new Storage) {}
 
 OpenOBSBOTUVCTransport::~OpenOBSBOTUVCTransport() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (storage_->device) {
-        (*storage_->device)->USBDeviceClose(storage_->device);
-        (*storage_->device)->Release(storage_->device);
-    }
+    closeLocked();
     delete storage_;
 }
 
 bool OpenOBSBOTUVCTransport::open(OBSBOTOpenDeviceProfile profile, std::string &error) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (storage_->device) return storage_->profile == profile;
+    int32_t ioReturn = kIOReturnSuccess;
+    if (!openLocked(profile, {}, 0, error, ioReturn)) {
+        storage_->recovery.noteFailure(ioReturn);
+        return false;
+    }
+    storage_->configured = true;
+    ++storage_->generation;
+    storage_->recovery.noteHealthy();
+    return true;
+}
+
+bool OpenOBSBOTUVCTransport::openLocked(
+    OBSBOTOpenDeviceProfile profile,
+    const std::string &expectedSerial,
+    uint32_t expectedLocationID,
+    std::string &error,
+    int32_t &ioReturn
+) noexcept {
     CFMutableDictionaryRef matching = deviceMatchingDictionary(
         open_obsbot_protocol::vendorID,
         open_obsbot_protocol::productID(profile)
     );
     if (!matching) {
         error = "unable to construct the OBSBOT USB match";
+        ioReturn = kIOReturnNoMemory;
         return false;
     }
     io_iterator_t iterator = IO_OBJECT_NULL;
     const IOReturn matched = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator);
     if (matched != kIOReturnSuccess || iterator == IO_OBJECT_NULL) {
         error = "unable to enumerate the OBSBOT USB device";
+        ioReturn = matched == kIOReturnSuccess ? kIOReturnNoDevice : matched;
         return false;
     }
     io_service_t selected = IO_OBJECT_NULL;
     io_service_t candidate = IO_OBJECT_NULL;
-    size_t count = 0;
+    size_t matchingCount = 0;
     while ((candidate = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
-        ++count;
-        if (selected == IO_OBJECT_NULL) selected = candidate;
-        else IOObjectRelease(candidate);
+        const std::string candidateSerial = usbSerial(candidate);
+        const uint32_t candidateLocationID = usbLocationID(candidate);
+        const bool identityMatches = !expectedSerial.empty()
+            ? candidateSerial == expectedSerial
+            : (expectedLocationID == 0 || candidateLocationID == expectedLocationID);
+        if (identityMatches) {
+            ++matchingCount;
+            if (selected == IO_OBJECT_NULL) {
+                selected = candidate;
+                continue;
+            }
+        }
+        IOObjectRelease(candidate);
     }
     IOObjectRelease(iterator);
-    if (count != 1 || selected == IO_OBJECT_NULL) {
+    if (matchingCount != 1 || selected == IO_OBJECT_NULL) {
         if (selected != IO_OBJECT_NULL) IOObjectRelease(selected);
-        error = count == 0
-            ? "no compatible OBSBOT USB device is connected"
-            : "multiple compatible OBSBOT devices require explicit USB-path binding";
+        error = matchingCount == 0
+            ? (expectedSerial.empty()
+                ? "no compatible OBSBOT USB device is connected"
+                : "the bound OBSBOT USB identity is not connected")
+            : "multiple compatible OBSBOT devices match the control identity";
+        ioReturn = matchingCount == 0 ? kIOReturnNoDevice : kIOReturnExclusiveAccess;
         return false;
     }
     const std::string serial = usbSerial(selected);
+    const uint32_t locationID = usbLocationID(selected);
     uint8_t interfaceNumber = 0;
     const bool hasVideoControl = videoControlInterface(selected, interfaceNumber);
     IOReturn openResult = kIOReturnNoDevice;
@@ -264,13 +322,24 @@ bool OpenOBSBOTUVCTransport::open(OBSBOTOpenDeviceProfile profile, std::string &
         error = !hasVideoControl
             ? "the OBSBOT exposes no UVC VideoControl interface"
             : "unable to open the OBSBOT USB control endpoint: " + std::to_string(openResult);
+        ioReturn = hasVideoControl ? openResult : kIOReturnUnsupported;
         return false;
     }
     storage_->device = device;
     storage_->videoControlInterface = interfaceNumber;
     storage_->profile = profile;
     storage_->serial = serial;
+    storage_->locationID = locationID;
+    ioReturn = kIOReturnSuccess;
     return true;
+}
+
+void OpenOBSBOTUVCTransport::closeLocked() noexcept {
+    if (!storage_->device) return;
+    (*storage_->device)->USBDeviceClose(storage_->device);
+    (*storage_->device)->Release(storage_->device);
+    storage_->device = nullptr;
+    storage_->videoControlInterface = 0;
 }
 
 bool OpenOBSBOTUVCTransport::openDetected(std::string &error) noexcept {
@@ -293,6 +362,103 @@ bool OpenOBSBOTUVCTransport::openDetected(std::string &error) noexcept {
 bool OpenOBSBOTUVCTransport::isOpen() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return storage_->device != nullptr;
+}
+
+OpenOBSBOTRecoverySnapshot OpenOBSBOTUVCTransport::recoveryStatus() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return storage_->recovery.snapshot(storage_->generation);
+}
+
+bool OpenOBSBOTUVCTransport::serviceRecovery(std::string &error) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!storage_->configured) return false;
+
+    const auto profile = storage_->profile;
+    const std::string serial = storage_->serial;
+    const uint32_t locationID = storage_->locationID;
+    std::string reopenError;
+    const auto attempt = attemptOpenOBSBOTRecovery(
+        storage_->recovery,
+        [&]() -> int32_t {
+            closeLocked();
+            if (serial.empty() && locationID == 0) {
+                reopenError = "the OBSBOT exposes no stable serial or USB location identity";
+                return kIOReturnUnsupported;
+            }
+            int32_t ioReturn = kIOReturnSuccess;
+            return openLocked(profile, serial, locationID, reopenError, ioReturn)
+                ? kIOReturnSuccess
+                : ioReturn;
+        },
+        [&]() -> int32_t {
+            std::array<int32_t, 2> panTilt {};
+            return uvcControl(
+                storage_->device,
+                storage_->videoControlInterface,
+                0xA1,
+                0x81,
+                0x0D,
+                cameraTerminalEntity,
+                panTilt.data(),
+                static_cast<uint16_t>(sizeof(panTilt))
+            );
+        },
+        [&]() -> int32_t {
+            const auto safeStop = open_obsbot_protocol::externalVelocity(profile, 0, 0);
+            return safeStop
+                ? submitFrameDirectLocked(
+                    safeStop->command,
+                    safeStop->receiver,
+                    safeStop->payload.data(),
+                    safeStop->payload.size()
+                )
+                : kIOReturnUnsupported;
+        },
+        [&]() { closeLocked(); },
+        []() { return OpenOBSBOTRecoveryPolicy::Clock::now(); },
+        OpenOBSBOTRecoveryPolicy::Clock::now()
+    );
+    if (!attempt.attempted()) return false;
+    if (!attempt.endpointValidated()) {
+        switch (attempt.outcome) {
+        case OpenOBSBOTRecoveryAttemptOutcome::reopenFailed:
+            error = reopenError.empty()
+                ? "unable to reopen the OBSBOT control endpoint: " + std::to_string(attempt.ioReturn)
+                : reopenError;
+            break;
+        case OpenOBSBOTRecoveryAttemptOutcome::readProbeFailed:
+            error = "the rebound OBSBOT control endpoint failed its attitude probe: "
+                + std::to_string(attempt.ioReturn);
+            break;
+        case OpenOBSBOTRecoveryAttemptOutcome::writeProbeFailed:
+            error = "the rebound OBSBOT control endpoint failed its safe write probe: "
+                + std::to_string(attempt.ioReturn);
+            break;
+        case OpenOBSBOTRecoveryAttemptOutcome::notAttempted:
+        case OpenOBSBOTRecoveryAttemptOutcome::endpointValidated:
+            break;
+        }
+        return false;
+    }
+
+    ++storage_->generation;
+    error.clear();
+    return true;
+}
+
+bool OpenOBSBOTUVCTransport::commitRecovery() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return storage_->device != nullptr && storage_->recovery.commitRecovery();
+}
+
+void OpenOBSBOTUVCTransport::abortRecovery(int32_t ioReturn) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (storage_->recovery.snapshot(storage_->generation).state
+        != OpenOBSBOTControlState::restoring) {
+        return;
+    }
+    closeLocked();
+    storage_->recovery.noteFailure(ioReturn);
 }
 
 OBSBOTOpenDeviceProfile OpenOBSBOTUVCTransport::profile() const noexcept {
@@ -318,24 +484,52 @@ int OpenOBSBOTUVCTransport::readAttitudeLocked(
     double &pitchDegrees,
     double &panDegrees
 ) noexcept {
-    if (!storage_->device) return failure;
     std::array<int32_t, 2> panTilt {};
-    const IOReturn result = uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    if (submitControlLocked(
         0xA1,
         0x81,
         0x0D,
         cameraTerminalEntity,
         panTilt.data(),
         static_cast<uint16_t>(sizeof(panTilt))
-    );
-    if (result != kIOReturnSuccess) return failure;
+    ) != success) return failure;
     panDegrees = static_cast<double>(panTilt[0]) / 3600.0;
     // UVC tilt is positive upward. SOMA's established gimbal frame uses the
     // opposite sign, so normalize once at this transport boundary.
     pitchDegrees = -static_cast<double>(panTilt[1]) / 3600.0;
     return std::isfinite(pitchDegrees) && std::isfinite(panDegrees) ? success : failure;
+}
+
+void OpenOBSBOTUVCTransport::recordTransferFailureLocked(int32_t ioReturn) noexcept {
+    closeLocked();
+    storage_->recovery.noteFailure(ioReturn);
+}
+
+int OpenOBSBOTUVCTransport::submitControlLocked(
+    uint8_t requestType,
+    uint8_t request,
+    uint8_t selector,
+    uint8_t entity,
+    void *data,
+    uint16_t length
+) noexcept {
+    const auto state = storage_->recovery.snapshot(storage_->generation).state;
+    if (!storage_->device
+        || (state != OpenOBSBOTControlState::healthy
+            && state != OpenOBSBOTControlState::restoring)) return failure;
+    const IOReturn result = uvcControl(
+        storage_->device,
+        storage_->videoControlInterface,
+        requestType,
+        request,
+        selector,
+        entity,
+        data,
+        length
+    );
+    if (result == kIOReturnSuccess) return success;
+    recordTransferFailureLocked(result);
+    return failure;
 }
 
 int OpenOBSBOTUVCTransport::sendFrame(
@@ -344,7 +538,26 @@ int OpenOBSBOTUVCTransport::sendFrame(
     const void *payloadBytes,
     size_t payloadSize
 ) noexcept {
-    if (!storage_->device || payloadSize > 44) return failure;
+    const auto state = storage_->recovery.snapshot(storage_->generation).state;
+    if (!storage_->device
+        || (state != OpenOBSBOTControlState::healthy
+            && state != OpenOBSBOTControlState::restoring)
+        || payloadSize > 44) {
+        return failure;
+    }
+    const IOReturn result = submitFrameDirectLocked(command, receiver, payloadBytes, payloadSize);
+    if (result == kIOReturnSuccess) return success;
+    recordTransferFailureLocked(result);
+    return failure;
+}
+
+int32_t OpenOBSBOTUVCTransport::submitFrameDirectLocked(
+    uint16_t command,
+    uint8_t receiver,
+    const void *payloadBytes,
+    size_t payloadSize
+) noexcept {
+    if (!storage_->device || payloadSize > 44) return kIOReturnNotOpen;
     std::array<uint8_t, 60> frame {};
     frame[0] = 0xAA;
     frame[1] = 0x25;
@@ -359,7 +572,7 @@ int OpenOBSBOTUVCTransport::sendFrame(
         std::memcpy(frame.data() + 16, payloadBytes, payloadSize);
         writeU16LE(frame.data() + 14, crc16USB(frame.data() + 12, payloadSize + 4));
     }
-    const IOReturn result = uvcControl(
+    return uvcControl(
         storage_->device,
         storage_->videoControlInterface,
         0x21,
@@ -369,7 +582,6 @@ int OpenOBSBOTUVCTransport::sendFrame(
         frame.data(),
         static_cast<uint16_t>(frame.size())
     );
-    return result == kIOReturnSuccess ? success : failure;
 }
 
 int OpenOBSBOTUVCTransport::setExternalVelocity(float pitch, float pan) noexcept {
@@ -415,8 +627,7 @@ int OpenOBSBOTUVCTransport::center() noexcept {
         double pan = 0;
         if (readAttitudeLocked(pitch, pan) != success) break;
         if (std::hypot(pitch, pan) <= 2.0) {
-            setExternalVelocityLocked(0, 0);
-            return success;
+            return setExternalVelocityLocked(0, 0);
         }
         const float pitchVelocity = static_cast<float>(std::clamp(-pitch * 1.6, -60.0, 60.0));
         const float panVelocity = static_cast<float>(std::clamp(-pan * 1.6, -80.0, 80.0));
@@ -440,12 +651,10 @@ int OpenOBSBOTUVCTransport::setAwake(bool awake) noexcept {
 
 int OpenOBSBOTUVCTransport::setZoomFactor(double factor) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!storage_->device || !std::isfinite(factor) || factor < 1 || factor > 4) return failure;
+    if (!std::isfinite(factor) || factor < 1 || factor > 4) return failure;
     int16_t minimum = 0;
     int16_t maximum = 0;
-    IOReturn result = uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    int result = submitControlLocked(
         0xA1,
         0x82,
         0x0B,
@@ -453,10 +662,8 @@ int OpenOBSBOTUVCTransport::setZoomFactor(double factor) noexcept {
         &minimum,
         sizeof(minimum)
     );
-    if (result == kIOReturnSuccess) {
-        result = uvcControl(
-            storage_->device,
-            storage_->videoControlInterface,
+    if (result == success) {
+        result = submitControlLocked(
             0xA1,
             0x83,
             0x0B,
@@ -465,14 +672,12 @@ int OpenOBSBOTUVCTransport::setZoomFactor(double factor) noexcept {
             sizeof(maximum)
         );
     }
-    if (result != kIOReturnSuccess || maximum <= minimum) return failure;
+    if (result != success || maximum <= minimum) return failure;
     const double normalized = (factor - 1.0) / 3.0;
     int16_t units = static_cast<int16_t>(std::lround(
         static_cast<double>(minimum) + static_cast<double>(maximum - minimum) * normalized
     ));
-    result = uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    return submitControlLocked(
         0x21,
         0x01,
         0x0B,
@@ -480,12 +685,10 @@ int OpenOBSBOTUVCTransport::setZoomFactor(double factor) noexcept {
         &units,
         sizeof(units)
     );
-    return result == kIOReturnSuccess ? success : failure;
 }
 
 int OpenOBSBOTUVCTransport::enableHumanTracking() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!storage_->device) return failure;
     if (storage_->profile == OBSBOTOpenDeviceProfile::tiny3Lite) {
         if (setAIWorkModeLocked(0x02, 0x00) != success) return failure;
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -496,9 +699,7 @@ int OpenOBSBOTUVCTransport::enableHumanTracking() noexcept {
     // on it. Its operational tracking switch is the 60-byte status/control XU:
     // tag 0x16, two-byte value, human work mode 0x02, normal framing 0x00.
     auto tracking = open_obsbot_protocol::trackingModeControl(0x02);
-    const IOReturn trackingResult = uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    const int trackingResult = submitControlLocked(
         0x21,
         0x01,
         statusSelector,
@@ -506,24 +707,21 @@ int OpenOBSBOTUVCTransport::enableHumanTracking() noexcept {
         tracking.data(),
         static_cast<uint16_t>(tracking.size())
     );
-    if (trackingResult != kIOReturnSuccess) return failure;
+    if (trackingResult != success) return failure;
     const uint8_t sport = 2;
     return sendFrame(0x0CC4, 0x04, &sport, sizeof(sport));
 }
 
 int OpenOBSBOTUVCTransport::setAIWorkModeLocked(uint8_t mode, uint8_t submode) noexcept {
-    if (!storage_->device) return failure;
     auto control = open_obsbot_protocol::trackingModeControl(mode, submode);
-    return uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    return submitControlLocked(
         0x21,
         0x01,
         statusSelector,
         extensionUnitEntity,
         control.data(),
         static_cast<uint16_t>(control.size())
-    ) == kIOReturnSuccess ? success : failure;
+    );
 }
 
 int OpenOBSBOTUVCTransport::selectHumanTrackingTarget(
@@ -560,7 +758,6 @@ int OpenOBSBOTUVCTransport::selectHumanTrackingTargetLocked(
 
 int OpenOBSBOTUVCTransport::disableHumanTracking() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!storage_->device) return failure;
     if (storage_->profile == OBSBOTOpenDeviceProfile::tiny3Lite) {
         const auto target = open_obsbot_protocol::clearTiny3HumanTarget();
         const int targetResult = sendFrame(
@@ -573,21 +770,19 @@ int OpenOBSBOTUVCTransport::disableHumanTracking() noexcept {
         return targetResult == success && modeResult == success ? success : failure;
     }
     auto tracking = open_obsbot_protocol::trackingModeControl(0x00);
-    return uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    return submitControlLocked(
         0x21,
         0x01,
         statusSelector,
         extensionUnitEntity,
         tracking.data(),
         static_cast<uint16_t>(tracking.size())
-    ) == kIOReturnSuccess ? success : failure;
+    );
 }
 
 int OpenOBSBOTUVCTransport::setAudioMode(uint8_t source, uint8_t mode) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!storage_->device || storage_->profile != OBSBOTOpenDeviceProfile::tiny3Lite
+    if (storage_->profile != OBSBOTOpenDeviceProfile::tiny3Lite
         || source > 1 || mode > 5 || mode == 3) {
         return failure;
     }
@@ -595,16 +790,14 @@ int OpenOBSBOTUVCTransport::setAudioMode(uint8_t source, uint8_t mode) noexcept 
     writeU16LE(control.data(), 0x0222);
     control[2] = source;
     control[3] = mode;
-    return uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    return submitControlLocked(
         0x21,
         0x01,
         statusSelector,
         extensionUnitEntity,
         control.data(),
         static_cast<uint16_t>(control.size())
-    ) == kIOReturnSuccess ? success : failure;
+    );
 }
 
 int OpenOBSBOTUVCTransport::setAudioInputGain(int16_t percent) noexcept {
@@ -614,20 +807,18 @@ int OpenOBSBOTUVCTransport::setAudioInputGain(int16_t percent) noexcept {
 
 int OpenOBSBOTUVCTransport::setSoundFollowing(bool enabled) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!storage_->device || storage_->profile != OBSBOTOpenDeviceProfile::tiny3Lite) return failure;
+    if (storage_->profile != OBSBOTOpenDeviceProfile::tiny3Lite) return failure;
     std::array<uint8_t, 60> control {};
     writeU16LE(control.data(), 0x0125);
     writeU32LE(control.data() + 2, enabled ? 1u : 0u);
-    return uvcControl(
-        storage_->device,
-        storage_->videoControlInterface,
+    return submitControlLocked(
         0x21,
         0x01,
         statusSelector,
         extensionUnitEntity,
         control.data(),
         static_cast<uint16_t>(control.size())
-    ) == kIOReturnSuccess ? success : failure;
+    );
 }
 
 int OpenOBSBOTUVCTransport::setIndicatorStateLocked(uint8_t stateID) noexcept {

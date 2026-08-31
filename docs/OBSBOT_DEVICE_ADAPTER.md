@@ -26,6 +26,33 @@ The boundary has one direction:
 No cognitive or UI layer owns product IDs, transport opcodes, LED state IDs,
 or packet layouts.
 
+## Control-plane recovery
+
+Video and audio capture do not share the vendor control endpoint. A healthy
+media stream therefore does not imply that gimbal, tracking, audio-mode, or
+indicator writes are available. `OpenOBSBOTUVCTransport` maintains an explicit
+control-plane state independent of capture health.
+
+The first failed UVC/XU transfer closes and releases the stale IOKit device
+interface. Further writes are held by a circuit breaker rather than retried
+against that handle. Reconnection uses the original product profile and USB
+serial identity; devices without a serial are constrained to their macOS USB
+`locationID` instead. That fallback binds recovery to the same USB topology,
+not to a cryptographically unique device, because the hardware exposes no
+serial. The rebound endpoint must pass both an attitude read and a
+zero-velocity vendor write before entering provisional restoration. It becomes
+healthy only after the safe stop and current state have also been restored.
+Failed attempts retain their failure streak and use bounded backoff from 100 ms
+to 5 seconds.
+
+After a verified reconnect, the bridge first disables native tracking and
+commands zero velocity. It then restores only a current native-tracking lease,
+a still-live external motion intent, or a non-expired absolute position. The
+most recent semantic indicator presentation, brightness, and enabled state are
+reapplied once. Expired motion and recenter requests are not replayed. Recovery
+transitions include the raw macOS `IOReturn`, retry count, endpoint generation,
+and next-attempt delay in the actuator trace.
+
 ## Supported products
 
 | Product | USB identity | Native control dependency |
