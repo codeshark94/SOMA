@@ -605,7 +605,7 @@ final class CognitiveEmbodimentTests: XCTestCase {
         let unknown = shadowRequest(
             id: "track-unknown",
             layer: .l1,
-            owner: "l1:e4b",
+            owner: "l1:e2b",
             priority: 40,
             now: now,
             operation: .trackTarget(TrackTargetGoal(targetReference: "target:person"))
@@ -615,7 +615,7 @@ final class CognitiveEmbodimentTests: XCTestCase {
         let registration = shadowRequest(
             id: "register-person",
             layer: .l1,
-            owner: "l1:e4b",
+            owner: "l1:e2b",
             priority: 40,
             now: now,
             operation: .registerTarget(
@@ -632,7 +632,7 @@ final class CognitiveEmbodimentTests: XCTestCase {
         let tracking = shadowRequest(
             id: "track-person",
             layer: .l1,
-            owner: "l1:e4b",
+            owner: "l1:e2b",
             priority: 40,
             now: now,
             operation: .trackTarget(TrackTargetGoal(targetReference: "target:person"))
@@ -725,7 +725,7 @@ final class CognitiveEmbodimentTests: XCTestCase {
         let registration = shadowRequest(
             id: "socket-register",
             layer: .l1,
-            owner: "l1:e4b-socket",
+            owner: "l1:e2b-socket",
             priority: 45,
             now: now,
             operation: .registerTarget(

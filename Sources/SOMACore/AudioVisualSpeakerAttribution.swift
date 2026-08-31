@@ -160,8 +160,9 @@ public enum LiveVoiceSpeakerEpisodeState: String, Equatable, Sendable {
 }
 
 /// Temporal speech evidence required before a new participant episode can be
-/// promoted into a Live Voice session. A single classifier window is never
-/// sufficient, even when its confidence is high.
+/// promoted into a Live Voice session. A strong window may qualify speech
+/// immediately; the episode gate still requires matching visual contact and
+/// independent speaker evidence before it authorizes a session.
 public struct LiveVoiceOpeningSpeechConfiguration: Equatable, Sendable {
     public let strongConfidence: Double
     public let supportingConfidence: Double
@@ -172,7 +173,7 @@ public struct LiveVoiceOpeningSpeechConfiguration: Equatable, Sendable {
     public init(
         strongConfidence: Double = 0.80,
         supportingConfidence: Double = 0.68,
-        requiredStrongWindows: Int = 2,
+        requiredStrongWindows: Int = 1,
         requiredSupportingWindows: Int = 3,
         maximumWindowGapMilliseconds: UInt64 = 650
     ) {

@@ -165,6 +165,7 @@ public struct LiveVoiceInitialTurnValidation: Equatable, Sendable {
 public struct LiveVoiceSessionInactivityGate: Equatable, Sendable {
     public let timeoutMilliseconds: UInt64
     public private(set) var deadlineNS: UInt64?
+    public private(set) var assistantActivityInProgress = false
 
     public init(timeoutMilliseconds: UInt64 = 60_000) {
         precondition(timeoutMilliseconds > 0)
@@ -182,13 +183,34 @@ public struct LiveVoiceSessionInactivityGate: Equatable, Sendable {
         return renew(at: monotonicNS)
     }
 
+    /// Suspends user-silence expiry while the assistant is generating, using
+    /// tools, or playing a response. This does not count assistant output as
+    /// participant activity; it prevents SOMA from consuming the
+    /// participant's listening window with its own turn.
+    @discardableResult
+    public mutating func beginAssistantActivity() -> Bool {
+        guard deadlineNS != nil else { return false }
+        assistantActivityInProgress = true
+        return true
+    }
+
+    /// Starts a fresh participant-silence interval only after the entire
+    /// assistant turn, including buffered playback, has finished.
+    @discardableResult
+    public mutating func endAssistantActivity(at monotonicNS: UInt64) -> UInt64? {
+        guard deadlineNS != nil, assistantActivityInProgress else { return nil }
+        assistantActivityInProgress = false
+        return renew(at: monotonicNS)
+    }
+
     public func shouldClose(at monotonicNS: UInt64) -> Bool {
-        guard let deadlineNS else { return false }
+        guard !assistantActivityInProgress, let deadlineNS else { return false }
         return monotonicNS >= deadlineNS
     }
 
     public mutating func close() {
         deadlineNS = nil
+        assistantActivityInProgress = false
     }
 
     @discardableResult

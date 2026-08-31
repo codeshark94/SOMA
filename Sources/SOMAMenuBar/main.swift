@@ -887,27 +887,44 @@ private struct SOMASettingsView: View {
                 Text("Only voices accepted by the installed Codex realtime transport are shown; groups are curated by listening.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Divider()
-                Picker("Microphone", selection: binding(\.audioInputDeviceUID)) {
-                    Text("Automatic · OBSBOT preferred").tag(Optional<String>.none)
-                    ForEach(model.audioDevices.inputs) { device in
-                        Text(audioDeviceLabel(device, defaultUID: model.audioDevices.defaultInputUID))
-                            .tag(Optional(device.uid))
-                    }
-                    if let selected = model.settings.audioInputDeviceUID,
-                       !model.audioDevices.inputs.contains(where: { $0.uid == selected }) {
-                        Text("Unavailable preferred microphone").tag(Optional(selected))
-                    }
+                Toggle(isOn: spaceMarineModeBinding) {
+                    Label("Space Marine Mode", systemImage: "shield.lefthalf.filled")
                 }
-                Picker("Speaker", selection: binding(\.audioOutputDeviceUID)) {
-                    Text("System default").tag(Optional<String>.none)
-                    ForEach(model.audioDevices.outputs) { device in
-                        Text(audioDeviceLabel(device, defaultUID: model.audioDevices.defaultOutputUID))
-                            .tag(Optional(device.uid))
+                .disabled(!model.settings.realtimeVoiceEnabled)
+                Divider()
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
+                    GridRow {
+                        Text("Microphone")
+                            .gridColumnAlignment(.trailing)
+                        Picker("Microphone", selection: binding(\.audioInputDeviceUID)) {
+                            Text("Automatic · OBSBOT preferred").tag(Optional<String>.none)
+                            ForEach(model.audioDevices.inputs) { device in
+                                Text(audioDeviceLabel(device, defaultUID: model.audioDevices.defaultInputUID))
+                                    .tag(Optional(device.uid))
+                            }
+                            if let selected = model.settings.audioInputDeviceUID,
+                               !model.audioDevices.inputs.contains(where: { $0.uid == selected }) {
+                                Text("Unavailable preferred microphone").tag(Optional(selected))
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    if let selected = model.settings.audioOutputDeviceUID,
-                       !model.audioDevices.outputs.contains(where: { $0.uid == selected }) {
-                        Text("Unavailable preferred speaker").tag(Optional(selected))
+                    GridRow {
+                        Text("Speaker")
+                        Picker("Speaker", selection: binding(\.audioOutputDeviceUID)) {
+                            Text("System default").tag(Optional<String>.none)
+                            ForEach(model.audioDevices.outputs) { device in
+                                Text(audioDeviceLabel(device, defaultUID: model.audioDevices.defaultOutputUID))
+                                    .tag(Optional(device.uid))
+                            }
+                            if let selected = model.settings.audioOutputDeviceUID,
+                               !model.audioDevices.outputs.contains(where: { $0.uid == selected }) {
+                                Text("Unavailable preferred speaker").tag(Optional(selected))
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
                 HStack {
@@ -1413,6 +1430,15 @@ private struct SOMASettingsView: View {
                     max($0, SOMAControlSettings.realtimeVoiceSilenceTimeoutRange.lowerBound),
                     SOMAControlSettings.realtimeVoiceSilenceTimeoutRange.upperBound
                 )
+            }
+        )
+    }
+
+    private var spaceMarineModeBinding: Binding<Bool> {
+        Binding(
+            get: { model.settings.realtimeVoiceMode == .spaceMarine },
+            set: { enabled in
+                model.settings.realtimeVoiceMode = enabled ? .spaceMarine : .natural
             }
         )
     }

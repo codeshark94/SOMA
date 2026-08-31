@@ -147,33 +147,18 @@ to Gemma, traces, or remote services.
 verifies every runtime file against `config/l05-model.sha256`, and atomically
 activates the checkpoint. The repository does not redistribute the model.
 
-This is L1's optional local visual helper. A same-image three-request
+This is L1's optional local semantic helper. A same-image three-request
 probe measured 1.47 s cold and 1.39 s warm-median inference with a 4.20 GB
 MLX-reported peak. It remains asynchronous advisory cognition and is never part
-of the L0 tracking or motor loop. MLX uses the Apple GPU and unified memory,
-not the Neural Engine. The persistent launcher leaves it off by default because
+of the L0 tracking or motor loop. The same persistent E2B process also evaluates
+current Live Voice turns for a validated one-tool advisory; these requests run
+before the next replaceable visual refresh without interrupting an inference in
+progress. It cannot execute tools or speak. MLX uses the Apple GPU and unified
+memory, not the Neural Engine. The persistent launcher leaves it off by default because
 it adds multi-gigabyte unified-memory pressure without contributing to L0
 fixation or social decisions. Set `SOMA_ENABLE_L05_VLM=1` only for an explicit
 visual audit. The worker requires the existing local path and has no Ollama or
 network fallback.
 
-## Evaluated local Gemma 4 E4B MLX-VLM fallback
-
-- Local directory: `~/Library/Application Support/SOMA/models/gemma-4-e4b-it-nvfp4`
-  (downloaded runtime asset; not bundled in the Swift package or Git repository).
-- Repository: [mlx-community/gemma-4-e4b-it-nvfp4](https://huggingface.co/mlx-community/gemma-4-e4b-it-nvfp4)
-  at revision `769ca8889f89f8ec8c1ca59bf427332895eb1cb2`.
-- Upstream: `google/gemma-4-E4B-it` source revision
-  `fee6332c1abaafb77f6f9624236c63aa2f1d0187`, according to the conversion card.
-- Variant: NVFP4; `model.safetensors` size 5,146,755,012 bytes and SHA-256
-  `42361d0a7d1af5c9cf6f42c2a46be0f39fa4e060cedf0dfc43b0b4d97e413c9e`.
-- License: Gemma terms, as declared by the conversion model card. The operator
-  is responsible for accepting and complying with those terms for the local
-  downloaded checkpoint.
-
-E4B remains an evaluated comparison fallback, not the persistent default. MLX
-runs it on the Apple GPU and unified memory, not the Neural Engine. The
-real-time L0 path never waits for it, and its scalar advisory output has no
-target-selection or actuator authority. The command line requires an existing
-local directory; there is no runtime network fallback. The worker calls
-`mlx-vlm` directly and never routes the local checkpoint through Ollama.
+The local semantic worker accepts only this pinned E2B checkpoint. There is no
+alternate local-model fallback and no Ollama route for L0.5 perception.

@@ -41,6 +41,20 @@ final class L1SituationStreamTests: XCTestCase {
         XCTAssertNil(LiveVoiceOpeningControllerEvent.make(opening: " \n ", languageTag: "ko"))
     }
 
+    func testSpaceMarineOpeningCarriesIntentWithoutForcingKoreanVerbatimDelivery() {
+        let opening = "승엽님, 오늘 무엇을 연구하고 계신가요?"
+        let event = LiveVoiceOpeningControllerEvent.make(
+            opening: opening,
+            languageTag: "ko-KR",
+            voiceMode: .spaceMarine
+        )
+        XCTAssertEqual(event, """
+        ⟦SOMA_OPENING_INTENT source_language=ko-kr target_language=en delivery=semantic_once_then_listen⟧
+        \(opening)
+        ⟦/SOMA_OPENING_INTENT⟧
+        """)
+    }
+
     func testLiveVoiceConversationFrameDoesNotAssumeEveryContactIsAServiceRequest() {
         let participantOrigin = LiveVoiceConversationFrame.originInstruction(
             isProactiveSession: false

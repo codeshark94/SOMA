@@ -716,6 +716,21 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertTrue(gate.shouldClose(at: deadline))
     }
 
+    func testAssistantTurnSuspendsSilenceExpiryAndRestartsItAfterPlayback() {
+        let start: UInt64 = 1_000_000_000
+        var gate = LiveVoiceSessionInactivityGate()
+        let originalDeadline = gate.activate(at: start)
+
+        XCTAssertTrue(gate.beginAssistantActivity())
+        XCTAssertFalse(gate.shouldClose(at: originalDeadline + 30_000_000_000))
+
+        let playbackEnded = originalDeadline + 45_000_000_000
+        let renewedDeadline = gate.endAssistantActivity(at: playbackEnded)
+        XCTAssertEqual(renewedDeadline, playbackEnded + 60_000_000_000)
+        XCTAssertFalse(gate.shouldClose(at: renewedDeadline! - 1))
+        XCTAssertTrue(gate.shouldClose(at: renewedDeadline!))
+    }
+
     func testLiveVoiceInputLevelerBoostsOnlyVADAdmittedQuietSpeech() {
         var leveler = LiveVoiceInputLeveler()
         let quietSpeech = (0..<960).map { index in
@@ -918,26 +933,14 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(evidence.snapshot.supportingWindowCount, 0)
     }
 
-    func testOpeningSpeechEvidenceRequiresTemporalSupportAndResetsAtOffset() {
+    func testOpeningSpeechEvidenceAcceptsOneStrongWindowAndResetsAtOffset() {
         var evidence = LiveVoiceOpeningSpeechAccumulator()
         let start: UInt64 = 2_000_000_000
 
-        XCTAssertFalse(evidence.observe(
+        XCTAssertTrue(evidence.observe(
             active: true,
             confidence: 0.84,
             at: start
-        ).qualified)
-        let repeatedTimestamp = evidence.observe(
-            active: true,
-            confidence: 0.91,
-            at: start
-        )
-        XCTAssertFalse(repeatedTimestamp.qualified)
-        XCTAssertEqual(repeatedTimestamp.strongWindowCount, 1)
-        XCTAssertTrue(evidence.observe(
-            active: true,
-            confidence: 0.86,
-            at: start + 260_000_000
         ).qualified)
 
         XCTAssertFalse(evidence.observe(
@@ -1033,7 +1036,9 @@ final class EventImportanceTests: XCTestCase {
     }
 
     func testSpeakerEpisodeConfirmsAfterRepeatedStrongSpeechEvidence() {
-        var gate = LiveVoiceSpeakerEpisodeGate()
+        var gate = LiveVoiceSpeakerEpisodeGate(
+            openingSpeechConfiguration: .init(requiredStrongWindows: 2)
+        )
         let start: UInt64 = 4_000_000_000
         XCTAssertEqual(gate.observe(
             active: true,
@@ -1074,7 +1079,9 @@ final class EventImportanceTests: XCTestCase {
     }
 
     func testSpeakerEpisodeUsesAudioWindowTimeAcrossDelayedCallbacks() {
-        var gate = LiveVoiceSpeakerEpisodeGate()
+        var gate = LiveVoiceSpeakerEpisodeGate(
+            openingSpeechConfiguration: .init(requiredStrongWindows: 2)
+        )
         let onset: UInt64 = 5_000_000_000
         XCTAssertEqual(gate.observe(
             active: true,
@@ -1768,6 +1775,24 @@ final class EventImportanceTests: XCTestCase {
             at: 3_250_000_000
         )
         XCTAssertFalse(restarted.admitted)
+    }
+
+    func testBargeInRequiresANewSpeechOnsetAfterAssistantOutputBegins() {
+        var boundary = LiveVoiceBargeInEpisodeBoundary()
+        boundary.observeSpeechOnset(at: 900_000_000)
+        boundary.beginAssistantOutput(at: 1_000_000_000)
+        boundary.observeSpeechOnset(at: 950_000_000)
+        XCTAssertFalse(boundary.hasNewSpeechOnset)
+
+        boundary.observeSpeechOnset(at: 1_100_000_000)
+        XCTAssertTrue(boundary.hasNewSpeechOnset)
+        XCTAssertFalse(boundary.admitsSpeakerEvidence(observedAt: 950_000_000))
+        XCTAssertFalse(boundary.admitsSpeakerEvidence(observedAt: nil))
+        XCTAssertTrue(boundary.admitsSpeakerEvidence(observedAt: 1_120_000_000))
+
+        boundary.endAssistantOutput()
+        XCTAssertFalse(boundary.hasNewSpeechOnset)
+        XCTAssertFalse(boundary.admitsSpeakerEvidence(observedAt: 1_120_000_000))
     }
 
     func testUnverifiedPlaybackEpisodeRemainsQuarantinedBeyondTrailingTimer() {

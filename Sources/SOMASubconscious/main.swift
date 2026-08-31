@@ -1223,6 +1223,10 @@ private struct Options {
             guard FileManager.default.fileExists(atPath: l1AuxiliaryVLMModel) else {
                 throw RuntimeError.invalidArgument("L1 auxiliary VLM model is unavailable locally: \(l1AuxiliaryVLMModel)")
             }
+            guard URL(fileURLWithPath: l1AuxiliaryVLMModel).lastPathComponent
+                == "gemma-4-e2b-it-4bit" else {
+                throw RuntimeError.invalidArgument("L1 auxiliary VLM supports only the pinned E2B checkpoint")
+            }
         }
         return Options(
             duration: duration,
@@ -12611,7 +12615,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "control_settings",
             state: "loaded",
-            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); input_uid=\(controlSettings.audioInputDeviceUID ?? "automatic"); output_uid=\(controlSettings.audioOutputDeviceUID ?? "system_default"); active_turn_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn); hermes_agent=\(controlSettings.hermesAgentDelegationEnabled); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
+            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); input_uid=\(controlSettings.audioInputDeviceUID ?? "automatic"); output_uid=\(controlSettings.audioOutputDeviceUID ?? "system_default"); active_turn_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn); hermes_agent=\(controlSettings.hermesAgentDelegationEnabled); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
         ))
     }
     let identityPresence = IdentityPresenceCoordinator(
@@ -13213,8 +13217,14 @@ private func run(_ options: Options) throws {
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     let liveVoiceBox = LiveVoiceLauncherBox()
     let l1LiveToolSupervisor: L1LiveConversationToolSupervisor?
-    do {
-        let supervisor = try L1LiveConversationToolSupervisor(
+    if let l1AuxiliarySemanticBridge {
+        l1LiveToolSupervisor = L1LiveConversationToolSupervisor(
+            infer: { request, completion in
+                l1AuxiliarySemanticBridge.submitToolAdvice(
+                    request,
+                    completion: completion
+                )
+            },
             onHealth: { state, message in
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -13238,16 +13248,14 @@ private func run(_ options: Options) throws {
                 ))
             }
         )
-        supervisor.prewarm()
-        l1LiveToolSupervisor = supervisor
-    } catch {
+    } else {
         l1LiveToolSupervisor = nil
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNanoseconds(),
             source: "l1_live_tool",
-            state: "unavailable",
-            message: String(error.localizedDescription.prefix(192))
+            state: "disabled",
+            message: "e2b_worker_unavailable"
         ))
     }
     defer { l1LiveToolSupervisor?.stop() }
@@ -13291,6 +13299,7 @@ private func run(_ options: Options) throws {
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(
             voice: controlSettings.realtimeVoice,
+            voiceMode: controlSettings.realtimeVoiceMode,
             audioOutputDeviceUID: controlSettings.audioOutputDeviceUID,
             currentCameraImageDataURI: {
                 liveCameraFrameRelay?.currentImageDataURI(at: monotonicNanoseconds())
@@ -13368,13 +13377,45 @@ private func run(_ options: Options) throws {
                         maximumGainDB
                     )
                 ))
-            case let .outputPlaybackReady(mode, route):
+            case let .outputPlaybackReady(mode, route, effectProfile):
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: "output_ready",
-                    message: "mode=\(mode); route=\(route)"
+                    message: "mode=\(mode); route=\(route); effect_profile=\(effectProfile)"
+                ))
+            case let .audioPlayoutSourceSelected(source):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "audio_playout_source",
+                    message: "source=\(source)"
+                ))
+            case let .audioPlayoutStatus(
+                state,
+                sampleRate,
+                channels,
+                chunkDurationMilliseconds,
+                arrivalGapMilliseconds,
+                queuedDurationMilliseconds,
+                underruns
+            ):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "audio_playout_\(state)",
+                    message: String(
+                        format: "sample_rate=%d; channels=%d; chunk_ms=%.1f; arrival_gap_ms=%@; queued_ms=%.1f; underruns=%d",
+                        sampleRate,
+                        channels,
+                        chunkDurationMilliseconds,
+                        arrivalGapMilliseconds.map { String(format: "%.1f", $0) } ?? "na",
+                        queuedDurationMilliseconds,
+                        underruns
+                    )
                 ))
             case .naturalTurnTakingConfirmed:
                 writer.write(RuntimeEvent(
@@ -13750,7 +13791,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=preplayback_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=post_effect_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -15006,6 +15047,7 @@ private func run(_ options: Options) throws {
                             : speakerSnapshot.assessment.admitsAudio
                     ),
                     duplexSpeakerVerified: duplexSpeakerVerified,
+                    duplexSpeakerEvidenceNS: speakerSnapshot.speakerEvidenceObservedNS,
                     discardBufferedEpisode: !evidence.active && (
                         speakerEpisode.endedState == .pending
                             || speakerEpisode.endedState == .rejected

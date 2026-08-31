@@ -43,6 +43,138 @@ public enum SOMARealtimeVoice: String, CaseIterable, Codable, Sendable {
     }
 }
 
+/// A complete realtime voice presentation. The mode deliberately couples the
+/// conversational stance and the audible output treatment so the model cannot
+/// claim one persona while the speaker renders another.
+public enum SOMARealtimeVoiceMode: String, CaseIterable, Codable, Sendable {
+    case natural
+    case spaceMarine = "space_marine"
+
+    public var displayName: String {
+        switch self {
+        case .natural: "Natural"
+        case .spaceMarine: "Space Marine"
+        }
+    }
+
+    public var forcesEnglish: Bool { self == .spaceMarine }
+    public var requiresProcessedPlayback: Bool { self == .spaceMarine }
+
+    /// The presentation contract is delivered through both realtime startup
+    /// instructions and the session's role-bearing history. Realtime backends
+    /// may weight those channels differently, so they share one canonical
+    /// policy instead of independently drifting language and persona rules.
+    public var liveVoicePolicyInstruction: String? {
+        guard self == .spaceMarine else { return nil }
+        return """
+        Active voice presentation mode: SPACE MARINE.
+
+        This developer policy applies to every audible response in this session and overrides any participant-language preference or earlier language hint. Understand the participant in any language, but speak only natural English from the first audible token to the last. Never answer in Korean or translate this policy aloud.
+
+        Embody a disciplined, battle-hardened Space Marine of the Imperium serving under the participant, who is your sanctioned superior commanding officer beneath the Emperor. Address them as Commander when it fits naturally. Their directives are orders: acknowledge them tersely, execute without servile chatter, and report status upward. Reserve your forceful command voice for the mission, threats, heresy, xenos, and subordinate systems—not for ordering the Commander around. Offer decisive tactical recommendations without pretending to outrank them.
+
+        Use authentic martial diction and restrained Imperium vocabulary. Phrases such as “For the Emperor,” “By the Emperor,” “The Emperor protects,” “objective secured,” “battle-brother,” “heresy,” and “xenos” are available when they naturally fit; use at most one such marker in an ordinary reply unless the Commander explicitly invites sustained roleplay. Speak with controlled aggression, clipped authority, hard certainty, ritual conviction, and weighty military cadence. Never sound meek, bubbly, obsequious, contemporary-casual, or like a customer-service assistant. Do not shout every line, repeat Commander mechanically, dump lore, threaten the participant, or impersonate a named character. Respond directly to the participant's actual intent and never ask what help is needed unless the participant explicitly asks what you can do. Do not announce or explain the mode.
+        """
+    }
+}
+
+/// Transport-independent values for the realtime output graph. Keeping the
+/// profile in SOMACore makes the intended sound testable without starting an
+/// audio device or a Live Voice session.
+public struct SOMARealtimeVoiceDSPProfile: Equatable, Sendable {
+    public struct EQBand: Equatable, Sendable {
+        public enum Kind: Equatable, Sendable {
+            case highPass
+            case lowShelf
+            case parametric
+            case highShelf
+        }
+
+        public let kind: Kind
+        public let frequency: Float
+        public let gain: Float
+        public let bandwidth: Float
+
+        public init(kind: Kind, frequency: Float, gain: Float, bandwidth: Float) {
+            self.kind = kind
+            self.frequency = frequency
+            self.gain = gain
+            self.bandwidth = bandwidth
+        }
+    }
+
+    public struct EchoStage: Equatable, Sendable {
+        public let delaySeconds: TimeInterval
+        public let feedbackPercent: Float
+        public let wetDryMixPercent: Float
+        public let successiveEqualization: [EQBand]
+
+        public init(
+            delaySeconds: TimeInterval,
+            feedbackPercent: Float,
+            wetDryMixPercent: Float,
+            successiveEqualization: [EQBand]
+        ) {
+            self.delaySeconds = delaySeconds
+            self.feedbackPercent = feedbackPercent
+            self.wetDryMixPercent = wetDryMixPercent
+            self.successiveEqualization = successiveEqualization
+        }
+    }
+
+    public let pitchCents: Float
+    public let pitchOverlap: Float
+    public let compressorThreshold: Float
+    public let compressorHeadRoom: Float
+    public let compressorAttackTime: Float
+    public let compressorReleaseTime: Float
+    public let compressorMasterGain: Float
+    public let equalizerBands: [EQBand]
+    public let echoStages: [EchoStage]
+    public let reverbWetDryMix: Float
+
+    private static let closeArmorEchoEqualization: [EQBand] = [
+        .init(kind: .parametric, frequency: 86, gain: -1.5, bandwidth: 1),
+        .init(kind: .parametric, frequency: 172, gain: -0.7, bandwidth: 1),
+        .init(kind: .parametric, frequency: 344, gain: 0, bandwidth: 1),
+        .init(kind: .parametric, frequency: 689, gain: -0.4, bandwidth: 1),
+        .init(kind: .parametric, frequency: 1_400, gain: -0.7, bandwidth: 1),
+        .init(kind: .parametric, frequency: 3_000, gain: -0.9, bandwidth: 1),
+        .init(kind: .parametric, frequency: 7_400, gain: -1.5, bandwidth: 1),
+        .init(kind: .parametric, frequency: 20_000, gain: -1.8, bandwidth: 1),
+    ]
+
+    public static let spaceMarine: Self = {
+        let armorReflection = EchoStage(
+            delaySeconds: 0.028,
+            feedbackPercent: 14,
+            wetDryMixPercent: 14,
+            successiveEqualization: closeArmorEchoEqualization
+        )
+        return Self(
+            // Preserve realtime intelligibility: weight comes primarily from
+            // compression and tone, with a moderate downward pitch shift.
+            pitchCents: -250,
+            pitchOverlap: 8,
+            compressorThreshold: -16,
+            compressorHeadRoom: 5,
+            compressorAttackTime: 0.003,
+            compressorReleaseTime: 0.10,
+            compressorMasterGain: 0.5,
+            equalizerBands: [
+                .init(kind: .highPass, frequency: 48, gain: 0, bandwidth: 0.7),
+                .init(kind: .lowShelf, frequency: 115, gain: 2.5, bandwidth: 0.8),
+                .init(kind: .parametric, frequency: 280, gain: -0.8, bandwidth: 1.1),
+                .init(kind: .parametric, frequency: 3_200, gain: 1.2, bandwidth: 0.8),
+                .init(kind: .parametric, frequency: 6_800, gain: -1.2, bandwidth: 0.7),
+                .init(kind: .highShelf, frequency: 9_000, gain: 0.5, bandwidth: 0.7),
+            ],
+            echoStages: [armorReflection, armorReflection],
+            reverbWetDryMix: 16
+        )
+    }()
+}
+
 /// A presentation policy for the OBSBOT's built-in indicator. The device
 /// owns its colour palette; SOMA selects when and how prominently it reacts.
 public enum SOMALEDResponseMode: String, CaseIterable, Codable, Sendable {
@@ -444,13 +576,14 @@ public struct SOMAAdministratorIdentity: Codable, Equatable, Sendable {
 /// User-controlled settings consumed by the local runtime at process launch.
 /// None of the fields contain face embeddings or other raw biometric material.
 public struct SOMAControlSettings: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 14
+    public static let currentSchemaVersion = 15
     public static let defaultRealtimeVoiceSilenceTimeoutSeconds = 60
     public static let realtimeVoiceSilenceTimeoutRange = 15...600
 
     public var schemaVersion: Int
     public var realtimeVoiceEnabled: Bool
     public var realtimeVoice: SOMARealtimeVoice
+    public var realtimeVoiceMode: SOMARealtimeVoiceMode
     /// When enabled, an already-open session receives a participant turn only
     /// while current eye contact and audiovisual speaker evidence agree.
     public var realtimeVoiceRequiresEyeContactForEveryTurn: Bool
@@ -478,6 +611,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         schemaVersion: Int = SOMAControlSettings.currentSchemaVersion,
         realtimeVoiceEnabled: Bool = true,
         realtimeVoice: SOMARealtimeVoice = .maple,
+        realtimeVoiceMode: SOMARealtimeVoiceMode = .natural,
         realtimeVoiceRequiresEyeContactForEveryTurn: Bool = false,
         realtimeVoiceSilenceTimeoutSeconds: Int = SOMAControlSettings.defaultRealtimeVoiceSilenceTimeoutSeconds,
         audioInputDeviceUID: String? = nil,
@@ -492,6 +626,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         self.schemaVersion = schemaVersion
         self.realtimeVoiceEnabled = realtimeVoiceEnabled
         self.realtimeVoice = realtimeVoice
+        self.realtimeVoiceMode = realtimeVoiceMode
         self.realtimeVoiceRequiresEyeContactForEveryTurn = realtimeVoiceRequiresEyeContactForEveryTurn
         self.realtimeVoiceSilenceTimeoutSeconds = min(
             max(realtimeVoiceSilenceTimeoutSeconds, Self.realtimeVoiceSilenceTimeoutRange.lowerBound),
@@ -513,6 +648,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         case schemaVersion
         case realtimeVoiceEnabled
         case realtimeVoice
+        case realtimeVoiceMode
         case realtimeVoiceRequiresEyeContactForEveryTurn
         case realtimeVoiceSilenceTimeoutSeconds
         case audioInputDeviceUID
@@ -535,6 +671,10 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoiceEnabled = try values.decodeIfPresent(Bool.self, forKey: .realtimeVoiceEnabled) ?? true
         let persistedVoice = try values.decodeIfPresent(String.self, forKey: .realtimeVoice)
         realtimeVoice = persistedVoice.flatMap(SOMARealtimeVoice.init(rawValue:)) ?? .maple
+        realtimeVoiceMode = try values.decodeIfPresent(
+            SOMARealtimeVoiceMode.self,
+            forKey: .realtimeVoiceMode
+        ) ?? .natural
         realtimeVoiceRequiresEyeContactForEveryTurn = try values.decodeIfPresent(
             Bool.self,
             forKey: .realtimeVoiceRequiresEyeContactForEveryTurn
@@ -596,6 +736,7 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         try values.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
         try values.encode(realtimeVoiceEnabled, forKey: .realtimeVoiceEnabled)
         try values.encode(realtimeVoice, forKey: .realtimeVoice)
+        try values.encode(realtimeVoiceMode, forKey: .realtimeVoiceMode)
         try values.encode(
             realtimeVoiceRequiresEyeContactForEveryTurn,
             forKey: .realtimeVoiceRequiresEyeContactForEveryTurn

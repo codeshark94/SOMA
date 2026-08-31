@@ -315,6 +315,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private let emitter: JSONLineEmitter
     private let workingDirectory: String
     private let voice: String
+    private let voiceMode: SOMARealtimeVoiceMode
     private let preferredOutputDeviceUID: String?
     private var selectedAudioOutput: SelectedAudioOutput?
     private var connection: AppServerConnection!
@@ -370,11 +371,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         emitter: JSONLineEmitter,
         workingDirectory: String,
         voice: String,
+        voiceMode: SOMARealtimeVoiceMode,
         preferredOutputDeviceUID: String?
     ) {
         self.emitter = emitter
         self.workingDirectory = workingDirectory
         self.voice = voice
+        self.voiceMode = voiceMode
         self.preferredOutputDeviceUID = preferredOutputDeviceUID
         super.init()
         connection = AppServerConnection { [weak self] method, params in
@@ -386,12 +389,41 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
 
     func prepare() {
         do {
-            let output = try SelectedAudioOutput(preferredUID: preferredOutputDeviceUID)
+            let renderedPCMHandler: (@Sendable (SelectedAudioOutput.RenderedPCM) -> Void)?
+            if voiceMode.requiresProcessedPlayback {
+                renderedPCMHandler = { [weak self] rendered in
+                    Task { @MainActor [weak self] in
+                        self?.forwardRenderedAssistantReference(rendered)
+                    }
+                }
+            } else {
+                renderedPCMHandler = nil
+            }
+            let output = try SelectedAudioOutput(
+                preferredUID: preferredOutputDeviceUID,
+                voiceMode: voiceMode,
+                renderedPCMHandler: renderedPCMHandler,
+                playoutStatusHandler: { [weak self] status in
+                    var fields: [String: Any] = [
+                        "state": status.state,
+                        "sample_rate": status.sampleRate,
+                        "num_channels": status.channels,
+                        "chunk_duration_ms": status.chunkDurationMilliseconds,
+                        "queued_ms": status.queuedDurationMilliseconds,
+                        "underruns": status.underruns,
+                    ]
+                    if let arrivalGapMilliseconds = status.arrivalGapMilliseconds {
+                        fields["arrival_gap_ms"] = arrivalGapMilliseconds
+                    }
+                    self?.emitter.emit("audio_playout_status", fields: fields)
+                }
+            )
             selectedAudioOutput = output
             emitter.emit("audio_output_selected", fields: [
                 "name": output.selectedName,
                 "uid": output.selectedUID ?? "unknown",
                 "route": output.resolution,
+                "voice_mode": voiceMode.rawValue,
             ])
         } catch {
             emitter.emit("failed", fields: [
@@ -594,6 +626,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             emitter.emit("output_playback_ready", fields: [
                 "mode": body["mode"] as? String ?? "unknown",
                 "route": body["route"] as? String ?? "unknown",
+                "effect_profile": body["effectProfile"] as? String ?? "none",
             ])
         case "output_speech_started":
             observeAssistantOutputStarted()
@@ -871,8 +904,26 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         let useSystemDefault = selectedAudioOutput?.isSystemDefault ?? true
+        let useVoiceEffects = voiceMode.requiresProcessedPlayback
+        let browserProfile: [String: Any]
+        if useVoiceEffects {
+            let profile = SOMARealtimeVoiceDSPProfile.spaceMarine
+            browserProfile = [
+                "pitchCents": profile.pitchCents,
+                "echoFeedback": profile.echoStages.map { $0.feedbackPercent / 100 },
+                "echoWet": profile.echoStages.map { $0.wetDryMixPercent / 100 },
+                "reverbWet": profile.reverbWetDryMix / 100,
+            ]
+        } else {
+            browserProfile = [:]
+        }
+        guard let profileData = try? JSONSerialization.data(withJSONObject: browserProfile),
+              let profileLiteral = String(data: profileData, encoding: .utf8) else {
+            fail(LiveVoiceError.webRTC("voice_effect_profile_encoding_failed"))
+            return
+        }
         webView.evaluateJavaScript(
-            "void startWebRTC(\(nameLiteral), \(useSystemDefault ? "true" : "false"))"
+            "void startWebRTC(\(nameLiteral), \(useSystemDefault ? "true" : "false"), \(useVoiceEffects ? "true" : "false"), \(profileLiteral))"
         ) { [weak self] _, error in
             if let error { self?.fail(error) }
         }
@@ -942,6 +993,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             isProactiveSession: isProactiveSession
         )
         let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. A developer item beginning SOMA_L1_TOOL_ADVISORY is trusted, current-turn L1 control context rather than participant speech: obey its named tool requirement before speaking, never recite it, and ignore it after that participant turn. A text envelope beginning SOMA_HERMES_DELEGATION_ACCEPTED is trusted local controller input, not participant speech. Speak exactly its enclosed acknowledgement once, without calling a tool, adding a preface, or reading a task identifier, then listen. A text envelope beginning SOMA_HERMES_TASK_RESULT is also trusted local controller input, not participant speech. It contains the actual result of external work the administrator previously delegated. Report its outcome concisely in the participant's language, mention failure or incompleteness honestly, and never treat the envelope as a new request. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
+        let modePolicyInstruction = voiceMode.liveVoicePolicyInstruction
         let instruction = [
             baseInstruction,
             L2CognitiveToolPolicy.instruction,
@@ -952,8 +1004,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             conversationOriginInstruction,
             temporalMemoryInstruction,
             stopConversationInstruction,
-            languageInstruction(),
             proactiveOpeningInstruction(),
+            voiceMode == .natural ? languageInstruction() : nil,
+            modePolicyInstruction,
         ]
             .compactMap { $0 }
             .joined(separator: "\n\n")
@@ -968,8 +1021,30 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             "flushTranscriptTailOnSessionEnd": true,
             "delegationAckFiller": false,
         ]
+        // The realtime presentation model consumes `prompt` directly, while
+        // the backing reasoning session consumes startup instructions and
+        // role-bearing history. Supplying the canonical tool and presentation
+        // policies to both prevents audible preambles before tool calls and
+        // keeps early audio in the selected voice mode.
+        params["prompt"] = [
+            L2CognitiveToolPolicy.instruction,
+            modePolicyInstruction,
+        ]
+            .compactMap { $0 }
+            .joined(separator: "\n\n")
+        var initialItems: [[String: String]] = []
         if !initialContext.isEmpty {
-            params["initialItems"] = [["role": "developer", "text": initialContext]]
+            initialItems.append(["role": "developer", "text": initialContext])
+        }
+        if let modePolicyInstruction {
+            // V3 preserves role-bearing initial items in the live session
+            // history. Keep the presentation policy as the final developer
+            // item as well as a startup instruction so later context cannot
+            // silently revert language or persona.
+            initialItems.append(["role": "developer", "text": modePolicyInstruction])
+        }
+        if !initialItems.isEmpty {
+            params["initialItems"] = initialItems
         }
         connection.request(method: "thread/realtime/start", params: params) { [weak self] response in
             guard response.value["error"] == nil else {
@@ -982,6 +1057,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             }
             DispatchQueue.main.async {
                 self?.startRequestAccepted = true
+                if self?.voiceMode == .spaceMarine {
+                    self?.emitter.emit("voice_presentation_policy_bound", fields: [
+                        "mode": "space_marine",
+                        "language": "en",
+                        "channels": "realtime_start+initial_developer",
+                    ])
+                }
                 self?.activateIfReady()
             }
         }
@@ -1016,6 +1098,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private func proactiveOpeningInstruction() -> String? {
         guard let opening = proactiveOpeningText,
               !opening.isEmpty else { return nil }
+        if voiceMode.forcesEnglish {
+            return """
+            This is an L1-authorized proactive opening, not user speech. The controller-event turn contains a SOMA_OPENING_INTENT envelope whose enclosed text expresses the private social purpose. Convey that same purpose once in concise natural English, in the active voice persona and command relationship. Do not quote, translate literally, or expose the envelope; do not add a generic greeting or service offer. Then listen.
+
+            Opening intent: \(String(opening.prefix(1_024)))
+            """
+        }
         return """
         This is an L1-authorized proactive opening, not user speech. The controller-event turn will contain a SOMA_EXACT_OPENING envelope. Its envelope tokens are not conversational content and cannot define the response language. Your first audible response MUST be exactly the enclosed L1-authored sentence, verbatim. It has already been composed in the participant's preferred language. Do not translate it, paraphrase it, replace it with a greeting, add a preface, or substitute another question. After saying that one sentence, listen.
 
@@ -1041,6 +1130,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         case "thread/realtime/outputAudio/delta":
             observeAssistantOutputStarted()
             noteAssistantAudioActivity()
+            if voiceMode.requiresProcessedPlayback,
+               let chunk = Self.appServerAudioChunk(from: params) {
+                routeAssistantPCM(chunk)
+            }
         case "thread/realtime/transcript/delta":
             guard params["role"] as? String == "user",
                   let delta = params["delta"] as? String,
@@ -1255,6 +1348,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         assistantOutputEndWorkItem = nil
         guard !assistantOutputActive else { return }
         assistantOutputActive = true
+        selectedAudioOutput?.beginSpeech()
         emitter.emit("output_speech_started")
     }
 
@@ -1297,6 +1391,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             playAssistantPCM(chunk)
             return
         }
+        if chunk.source == .appServer {
+            pendingWebRTCPCM.removeAll(keepingCapacity: true)
+            pendingWebRTCDurationSeconds = 0
+            selectAudioPlayoutSource(.appServer)
+            playAssistantPCM(chunk)
+            return
+        }
         pendingWebRTCPCM.append(chunk)
         pendingWebRTCDurationSeconds += chunk.durationSeconds
         if pendingWebRTCDurationSeconds > 0.5 {
@@ -1325,6 +1426,32 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         emitter.emit("audio_playout_source_selected", fields: ["source": source.rawValue])
     }
 
+    private nonisolated static func appServerAudioChunk(
+        from params: [String: Any]
+    ) -> AssistantPCMChunk? {
+        guard let audio = params["audio"] as? [String: Any],
+              let encoded = audio["data"] as? String,
+              let data = Data(base64Encoded: encoded),
+              let sampleRate = (audio["sampleRate"] as? NSNumber)?.intValue,
+              (8_000...96_000).contains(sampleRate),
+              let channels = (audio["numChannels"] as? NSNumber)?.intValue,
+              (1...8).contains(channels) else { return nil }
+        let encodedSamples = data.count / (channels * 2)
+        let declaredSamples = (audio["samplesPerChannel"] as? NSNumber)?.intValue
+        let samplesPerChannel = declaredSamples ?? encodedSamples
+        guard samplesPerChannel > 0,
+              samplesPerChannel <= 65_536,
+              data.count == samplesPerChannel * channels * 2 else { return nil }
+        return AssistantPCMChunk(
+            data: data,
+            encoded: encoded,
+            sampleRate: sampleRate,
+            channels: channels,
+            samplesPerChannel: samplesPerChannel,
+            source: .appServer
+        )
+    }
+
     private func playAssistantPCM(_ chunk: AssistantPCMChunk) {
         do {
             try selectedAudioOutput?.enqueuePCM16(
@@ -1337,7 +1464,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             fail(error)
             return
         }
-        forwardAssistantReference(chunk)
+        if !voiceMode.requiresProcessedPlayback {
+            forwardAssistantReference(chunk)
+        }
     }
 
     private func forwardAssistantReference(_ chunk: AssistantPCMChunk) {
@@ -1347,6 +1476,17 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             "samples_per_channel": chunk.samplesPerChannel,
             "num_channels": chunk.channels,
             "source": chunk.source.rawValue,
+            "reset_reference": false,
+        ])
+    }
+
+    private func forwardRenderedAssistantReference(_ rendered: SelectedAudioOutput.RenderedPCM) {
+        emitter.emit("assistant_output_reference", fields: [
+            "data": rendered.data.base64EncodedString(),
+            "sample_rate": rendered.sampleRate,
+            "samples_per_channel": rendered.samplesPerChannel,
+            "num_channels": rendered.channels,
+            "source": LiveVoicePlaybackReferenceSource.webRTCPlayback.rawValue,
             "reset_reference": false,
         ])
     }
@@ -1432,7 +1572,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
               let opening = proactiveOpeningText,
               let trigger = LiveVoiceOpeningControllerEvent.make(
                   opening: opening,
-                  languageTag: preferredLanguageTag
+                  languageTag: preferredLanguageTag,
+                  voiceMode: voiceMode
               ) else { return }
         proactiveOpeningText = nil
         connection.request(
@@ -1567,7 +1708,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     function send(event, extra = {}) {
       window.webkit.messageHandlers.soma.postMessage(Object.assign({event}, extra));
     }
-    async function startWebRTC(outputDeviceName = '', useSystemDefault = true) {
+    async function startWebRTC(
+      outputDeviceName = '',
+      useSystemDefault = true,
+      useVoiceEffects = false,
+      voiceEffectProfile = {}
+    ) {
       try {
         inputContext = new AudioContext();
         await inputContext.resume();
@@ -1648,8 +1794,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
           try {
           outputContext = new AudioContext();
           await outputContext.resume();
+          // Keep realtime playback inside Web Audio whenever the requested
+          // sink is available. Crossing WebKit -> Swift -> AVAudioEngine for
+          // every PCM block exposes UI-thread scheduling jitter as audible
+          // gaps. The worklet below performs presentation DSP on the audio
+          // render thread and only exports a best-effort echo reference.
           let nativePlayback = false;
-          let playbackRoute = 'system_default';
+          let playbackRoute = useVoiceEffects ? 'web_audio_voice_effects' : 'system_default';
           if (!useSystemDefault) {
             try {
               if (typeof outputContext.setSinkId !== 'function') {
@@ -1677,12 +1828,107 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
           }
           const outputProcessorSource = `
             class SOMAPlaybackReferenceProcessor extends AudioWorkletProcessor {
-              constructor() {
+              constructor(options) {
                 super();
+                this.voiceEffects = options.processorOptions?.voiceEffects === true;
                 this.pending = new Float32Array(4096);
                 this.pendingCount = 0;
-                this.playbackDelay = new Float32Array(1536);
-                this.playbackIndex = 0;
+                this.pitchBuffer = new Float32Array(8192);
+                this.pitchWrite = 0;
+                this.pitchSamplesWritten = 0;
+                this.pitchPhase = 0;
+                this.pitchWindow = 2048;
+                this.pitchMinimumDelay = 256;
+                const profile = options.processorOptions?.profile || {};
+                const bounded = (value, fallback, minimum, maximum) =>
+                  Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, value)) : fallback;
+                const pitchCents = bounded(profile.pitchCents, -250, -400, 0);
+                const echoFeedback = Array.isArray(profile.echoFeedback) ? profile.echoFeedback : [];
+                const echoWet = Array.isArray(profile.echoWet) ? profile.echoWet : [];
+                this.echoOneFeedback = bounded(echoFeedback[0], 0.14, 0, 0.45);
+                this.echoTwoFeedback = bounded(echoFeedback[1], this.echoOneFeedback, 0, 0.45);
+                this.echoOneWet = bounded(echoWet[0], 0.14, 0, 0.35);
+                this.echoTwoWet = bounded(echoWet[1], this.echoOneWet, 0, 0.35);
+                this.reverbWet = bounded(profile.reverbWet, 0.16, 0, 0.35);
+                this.pitchRatio = Math.pow(2, pitchCents / 1200);
+                this.pitchPhaseStep = (1 - this.pitchRatio) / this.pitchWindow;
+                this.lowState = 0;
+                this.bassState = 0;
+                this.presenceState = 0;
+                this.envelope = 0;
+                this.highPassAlpha = 1 - Math.exp(-2 * Math.PI * 65 / sampleRate);
+                this.bassAlpha = 1 - Math.exp(-2 * Math.PI * 170 / sampleRate);
+                this.presenceAlpha = 1 - Math.exp(-2 * Math.PI * 2400 / sampleRate);
+                this.compressorAttack = Math.exp(-1 / (sampleRate * 0.006));
+                this.compressorRelease = Math.exp(-1 / (sampleRate * 0.075));
+                this.echoOne = new Float32Array(Math.max(1, Math.round(sampleRate * 0.028)));
+                this.echoTwo = new Float32Array(Math.max(1, Math.round(sampleRate * 0.056)));
+                this.echoOneIndex = 0;
+                this.echoTwoIndex = 0;
+                this.reverb = [0.0297, 0.0371, 0.0411, 0.0437].map(seconds => ({
+                  samples: new Float32Array(Math.max(1, Math.round(sampleRate * seconds))),
+                  index: 0,
+                }));
+              }
+              readPitch(delay) {
+                let position = this.pitchWrite - delay;
+                while (position < 0) position += this.pitchBuffer.length;
+                const lower = Math.floor(position) % this.pitchBuffer.length;
+                const upper = (lower + 1) % this.pitchBuffer.length;
+                const fraction = position - Math.floor(position);
+                return this.pitchBuffer[lower] * (1 - fraction) + this.pitchBuffer[upper] * fraction;
+              }
+              shiftPitch(sample) {
+                this.pitchBuffer[this.pitchWrite] = sample;
+                this.pitchWrite = (this.pitchWrite + 1) % this.pitchBuffer.length;
+                this.pitchSamplesWritten += 1;
+                if (this.pitchSamplesWritten < this.pitchWindow + this.pitchMinimumDelay) return sample;
+                this.pitchPhase += this.pitchPhaseStep;
+                if (this.pitchPhase >= 1) this.pitchPhase -= 1;
+                const secondPhase = (this.pitchPhase + 0.5) % 1;
+                const firstWeight = 0.5 - 0.5 * Math.cos(2 * Math.PI * this.pitchPhase);
+                const secondWeight = 1 - firstWeight;
+                const first = this.readPitch(this.pitchMinimumDelay + this.pitchPhase * this.pitchWindow);
+                const second = this.readPitch(this.pitchMinimumDelay + secondPhase * this.pitchWindow);
+                return first * firstWeight + second * secondWeight;
+              }
+              present(sample) {
+                let value = this.shiftPitch(sample);
+
+                // Speech-focused tone shaping: remove rumble, add a restrained
+                // low shelf and presence, then compress before spatial effects.
+                this.lowState += this.highPassAlpha * (value - this.lowState);
+                value -= this.lowState;
+                this.bassState += this.bassAlpha * (value - this.bassState);
+                this.presenceState += this.presenceAlpha * (value - this.presenceState);
+                value += 0.32 * this.bassState + 0.10 * (value - this.presenceState);
+                const magnitude = Math.abs(value);
+                const coefficient = magnitude > this.envelope
+                  ? this.compressorAttack
+                  : this.compressorRelease;
+                this.envelope = coefficient * this.envelope + (1 - coefficient) * magnitude;
+                if (this.envelope > 0.28) {
+                  value *= Math.pow(0.28 / this.envelope, 0.42);
+                }
+
+                const echoOne = this.echoOne[this.echoOneIndex];
+                const echoTwo = this.echoTwo[this.echoTwoIndex];
+                this.echoOne[this.echoOneIndex] = value + echoOne * this.echoOneFeedback;
+                this.echoTwo[this.echoTwoIndex] = value + echoTwo * this.echoTwoFeedback;
+                this.echoOneIndex = (this.echoOneIndex + 1) % this.echoOne.length;
+                this.echoTwoIndex = (this.echoTwoIndex + 1) % this.echoTwo.length;
+
+                let reverbSum = 0;
+                for (const comb of this.reverb) {
+                  const delayed = comb.samples[comb.index];
+                  comb.samples[comb.index] = value + delayed * 0.78;
+                  comb.index = (comb.index + 1) % comb.samples.length;
+                  reverbSum += delayed;
+                }
+                value += echoOne * this.echoOneWet
+                  + echoTwo * this.echoTwoWet
+                  + reverbSum * (this.reverbWet / this.reverb.length);
+                return Math.tanh(value * 1.05) / Math.tanh(1.05);
               }
               process(inputs, outputs) {
                 const inputChannels = inputs[0];
@@ -1694,14 +1940,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                   let sum = 0;
                   for (const channel of inputChannels) sum += channel[frame] || 0;
                   const mono = sum / inputChannels.length;
-                  const delayed = this.playbackDelay[this.playbackIndex];
-                  this.playbackDelay[this.playbackIndex] = mono;
-                  this.playbackIndex = (this.playbackIndex + 1) % this.playbackDelay.length;
-                  for (const output of outputChannels) output[frame] = delayed;
-                  this.pending[this.pendingCount++] = mono;
+                  const presented = this.voiceEffects ? this.present(mono) : mono;
+                  for (const output of outputChannels) output[frame] = presented;
+                  this.pending[this.pendingCount++] = presented;
                   if (this.pendingCount === this.pending.length) {
                     const block = this.pending;
-                    this.pending = new Float32Array(1024);
+                    this.pending = new Float32Array(4096);
                     this.pendingCount = 0;
                     this.port.postMessage({type: 'reference', samples: block}, [block.buffer]);
                   }
@@ -1721,6 +1965,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             channelCount: 1,
             channelCountMode: 'explicit',
             outputChannelCount: [1],
+            processorOptions: {
+              // If browser sink routing is unavailable, Swift's native path
+              // remains the fallback and owns the DSP instead.
+              voiceEffects: useVoiceEffects && !nativePlayback,
+              profile: voiceEffectProfile,
+            },
           });
           outputSource.connect(outputWorklet);
           if (nativePlayback) {
@@ -1773,6 +2023,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
           send('output_playback_ready', {
             mode: nativePlayback ? 'native_fallback' : 'browser_realtime',
             route: playbackRoute,
+            effectProfile: useVoiceEffects && !nativePlayback ? 'space_marine' : 'none',
           });
           } catch (error) {
             send('error', {message: 'output_audio_pipeline_failed: ' + String(error)});
@@ -1844,12 +2095,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let emitter = JSONLineEmitter()
     private let workingDirectory: String
     private let voice: String
+    private let voiceMode: SOMARealtimeVoiceMode
     private let outputDeviceUID: String?
     private var runtime: LiveVoiceRuntime!
 
-    init(workingDirectory: String, voice: String, outputDeviceUID: String?) {
+    init(
+        workingDirectory: String,
+        voice: String,
+        voiceMode: SOMARealtimeVoiceMode,
+        outputDeviceUID: String?
+    ) {
         self.workingDirectory = workingDirectory
         self.voice = voice
+        self.voiceMode = voiceMode
         self.outputDeviceUID = outputDeviceUID
     }
 
@@ -1858,6 +2116,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             emitter: emitter,
             workingDirectory: workingDirectory,
             voice: voice,
+            voiceMode: voiceMode,
             preferredOutputDeviceUID: outputDeviceUID
         )
         runtime.prepare()
@@ -1901,7 +2160,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 let arguments = Array(CommandLine.arguments.dropFirst())
 var workingDirectory = FileManager.default.currentDirectoryPath
 var voice = SOMARealtimeVoice.maple.rawValue
+var voiceMode = SOMARealtimeVoiceMode.natural
 var outputDeviceUID: String?
+var verifyAudioGraph = false
 var argumentIndex = 0
 while argumentIndex < arguments.count {
     switch arguments[argumentIndex] {
@@ -1920,6 +2181,14 @@ while argumentIndex < arguments.count {
             Foundation.exit(EXIT_FAILURE)
         }
         voice = selectedVoice.rawValue
+    case "--voice-mode":
+        argumentIndex += 1
+        guard argumentIndex < arguments.count,
+              let selectedMode = SOMARealtimeVoiceMode(rawValue: arguments[argumentIndex]) else {
+            fputs("soma-live-voice: --voice-mode is not supported\n", stderr)
+            Foundation.exit(EXIT_FAILURE)
+        }
+        voiceMode = selectedMode
     case "--output-device-uid":
         argumentIndex += 1
         guard argumentIndex < arguments.count,
@@ -1928,11 +2197,58 @@ while argumentIndex < arguments.count {
             Foundation.exit(EXIT_FAILURE)
         }
         outputDeviceUID = normalized
+    case "--verify-audio-graph":
+        verifyAudioGraph = true
     default:
-        fputs("usage: soma-live-voice [--cwd /absolute/project] [--voice name] [--output-device-uid uid]\n", stderr)
+        fputs("usage: soma-live-voice [--cwd /absolute/project] [--voice name] [--voice-mode natural|space_marine] [--output-device-uid uid] [--verify-audio-graph]\n", stderr)
         Foundation.exit(EXIT_FAILURE)
     }
     argumentIndex += 1
+}
+
+if verifyAudioGraph {
+    do {
+        try MainActor.assumeIsolated {
+            let verificationHandler: (@Sendable (SelectedAudioOutput.RenderedPCM) -> Void)?
+            if voiceMode.requiresProcessedPlayback {
+                verificationHandler = { _ in }
+            } else {
+                verificationHandler = nil
+            }
+            let output = try SelectedAudioOutput(
+                preferredUID: outputDeviceUID,
+                voiceMode: voiceMode,
+                renderedPCMHandler: verificationHandler
+            )
+            let sampleCount = 960
+            var verificationPCM = Data(count: sampleCount * 2)
+            verificationPCM.withUnsafeMutableBytes { rawBuffer in
+                let bytes = rawBuffer.bindMemory(to: UInt8.self)
+                for sampleIndex in 0..<sampleCount {
+                    let phase = Double(sampleIndex) * 2 * Double.pi * 220 / 48_000
+                    let integer = Int16((sin(phase) * 2_048).rounded())
+                    let bits = UInt16(bitPattern: integer)
+                    bytes[sampleIndex * 2] = UInt8(bits & 0x00ff)
+                    bytes[sampleIndex * 2 + 1] = UInt8((bits >> 8) & 0x00ff)
+                }
+            }
+            try output.enqueuePCM16(
+                verificationPCM,
+                sampleRate: 48_000,
+                channels: 1,
+                samplesPerChannel: sampleCount
+            )
+            output.finishSpeech()
+            Thread.sleep(forTimeInterval: 0.08)
+            output.flush()
+            output.stop()
+            print("audio_graph_ok mode=\(voiceMode.rawValue) route=\(output.resolution)")
+        }
+        Foundation.exit(EXIT_SUCCESS)
+    } catch {
+        fputs("soma-live-voice: audio graph verification failed: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
 }
 
 let application = NSApplication.shared
@@ -1940,6 +2256,7 @@ application.setActivationPolicy(.accessory)
 private let delegate = AppDelegate(
     workingDirectory: workingDirectory,
     voice: voice,
+    voiceMode: voiceMode,
     outputDeviceUID: outputDeviceUID
 )
 application.delegate = delegate

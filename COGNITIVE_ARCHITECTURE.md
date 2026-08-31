@@ -12,17 +12,19 @@ not imply that a language model is part of the real-time control loop.
 | Layer | Primary implementation | Responsibility | Authority |
 | --- | --- | --- | --- |
 | L0 subconscious | Local Core ML, temporal fusion, and deterministic control | Continuous perception, target continuity, VAD, spatial coverage, immediate motor control, and interaction-readiness evidence | Sole executor of hard real-time device commands and physical vetoes; supplies autonomous behaviour when no cognitive lease is active |
-| L1a persistent thought stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Evidence-grounded hypothesis maintenance, memory association, curiosity, self-correction, intentions, and foreground-thought competition | May request bounded visual context and form an abstract intention; cannot speak or control the gimbal |
+| L1a persistent thought stream | Primary `gemma4:31b-cloud` plus optional local E2B semantic helper | Evidence-grounded hypothesis maintenance, memory association, curiosity, self-correction, intentions, foreground-thought competition, and current-turn tool advice | May request bounded visual context and form an abstract intention or tool advisory; cannot execute a tool, speak, or control the gimbal |
 | L1b executive judgment | A separate call to the same `gemma4:31b-cloud` route | Decides whether one current intention should become one currently permitted social or attention action | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends device velocity directly |
 | L2 human interaction and executive reasoning | Codex account session with app-server GPT-Live WebRTC; explicit local fallback | Conversation, high-order reasoning, tool use, and delegation of user-requested external work | Opens directly from authorized L0 contact evidence, or from an L1-approved proactive opening; neither route waits on the other. It receives scoped text context, may pull image context through Codex/MCP, uses leased embodiment goals when observation or expression is needed, and may delegate explicit administrator work to the durable Hermes worker queue |
 
 The fast 31B cloud route is the primary L1 stream and may run frequently while
-human or task context is active. E2B is a local visual helper within that same
+human or task context is active. E2B is a local semantic helper within that same
 stream, not an independent L0.5 consciousness or motor owner. L1 may invoke it
 when remote image disclosure is disallowed or a provisional local sketch is
 useful. E2B results remain provisional until the primary L1 cycle accepts or
-revises them. E2B produces normalized workspace evidence rather than calling
-Gemma or issuing an action itself.
+revises them. During Live Voice, the same single-flight E2B worker can also
+recommend one currently available MCP tool for the active participant turn;
+the recommendation is validated and L2 retains execution authority. E2B
+produces normalized evidence or advice rather than issuing an action itself.
 
 The running `gemma4:31b-cloud` adapter uses Ollama's local `/api/chat`
 transport to reach the selected cloud route. One priority queue permits exactly
@@ -43,7 +45,7 @@ route-planning question, but it is never routine conversational context.
 flowchart LR
     Sensors["Camera and microphone"] --> L0["L0 perception and motor control"]
     L0 --> Evidence["Normalized evidence"]
-    Helper["Local E2B visual helper"] --> Evidence
+    Helper["Local E2B semantic helper"] --> Evidence
     Evidence --> Workspace["Persistent mental workspace"]
     Memory["Short, medium, and long-term memory"] <--> Workspace
     Workspace --> L1A["L1a thought update"]
@@ -883,7 +885,7 @@ Official implementation references:
 | Milestone | Status | Acceptance evidence |
 | --- | --- | --- |
 | C0 L0 embodied baseline | Implemented; physical behaviour tuning continues | Bounded local perception/control traces, owner arbitration, and existing core checks |
-| C1 E2B L1 visual helper | Worker implemented; opt-in for visual audit | Direct-MLX bounded worker is advisory, consumes substantial unified memory, and has no independent layer or motor lease |
+| C1 E2B L1 semantic helper | Worker implemented; opt-in with visual evidence and current-turn tool advice sharing one queue | Direct-MLX bounded worker is advisory, consumes substantial unified memory, and has no independent layer, tool authority, or motor lease |
 | C2 Memory contracts and store | Core, encrypted runtime store, L1 read projection, and finalized Live-turn ingestion implemented; consolidation remains pending | Versioned schemas, exact encrypted local L2 turns, L1 consolidation links, provenance/consent validator, encrypted short/medium/long store, correction, deletion, policy-filtered remote projection, and replay checks |
 | C3 Event-importance router | Core implemented; deployment labels and shadow integration pending | Versioned route probabilities, direct L2 interaction dispatch plus parallel L1 context, interaction/safety policy masks, 32-row bootstrap contract, calibration and false/missed-wake report; real labelled corpus still required |
 | C4 31B L1 conscious stream | Persistent workspace, separate L1a/L1b calls, adaptive stochastic reflection, selective restore, and installed cutover implemented; long soak and physical scenario matrix remain | Idempotent semantic evidence reduction, hypothesis lifecycle and confidence decay, canonical relationship uncertainty, seeded foreground competition, executive-first single-flight queue, revision-bound decisions, intention-episode idempotence, encrypted bounded checkpoint, and stale transient-state reset |

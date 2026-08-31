@@ -6,7 +6,17 @@ enum AppServerLiveVoiceEvent: Sendable {
     case active(threadID: String?, personEntityID: UUID?)
     case inputTransportStarted
     case inputBootstrapReplayed(durationMilliseconds: Double, peakDBFS: Double, maximumGainDB: Double)
-    case outputPlaybackReady(mode: String, route: String)
+    case outputPlaybackReady(mode: String, route: String, effectProfile: String)
+    case audioPlayoutSourceSelected(source: String)
+    case audioPlayoutStatus(
+        state: String,
+        sampleRate: Int,
+        channels: Int,
+        chunkDurationMilliseconds: Double,
+        arrivalGapMilliseconds: Double?,
+        queuedDurationMilliseconds: Double,
+        underruns: Int
+    )
     case naturalTurnTakingConfirmed
     case responseInterrupted
     case interruptedAudioCleared
@@ -61,6 +71,13 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let resetReference: Bool?
     let mode: String?
     let route: String?
+    let effectProfile: String?
+    let source: String?
+    let state: String?
+    let chunkDurationMilliseconds: Double?
+    let arrivalGapMilliseconds: Double?
+    let queuedDurationMilliseconds: Double?
+    let underruns: Int?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -80,6 +97,13 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case resetReference = "reset_reference"
         case mode
         case route
+        case effectProfile = "effect_profile"
+        case source
+        case state
+        case chunkDurationMilliseconds = "chunk_duration_ms"
+        case arrivalGapMilliseconds = "arrival_gap_ms"
+        case queuedDurationMilliseconds = "queued_ms"
+        case underruns
     }
 }
 
@@ -115,6 +139,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "soma.live-voice.app-server", qos: .userInitiated)
     private let projectDirectory: String
     private let voice: SOMARealtimeVoice
+    private let voiceMode: SOMARealtimeVoiceMode
     private let audioOutputDeviceUID: String?
     private let currentCameraImageDataURI: (@Sendable () -> String?)?
     private let embodimentSocketURL: URL?
@@ -146,6 +171,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var duplexCaptureGate = LiveVoiceDuplexCaptureGate()
     private var echoReferenceMatcher = LiveVoiceEchoReferenceMatcher()
     private var acousticBargeInGate = LiveVoiceAcousticBargeInGate()
+    private var bargeInEpisodeBoundary = LiveVoiceBargeInEpisodeBoundary()
     private var lastEchoRelationship: LiveVoiceEchoRelationship?
     private var outputReferenceReported = false
     private var duplexEpisodeInProgress = false
@@ -168,6 +194,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var latestUserTranscriptNS: UInt64?
     private var latestUserTranscript = ""
     private var assistantOutputStartedForTurn = false
+    private var assistantResponseInProgress = false
+    private var assistantPlaybackActive = false
     private var initialTurnValidation: LiveVoiceInitialTurnValidation
     private var proactiveOpeningAwaitingParticipant = false
     private var proactiveOpeningDelivered = false
@@ -177,6 +205,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     init(
         projectDirectory: String? = nil,
         voice: SOMARealtimeVoice = .maple,
+        voiceMode: SOMARealtimeVoiceMode = .natural,
         audioOutputDeviceUID: String? = nil,
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         embodimentSocketURL: URL? = nil,
@@ -196,6 +225,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             ?? ProcessInfo.processInfo.environment["SOMA_ROOT"]
             ?? FileManager.default.currentDirectoryPath
         self.voice = voice
+        self.voiceMode = voiceMode
         self.audioOutputDeviceUID = SOMAControlSettings.normalizedDeviceUID(audioOutputDeviceUID)
         self.currentCameraImageDataURI = currentCameraImageDataURI
         self.embodimentSocketURL = embodimentSocketURL
@@ -370,6 +400,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         _ active: Bool,
         admitted: Bool = true,
         duplexSpeakerVerified: Bool = false,
+        duplexSpeakerEvidenceNS: UInt64? = nil,
         discardBufferedEpisode: Bool = false,
         onsetCaptureNS: UInt64? = nil,
         assessedThroughCaptureNS: UInt64? = nil,
@@ -385,9 +416,15 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             let duplexVerificationRequired = self.active
                 && duplexCaptureGate.requiresParticipantVerification(at: monotonicNS)
             duplexSpeechActive = active
+            if active, let onsetCaptureNS {
+                bargeInEpisodeBoundary.observeSpeechOnset(at: onsetCaptureNS)
+            }
             duplexSpeakerCandidateVerified = active
                 && duplexSpeakerVerified
                 && !discardBufferedEpisode
+                && (!duplexVerificationRequired || bargeInEpisodeBoundary.admitsSpeakerEvidence(
+                    observedAt: duplexSpeakerEvidenceNS
+                ))
             if active,
                let onsetCaptureNS,
                (!self.active || requireVerifiedSpeakerForEveryTurn || duplexVerificationRequired) {
@@ -614,6 +651,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private func resetDuplexCaptureState() {
         duplexCaptureGate.reset()
         acousticBargeInGate.reset()
+        bargeInEpisodeBoundary.reset()
         duplexEpisodeInProgress = false
         duplexEpisodeAdmitted = false
         duplexSpeechActive = false
@@ -625,6 +663,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeTurnAudioAdmitted = false
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
+        assistantResponseInProgress = false
+        assistantPlaybackActive = false
         initialTurnValidation.reset()
         speakerEpisodeAudio.end(keepingCapacity: keepingAudioCapacity)
         speakerEpisodeInProgress = false
@@ -819,6 +859,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         latestUserTranscriptNS = nil
         latestUserTranscript = ""
         assistantOutputStartedForTurn = false
+        assistantResponseInProgress = false
+        assistantPlaybackActive = false
         inputLeveler.reset()
         resetDuplexCaptureState()
         activeTurnAudioAdmitted = false
@@ -862,7 +904,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         process.executableURL = helperURL
-        process.arguments = ["--cwd", projectDirectory, "--voice", voice.rawValue]
+        process.arguments = [
+            "--cwd", projectDirectory,
+            "--voice", voice.rawValue,
+            "--voice-mode", voiceMode.rawValue,
+        ]
         if let audioOutputDeviceUID {
             process.arguments?.append(contentsOf: ["--output-device-uid", audioOutputDeviceUID])
         }
@@ -916,14 +962,20 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activeSessionCapability = sessionCapability
         generation &+= 1
         let launchGeneration = generation
+        let effectivePreferredLanguageTag = voiceMode.forcesEnglish
+            ? "en"
+            : (preferredLanguageTag ?? "")
+        let effectiveLanguageStartInstruction = voiceMode.forcesEnglish
+            ? ""
+            : (languageStartInstruction ?? "")
         guard send([
             "type": "start",
             "initialContext": String(initialContext.prefix(24_000)),
             "sessionCapability": sessionCapability ?? "",
             "embodimentSocketPath": embodimentSocketURL?.path ?? "",
             "appServerURL": persistentEndpoint?.absoluteString ?? "",
-            "preferredLanguageTag": preferredLanguageTag ?? "",
-            "languageStartInstruction": languageStartInstruction ?? "",
+            "preferredLanguageTag": effectivePreferredLanguageTag,
+            "languageStartInstruction": effectiveLanguageStartInstruction,
             "proactiveOpeningText": proactiveOpeningText ?? "",
             "interactionAuthority": interactionAuthority?.rawValue ?? "",
             "personContextReference": personContextReference?.uuidString.lowercased() ?? "",
@@ -1008,13 +1060,30 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             case "output_playback_ready":
                 onEvent(.outputPlaybackReady(
                     mode: String((event.mode ?? "unknown").prefix(64)),
-                    route: String((event.route ?? "unknown").prefix(128))
+                    route: String((event.route ?? "unknown").prefix(128)),
+                    effectProfile: String((event.effectProfile ?? "none").prefix(64))
+                ))
+            case "audio_playout_source_selected":
+                onEvent(.audioPlayoutSourceSelected(
+                    source: String((event.source ?? "unknown").prefix(64))
+                ))
+            case "audio_playout_status":
+                onEvent(.audioPlayoutStatus(
+                    state: String((event.state ?? "unknown").prefix(64)),
+                    sampleRate: max(0, event.sampleRate ?? 0),
+                    channels: max(0, event.numChannels ?? 0),
+                    chunkDurationMilliseconds: max(0, event.chunkDurationMilliseconds ?? 0),
+                    arrivalGapMilliseconds: event.arrivalGapMilliseconds,
+                    queuedDurationMilliseconds: max(0, event.queuedDurationMilliseconds ?? 0),
+                    underruns: max(0, event.underruns ?? 0)
                 ))
             case "natural_turn_taking_confirmed":
                 onEvent(.naturalTurnTakingConfirmed)
             case "response_interrupted":
+                finishAssistantGeneration(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.responseInterrupted)
             case "interrupted_audio_cleared":
+                finishAssistantPlayback(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.interruptedAudioCleared)
             case "proactive_opening_triggered":
                 onEvent(.proactiveOpeningTriggered)
@@ -1113,6 +1182,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     _ = closeSession(reason: "participant_input_unconfirmed_before_response")
                     continue
                 }
+                beginAssistantGeneration()
                 onEvent(.preparingResponse)
             case "output_speech_started":
                 if !initialTurnValidation.permitsAssistantResponse {
@@ -1123,7 +1193,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 lastEchoRelationship = nil
                 outputReferenceReported = false
                 assistantOutputStartedForTurn = true
-                duplexCaptureGate.beginAssistantOutput(at: DispatchTime.now().uptimeNanoseconds)
+                let outputStartedNS = DispatchTime.now().uptimeNanoseconds
+                beginAssistantPlayback()
+                duplexCaptureGate.beginAssistantOutput(at: outputStartedNS)
+                bargeInEpisodeBoundary.beginAssistantOutput(at: outputStartedNS)
                 onEvent(.microphoneCaptureSuppressed)
                 onEvent(.assistantSpeechStarted)
                 if let latestUserTranscriptNS {
@@ -1138,7 +1211,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 }
                 onEvent(.responding)
             case "output_speech_ended":
-                duplexCaptureGate.endAssistantOutput(at: DispatchTime.now().uptimeNanoseconds)
+                let outputEndedNS = DispatchTime.now().uptimeNanoseconds
+                duplexCaptureGate.endAssistantOutput(at: outputEndedNS)
+                bargeInEpisodeBoundary.endAssistantOutput()
+                finishAssistantPlayback(at: outputEndedNS)
                 onEvent(.assistantSpeechEnded)
             case "assistant_output_reference":
                 guard let data = event.data,
@@ -1171,7 +1247,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 // Generation can complete before the remote playback buffer
                 // drains, so microphone capture resumes only when playback
                 // reports output_speech_ended.
-                finishAssistantResponseIfNeeded()
+                finishAssistantResponseIfNeeded(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.responseCompleted)
             case "ended":
                 guard active || gate.phase == .starting else { continue }
@@ -1254,10 +1330,46 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         armInactivityTimeout(at: monotonicNS)
     }
 
-    private func finishAssistantResponseIfNeeded() {
-        guard awaitingAssistantResponse else { return }
-        awaitingAssistantResponse = false
-        latestUserTranscriptNS = nil
+    private func beginAssistantGeneration() {
+        assistantResponseInProgress = true
+        suspendUserSilenceTimeoutForAssistant()
+    }
+
+    private func beginAssistantPlayback() {
+        assistantPlaybackActive = true
+        suspendUserSilenceTimeoutForAssistant()
+    }
+
+    private func finishAssistantGeneration(at monotonicNS: UInt64) {
+        assistantResponseInProgress = false
+        resumeUserSilenceTimeoutIfAssistantIdle(at: monotonicNS)
+    }
+
+    private func finishAssistantPlayback(at monotonicNS: UInt64) {
+        assistantPlaybackActive = false
+        resumeUserSilenceTimeoutIfAssistantIdle(at: monotonicNS)
+    }
+
+    private func finishAssistantResponseIfNeeded(at monotonicNS: UInt64) {
+        if awaitingAssistantResponse {
+            awaitingAssistantResponse = false
+            latestUserTranscriptNS = nil
+        }
+        finishAssistantGeneration(at: monotonicNS)
+    }
+
+    private func suspendUserSilenceTimeoutForAssistant() {
+        guard active, inactivityGate.beginAssistantActivity() else { return }
+        inactivityTimer?.cancel()
+        inactivityTimer = nil
+    }
+
+    private func resumeUserSilenceTimeoutIfAssistantIdle(at monotonicNS: UInt64) {
+        guard active,
+              !assistantResponseInProgress,
+              !assistantPlaybackActive,
+              inactivityGate.endAssistantActivity(at: monotonicNS) != nil else { return }
+        armInactivityTimeout(at: monotonicNS)
     }
 
     private func elapsedMilliseconds(from earlier: UInt64, to later: UInt64) -> Double {
@@ -1460,6 +1572,7 @@ func testAppServerLiveVoiceLauncher() -> String {
             result.fail(reason)
             semaphore.signal()
         case .launchRequested, .inputTransportStarted, .outputPlaybackReady,
+             .audioPlayoutSourceSelected, .audioPlayoutStatus,
              .inputBootstrapReplayed,
              .responseInterrupted, .interruptedAudioCleared, .proactiveOpeningTriggered,
              .proactiveOpeningExtraOutputSuppressed, .hermesReportOfferStarted, .hearingUser,

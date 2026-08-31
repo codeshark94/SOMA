@@ -51,7 +51,7 @@ public struct LiveVoiceAcousticBargeInGate: Sendable {
     private var independentSinceNS: UInt64?
     private var admitted = false
 
-    public init(requiredIndependentMilliseconds: UInt64 = 320) {
+    public init(requiredIndependentMilliseconds: UInt64 = 500) {
         precondition(requiredIndependentMilliseconds > 0)
         precondition(requiredIndependentMilliseconds <= UInt64.max / 1_000_000)
         requiredIndependentNS = requiredIndependentMilliseconds * 1_000_000
@@ -101,6 +101,44 @@ public struct LiveVoiceAcousticBargeInGate: Sendable {
     public mutating func reset() {
         independentSinceNS = nil
         admitted = false
+    }
+}
+
+/// Binds an interruption to a new speech onset inside the current assistant
+/// output episode. Speech that opened the turn can still be active when the
+/// model begins responding; its detector tail is not a participant barge-in.
+public struct LiveVoiceBargeInEpisodeBoundary: Equatable, Sendable {
+    private var assistantOutputStartedNS: UInt64?
+    public private(set) var hasNewSpeechOnset = false
+
+    public init() {}
+
+    public mutating func beginAssistantOutput(at monotonicNS: UInt64) {
+        assistantOutputStartedNS = monotonicNS
+        hasNewSpeechOnset = false
+    }
+
+    public mutating func observeSpeechOnset(at monotonicNS: UInt64) {
+        guard let assistantOutputStartedNS,
+              monotonicNS > assistantOutputStartedNS else { return }
+        hasNewSpeechOnset = true
+    }
+
+    public func admitsSpeakerEvidence(observedAt monotonicNS: UInt64?) -> Bool {
+        guard hasNewSpeechOnset,
+              let assistantOutputStartedNS,
+              let monotonicNS,
+              monotonicNS > assistantOutputStartedNS else { return false }
+        return true
+    }
+
+    public mutating func endAssistantOutput() {
+        assistantOutputStartedNS = nil
+        hasNewSpeechOnset = false
+    }
+
+    public mutating func reset() {
+        endAssistantOutput()
     }
 }
 

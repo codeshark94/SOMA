@@ -17,6 +17,7 @@ final class SOMAControlSettingsTests: XCTestCase {
         let expected = SOMAControlSettings(
             realtimeVoiceEnabled: true,
             realtimeVoice: .maple,
+            realtimeVoiceMode: .spaceMarine,
             realtimeVoiceRequiresEyeContactForEveryTurn: true,
             realtimeVoiceSilenceTimeoutSeconds: 90,
             audioInputDeviceUID: "camera-microphone-uid",
@@ -56,6 +57,7 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: Data(legacy.utf8)
         )
         XCTAssertFalse(migrated.realtimeVoiceRequiresEyeContactForEveryTurn)
+        XCTAssertEqual(migrated.realtimeVoiceMode, .natural)
         XCTAssertEqual(migrated.realtimeVoiceSilenceTimeoutSeconds, 60)
         XCTAssertTrue(migrated.hermesAgentDelegationEnabled)
         XCTAssertNil(migrated.hermesAgentWorkspace)
@@ -76,6 +78,46 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: JSONEncoder().encode(settings)
         )
         XCTAssertEqual(bounded.realtimeVoiceSilenceTimeoutSeconds, 600)
+    }
+
+    func testSpaceMarineVoiceModePersistsAndCarriesTheReferenceDSPContract() throws {
+        let settings = SOMAControlSettings(realtimeVoiceMode: .spaceMarine)
+        let restored = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: JSONEncoder().encode(settings)
+        )
+
+        XCTAssertEqual(restored.realtimeVoiceMode, .spaceMarine)
+        XCTAssertTrue(restored.realtimeVoiceMode.forcesEnglish)
+        XCTAssertTrue(restored.realtimeVoiceMode.requiresProcessedPlayback)
+
+        let profile = SOMARealtimeVoiceDSPProfile.spaceMarine
+        XCTAssertEqual(profile.pitchCents, -250)
+        XCTAssertEqual(profile.echoStages.count, 2)
+        XCTAssertTrue(profile.echoStages.allSatisfy { $0.delaySeconds == 0.028 })
+        XCTAssertTrue(profile.echoStages.allSatisfy { $0.feedbackPercent == 14 })
+        XCTAssertTrue(profile.echoStages.allSatisfy { $0.wetDryMixPercent == 14 })
+        XCTAssertEqual(
+            profile.echoStages.first?.successiveEqualization.map(\.gain),
+            [-1.5, -0.7, 0, -0.4, -0.7, -0.9, -1.5, -1.8]
+        )
+        XCTAssertEqual(profile.compressorThreshold, -16)
+        XCTAssertEqual(profile.compressorMasterGain, 0.5)
+        XCTAssertEqual(profile.equalizerBands[1].gain, 2.5)
+        XCTAssertEqual(profile.reverbWetDryMix, 16)
+    }
+
+    func testSpaceMarinePolicyForcesEnglishAndRejectsGenericAssistantStance() {
+        let policy = SOMARealtimeVoiceMode.spaceMarine.liveVoicePolicyInstruction
+        XCTAssertNotNil(policy)
+        XCTAssertTrue(policy?.contains("speak only natural English") == true)
+        XCTAssertTrue(policy?.contains("superior commanding officer") == true)
+        XCTAssertTrue(policy?.contains("not for ordering the Commander around") == true)
+        XCTAssertTrue(policy?.contains("For the Emperor") == true)
+        XCTAssertTrue(policy?.contains("Imperium vocabulary") == true)
+        XCTAssertTrue(policy?.contains("use at most one such marker") == true)
+        XCTAssertTrue(policy?.contains("customer-service assistant") == true)
+        XCTAssertNil(SOMARealtimeVoiceMode.natural.liveVoicePolicyInstruction)
     }
 
     func testPreferredAudioRoutesPersistAndInvalidValuesBecomeAutomatic() throws {

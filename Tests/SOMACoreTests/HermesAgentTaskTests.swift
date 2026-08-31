@@ -5,6 +5,8 @@ import XCTest
 
 final class HermesAgentTaskTests: XCTestCase {
     func testEveryAdvertisedMCPToolHasAnExplicitCognitivePolicy() {
+        XCTAssertTrue(L2CognitiveToolPolicy.instruction.contains("before emitting its first audible token"))
+        XCTAssertTrue(L2CognitiveToolPolicy.instruction.contains("deliver one continuous grounded answer"))
         XCTAssertFalse(L2CognitiveToolPolicy.knownToolNames.isEmpty)
         for name in L2CognitiveToolPolicy.knownToolNames {
             XCTAssertNotNil(L2CognitiveToolPolicy.autonomy(for: name), name)

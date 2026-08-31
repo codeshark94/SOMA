@@ -497,35 +497,19 @@ swift run soma-subconscious --duration 30 \
   --l1-auxiliary-vlm-model "$HOME/Library/Application Support/SOMA/models/gemma-4-e2b-it-4bit"
 ```
 
-On the 24 GB Apple Silicon host, a three-request same-image direct-MLX
-comparison measured E2B at 1.47 s cold and 1.39 s warm median, versus E4B at
-3.00 s cold and 2.75 s warm median. The E2B checkpoint occupies 3.3 GiB instead
-of 4.8 GiB and reported a 4.20 GB MLX peak instead of 5.75 GB. E2B is therefore
-the preferred explicit helper and E4B remains a comparison fallback. Short-probe
-process RSS moved in the opposite direction—3.33 GB for E2B versus 2.31 GB for
-E4B—so this is not a claim that every memory metric improved. The person-free
-fixture stayed `ambient / none` under E2B, while E4B proposed
-`object_presentation / presented_object`; broader labelled human and object
-evaluation remains open. During an earlier concurrent E4B benchmark,
-the repaired L0 advanced 1,749 video callbacks, 700 person-model attempts,
-1,750 face-model attempts, and 1,750 vision updates during a 70-second window
-containing 20 consecutive E4B requests. Skipped frames and cumulative inference
-maxima did not increase, the L0 PID survived, and its trace recorded no runtime
-error or stall. That worker loaded in 2.79 s and its 20-request run measured a
-3.41 s cold inference and 2.79 s warm median. This is a bounded coexistence
-stress result, not permission to put semantic output in the motor path.
+On the 24 GB Apple Silicon host, a three-request same-image direct-MLX probe
+measured E2B at 1.47 s cold and 1.39 s warm median. The checkpoint occupies
+3.3 GiB and reported a 4.20 GB MLX peak. The person-free fixture stayed
+`ambient / none`; broader labelled human and object evaluation remains open.
+The worker accepts only the pinned E2B checkpoint and has no Ollama fallback.
+The same process multiplexes visual semantics and current-turn Live Voice tool
+advice on one inference queue. Tool advice precedes the next replaceable visual
+refresh; it never interrupts active inference and it has no execution authority.
 
-With the semantic-interrupt schema, an earlier E4B direct-MLX run loaded
-in 2.22 s, took 3.27 s cold and 2.65 s warm median, and consistently classified
-the person-free fixture as `ambient / none / 0.1`. The benchmark-only
-`gemma4:31b-cloud` comparison took 0.79 s cold and 0.89 s warm median on the
-same fixture. It was faster and has now been selected as the primary L1
-situational model. Its active situation-stream adapter still requires the
-memory, privacy projection, event
-router, and authority boundaries in [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md).
-The Ollama `gemma4:e4b-mlx` and `gemma4:12b-mlx` packages both returned HTTP 400
-for image input; loading them for that capability check also increased L0's
-cumulative Vision maximum, so both were unloaded and excluded.
+The selected `gemma4:31b-cloud` primary L1 situational model measured 0.79 s
+cold and 0.89 s warm median on the same fixture. Its active situation-stream
+adapter still requires the memory, privacy projection, event router, and
+authority boundaries in [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md).
 
 The earlier roughly five-minute `IOSurface` failure came from running every
 Vision request inside one long-lived GCD work item without a per-frame
@@ -537,12 +521,7 @@ keeps the direct-MLX side loop opt-in. Its first 234.34-second integrated smoke
 produced 48 semantic events, zero interrupt false positives, and zero auxiliary-worker
 runtime errors; semantic inference ranged from 2.70 to 3.25 seconds. This is
 enough for continuous development use, but it is not a multi-hour thermal
-qualification.
-The original E4B latency run is recorded in
-[l05-e4b-mlx-benchmark-20260815.json](artifacts/subconscious/l05-e4b-mlx-benchmark-20260815.json);
-the current E2B/E4B same-image decision is recorded in
-[l1-auxiliary-e2b-vs-e4b-20260815.json](artifacts/subconscious/l1-auxiliary-e2b-vs-e4b-20260815.json);
-the repaired L0 soak and 20-request coexistence window are recorded in
+qualification. The repaired L0 soak and coexistence window are recorded in
 [l0-lifetime-l05-coexistence-20260815.json](artifacts/subconscious/l0-lifetime-l05-coexistence-20260815.json).
 The interrupt feature, Ollama comparison, and integrated smoke are recorded in
 [l05-semantic-interrupt-benchmark-20260815.json](artifacts/subconscious/l05-semantic-interrupt-benchmark-20260815.json).

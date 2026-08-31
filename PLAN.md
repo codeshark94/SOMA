@@ -151,7 +151,9 @@ the evidence dissipates or the context changes. This is an L1 reconsideration
 request, not a new periodic cadence or an L0 command.
 
 E2B cannot by itself select or suppress a target, change a face lock, claim the camera owner,
-move the gimbal, speak, identify a person, retrieve memory, or invoke L1. The
+move the gimbal, speak, identify a person, retrieve memory, or invoke L1. During
+an active Live Voice session it may return one validated current-turn tool
+advisory, but L2 retains tool authority and independently admits the result. The
 shared MCP transport and running L0 arbiter accept the same leased semantic
 embodiment goals from L1 and L2—labels, attention priors, tracking, orientation,
 exploration, view alignment, and expression. The separately enabled motor
@@ -162,25 +164,18 @@ must already exist locally; no network or Ollama fallback is permitted. Direct M
 and unified memory, while L0 Core ML remains independently ANE-preferred. The
 worker has an 8 GB MLX evaluation limit and a 256 MB free-cache limit.
 
-The 2026-08-15 same-image direct-MLX comparison found E2B at 1.47 s cold and
-1.39 s warm median, versus E4B at 3.00 s cold and 2.75 s warm median. E2B's
-MLX-reported peak was 4.20 GB versus 5.75 GB, and its local checkpoint was
-3.3 GiB versus 4.8 GiB. E2B is therefore the preferred explicit helper; E4B remains a
-comparison fallback. Process RSS moved in the opposite direction in this short
-probe (3.33 GB E2B versus 2.31 GB E4B), so the decision is based on latency,
-MLX peak, disk footprint, and the bounded-worker isolation—not a claim that
-every memory metric is lower. Both remain semantic observers, not reflex or
-tracking components. The L0
+The pinned E2B checkpoint is the only supported local semantic helper. Its
+measured three-request direct-MLX latency was 1.47 s cold and 1.39 s warm
+median, with a 4.20 GB MLX-reported peak and a 3.3 GiB checkpoint. It remains a
+semantic observer, not a reflex or tracking component. The L0
 Vision worker's missing per-frame autorelease boundary was fixed and a same-PID
 898.43-second L0-only run reached 22,422 video callbacks with zero runtime
-error/stall events and bounded RSS. A following 20-request E4B stress window
-advanced L0 by 1,749 video callbacks with no new skipped frames or cumulative
-latency maxima. The persistent LaunchAgent keeps direct MLX opt-in and a first
+error/stall events and bounded RSS. The persistent LaunchAgent keeps direct MLX opt-in and a first
 234.34-second integrated smoke produced 48 semantic events, no interrupt false
 positive, and no auxiliary-worker runtime error. A longer thermal qualification remains an
-operational follow-up. The E2B/E4B semantic comparison used one person-free
-panorama fixture, so broader human and object accuracy evaluation remains open.
-Ollama is benchmark-only and never part of this runtime.
+operational follow-up. Broader labelled human and object accuracy evaluation
+remains open. Visual inference and Live Voice tool advice share one prioritized,
+single-flight E2B worker. Ollama is not part of this local semantic runtime.
 
 The persistent runtime now separates bounded forensic detail from durable
 operational history. Full scalar evidence rotates at 128 MiB with eight retained
