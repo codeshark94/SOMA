@@ -444,7 +444,7 @@ public struct SOMAAdministratorIdentity: Codable, Equatable, Sendable {
 /// User-controlled settings consumed by the local runtime at process launch.
 /// None of the fields contain face embeddings or other raw biometric material.
 public struct SOMAControlSettings: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 13
+    public static let currentSchemaVersion = 14
     public static let defaultRealtimeVoiceSilenceTimeoutSeconds = 60
     public static let realtimeVoiceSilenceTimeoutRange = 15...600
 
@@ -457,6 +457,10 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
     /// User silence closes the account-backed realtime session so an idle
     /// microphone never holds conversation resources indefinitely.
     public var realtimeVoiceSilenceTimeoutSeconds: Int
+    /// Preferred capture and playback routes. A disconnected preference is
+    /// resolved at launch to the most suitable available device.
+    public var audioInputDeviceUID: String?
+    public var audioOutputDeviceUID: String?
     /// Enables durable asynchronous work delegated by the administrator's L2
     /// session to a local Hermes Agent worker.
     public var hermesAgentDelegationEnabled: Bool
@@ -476,6 +480,8 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoice: SOMARealtimeVoice = .maple,
         realtimeVoiceRequiresEyeContactForEveryTurn: Bool = false,
         realtimeVoiceSilenceTimeoutSeconds: Int = SOMAControlSettings.defaultRealtimeVoiceSilenceTimeoutSeconds,
+        audioInputDeviceUID: String? = nil,
+        audioOutputDeviceUID: String? = nil,
         hermesAgentDelegationEnabled: Bool = true,
         hermesAgentWorkspace: String? = nil,
         led: SOMALEDSettings = .init(),
@@ -491,6 +497,8 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             max(realtimeVoiceSilenceTimeoutSeconds, Self.realtimeVoiceSilenceTimeoutRange.lowerBound),
             Self.realtimeVoiceSilenceTimeoutRange.upperBound
         )
+        self.audioInputDeviceUID = Self.normalizedDeviceUID(audioInputDeviceUID)
+        self.audioOutputDeviceUID = Self.normalizedDeviceUID(audioOutputDeviceUID)
         self.hermesAgentDelegationEnabled = hermesAgentDelegationEnabled
         self.hermesAgentWorkspace = Self.normalizedAbsolutePath(hermesAgentWorkspace)
         self.led = led
@@ -507,6 +515,8 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         case realtimeVoice
         case realtimeVoiceRequiresEyeContactForEveryTurn
         case realtimeVoiceSilenceTimeoutSeconds
+        case audioInputDeviceUID
+        case audioOutputDeviceUID
         case hermesAgentDelegationEnabled
         case hermesAgentWorkspace
         case led
@@ -536,6 +546,12 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
         realtimeVoiceSilenceTimeoutSeconds = min(
             max(decodedSilenceTimeout, Self.realtimeVoiceSilenceTimeoutRange.lowerBound),
             Self.realtimeVoiceSilenceTimeoutRange.upperBound
+        )
+        audioInputDeviceUID = Self.normalizedDeviceUID(
+            try values.decodeIfPresent(String.self, forKey: .audioInputDeviceUID)
+        )
+        audioOutputDeviceUID = Self.normalizedDeviceUID(
+            try values.decodeIfPresent(String.self, forKey: .audioOutputDeviceUID)
         )
         hermesAgentDelegationEnabled = try values.decodeIfPresent(
             Bool.self,
@@ -588,6 +604,8 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             realtimeVoiceSilenceTimeoutSeconds,
             forKey: .realtimeVoiceSilenceTimeoutSeconds
         )
+        try values.encodeIfPresent(audioInputDeviceUID, forKey: .audioInputDeviceUID)
+        try values.encodeIfPresent(audioOutputDeviceUID, forKey: .audioOutputDeviceUID)
         try values.encode(hermesAgentDelegationEnabled, forKey: .hermesAgentDelegationEnabled)
         try values.encodeIfPresent(
             Self.normalizedAbsolutePath(hermesAgentWorkspace),
@@ -606,6 +624,15 @@ public struct SOMAControlSettings: Codable, Equatable, Sendable {
             return nil
         }
         return String(URL(fileURLWithPath: trimmed).standardizedFileURL.path.prefix(1_024))
+    }
+
+    public static func normalizedDeviceUID(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.contains("\n"),
+              !trimmed.contains("\0") else { return nil }
+        return String(trimmed.prefix(512))
     }
 }
 

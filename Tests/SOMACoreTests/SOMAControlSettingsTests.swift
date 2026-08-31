@@ -19,6 +19,8 @@ final class SOMAControlSettingsTests: XCTestCase {
             realtimeVoice: .maple,
             realtimeVoiceRequiresEyeContactForEveryTurn: true,
             realtimeVoiceSilenceTimeoutSeconds: 90,
+            audioInputDeviceUID: "camera-microphone-uid",
+            audioOutputDeviceUID: "desk-speaker-uid",
             hermesAgentDelegationEnabled: true,
             hermesAgentWorkspace: "/tmp/soma-worker",
             led: .init(responseMode: .contextual, brightness: 3),
@@ -74,6 +76,21 @@ final class SOMAControlSettingsTests: XCTestCase {
             from: JSONEncoder().encode(settings)
         )
         XCTAssertEqual(bounded.realtimeVoiceSilenceTimeoutSeconds, 600)
+    }
+
+    func testPreferredAudioRoutesPersistAndInvalidValuesBecomeAutomatic() throws {
+        let settings = SOMAControlSettings(
+            audioInputDeviceUID: "  camera-microphone-uid  ",
+            audioOutputDeviceUID: "desk-speaker-uid"
+        )
+        let restored = try JSONDecoder().decode(
+            SOMAControlSettings.self,
+            from: JSONEncoder().encode(settings)
+        )
+
+        XCTAssertEqual(restored.audioInputDeviceUID, "camera-microphone-uid")
+        XCTAssertEqual(restored.audioOutputDeviceUID, "desk-speaker-uid")
+        XCTAssertNil(SOMAControlSettings.normalizedDeviceUID("  \n  "))
     }
 
     func testHermesAgentSettingsPersistAndNormalizeWorkspace() throws {

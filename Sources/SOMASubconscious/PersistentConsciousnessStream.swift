@@ -8,6 +8,12 @@ protocol L1ThoughtStreaming: AnyObject, Sendable {
     func recordNonverbalInvitation(with entityID: UUID, at monotonicNS: UInt64)
     func recordCognitiveAction(_ episode: CognitiveActionEpisode) async -> Bool
     func reserveCognitiveAction(_ query: CognitiveActionQuery) async -> Bool
+    func recordConversationTurn(
+        threadID: String,
+        role: ConversationParticipantRole,
+        text: String,
+        at monotonicNS: UInt64
+    )
     func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt)
     func stop()
 }
@@ -350,6 +356,34 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
 
     func reserveCognitiveAction(_ query: CognitiveActionQuery) async -> Bool {
         await workspace.reserveCognitiveAction(query)
+    }
+
+    func recordConversationTurn(
+        threadID: String,
+        role: ConversationParticipantRole,
+        text: String,
+        at monotonicNS: UInt64
+    ) {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        queue.async { [weak self] in
+            guard let self, !stopped else { return }
+            let speaker = role == .user ? "The participant" : "SOMA L2"
+            enqueueEvidence(MentalEvidenceEvent(
+                id: "conversation-turn:\(String(threadID.prefix(96))):\(role.rawValue):\(monotonicNS)",
+                observedAt: Date(),
+                kind: .conversationOutcome,
+                summary: "\(speaker) said: \(String(normalized.prefix(2_048)))",
+                subjectEntityID: presences.keys.first,
+                confidence: 1,
+                novelty: role == .user ? 0.8 : 0.55,
+                contextPatch: MentalContextPatch(conversationActive: true),
+                driveSignal: MentalDriveSignal(
+                    curiosity: role == .user ? 0.08 : 0,
+                    socialInterest: role == .user ? 0.12 : 0.04
+                )
+            ))
+        }
     }
 
     func stop() {

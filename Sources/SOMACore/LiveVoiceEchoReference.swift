@@ -29,6 +29,81 @@ public struct LiveVoiceEchoAssessment: Equatable, Sendable {
     public var permitsBargeIn: Bool { relationship == .acousticallyIndependent }
 }
 
+public struct LiveVoiceAcousticBargeInObservation: Equatable, Sendable {
+    public let admitted: Bool
+    public let becameAdmitted: Bool
+    public let becameRevoked: Bool
+
+    public init(admitted: Bool, becameAdmitted: Bool, becameRevoked: Bool) {
+        self.admitted = admitted
+        self.becameAdmitted = becameAdmitted
+        self.becameRevoked = becameRevoked
+    }
+}
+
+/// Requires acoustic independence to remain stable before microphone audio can
+/// interrupt assistant playback. A single early correlation estimate is not
+/// authoritative because the loudspeaker reference and room echo arrive on
+/// different buffers. Independence is therefore provisional until it persists,
+/// and any later loss of independence revokes the admission for that episode.
+public struct LiveVoiceAcousticBargeInGate: Sendable {
+    private let requiredIndependentNS: UInt64
+    private var independentSinceNS: UInt64?
+    private var admitted = false
+
+    public init(requiredIndependentMilliseconds: UInt64 = 320) {
+        precondition(requiredIndependentMilliseconds > 0)
+        precondition(requiredIndependentMilliseconds <= UInt64.max / 1_000_000)
+        requiredIndependentNS = requiredIndependentMilliseconds * 1_000_000
+    }
+
+    public mutating func observe(
+        speechActive: Bool,
+        speakerVerified: Bool,
+        relationship: LiveVoiceEchoRelationship,
+        at monotonicNS: UInt64
+    ) -> LiveVoiceAcousticBargeInObservation {
+        let wasAdmitted = admitted
+        guard speechActive, speakerVerified else {
+            reset()
+            return .init(
+                admitted: false,
+                becameAdmitted: false,
+                becameRevoked: wasAdmitted
+            )
+        }
+
+        guard relationship == .acousticallyIndependent else {
+            independentSinceNS = nil
+            admitted = false
+            return .init(
+                admitted: false,
+                becameAdmitted: false,
+                becameRevoked: wasAdmitted
+            )
+        }
+
+        if independentSinceNS == nil {
+            independentSinceNS = monotonicNS
+        }
+        if let independentSinceNS,
+           monotonicNS >= independentSinceNS,
+           monotonicNS - independentSinceNS >= requiredIndependentNS {
+            admitted = true
+        }
+        return .init(
+            admitted: admitted,
+            becameAdmitted: admitted && !wasAdmitted,
+            becameRevoked: false
+        )
+    }
+
+    public mutating func reset() {
+        independentSinceNS = nil
+        admitted = false
+    }
+}
+
 public enum LiveVoicePlaybackReferenceSource: String, Sendable {
     case appServer = "app_server"
     case webRTCPlayback = "webrtc_playback"
@@ -93,8 +168,8 @@ public struct LiveVoiceEchoReferenceMatcher: Sendable {
         maximumAnalysisMilliseconds: Int = 420,
         referenceRetentionMilliseconds: Int = 3_000,
         microphoneRetentionMilliseconds: Int = 1_200,
-        echoCorrelationThreshold: Double = 0.62,
-        independentCorrelationThreshold: Double = 0.36
+        echoCorrelationThreshold: Double = 0.36,
+        independentCorrelationThreshold: Double = 0.24
     ) {
         precondition(minimumAnalysisMilliseconds > 0)
         precondition(maximumAnalysisMilliseconds >= minimumAnalysisMilliseconds)

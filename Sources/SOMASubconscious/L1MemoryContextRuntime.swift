@@ -2691,6 +2691,23 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
         return await stream?.reserveCognitiveAction(query) ?? false
     }
 
+    func recordConversationTurn(
+        threadID: String,
+        role: ConversationParticipantRole,
+        text: String,
+        at monotonicNS: UInt64
+    ) {
+        lock.lock()
+        let stream = self.stream
+        lock.unlock()
+        stream?.recordConversationTurn(
+            threadID: threadID,
+            role: role,
+            text: text,
+            at: monotonicNS
+        )
+    }
+
     private func currentStream() -> (any L1ThoughtStreaming)? {
         lock.lock()
         defer { lock.unlock() }

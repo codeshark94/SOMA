@@ -80,6 +80,38 @@ public enum AudioVisualSpeakerAttribution {
     }
 }
 
+public struct TimestampedVisualGazeEvidence: Equatable, Sendable {
+    public let state: VisualGazeEvidence
+    public let observedNS: UInt64
+
+    public init(state: VisualGazeEvidence, observedNS: UInt64) {
+        self.state = state
+        self.observedNS = observedNS
+    }
+}
+
+/// Resolves the last meaningful gaze observation at acoustic onset. Missing
+/// landmarks are absence of evidence, not evidence that contact ended; an
+/// explicit averted observation still supersedes an earlier direct one.
+public enum LiveVoiceOnsetGazeResolver {
+    public static func resolve(
+        _ samples: [TimestampedVisualGazeEvidence],
+        onsetNS: UInt64,
+        maximumAgeMilliseconds: UInt64 = 250
+    ) -> TimestampedVisualGazeEvidence? {
+        precondition(maximumAgeMilliseconds > 0)
+        precondition(maximumAgeMilliseconds <= UInt64.max / 1_000_000)
+        let maximumAgeNS = maximumAgeMilliseconds * 1_000_000
+        return samples
+            .filter {
+                $0.state != .unavailable
+                    && onsetNS >= $0.observedNS
+                    && onsetNS - $0.observedNS <= maximumAgeNS
+            }
+            .max { $0.observedNS < $1.observedNS }
+    }
+}
+
 public enum AudioVisualEpisodeEvidence {
     public static func resolvedOnset(
         classifiedWindowStartNS: UInt64,

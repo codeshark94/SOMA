@@ -1,4 +1,5 @@
 #include "OpenOBSBOTContract.hpp"
+#include "OpenOBSBOTCommandContract.hpp"
 #include "OpenOBSBOTUVCTransport.hpp"
 
 #include <mach/mach_time.h>
@@ -583,13 +584,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
     bool nativeTracking = false;
     bool nativeTrackingRequested = false;
     bool externalControl = false;
-    struct NativeTarget {
-        float x;
-        float y;
-        float width;
-        float height;
-    };
-    std::optional<NativeTarget> nativeTarget;
+    std::optional<soma::OpenOBSBOTNativeTarget> nativeTarget;
     struct PositionTarget {
         double pitch;
         double pan;
@@ -618,7 +613,9 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
         : Clock::time_point::max();
     auto reportedRecovery = transport.recoveryStatus();
 
-    const auto validNativeTarget = [&](const std::optional<NativeTarget> &target) {
+    const auto validNativeTarget = [&](
+        const std::optional<soma::OpenOBSBOTNativeTarget> &target
+    ) {
         return !target || soma::open_obsbot_protocol::isValidHumanTarget(
             identity.profile,
             target->x,
@@ -627,7 +624,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
             target->height
         );
     };
-    const auto activateNativeTracking = [&](const std::optional<NativeTarget> &target) {
+    const auto activateNativeTracking = [&](const std::optional<soma::OpenOBSBOTNativeTarget> &target) {
         if (!validNativeTarget(target)) return -1;
         int result = transport.enableHumanTracking();
         if (result == 0 && tiny3 && target) {
@@ -839,26 +836,18 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                 if (verb == "heartbeat") {
                     if (nativeTrackingRequested && commandID == nativeCommandID) lastHeartbeat = Clock::now();
                 } else if (verb == "native_start") {
-                    std::optional<NativeTarget> requestedTarget;
-                    if (tiny3 && tokens.size() == 6) {
-                        requestedTarget = NativeTarget {
-                            std::stof(tokens[2]),
-                            std::stof(tokens[3]),
-                            std::stof(tokens[4]),
-                            std::stof(tokens[5]),
-                        };
-                    } else if (tokens.size() != 2) {
+                    const auto request = soma::openOBSBOTNativeStartRequest(
+                        identity.profile,
+                        tokens
+                    );
+                    if (!request.accepted()) {
                         trace.event("camera.ack", "fault", "native_target_rejected", -1,
-                                    "reason=invalid_field_count; profile=" + profileID,
+                                    "reason=" + std::string(soma::openOBSBOTNativeStartErrorID(request.error))
+                                        + "; profile=" + profileID,
                                     commandID);
                         continue;
                     }
-                    if (!validNativeTarget(requestedTarget)) {
-                        trace.event("camera.ack", "fault", "native_target_rejected", -1,
-                                    "reason=invalid_normalized_bounds; profile=" + profileID,
-                                    commandID);
-                        continue;
-                    }
+                    const auto requestedTarget = request.target;
                     recenterRequested = false;
                     recenterDeadline.reset();
                     nativeTrackingRequested = true;

@@ -94,9 +94,36 @@ private struct ExploreArguments: Codable {
     let policy: ExplorationPolicyGoal
 }
 
-private struct CaptureArguments: Codable {
+private struct CaptureArguments: Decodable {
     let control: ControlArguments
     let goal: CaptureViewGoal
+
+    private enum CodingKeys: String, CodingKey {
+        case control, goal
+        case targetReference = "target_reference"
+        case bearing
+        case fieldOfViewDegrees = "field_of_view_degrees"
+        case currentFrame = "current_frame"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        control = try values.decode(ControlArguments.self, forKey: .control)
+        if let nested = try values.decodeIfPresent(CaptureViewGoal.self, forKey: .goal) {
+            goal = nested
+            return
+        }
+        let targetReference = try values.decodeIfPresent(String.self, forKey: .targetReference)
+        let bearing = try values.decodeIfPresent(GimbalRelativeBearing.self, forKey: .bearing)
+        let fieldOfViewDegrees = try values.decodeIfPresent(Double.self, forKey: .fieldOfViewDegrees)
+        let requestedCurrentFrame = try values.decodeIfPresent(Bool.self, forKey: .currentFrame)
+        goal = CaptureViewGoal(
+            targetReference: targetReference,
+            bearing: bearing,
+            fieldOfViewDegrees: fieldOfViewDegrees,
+            currentFrame: requestedCurrentFrame ?? (targetReference == nil && bearing == nil)
+        )
+    }
 }
 
 private struct OpticalZoomArguments: Codable {
@@ -420,11 +447,11 @@ private final class EmbodimentMCPServer {
                 }
             } else {
                 arguments.removeValue(forKey: "cognitive_intent")
-                guard let gatewayIntent = L2CognitiveToolPolicy.gatewayEpistemicIntent(
+                guard let gatewayIntent = L2CognitiveToolPolicy.gatewayIntent(
                     for: name,
                     goalEpisodeID: gatewayReadGoalEpisodeID
                 ) else {
-                    write(result: toolFailure("tool has no epistemic authorization policy: \(name)"), id: id)
+                    write(result: toolFailure("tool has no gateway authorization policy: \(name)"), id: id)
                     return
                 }
                 cognitiveIntent = gatewayIntent
@@ -898,7 +925,10 @@ private final class EmbodimentMCPServer {
                         ok: true,
                         decision: initial.decision,
                         snapshot: lastSnapshot,
-                        viewResource: resource
+                        viewResource: resource,
+                        identityRoster: presentIdentityRoster(
+                            sessionAuthorization: sessionAuthorization
+                        )
                     )
                 case .failed, .expired:
                     return EmbodimentIPCReply(
@@ -922,6 +952,28 @@ private final class EmbodimentMCPServer {
             decision: initial.decision,
             snapshot: lastSnapshot
         )
+    }
+
+    /// A camera image alone cannot establish a person's local identity. Bind a
+    /// fresh, separately authorized recognition projection to the completed
+    /// capture so L2 can answer identity questions without guessing from
+    /// pixels or relying on a second opportunistic tool choice.
+    private func presentIdentityRoster(
+        sessionAuthorization: String?
+    ) -> IdentityRosterSnapshot? {
+        guard let sessionAuthorization,
+              let reply = try? EmbodimentShadowSocketClient.send(
+                .init(
+                    kind: .identityRoster,
+                    identityRosterQuery: .present,
+                    sessionAuthorization: sessionAuthorization
+                ),
+                socketURL: socketURL
+              ),
+              reply.ok else {
+            return nil
+        }
+        return reply.identityRoster
     }
 
     private func sessionAuthorization(
@@ -1167,6 +1219,7 @@ private final class EmbodimentMCPServer {
         case "capture_view":
             if let decision = reply.decision { projected["decision"] = try? jsonObject(decision) }
             if let resource = reply.viewResource { projected["view_resource"] = try? jsonObject(resource) }
+            if let roster = reply.identityRoster { projected["identity_roster"] = try? jsonObject(roster) }
         default:
             if let decision = reply.decision { projected["decision"] = try? jsonObject(decision) }
         }
@@ -1260,56 +1313,7 @@ private final class EmbodimentMCPServer {
     private func bounded(_ message: String) -> String { String(message.prefix(240)) }
 
     private var knownToolNames: Set<String> {
-        return [
-            "end_conversation",
-            "get_robot_body_state",
-            "get_activity_overview",
-            "observe_host_screen",
-            "control_host_computer",
-            "list_scene_entities",
-            "get_spatial_map",
-            "get_view_capture",
-            "list_present_people",
-            "list_identity_registry",
-            "enroll_present_identity",
-            "register_semantic_target",
-            "remove_semantic_target",
-            "set_attention_policy",
-            "track_target",
-            "orient_to",
-            "set_exploration_policy",
-            "capture_view",
-            "set_camera_optical_zoom",
-            "set_audio_capture_mode",
-            "set_audio_input_gain",
-            "set_camera_white_balance",
-            "set_camera_exposure_lock",
-            "set_camera_focus",
-            "set_camera_absolute_exposure",
-            "set_camera_face_priority",
-            "set_camera_anti_flicker",
-            "set_camera_image_tuning",
-            "set_native_human_tracking_policy",
-            "set_camera_field_of_view",
-            "express_gimbal",
-            "release_embodiment",
-            "get_person_context",
-            "set_preferred_language",
-            "clear_preferred_language",
-            "set_contact_preference",
-            "set_person_rapport",
-            "set_person_fact",
-            "remove_person_fact",
-            "recall_episodes",
-            "list_information_needs",
-            "record_information_need_answer",
-            "delegate_hermes_task",
-            "continue_hermes_task",
-            "get_hermes_task",
-            "list_hermes_tasks",
-            "cancel_hermes_task",
-            "resolve_hermes_report_offer",
-        ]
+        L2CognitiveToolPolicy.knownToolNames
     }
 
     /// Every MCP operation is bound to one currently speaking participant.
@@ -1318,7 +1322,7 @@ private final class EmbodimentMCPServer {
     private var protectedToolNames: Set<String> { knownToolNames }
 
     private func toolDefinitions() -> [[String: Any]] {
-        embodimentStateTools()
+        let definitions = embodimentStateTools()
             + hostComputerTools()
             + conversationTools()
             + identityTools()
@@ -1326,6 +1330,23 @@ private final class EmbodimentMCPServer {
             + informationNeedTools()
             + hermesAgentTools()
             + embodimentControlTools()
+        let names = definitions.compactMap { $0["name"] as? String }
+        precondition(
+            names.count == definitions.count && Set(names).count == names.count,
+            "SOMA MCP tool definitions must have unique names"
+        )
+        precondition(
+            Set(names) == knownToolNames,
+            "SOMA MCP definitions and cognitive tool policy must expose the same tools"
+        )
+        precondition(
+            names.allSatisfy {
+                L2CognitiveToolPolicy.autonomy(for: $0) != nil
+                    && L2CognitiveToolPolicy.effect(for: $0) != nil
+            },
+            "Every SOMA MCP tool requires an explicit cognitive policy"
+        )
+        return definitions
     }
 
     private func embodimentStateTools() -> [[String: Any]] {
@@ -1484,9 +1505,11 @@ private final class EmbodimentMCPServer {
             tool("set_exploration_policy", "Lease an exploration distribution over regions, bearings, tempo, dwell, novelty, and continuity.", objectSchema([
                 "policy": explorationPolicySchema(),
             ], required: ["policy"])),
-            tool("capture_view", "Capture a view and return it as MCP image content plus a short-lived local resource link. Use goal.current_frame=true for the immediate current camera frame without moving the gimbal; use target_reference or bearing only when a reframed view is needed.", objectSchema([
-                "goal": captureGoalSchema(),
-            ], required: ["goal"])),
+            tool("capture_view", "Capture camera evidence and return MCP image content plus a short-lived local resource link. When authorized, the result also includes the fresh local identity roster for recognized people present at capture time; use that roster rather than guessing identity from pixels. Call with no arguments for the immediate current frame without moving the gimbal. Supply target_reference or bearing only when a reframed view is needed.", objectSchema([
+                "target_reference": stringSchema(maxLength: 96),
+                "bearing": bearingSchema(),
+                "field_of_view_degrees": numberSchema(minimum: 5, maximum: 120),
+            ], required: [])),
             tool("set_camera_optical_zoom", "Set a physical camera zoom factor for a concrete detail-observation goal. L0 verifies the active device's reported factor and updates spatial projection before using later frames. Use 1.0 to restore the wide view.", objectSchema([
                 "goal": opticalZoomGoalSchema(),
             ], required: ["goal"])),

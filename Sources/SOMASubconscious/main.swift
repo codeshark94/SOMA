@@ -3968,6 +3968,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// ownership or outlive fresh visual evidence.
     private var auditoryOrientingAdmission = SOMACore.AuditoryOrientingAdmission()
     private var auditoryOrientingLease = SOMACore.AuditoryOrientingLease()
+    private var acousticExplorationArousal = SOMACore.AcousticExplorationArousal()
+    /// One acoustic onset without a measured DOA may resample spatial novelty,
+    /// but it has no evidence for changing elevation. Consume this flag only
+    /// after a reachable horizontal route has been planned.
+    private var acousticHorizontalResamplePending = false
     private let auditoryMotionQualificationDelayNS: UInt64 = 900_000_000
     private struct AuditoryOrientationTrajectory {
         let requestID: String
@@ -5501,7 +5506,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             guard let admitted = self.auditoryOrientingAdmission.observeOnset(evidence) else { return }
-            self.beginAuditoryOrienting(from: admitted, corroboration: "salient_transient")
+            self.routeAuditoryOrienting(from: admitted, corroboration: "salient_transient")
         }
     }
 
@@ -5517,8 +5522,68 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 confidence: confidence,
                 at: monotonicNS
             ) else { return }
-            self.beginAuditoryOrienting(from: admitted, corroboration: "neural_voice")
+            self.routeAuditoryOrienting(from: admitted, corroboration: "neural_voice")
         }
+    }
+
+    private func routeAuditoryOrienting(
+        from evidence: SOMACore.AuditoryOnsetEvidence,
+        corroboration: String
+    ) {
+        if deviceCapabilities?.supportsDeviceSoundLocalization == true {
+            beginAuditoryOrienting(from: evidence, corroboration: corroboration)
+        } else {
+            beginAcousticExplorationArousal(from: evidence, corroboration: corroboration)
+        }
+    }
+
+    /// Devices without a validated numeric/firmware DOA path cannot turn to a
+    /// measured bearing. A loud onset still raises L0 exploration arousal: the
+    /// active spherical route is resampled immediately and then moves faster,
+    /// while every social and higher-layer motor owner remains authoritative.
+    private func beginAcousticExplorationArousal(
+        from evidence: SOMACore.AuditoryOnsetEvidence,
+        corroboration: String
+    ) {
+        let monotonicNS = max(evidence.monotonicNS, monotonicNanoseconds())
+        guard case .running = state,
+              helperReady,
+              process.isRunning,
+              scanRunning,
+              scanPriority == .l0,
+              activeCognitiveMotorRequestID == nil,
+              !auditoryMotorOrientationBlocked(at: monotonicNS),
+              let profile = acousticExplorationArousal.observe(
+                  evidence,
+                  explorationActive: true,
+                  at: monotonicNS
+              ) else {
+            return
+        }
+        explorationWaypoint = nil
+        explorationWaypointStartedNS = nil
+        explorationWaypointDeadlineNS = nil
+        explorationWaypointStartingPose = nil
+        explorationWaypointSource = nil
+        panoramaWaypointStableSinceNS = nil
+        explorationBoundaryTurning = false
+        acousticHorizontalResamplePending = true
+        writer.write(RuntimeEvent(
+            event: "audio.exploration_arousal",
+            monotonicNS: monotonicNS,
+            source: "audio_onset",
+            state: "route_resampled",
+            message: String(
+                format: "corroboration=%@; level_db=%.1f; threshold_db=%.1f; confidence=%.3f; intensity=%.3f; speed_multiplier=%.2f; acceleration_multiplier=%.2f",
+                corroboration,
+                evidence.levelDB,
+                evidence.thresholdDB,
+                evidence.confidence,
+                profile.intensity,
+                profile.speedMultiplier,
+                profile.accelerationMultiplier
+            )
+        ))
     }
 
     /// Tiny 3 Lite exposes firmware sound following as a motor mode, not as a
@@ -8281,6 +8346,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         poseWaitStopIssued = false
         poseStreamDegradedReported = false
         smoothExploration.reset()
+        acousticExplorationArousal.clear()
+        acousticHorizontalResamplePending = false
     }
 
     private func hasRecentObservedFace(at monotonicNS: UInt64) -> Bool {
@@ -8363,6 +8430,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 poseStreamDegradedReported = false
             }
             poseWaitStopIssued = false
+            let acousticProfile = acousticExplorationArousal.profile(at: now)
             if cameraGeometryCalibrationMode {
                 runCameraGeometryCalibrationTick(
                     pose: pose,
@@ -8398,19 +8466,28 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 } else {
                     for _ in 0..<8 {
                         let coverageUniform = nextExplorationUniform()
+                        let effectiveTemperature = explorationTemperature
+                            * acousticProfile.samplingTemperatureMultiplier
                         guard let sampledDirection = spatialAtlas.sampleNextDirection(
                             from: pose,
                             at: now,
-                            temperature: explorationTemperature,
+                            temperature: effectiveTemperature,
                             uniform: coverageUniform
                         ) else { break }
+                        let requestedBearing = acousticHorizontalResamplePending
+                            ? AcousticExplorationResamplePolicy.horizontalBearing(
+                                sampled: sampledDirection,
+                                currentPose: pose
+                            )
+                            : sampledDirection.bearing
                         if let motionGuide = GimbalVisibilityRoutePlanner.guide(
-                            to: sampledDirection.bearing,
+                            to: requestedBearing,
                             from: pose,
                             kinematicEnvelope: activeKinematicEnvelope,
                             observationPreference: .centered
                         ) {
                             plannedDirection = (sampledDirection, motionGuide, coverageUniform)
+                            acousticHorizontalResamplePending = false
                             break
                         }
                         writer.write(RuntimeEvent(
@@ -8458,11 +8535,11 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                         panErrorDegrees: plannedDirection.guide.azimuthDegrees - pose.panDegrees,
                         pitchErrorDegrees: plannedDirection.guide.elevationDegrees - pose.pitchDegrees,
                         maximumPanDegreesPerSecond: min(
-                            maximumActiveExplorationPanDegreesPerSecond,
+                            maximumActiveExplorationPanDegreesPerSecond * acousticProfile.speedMultiplier,
                             calibration.maximumPanDegreesPerSecond
                         ),
                         maximumPitchDegreesPerSecond: min(
-                            maximumActiveExplorationPitchDegreesPerSecond,
+                            maximumActiveExplorationPitchDegreesPerSecond * acousticProfile.speedMultiplier,
                             calibration.maximumPitchDegreesPerSecond
                         )
                     ) * 1_000_000_000
@@ -8477,7 +8554,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     state: "coverage_direction_sampled",
                     message: String(
                         format: "selection=tempered_posterior; temperature=%.2f; uniform=%.6f; probability=%.3f; panorama_quality=%.3f; place_familiarity=%.3f; expected_information_gain=%.3f; cell_azimuth_degrees=%.2f; cell_elevation_degrees=%.2f; guide_azimuth_degrees=%.2f; guide_elevation_degrees=%.2f",
-                        explorationTemperature,
+                        explorationTemperature * acousticProfile.samplingTemperatureMultiplier,
                         plannedDirection.uniform,
                         plannedDirection.cell.probability,
                         plannedDirection.cell.panoramaQuality,
@@ -8497,10 +8574,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             let pitchError = SmoothExplorationDynamics.stoppingVelocity(
                     errorDegrees: direction.bearing.elevationDegrees - pose.pitchDegrees,
                     maximumDegreesPerSecond: min(
-                        maximumActiveExplorationPitchDegreesPerSecond,
+                        maximumActiveExplorationPitchDegreesPerSecond * acousticProfile.speedMultiplier,
                         calibration.maximumPitchDegreesPerSecond
                     ),
-                    accelerationDegreesPerSecondSquared: 80
+                    accelerationDegreesPerSecondSquared: 80 * acousticProfile.accelerationMultiplier
                 )
             let panError = SmoothExplorationDynamics.stoppingVelocity(
                     // The spherical map wraps at 180 degrees, but the
@@ -8509,10 +8586,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     // mathematical wrap boundary.
                     errorDegrees: direction.bearing.azimuthDegrees - pose.panDegrees,
                     maximumDegreesPerSecond: min(
-                        maximumActiveExplorationPanDegreesPerSecond,
+                        maximumActiveExplorationPanDegreesPerSecond * acousticProfile.speedMultiplier,
                         calibration.maximumPanDegreesPerSecond
                     ),
-                    accelerationDegreesPerSecondSquared: 120
+                    accelerationDegreesPerSecondSquared: 120 * acousticProfile.accelerationMultiplier
                 )
         desired = (
                 calibration.pitchCommand(
@@ -8525,12 +8602,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 ) * explorationPanPolarity,
                 explorationBoundaryTurning
                     ? "coverage_boundary_turn_curve"
-                    : "coverage_exploration_curve_\(explorationWaypointIndex + 1)"
+                    : (acousticProfile.intensity > 0
+                        ? "coverage_acoustic_search_curve_\(explorationWaypointIndex + 1)"
+                        : "coverage_exploration_curve_\(explorationWaypointIndex + 1)")
             )
         let velocity = smoothExploration.advance(
             towardPitch: desired.pitch,
             pan: desired.pan,
-            at: now
+            at: now,
+            maximumPitchAcceleration: 80 * acousticProfile.accelerationMultiplier,
+            maximumPanAcceleration: 120 * acousticProfile.accelerationMultiplier
         )
         sendSmoothExplorationVelocity(velocity, state: desired.state, at: now)
         scheduleScanControlTick(generation: generation, afterMilliseconds: 50)
@@ -8702,7 +8783,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         // already-clear views blend earlier into the next reachable route.
         // This keeps epistemic exploration continuous without stopping at a
         // waypoint merely because it was selected by the atlas posterior.
-        let lookAheadRadiusDegrees = 2 + 8 * (1 - direction.expectedInformationGain)
+        let acousticProfile = acousticExplorationArousal.profile(at: monotonicNS)
+        let lookAheadRadiusDegrees = 2
+            + 8 * (1 - direction.expectedInformationGain)
+            + acousticProfile.waypointLookAheadBoostDegrees
         let reached = SmoothExplorationDynamics.shouldBlendToNextWaypoint(
             panErrorDegrees: panError,
             pitchErrorDegrees: pitchError,
@@ -10228,10 +10312,17 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
                 && Self.matches($0.rect, targetRect)
         }
         let latestFaceSample = onsetFaceSamples.max { $0.observedNS < $1.observedNS }
-        let directGaze = latestFaceSample.map {
-            $0.gazeState == .direct
-                && onsetNS - $0.observedNS <= maximumGazeAgeAtOnsetNS
-        } ?? false
+        let decisiveGaze = LiveVoiceOnsetGazeResolver.resolve(
+            onsetFaceSamples.map {
+                TimestampedVisualGazeEvidence(
+                    state: $0.gazeState,
+                    observedNS: $0.observedNS
+                )
+            },
+            onsetNS: onsetNS,
+            maximumAgeMilliseconds: maximumGazeAgeAtOnsetNS / 1_000_000
+        )
+        let directGaze = decisiveGaze?.state == .direct
         episode = Episode(
             targetID: targetID,
             onsetNS: onsetNS,
@@ -10249,9 +10340,9 @@ private final class VisualSpeakerAttributionStore: @unchecked Sendable {
         return .init(
             evidence: evidence,
             assessment: AudioVisualSpeakerAttribution.assess(evidence),
-            directContactObservedNS: directGaze ? latestFaceSample?.observedNS : nil,
-            directContactContradictedNS: latestFaceSample?.gazeState == .averted
-                ? latestFaceSample?.observedNS
+            directContactObservedNS: directGaze ? decisiveGaze?.observedNS : nil,
+            directContactContradictedNS: decisiveGaze?.state == .averted
+                ? decisiveGaze?.observedNS
                 : nil,
             speakerEvidenceObservedNS: nil
         )
@@ -12432,14 +12523,27 @@ private func currentTaskMemorySnapshot() -> TaskMemorySnapshot? {
 
 private func run(_ options: Options) throws {
     let termination = GracefulShutdown(signals: [SIGTERM, SIGINT])
+    let controlSettings: SOMAControlSettings
+    let controlSettingsLoadError: Error?
+    do {
+        controlSettings = try SOMAControlSettingsStore(fileURL: options.controlSettingsURL).load()
+        controlSettingsLoadError = nil
+    } catch {
+        controlSettings = .init()
+        controlSettingsLoadError = error
+    }
     try requestAccess(for: .video, label: "camera")
     try requestAccess(for: .audio, label: "microphone")
     guard let videoDevice = obsbotDevice(for: .video, uniqueID: options.videoID) else {
         throw RuntimeError.unavailable("The requested OBSBOT video device is unavailable")
     }
-    guard let audioDevice = obsbotDevice(for: .audio, uniqueID: options.audioID) else {
-        throw RuntimeError.unavailable("The requested OBSBOT microphone is unavailable")
+    let preferredAudioUID = options.audioID == "auto"
+        ? controlSettings.audioInputDeviceUID
+        : options.audioID
+    guard let audioSelection = audioCaptureSelection(preferredUniqueID: preferredAudioUID) else {
+        throw RuntimeError.unavailable("No audio input device is available")
     }
+    let audioDevice = audioSelection.device
     let selectedFormat = try requestLowLatencyFormat(on: videoDevice)
 
     let writer = try JSONLWriter(
@@ -12493,24 +12597,21 @@ private func run(_ options: Options) throws {
             .appendingPathComponent("volatile", isDirectory: true)
     )
     defer { l1CurrentFrameRelay.removeRetainedFrame() }
-    let controlSettings: SOMAControlSettings
-    do {
-        controlSettings = try SOMAControlSettingsStore(fileURL: options.controlSettingsURL).load()
-        writer.write(RuntimeEvent(
-            event: "source.health",
-            monotonicNS: monotonicNanoseconds(),
-            source: "control_settings",
-            state: "loaded",
-            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); active_turn_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn); hermes_agent=\(controlSettings.hermesAgentDelegationEnabled); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
-        ))
-    } catch {
-        controlSettings = .init()
+    if let controlSettingsLoadError {
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNanoseconds(),
             source: "control_settings",
             state: "rejected",
-            message: String(error.localizedDescription.prefix(192))
+            message: String(controlSettingsLoadError.localizedDescription.prefix(192))
+        ))
+    } else {
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "control_settings",
+            state: "loaded",
+            message: "voice=\(controlSettings.realtimeVoice.rawValue); voice_enabled=\(controlSettings.realtimeVoiceEnabled); input_uid=\(controlSettings.audioInputDeviceUID ?? "automatic"); output_uid=\(controlSettings.audioOutputDeviceUID ?? "system_default"); active_turn_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn); hermes_agent=\(controlSettings.hermesAgentDelegationEnabled); led=\(controlSettings.led.responseMode.rawValue); brightness=\(controlSettings.led.brightness); led_signals=\(controlSettings.led.signals.count); admin_enrolled=\(controlSettings.administrator != nil)"
         ))
     }
     let identityPresence = IdentityPresenceCoordinator(
@@ -12775,7 +12876,7 @@ private func run(_ options: Options) throws {
     }
     defer { l1AuxiliarySemanticBridge?.stop() }
     let loadedDirectionCalibration: StereoDirectionCalibration?
-    if let calibrationURL = options.tdoaCalibrationURL {
+    if audioSelection.isOBSBOT, let calibrationURL = options.tdoaCalibrationURL {
         do {
             let calibration = try JSONDecoder().decode(StereoDirectionCalibration.self, from: Data(contentsOf: calibrationURL))
             guard calibration.schemaVersion == 1 else {
@@ -12835,7 +12936,9 @@ private func run(_ options: Options) throws {
     } else {
         cameraGeometryCalibration = nil
     }
-    let calibrationRecorder = options.tdoaCalibrationOutputURL.map { _ in TDOACalibrationRecorder() }
+    let calibrationRecorder = audioSelection.isOBSBOT
+        ? options.tdoaCalibrationOutputURL.map { _ in TDOACalibrationRecorder() }
+        : nil
     let worldModel = PredictiveWorldModel()
     let counters = LatencyCounters()
     let poseStore = GimbalPoseStore(geometryCalibration: cameraGeometryCalibration)
@@ -13109,6 +13212,45 @@ private func run(_ options: Options) throws {
     let speechInteractionBox = SpeechInteractionBox()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     let liveVoiceBox = LiveVoiceLauncherBox()
+    let l1LiveToolSupervisor: L1LiveConversationToolSupervisor?
+    do {
+        let supervisor = try L1LiveConversationToolSupervisor(
+            onHealth: { state, message in
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "l1_live_tool",
+                    state: state,
+                    message: message
+                ))
+            },
+            onAdvice: { advice, transcript in
+                let injected = liveVoiceBox.launcher?.injectL1ToolAdvice(
+                    advice,
+                    forUserTranscript: transcript
+                ) ?? false
+                writer.write(RuntimeEvent(
+                    event: "l1.live_tool",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "l1_live_tool",
+                    state: injected ? "injection_requested" : "held",
+                    message: "turn=\(advice.turnID.uuidString.lowercased()); tool=\(advice.toolName ?? "none"); reason=\(injected ? "current_turn" : "stale_or_output_started")"
+                ))
+            }
+        )
+        supervisor.prewarm()
+        l1LiveToolSupervisor = supervisor
+    } catch {
+        l1LiveToolSupervisor = nil
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "l1_live_tool",
+            state: "unavailable",
+            message: String(error.localizedDescription.prefix(192))
+        ))
+    }
+    defer { l1LiveToolSupervisor?.stop() }
     let hermesAgentDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/SOMA/hermes-agent", isDirectory: true)
     let hermesAgentKey = try OwnerOnlyInstallationSecret.loadOrCreate(
@@ -13149,6 +13291,7 @@ private func run(_ options: Options) throws {
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(
             voice: controlSettings.realtimeVoice,
+            audioOutputDeviceUID: controlSettings.audioOutputDeviceUID,
             currentCameraImageDataURI: {
                 liveCameraFrameRelay?.currentImageDataURI(at: monotonicNanoseconds())
             },
@@ -13179,6 +13322,7 @@ private func run(_ options: Options) throws {
                 ))
             case let .active(threadID, personEntityID):
                 l1LiveConversationState.begin()
+                if let threadID { l1LiveToolSupervisor?.begin(threadID: threadID) }
                 conversationContact.markConversationOpened(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 if let personEntityID {
@@ -13224,13 +13368,13 @@ private func run(_ options: Options) throws {
                         maximumGainDB
                     )
                 ))
-            case .outputPlaybackReady:
+            case let .outputPlaybackReady(mode, route):
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: "output_ready",
-                    message: "webrtc_audio_to_system_output"
+                    message: "mode=\(mode); route=\(route)"
                 ))
             case .naturalTurnTakingConfirmed:
                 writer.write(RuntimeEvent(
@@ -13309,6 +13453,7 @@ private func run(_ options: Options) throws {
                     message: String(reason.prefix(192))
                 ))
             case .embodimentMCPReady:
+                l1LiveToolSupervisor?.setMCPAvailable(true)
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
@@ -13333,6 +13478,7 @@ private func run(_ options: Options) throws {
                     message: String(reason.prefix(192))
                 ))
             case let .embodimentMCPUnavailable(reason):
+                l1LiveToolSupervisor?.setMCPAvailable(false)
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
@@ -13341,12 +13487,29 @@ private func run(_ options: Options) throws {
                     message: String(reason.prefix(192))
                 ))
             case let .embodimentMCPCall(tool, status, error):
+                l1LiveToolSupervisor?.observeToolCall(tool: tool, status: status)
                 writer.write(RuntimeEvent(
                     event: "l2.mcp",
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: status,
                     message: "tool=\(tool); error=\(error ?? "none")"
+                ))
+            case let .l1ToolAdviceAttached(tool):
+                writer.write(RuntimeEvent(
+                    event: "l1.live_tool",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "attached",
+                    message: "tool=\(tool)"
+                ))
+            case let .l1ToolAdviceRejected(tool, reason):
+                writer.write(RuntimeEvent(
+                    event: "l1.live_tool",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "rejected",
+                    message: "tool=\(tool); reason=\(reason)"
                 ))
             case let .inputAccepted(characters):
                 attentionGimbalBridge?.ingestLiveVoiceTurnAccepted()
@@ -13357,6 +13520,13 @@ private func run(_ options: Options) throws {
                     state: "input_transcript_ready",
                     message: "characters=\(min(characters, 65_535)); transcript_trace=false; local_archive=on_final"
                 ))
+            case let .transcriptPartial(threadID, text):
+                if let threadID {
+                    l1LiveToolSupervisor?.observeUserPartial(
+                        threadID: threadID,
+                        transcript: text
+                    )
+                }
             case let .transcriptFinalized(threadID, role, text):
                 if role == .user {
                     // A finalized user transcript is the first reliable proof
@@ -13371,6 +13541,25 @@ private func run(_ options: Options) throws {
                     state: role == .user ? "user" : "assistant",
                     message: String(text.prefix(300))
                 ))
+                if let threadID {
+                    l1ThoughtRelay.recordConversationTurn(
+                        threadID: threadID,
+                        role: role,
+                        text: text,
+                        at: eventNS
+                    )
+                    if role == .user {
+                        l1LiveToolSupervisor?.observeUserTurn(
+                            threadID: threadID,
+                            transcript: text
+                        )
+                    } else {
+                        l1LiveToolSupervisor?.observeAssistantTurn(
+                            threadID: threadID,
+                            transcript: text
+                        )
+                    }
+                }
                 if let threadID {
                     l1MemoryContext.archiveConversationTurn(
                         threadID: threadID,
@@ -13483,6 +13672,7 @@ private func run(_ options: Options) throws {
                 conversationContact.recordConversationActivity(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
             case let .ended(threadID, personEntityID, reason):
+                l1LiveToolSupervisor?.end(threadID: threadID)
                 l1LiveConversationState.end()
                 liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
@@ -13523,6 +13713,7 @@ private func run(_ options: Options) throws {
                     message: "task_id=\(taskID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
                 ))
             case let .failed(threadID, personEntityID, reason):
+                l1LiveToolSupervisor?.end(threadID: threadID)
                 l1LiveConversationState.end()
                 liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
@@ -14976,7 +15167,13 @@ private func run(_ options: Options) throws {
         state: selectedFormat.applied ? "selected" : "configuration_fallback",
         message: "\(identity(videoDevice).name); requested=\(selectedFormat.requested); \(selectedFormat.detail)"
     ))
-    writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio", state: "selected", message: "\(identity(audioDevice).name)"))
+    writer.write(RuntimeEvent(
+        event: "source.health",
+        monotonicNS: monotonicNanoseconds(),
+        source: "audio",
+        state: audioSelection.resolution.contains("fallback") ? "configuration_fallback" : "selected",
+        message: "\(identity(audioDevice).name); uid=\(audioDevice.uniqueID); route=\(audioSelection.resolution); spatial_obsbot=\(audioSelection.isOBSBOT)"
+    ))
     if let directoryURL = options.faceLockDiagnosticDirectoryURL {
         writer.write(RuntimeEvent(
             event: "source.health",
@@ -15003,8 +15200,10 @@ private func run(_ options: Options) throws {
         writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "configured", message: "calibrated_stereo_tdoa"))
     } else if calibrationRecorder != nil {
         writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "calibrating", message: "three_positions=left,center,right"))
-    } else {
+    } else if audioSelection.isOBSBOT {
         writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "calibration_required", message: "direction remains unknown until a three-position calibration is supplied"))
+    } else {
+        writer.write(RuntimeEvent(event: "source.health", monotonicNS: monotonicNanoseconds(), source: "audio_tdoa", state: "unavailable_for_selected_input", message: "selected microphone is not the camera-mounted OBSBOT array"))
     }
     visionWorker.start()
     session.startRunning()
@@ -15214,6 +15413,48 @@ private func obsbotDevice(for mediaType: AVMediaType, uniqueID: String) -> AVCap
         return exact
     }
     return obsbots.first
+}
+
+private struct AudioCaptureSelection {
+    let device: AVCaptureDevice
+    let resolution: String
+
+    var isOBSBOT: Bool {
+        device.localizedName.range(of: "obsbot", options: .caseInsensitive) != nil
+    }
+}
+
+private func audioCaptureSelection(preferredUniqueID: String?) -> AudioCaptureSelection? {
+    let devices: [AVCaptureDevice]
+    if #available(macOS 14.0, *) {
+        devices = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone],
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
+    } else {
+        devices = AVCaptureDevice.devices(for: .audio)
+    }
+    if let preferredUniqueID,
+       let preferred = devices.first(where: { $0.uniqueID == preferredUniqueID }) {
+        return AudioCaptureSelection(device: preferred, resolution: "preferred")
+    }
+    if let obsbot = devices.first(where: {
+        $0.localizedName.range(of: "obsbot", options: .caseInsensitive) != nil
+    }) {
+        return AudioCaptureSelection(
+            device: obsbot,
+            resolution: preferredUniqueID == nil ? "automatic_obsbot" : "preferred_unavailable_obsbot_fallback"
+        )
+    }
+    if let systemDefault = AVCaptureDevice.default(for: .audio) {
+        return AudioCaptureSelection(
+            device: systemDefault,
+            resolution: preferredUniqueID == nil ? "system_default" : "preferred_unavailable_system_fallback"
+        )
+    }
+    guard let first = devices.first else { return nil }
+    return AudioCaptureSelection(device: first, resolution: "first_available_fallback")
 }
 
 private func requestAccess(for mediaType: AVMediaType, label: String) throws {

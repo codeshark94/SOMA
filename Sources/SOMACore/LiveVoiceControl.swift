@@ -264,6 +264,7 @@ public struct LiveVoiceDuplexCaptureGate: Sendable {
     private var participantSpeechActive = false
     private var verifiedParticipantSpeech = false
     private var unverifiedPlaybackEpisodeActive = false
+    private var speechPredatesAssistantOutput = false
 
     public init(trailingSuppressionMilliseconds: UInt64 = 500) {
         playback = LiveVoicePlaybackCaptureGate(
@@ -273,7 +274,12 @@ public struct LiveVoiceDuplexCaptureGate: Sendable {
 
     public mutating func beginAssistantOutput(at monotonicNS: UInt64) {
         playback.beginAssistantOutput(at: monotonicNS)
-        if participantSpeechActive, !verifiedParticipantSpeech {
+        if participantSpeechActive {
+            // The model may begin output before the local VAD publishes the
+            // offset of the turn it just consumed. That continuing tail is not
+            // a new barge-in episode and must never be submitted twice.
+            speechPredatesAssistantOutput = true
+            verifiedParticipantSpeech = false
             unverifiedPlaybackEpisodeActive = true
         }
     }
@@ -290,13 +296,15 @@ public struct LiveVoiceDuplexCaptureGate: Sendable {
         if active,
            !participantSpeechActive,
            playback.suppressesMicrophone(at: monotonicNS) {
+            speechPredatesAssistantOutput = false
             unverifiedPlaybackEpisodeActive = true
         }
         participantSpeechActive = active
         if !active {
             verifiedParticipantSpeech = false
             unverifiedPlaybackEpisodeActive = false
-        } else if verified {
+            speechPredatesAssistantOutput = false
+        } else if verified, !speechPredatesAssistantOutput {
             verifiedParticipantSpeech = true
         }
     }
@@ -311,11 +319,19 @@ public struct LiveVoiceDuplexCaptureGate: Sendable {
             && !(participantSpeechActive && verifiedParticipantSpeech)
     }
 
+    public mutating func revokeParticipantSpeechVerification(at monotonicNS: UInt64) {
+        verifiedParticipantSpeech = false
+        if participantSpeechActive, playback.suppressesMicrophone(at: monotonicNS) {
+            unverifiedPlaybackEpisodeActive = true
+        }
+    }
+
     public mutating func reset() {
         playback.reset()
         participantSpeechActive = false
         verifiedParticipantSpeech = false
         unverifiedPlaybackEpisodeActive = false
+        speechPredatesAssistantOutput = false
     }
 }
 

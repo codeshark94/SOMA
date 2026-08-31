@@ -1,5 +1,6 @@
 #include "OpenOBSBOTProtocol.hpp"
 #include "OpenOBSBOTContract.hpp"
+#include "OpenOBSBOTCommandContract.hpp"
 #include "OpenOBSBOTRecovery.hpp"
 
 #include <cassert>
@@ -116,6 +117,41 @@ int main() {
         0.5f,
         0.7f
     ));
+
+    const std::vector<std::string> boundedNativeStart {
+        "native_start", "command-1", "0.2", "0.1", "0.5", "0.7",
+    };
+    const auto tiny2NativeStart = soma::openOBSBOTNativeStartRequest(
+        OBSBOTOpenDeviceProfile::tiny2Lite,
+        boundedNativeStart
+    );
+    assert(tiny2NativeStart.accepted());
+    assert(!tiny2NativeStart.target);
+    const auto tiny3NativeStart = soma::openOBSBOTNativeStartRequest(
+        OBSBOTOpenDeviceProfile::tiny3Lite,
+        boundedNativeStart
+    );
+    assert(tiny3NativeStart.accepted());
+    assert(tiny3NativeStart.target);
+    assert(std::abs(tiny3NativeStart.target->x - 0.2f) < 0.001f);
+    const auto targetlessNativeStart = soma::openOBSBOTNativeStartRequest(
+        OBSBOTOpenDeviceProfile::tiny2Lite,
+        {"native_start", "command-2"}
+    );
+    assert(targetlessNativeStart.accepted());
+    assert(!targetlessNativeStart.target);
+    const auto invalidNativeBounds = soma::openOBSBOTNativeStartRequest(
+        OBSBOTOpenDeviceProfile::tiny2Lite,
+        {"native_start", "command-3", "0.8", "0.1", "0.5", "0.7"}
+    );
+    assert(!invalidNativeBounds.accepted());
+    assert(invalidNativeBounds.error == soma::OpenOBSBOTNativeStartError::invalidNormalizedBounds);
+    const auto invalidNativeNumber = soma::openOBSBOTNativeStartRequest(
+        OBSBOTOpenDeviceProfile::tiny2Lite,
+        {"native_start", "command-4", "0.2x", "0.1", "0.5", "0.7"}
+    );
+    assert(!invalidNativeNumber.accepted());
+    assert(invalidNativeNumber.error == soma::OpenOBSBOTNativeStartError::invalidNumber);
 
     const auto tiny3Clear = clearTiny3HumanTarget();
     assert(tiny3Clear.command == 0x0684 && tiny3Clear.payload.size() == 24);

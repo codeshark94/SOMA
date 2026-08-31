@@ -6,7 +6,7 @@ enum AppServerLiveVoiceEvent: Sendable {
     case active(threadID: String?, personEntityID: UUID?)
     case inputTransportStarted
     case inputBootstrapReplayed(durationMilliseconds: Double, peakDBFS: Double, maximumGainDB: Double)
-    case outputPlaybackReady
+    case outputPlaybackReady(mode: String, route: String)
     case naturalTurnTakingConfirmed
     case responseInterrupted
     case interruptedAudioCleared
@@ -23,7 +23,10 @@ enum AppServerLiveVoiceEvent: Sendable {
     case personContextReady
     case personContextUnavailable(reason: String)
     case embodimentMCPCall(tool: String, status: String, error: String?)
+    case l1ToolAdviceAttached(tool: String)
+    case l1ToolAdviceRejected(tool: String, reason: String)
     case inputAccepted(characters: Int)
+    case transcriptPartial(threadID: String?, text: String)
     case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
     case preparingResponse
     case responseStarted(latencyMilliseconds: Double)
@@ -56,6 +59,8 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let samplesPerChannel: Int?
     let numChannels: Int?
     let resetReference: Bool?
+    let mode: String?
+    let route: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -73,6 +78,8 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case samplesPerChannel = "samples_per_channel"
         case numChannels = "num_channels"
         case resetReference = "reset_reference"
+        case mode
+        case route
     }
 }
 
@@ -108,6 +115,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "soma.live-voice.app-server", qos: .userInitiated)
     private let projectDirectory: String
     private let voice: SOMARealtimeVoice
+    private let audioOutputDeviceUID: String?
     private let currentCameraImageDataURI: (@Sendable () -> String?)?
     private let embodimentSocketURL: URL?
     private let persistentAppServer: PersistentAppServerBroker?
@@ -137,10 +145,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var inputLeveler = LiveVoiceInputLeveler()
     private var duplexCaptureGate = LiveVoiceDuplexCaptureGate()
     private var echoReferenceMatcher = LiveVoiceEchoReferenceMatcher()
+    private var acousticBargeInGate = LiveVoiceAcousticBargeInGate()
     private var lastEchoRelationship: LiveVoiceEchoRelationship?
     private var outputReferenceReported = false
     private var duplexEpisodeInProgress = false
     private var duplexEpisodeAdmitted = false
+    private var duplexSpeechActive = false
+    private var duplexSpeakerCandidateVerified = false
+    private var nextContinuousEchoAssessmentNS: UInt64 = 0
     private var inputTransportReported = false
     private var active = false
     private var activeTurnAudioAdmitted = false
@@ -154,6 +166,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var openingVisualContextAttached = false
     private var awaitingAssistantResponse = false
     private var latestUserTranscriptNS: UInt64?
+    private var latestUserTranscript = ""
+    private var assistantOutputStartedForTurn = false
     private var initialTurnValidation: LiveVoiceInitialTurnValidation
     private var proactiveOpeningAwaitingParticipant = false
     private var proactiveOpeningDelivered = false
@@ -163,6 +177,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     init(
         projectDirectory: String? = nil,
         voice: SOMARealtimeVoice = .maple,
+        audioOutputDeviceUID: String? = nil,
         currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         embodimentSocketURL: URL? = nil,
         requireVerifiedSpeakerForEveryTurn: Bool = false,
@@ -181,6 +196,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             ?? ProcessInfo.processInfo.environment["SOMA_ROOT"]
             ?? FileManager.default.currentDirectoryPath
         self.voice = voice
+        self.audioOutputDeviceUID = SOMAControlSettings.normalizedDeviceUID(audioOutputDeviceUID)
         self.currentCameraImageDataURI = currentCameraImageDataURI
         self.embodimentSocketURL = embodimentSocketURL
         self.requireVerifiedSpeakerForEveryTurn = requireVerifiedSpeakerForEveryTurn
@@ -368,6 +384,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             inputLeveler.observeVoiceActivity(active)
             let duplexVerificationRequired = self.active
                 && duplexCaptureGate.requiresParticipantVerification(at: monotonicNS)
+            duplexSpeechActive = active
+            duplexSpeakerCandidateVerified = active
+                && duplexSpeakerVerified
+                && !discardBufferedEpisode
             if active,
                let onsetCaptureNS,
                (!self.active || requireVerifiedSpeakerForEveryTurn || duplexVerificationRequired) {
@@ -393,20 +413,29 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     correlation: echoAssessment.maximumCorrelation
                 ))
             }
-            let acousticallyIndependent = !duplexVerificationRequired
-                || echoAssessment?.permitsBargeIn == true
-            let effectiveDuplexSpeakerVerification = duplexSpeakerVerified
-                && acousticallyIndependent
-                && !discardBufferedEpisode
+            let acousticAdmission = acousticBargeInGate.observe(
+                speechActive: active,
+                speakerVerified: duplexSpeakerCandidateVerified,
+                relationship: echoAssessment?.relationship ?? .insufficientEvidence,
+                at: monotonicNS
+            )
+            let effectiveDuplexSpeakerVerification = duplexSpeakerCandidateVerified
+                && (!duplexVerificationRequired || acousticAdmission.admitted)
             duplexCaptureGate.observeParticipantSpeech(
                 active: active,
                 verified: effectiveDuplexSpeakerVerification,
                 at: monotonicNS
             )
+            if acousticAdmission.becameRevoked {
+                duplexCaptureGate.revokeParticipantSpeechVerification(at: monotonicNS)
+                activeTurnAudioAdmitted = false
+            }
+            let newlyReleasedBargeIn = wasDuplexQuarantined
+                && !duplexCaptureGate.quarantinesMicrophone(at: monotonicNS)
             if self.active,
                active,
                effectiveDuplexSpeakerVerification,
-               wasDuplexQuarantined,
+               newlyReleasedBargeIn,
                let assessedThroughCaptureNS {
                 let captured = speakerEpisodeAudio.take(
                     throughCaptureNS: assessedThroughCaptureNS,
@@ -421,7 +450,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     bufferedMilliseconds: durationMilliseconds
                 ))
             }
-            if active, admitted {
+            if active, admitted, !duplexVerificationRequired {
                 activeTurnAudioAdmitted = true
             } else if !active {
                 activeTurnAudioAdmitted = false
@@ -501,6 +530,52 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             captured.samples,
             sampleRate: captured.sampleRate
         )
+        if active,
+           duplexSpeechActive,
+           duplexCaptureGate.requiresParticipantVerification(at: captured.captureNS),
+           captured.captureNS >= nextContinuousEchoAssessmentNS {
+            let nextAssessment = captured.captureNS.addingReportingOverflow(100_000_000)
+            nextContinuousEchoAssessmentNS = nextAssessment.overflow
+                ? UInt64.max
+                : nextAssessment.partialValue
+            let wasQuarantined = duplexCaptureGate.quarantinesMicrophone(at: captured.captureNS)
+            let assessment = echoReferenceMatcher.assess()
+            if assessment.relationship != lastEchoRelationship {
+                lastEchoRelationship = assessment.relationship
+                onEvent(.playbackEchoAssessed(
+                    relationship: assessment.relationship,
+                    correlation: assessment.maximumCorrelation
+                ))
+            }
+            let admission = acousticBargeInGate.observe(
+                speechActive: true,
+                speakerVerified: duplexSpeakerCandidateVerified,
+                relationship: assessment.relationship,
+                at: captured.captureNS
+            )
+            if admission.admitted {
+                duplexCaptureGate.observeParticipantSpeech(
+                    active: true,
+                    verified: true,
+                    at: captured.captureNS
+                )
+            } else if admission.becameRevoked {
+                duplexCaptureGate.revokeParticipantSpeechVerification(at: captured.captureNS)
+                activeTurnAudioAdmitted = false
+            }
+            if wasQuarantined,
+               !duplexCaptureGate.quarantinesMicrophone(at: captured.captureNS) {
+                let buffered = speakerEpisodeAudio.take()
+                let durationMilliseconds = Double(buffered.reduce(0) { $0 &+ $1.durationNS })
+                    / 1_000_000
+                for chunk in buffered.map(makeBufferedAudio) { send(chunk) }
+                duplexEpisodeAdmitted = true
+                activeTurnAudioAdmitted = true
+                onEvent(.participantBargeInAdmitted(
+                    bufferedMilliseconds: durationMilliseconds
+                ))
+            }
+        }
         if duplexCaptureGate.quarantinesMicrophone(at: captured.captureNS) {
             speakerEpisodeAudio.ingest(
                 captured,
@@ -538,8 +613,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 
     private func resetDuplexCaptureState() {
         duplexCaptureGate.reset()
+        acousticBargeInGate.reset()
         duplexEpisodeInProgress = false
         duplexEpisodeAdmitted = false
+        duplexSpeechActive = false
+        duplexSpeakerCandidateVerified = false
+        nextContinuousEchoAssessmentNS = 0
     }
 
     private func resetSessionEphemera(keepingAudioCapacity: Bool) {
@@ -646,6 +725,39 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
+    /// Adds a private, turn-bound L1 recommendation to the active realtime
+    /// thread. It is admitted only while the exact user transcript is still
+    /// awaiting its first spoken output; a late advisory is discarded instead
+    /// of leaking into the next conversational turn.
+    func injectL1ToolAdvice(
+        _ advice: L1LiveToolAdvice,
+        forUserTranscript transcript: String
+    ) -> Bool {
+        queue.sync {
+            guard active,
+                  activeThreadID == advice.threadID,
+                  awaitingAssistantResponse,
+                  !assistantOutputStartedForTurn,
+                  latestUserTranscript == transcript,
+                  advice.action == .recommendTool,
+                  let tool = advice.toolName,
+                  L2CognitiveToolPolicy.knownToolNames.contains(tool) else {
+                return false
+            }
+            let quote = advice.groundingQuote ?? ""
+            let instruction = """
+            SOMA_L1_TOOL_ADVISORY
+            This is private current-turn control context, not participant speech and not text to recite. L1 independently determined that the latest participant turn requires the SOMA MCP tool `\(tool)` before a grounded answer. The grounding phrase was: "\(quote)". If this exact tool has not already completed for the current turn, call it now, silently, and use its actual result before speaking. Do not substitute a verbal promise, inferred result, or another tool. If the call fails or is unavailable, report that concrete failure briefly. This advisory expires with the current participant turn.
+            """
+            return send([
+                "type": "append_instruction",
+                "taskID": advice.turnID.uuidString.lowercased(),
+                "data": String(instruction.prefix(4_096)),
+                "tool": tool,
+            ])
+        }
+    }
+
     private func sendHermesTaskResult(_ task: HermesAgentTask) -> Bool {
         guard active,
               task.status == .completed,
@@ -705,6 +817,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         openingVisualContextAttached = false
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
+        latestUserTranscript = ""
+        assistantOutputStartedForTurn = false
         inputLeveler.reset()
         resetDuplexCaptureState()
         activeTurnAudioAdmitted = false
@@ -749,6 +863,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let errorPipe = Pipe()
         process.executableURL = helperURL
         process.arguments = ["--cwd", projectDirectory, "--voice", voice.rawValue]
+        if let audioOutputDeviceUID {
+            process.arguments?.append(contentsOf: ["--output-device-uid", audioOutputDeviceUID])
+        }
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
@@ -889,7 +1006,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 inputTransportReported = true
                 onEvent(.inputTransportStarted)
             case "output_playback_ready":
-                onEvent(.outputPlaybackReady)
+                onEvent(.outputPlaybackReady(
+                    mode: String((event.mode ?? "unknown").prefix(64)),
+                    route: String((event.route ?? "unknown").prefix(128))
+                ))
             case "natural_turn_taking_confirmed":
                 onEvent(.naturalTurnTakingConfirmed)
             case "response_interrupted":
@@ -939,11 +1059,25 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     status: status,
                     error: error?.isEmpty == false ? String(error!.prefix(192)) : nil
                 ))
+            case "l1_tool_advice_attached":
+                onEvent(.l1ToolAdviceAttached(tool: String((event.tool ?? "unknown").prefix(96))))
+            case "l1_tool_advice_rejected":
+                onEvent(.l1ToolAdviceRejected(
+                    tool: String((event.tool ?? "unknown").prefix(96)),
+                    reason: String((event.reason ?? "unknown").prefix(192))
+                ))
             case "input_transcript_ready":
                 if (event.characters ?? 0) > 0 {
                     confirmInitialParticipantInput()
                 }
                 onEvent(.inputAccepted(characters: max(0, event.characters ?? 0)))
+            case "transcript_partial":
+                guard let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !text.isEmpty else { continue }
+                onEvent(.transcriptPartial(
+                    threadID: event.threadID,
+                    text: String(text.prefix(4_096))
+                ))
             case "transcript_finalized":
                 guard let rawRole = event.role,
                       let role = ConversationParticipantRole(rawValue: rawRole),
@@ -964,6 +1098,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     let now = DispatchTime.now().uptimeNanoseconds
                     awaitingAssistantResponse = true
                     latestUserTranscriptNS = now
+                    latestUserTranscript = String(text.prefix(4_096))
+                    assistantOutputStartedForTurn = false
                     recordUserActivity(at: now)
                     onEvent(.inputAccepted(characters: text.count))
                 }
@@ -986,6 +1122,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 echoReferenceMatcher.reset()
                 lastEchoRelationship = nil
                 outputReferenceReported = false
+                assistantOutputStartedForTurn = true
                 duplexCaptureGate.beginAssistantOutput(at: DispatchTime.now().uptimeNanoseconds)
                 onEvent(.microphoneCaptureSuppressed)
                 onEvent(.assistantSpeechStarted)
@@ -1329,8 +1466,9 @@ func testAppServerLiveVoiceLauncher() -> String {
              .visualContextAttached, .visualContextRejected,
              .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
              .hermesTaskResultAccepted, .hermesTaskResultRejected,
-             .personContextUnavailable, .embodimentMCPCall, .inputAccepted,
-             .transcriptFinalized, .preparingResponse, .responseStarted,
+             .personContextUnavailable, .embodimentMCPCall,
+             .l1ToolAdviceAttached, .l1ToolAdviceRejected, .inputAccepted,
+             .transcriptPartial, .transcriptFinalized, .preparingResponse, .responseStarted,
              .assistantSpeechStarted, .assistantSpeechEnded,
              .assistantOutputReferenceReady, .microphoneCaptureSuppressed,
              .playbackEchoAssessed, .participantBargeInAdmitted, .acousticEchoDiscarded,

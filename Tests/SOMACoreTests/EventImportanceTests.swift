@@ -1003,6 +1003,35 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(incidentalMotion.speechEvidence.qualified)
     }
 
+    func testOnsetGazeResolverBridgesMissingLandmarksButNotAvertedGaze() {
+        let onset: UInt64 = 2_000_000_000
+        let direct = TimestampedVisualGazeEvidence(
+            state: .direct,
+            observedNS: onset - 180_000_000
+        )
+        let unavailable = TimestampedVisualGazeEvidence(
+            state: .unavailable,
+            observedNS: onset - 40_000_000
+        )
+        XCTAssertEqual(
+            LiveVoiceOnsetGazeResolver.resolve([direct, unavailable], onsetNS: onset),
+            direct
+        )
+
+        let averted = TimestampedVisualGazeEvidence(
+            state: .averted,
+            observedNS: onset - 20_000_000
+        )
+        XCTAssertEqual(
+            LiveVoiceOnsetGazeResolver.resolve([direct, unavailable, averted], onsetNS: onset),
+            averted
+        )
+        XCTAssertNil(LiveVoiceOnsetGazeResolver.resolve(
+            [.init(state: .direct, observedNS: onset - 251_000_000)],
+            onsetNS: onset
+        ))
+    }
+
     func testSpeakerEpisodeConfirmsAfterRepeatedStrongSpeechEvidence() {
         var gate = LiveVoiceSpeakerEpisodeGate()
         let start: UInt64 = 4_000_000_000
@@ -1619,6 +1648,32 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertTrue(gate.quarantinesMicrophone(at: 1_400_000_000))
     }
 
+    func testDuplexCaptureGateCanRevokeAnAcousticallyInvalidatedBargeIn() {
+        var gate = LiveVoiceDuplexCaptureGate()
+        gate.beginAssistantOutput(at: 1_000_000_000)
+        gate.observeParticipantSpeech(active: true, verified: true, at: 1_100_000_000)
+        XCTAssertFalse(gate.quarantinesMicrophone(at: 1_100_000_000))
+
+        gate.revokeParticipantSpeechVerification(at: 1_200_000_000)
+        XCTAssertTrue(gate.quarantinesMicrophone(at: 1_200_000_000))
+    }
+
+    func testSpeechTailThatPredatesAssistantOutputCannotBecomeABargeIn() {
+        var gate = LiveVoiceDuplexCaptureGate()
+        gate.observeParticipantSpeech(active: true, verified: true, at: 1_000_000_000)
+        XCTAssertFalse(gate.quarantinesMicrophone(at: 1_000_000_000))
+
+        gate.beginAssistantOutput(at: 1_100_000_000)
+        XCTAssertTrue(gate.quarantinesMicrophone(at: 1_100_000_000))
+
+        gate.observeParticipantSpeech(active: true, verified: true, at: 1_200_000_000)
+        XCTAssertTrue(gate.quarantinesMicrophone(at: 1_200_000_000))
+
+        gate.observeParticipantSpeech(active: false, verified: false, at: 1_300_000_000)
+        gate.observeParticipantSpeech(active: true, verified: true, at: 1_400_000_000)
+        XCTAssertFalse(gate.quarantinesMicrophone(at: 1_400_000_000))
+    }
+
     func testVerifiedStrictBargeInRemainsReleasedWhilePlaybackIsStillActive() {
         var gate = LiveVoiceDuplexCaptureGate()
         gate.beginAssistantOutput(at: 1_000_000_000)
@@ -1636,6 +1691,83 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(gate.quarantinesMicrophone(at: 1_400_000_000))
         gate.observeParticipantSpeech(active: false, verified: false, at: 1_600_000_000)
         XCTAssertTrue(gate.quarantinesMicrophone(at: 1_600_000_000))
+    }
+
+    func testAcousticBargeInRequiresSustainedIndependentEvidence() {
+        var gate = LiveVoiceAcousticBargeInGate(requiredIndependentMilliseconds: 320)
+        let first = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 1_000_000_000
+        )
+        XCTAssertFalse(first.admitted)
+
+        let early = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 1_319_000_000
+        )
+        XCTAssertFalse(early.admitted)
+
+        let admitted = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 1_320_000_000
+        )
+        XCTAssertTrue(admitted.admitted)
+        XCTAssertTrue(admitted.becameAdmitted)
+    }
+
+    func testAcousticBargeInRevokesWhenPlaybackCorrelationReturns() {
+        var gate = LiveVoiceAcousticBargeInGate(requiredIndependentMilliseconds: 100)
+        _ = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 2_000_000_000
+        )
+        let admitted = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 2_100_000_000
+        )
+        XCTAssertTrue(admitted.admitted)
+
+        let revoked = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .ambiguous,
+            at: 2_120_000_000
+        )
+        XCTAssertFalse(revoked.admitted)
+        XCTAssertTrue(revoked.becameRevoked)
+    }
+
+    func testAcousticBargeInDoesNotAccumulateAcrossAmbiguousPlayback() {
+        var gate = LiveVoiceAcousticBargeInGate(requiredIndependentMilliseconds: 200)
+        _ = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 3_000_000_000
+        )
+        _ = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .ambiguous,
+            at: 3_150_000_000
+        )
+        let restarted = gate.observe(
+            speechActive: true,
+            speakerVerified: true,
+            relationship: .acousticallyIndependent,
+            at: 3_250_000_000
+        )
+        XCTAssertFalse(restarted.admitted)
     }
 
     func testUnverifiedPlaybackEpisodeRemainsQuarantinedBeyondTrailingTimer() {

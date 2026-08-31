@@ -4,6 +4,14 @@ import XCTest
 @testable import SOMACore
 
 final class HermesAgentTaskTests: XCTestCase {
+    func testEveryAdvertisedMCPToolHasAnExplicitCognitivePolicy() {
+        XCTAssertFalse(L2CognitiveToolPolicy.knownToolNames.isEmpty)
+        for name in L2CognitiveToolPolicy.knownToolNames {
+            XCTAssertNotNil(L2CognitiveToolPolicy.autonomy(for: name), name)
+            XCTAssertNotNil(L2CognitiveToolPolicy.effect(for: name), name)
+        }
+    }
+
     func testEncryptedTaskStoreRoundTripsAndDoesNotExposeResult() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("soma-hermes-task-\(UUID().uuidString)", isDirectory: true)
@@ -70,15 +78,20 @@ final class HermesAgentTaskTests: XCTestCase {
 
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_robot_body_state"))
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_activity_overview"))
+        XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "capture_view"))
         XCTAssertTrue(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "delegate_hermes_task"))
         XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "get_robot_body_state"))
+        XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "capture_view"))
         XCTAssertTrue(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "set_person_fact"))
 
-        let gateway = L2CognitiveToolPolicy.gatewayEpistemicIntent(for: "get_activity_overview")
+        let gateway = L2CognitiveToolPolicy.gatewayIntent(for: "get_activity_overview")
         XCTAssertEqual(gateway?.authorizationBasis, .autonomousGoal)
         XCTAssertEqual(gateway?.evidenceIDs, [])
         XCTAssertFalse(gateway?.purpose.isEmpty ?? true)
-        XCTAssertNil(L2CognitiveToolPolicy.gatewayEpistemicIntent(for: "delegate_hermes_task"))
+        let captureGateway = L2CognitiveToolPolicy.gatewayIntent(for: "capture_view")
+        XCTAssertEqual(captureGateway?.authorizationBasis, .autonomousGoal)
+        XCTAssertEqual(captureGateway?.expectedInformationGain, 0.9)
+        XCTAssertNil(L2CognitiveToolPolicy.gatewayIntent(for: "delegate_hermes_task"))
     }
 
     func testTaskRoutingSeparatesHostWorkFromRobotEmbodiment() {

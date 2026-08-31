@@ -239,6 +239,12 @@ private final class SOMAControlModel: ObservableObject {
     @Published var settings: SOMAControlSettings
     @Published var envSettings: SOMAEnvSettings
     @Published private(set) var runtime = SOMARuntimeSnapshot.empty
+    @Published private(set) var audioDevices = SOMAAudioDeviceSnapshot(
+        inputs: [],
+        outputs: [],
+        defaultInputUID: nil,
+        defaultOutputUID: nil
+    )
     @Published private(set) var message: String?
     @Published private(set) var ollamaConnection: OllamaConnectionState = .unchecked
     @Published private(set) var externalDependencyAudit: ExternalDependencyAuditState = .unchecked
@@ -269,6 +275,7 @@ private final class SOMAControlModel: ObservableObject {
         }
         administratorDraftName = settings.administrator?.displayName ?? ""
         administratorDraftAddress = settings.administrator?.preferredAddress ?? ""
+        refreshAudioDevices()
         refresh()
         _ = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -284,6 +291,10 @@ private final class SOMAControlModel: ObservableObject {
 
     func refresh() {
         runtime = SOMARuntimeSnapshot.read(settings: settings)
+    }
+
+    func refreshAudioDevices() {
+        audioDevices = SOMAAudioDeviceCatalog.snapshot()
     }
 
     func clearMessage() {
@@ -767,6 +778,7 @@ private struct SOMASettingsView: View {
         .frame(minWidth: 770, idealWidth: 820, minHeight: 580, idealHeight: 620)
         .tint(SOMAAccent.color)
         .onChange(of: selection) { _ in model.clearMessage() }
+        .onAppear { model.refreshAudioDevices() }
     }
 
     private var sidebar: some View {
@@ -875,6 +887,41 @@ private struct SOMASettingsView: View {
                 Text("Only voices accepted by the installed Codex realtime transport are shown; groups are curated by listening.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Divider()
+                Picker("Microphone", selection: binding(\.audioInputDeviceUID)) {
+                    Text("Automatic · OBSBOT preferred").tag(Optional<String>.none)
+                    ForEach(model.audioDevices.inputs) { device in
+                        Text(audioDeviceLabel(device, defaultUID: model.audioDevices.defaultInputUID))
+                            .tag(Optional(device.uid))
+                    }
+                    if let selected = model.settings.audioInputDeviceUID,
+                       !model.audioDevices.inputs.contains(where: { $0.uid == selected }) {
+                        Text("Unavailable preferred microphone").tag(Optional(selected))
+                    }
+                }
+                Picker("Speaker", selection: binding(\.audioOutputDeviceUID)) {
+                    Text("System default").tag(Optional<String>.none)
+                    ForEach(model.audioDevices.outputs) { device in
+                        Text(audioDeviceLabel(device, defaultUID: model.audioDevices.defaultOutputUID))
+                            .tag(Optional(device.uid))
+                    }
+                    if let selected = model.settings.audioOutputDeviceUID,
+                       !model.audioDevices.outputs.contains(where: { $0.uid == selected }) {
+                        Text("Unavailable preferred speaker").tag(Optional(selected))
+                    }
+                }
+                HStack {
+                    Text("Unavailable preferences use the connected OBSBOT microphone or system default output.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        model.refreshAudioDevices()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .controlSize(.small)
+                }
                 Toggle(
                     "Require eye contact for every spoken turn",
                     isOn: binding(\.realtimeVoiceRequiresEyeContactForEveryTurn)
@@ -1345,6 +1392,13 @@ private struct SOMASettingsView: View {
 
     private func binding<T>(_ keyPath: WritableKeyPath<SOMAControlSettings, T>) -> Binding<T> {
         Binding(get: { model.settings[keyPath: keyPath] }, set: { model.settings[keyPath: keyPath] = $0 })
+    }
+
+    private func audioDeviceLabel(
+        _ device: SOMAAudioDeviceDescriptor,
+        defaultUID: String?
+    ) -> String {
+        device.uid == defaultUID ? "\(device.name) · System default" : device.name
     }
 
     private var ledModeBinding: Binding<SOMALEDResponseMode> {
