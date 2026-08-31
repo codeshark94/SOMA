@@ -176,3 +176,167 @@ public enum L1LiveToolAdviceResponseDecoder {
             .joined(separator: " ")
     }
 }
+
+/// Decodes Ollama's native `/api/chat` tool-call envelope into SOMA's bounded
+/// advisory contract. Authoritative request identifiers are supplied locally;
+/// the model selects at most one function and must ground it in the latest
+/// participant transcript.
+public enum L1LiveToolAdviceOllamaDecoder {
+    public static func decode(
+        _ data: Data,
+        for request: L1LiveToolAdviceRequest
+    ) throws -> L1LiveToolAdvice {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let message = root["message"] as? [String: Any] else {
+            throw L1LiveToolAdviceResponseError.malformedJSON
+        }
+        let calls = message["tool_calls"] as? [[String: Any]] ?? []
+        guard calls.count <= 1 else {
+            throw L1LiveToolAdviceResponseError.validationFailed([
+                "exactly zero or one native tool call is allowed",
+            ])
+        }
+        guard let call = calls.first else {
+            return L1LiveToolAdvice(
+                cycleID: request.cycleID,
+                threadID: request.threadID,
+                turnID: request.turnID,
+                action: .noAssist,
+                confidence: 1,
+                rationale: "The primary L1 model selected no tool."
+            )
+        }
+        guard let function = call["function"] as? [String: Any],
+              let name = function["name"] as? String else {
+            throw L1LiveToolAdviceResponseError.malformedJSON
+        }
+        let arguments: [String: Any]
+        if let object = function["arguments"] as? [String: Any] {
+            arguments = object
+        } else if let raw = function["arguments"] as? String,
+                  let encoded = raw.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] {
+            arguments = object
+        } else {
+            arguments = [:]
+        }
+        guard Set(arguments.keys).isSubset(of: ["grounding_quote"]) else {
+            throw L1LiveToolAdviceResponseError.validationFailed([
+                "native tool arguments may contain only grounding_quote",
+            ])
+        }
+        let object: [String: Any] = [
+            "cycle_id": request.cycleID.uuidString.lowercased(),
+            "thread_id": request.threadID,
+            "turn_id": request.turnID.uuidString.lowercased(),
+            "action": L1LiveToolAdviceAction.recommendTool.rawValue,
+            "tool_name": name,
+            "grounding_quote": arguments["grounding_quote"] ?? NSNull(),
+            "confidence": 0.85,
+            "rationale": "The primary L1 model selected this function through Ollama native tool calling.",
+        ]
+        guard let encoded = try? JSONSerialization.data(withJSONObject: object) else {
+            throw L1LiveToolAdviceResponseError.malformedJSON
+        }
+        return try L1LiveToolAdviceResponseDecoder.decode(encoded, for: request)
+    }
+}
+
+/// Routes narrow, read-only conversational intents without placing a remote
+/// model on the first-audio path. Ambiguous language still goes to the primary
+/// L1 model; only explicit status domains with an available canonical tool are
+/// admitted here.
+public enum L1LiveEpistemicReflexRouter {
+    private struct Route {
+        let tool: String
+        let subjectCues: [String]
+        let requestCues: [String]
+    }
+
+    private static let statusRequestCues = [
+        "report status", "give me a status", "status report please", "what are you doing",
+        "상태 보고", "상황 보고", "현황 보고", "뭐 하고 있어", "뭐하는 중",
+        "状态报告", "报告状态", "现在在做什么", "状況報告", "状態報告", "何をしている",
+    ]
+
+    private static let routes: [Route] = [
+        Route(
+            tool: "get_robot_body_state",
+            subjectCues: [
+                "camera", "gimbal", "tracking", "track", "body",
+                "카메라", "짐벌", "추적", "몸 상태",
+                "摄像头", "云台", "跟踪", "カメラ", "ジンバル", "追跡",
+            ],
+            requestCues: statusRequestCues
+        ),
+        Route(
+            tool: "list_hermes_tasks",
+            subjectCues: [
+                "hermes", "delegated task", "background task", "worker task",
+                "헤르메스", "맡긴 작업", "위임 작업", "백그라운드 작업",
+                "委托任务", "后台任务", "委任タスク", "バックグラウンド作業",
+            ],
+            requestCues: statusRequestCues
+        ),
+        Route(
+            tool: "get_activity_overview",
+            subjectCues: [],
+            requestCues: statusRequestCues
+        ),
+    ]
+
+    public static func route(_ request: L1LiveToolAdviceRequest) -> L1LiveToolAdvice? {
+        let transcript = request.latestUserTranscript
+        let foldedTranscript = fold(transcript)
+        guard !foldedTranscript.isEmpty else { return nil }
+        for route in routes {
+            guard request.availableTools.contains(route.tool),
+                  !request.toolsAlreadyCalled.contains(route.tool),
+                  route.subjectCues.isEmpty || route.subjectCues.contains(where: {
+                      foldedTranscript.contains(fold($0))
+                  }),
+                  let cue = route.requestCues.first(where: {
+                      foldedTranscript.contains(fold($0))
+                  }),
+                  let range = transcript.range(
+                      of: cue,
+                      options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
+                  ) else {
+                continue
+            }
+            return L1LiveToolAdvice(
+                cycleID: request.cycleID,
+                threadID: request.threadID,
+                turnID: request.turnID,
+                action: .recommendTool,
+                toolName: route.tool,
+                groundingQuote: String(transcript[range]),
+                confidence: 1,
+                rationale: "Explicit read-only status intent matched the canonical domain route."
+            )
+        }
+        return nil
+    }
+
+    private static func fold(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+            .filter { !$0.isWhitespace && !$0.isPunctuation }
+    }
+}
+
+/// The only L1 recommendations that the Live Voice host may execute directly.
+/// These tools are bounded current-state reads. Every other recommendation
+/// remains advisory so L2 retains authority over side effects and open-ended
+/// queries.
+public enum L1LiveDirectReadOnlyToolPolicy {
+    public static let toolNames: Set<String> = [
+        "get_activity_overview",
+        "get_robot_body_state",
+        "list_hermes_tasks",
+    ]
+
+    public static func permits(_ toolName: String) -> Bool {
+        toolNames.contains(toolName)
+    }
+}

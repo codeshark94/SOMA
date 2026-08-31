@@ -10,6 +10,7 @@ private struct Command: Decodable {
         case appendImage = "append_image"
         case appendText = "append_text"
         case appendInstruction = "append_instruction"
+        case executeReadOnlyTool = "execute_read_only_tool"
         case stop
     }
 
@@ -459,7 +460,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 // WebKit. Start them while the hidden audio frontend loads;
                 // the WebRTC offer is joined once both sides are ready.
                 break
-            case .appendAudio, .appendImage, .appendText, .appendInstruction, .stop:
+            case .appendAudio, .appendImage, .appendText, .appendInstruction,
+                 .executeReadOnlyTool, .stop:
                 pendingCommands.append(command)
                 return
             }
@@ -584,9 +586,116 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     }
                 }
             }
+        case .executeReadOnlyTool:
+            guard let threadID,
+                  let turnID = command.taskID,
+                  UUID(uuidString: turnID) != nil,
+                  let tool = command.tool,
+                  L1LiveDirectReadOnlyToolPolicy.permits(tool) else { return }
+            executeL1ReadOnlyTool(tool, turnID: turnID, threadID: threadID)
         case .stop:
             stop(reason: "control_stop")
         }
+    }
+
+    private func executeL1ReadOnlyTool(
+        _ tool: String,
+        turnID: String,
+        threadID: String
+    ) {
+        let startedNS = DispatchTime.now().uptimeNanoseconds
+        connection.request(
+            method: "mcpServer/tool/call",
+            params: [
+                "threadId": threadID,
+                "server": "soma_embodiment",
+                "tool": tool,
+                "arguments": [:],
+            ]
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let result = response.value["result"] as? [String: Any]
+                let protocolError = response.value["error"]
+                let toolFailed = (result?["isError"] as? Bool) == true
+                let succeeded = protocolError == nil && !toolFailed && result != nil
+                let latencyMS = Double(
+                    DispatchTime.now().uptimeNanoseconds - startedNS
+                ) / 1_000_000
+                let errorMessage: String
+                if protocolError != nil {
+                    errorMessage = AppServerConnection.responseMessage(response.value)
+                } else if toolFailed {
+                    errorMessage = Self.firstToolErrorText(result) ?? "tool_returned_error"
+                } else {
+                    errorMessage = ""
+                }
+                self.emitter.emit("embodiment_mcp_call", fields: [
+                    "tool": tool,
+                    "status": succeeded ? "completed" : "failed",
+                    "error": String(errorMessage.prefix(192)),
+                    "latency_ms": latencyMS,
+                    "origin": "l1_direct_read_only",
+                ])
+
+                let resultObject: Any = result ?? [
+                    "isError": true,
+                    "error": errorMessage.isEmpty ? "tool_result_unavailable" : errorMessage,
+                ]
+                guard JSONSerialization.isValidJSONObject(resultObject),
+                      let data = try? JSONSerialization.data(
+                          withJSONObject: resultObject,
+                          options: [.sortedKeys]
+                      ),
+                      let json = String(data: data, encoding: .utf8) else {
+                    self.emitter.emit("l1_tool_advice_rejected", fields: [
+                        "turn_id": turnID,
+                        "tool": tool,
+                        "reason": "tool_result_encoding_failed",
+                    ])
+                    return
+                }
+                let instruction = """
+                SOMA_L1_DIRECT_TOOL_RESULT
+                This is private current-turn control context, not participant speech and not text to recite. L1 executed the read-only SOMA MCP tool `\(tool)` for the latest participant request. Use this actual result now and begin the grounded answer without a generic preamble. Do not call the same tool again for this turn.
+                result: \(String(json.prefix(48_000)))
+                """
+                let item: [String: Any] = [
+                    "type": "message",
+                    "role": "developer",
+                    "content": [["type": "input_text", "text": instruction]],
+                ]
+                self.connection.request(
+                    method: "thread/inject_items",
+                    params: ["threadId": threadID, "items": [item]]
+                ) { [weak self] injection in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if injection.value["error"] == nil {
+                            self.emitter.emit("l1_tool_advice_attached", fields: [
+                                "turn_id": turnID,
+                                "tool": tool,
+                                "execution": "direct_read_only",
+                            ])
+                        } else {
+                            self.emitter.emit("l1_tool_advice_rejected", fields: [
+                                "turn_id": turnID,
+                                "tool": tool,
+                                "reason": AppServerConnection.responseMessage(injection.value),
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static func firstToolErrorText(_ result: [String: Any]?) -> String? {
+        guard let content = result?["content"] as? [[String: Any]] else { return nil }
+        return content.compactMap { $0["text"] as? String }
+            .first(where: {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            })
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -724,6 +833,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             "ephemeral": true,
             "approvalPolicy": "never",
             "sandbox": effectiveSandbox,
+            "config": [
+                "model_auto_compact_token_limit": LiveVoiceContextRetentionPolicy.backingAutoCompactTokenLimit,
+                "model_auto_compact_token_limit_scope": LiveVoiceContextRetentionPolicy.backingAutoCompactTokenLimitScope,
+                "compact_prompt": LiveVoiceContextRetentionPolicy.backingCompactionPrompt,
+            ],
         ]
         connection.request(
             method: "thread/start",
@@ -1029,6 +1143,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         params["prompt"] = [
             L2CognitiveToolPolicy.instruction,
             modePolicyInstruction,
+            initialContext.isEmpty ? nil : initialContext,
         ]
             .compactMap { $0 }
             .joined(separator: "\n\n")
@@ -1115,6 +1230,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private func handleNotification(method: String, params: [String: Any]) {
         guard params["threadId"] as? String == threadID else { return }
         switch method {
+        case "thread/compacted":
+            emitter.emit("backing_context_compacted", fields: [
+                "turn_id": params["turnId"] as? String ?? "unknown",
+                "token_limit": LiveVoiceContextRetentionPolicy.backingAutoCompactTokenLimit,
+                "scope": LiveVoiceContextRetentionPolicy.backingAutoCompactTokenLimitScope,
+            ])
         case "thread/realtime/started":
             appServerStarted = true
             activateIfReady()
@@ -1259,7 +1380,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
            observedRealtimeEventTypes.insert(type).inserted {
             emitter.emit("realtime_event_type", fields: ["type": String(type.prefix(128))])
         }
-        if type == "session.started" || type == "session.updated" {
+        if type == "session.started" || type == "session.created" || type == "session.updated" {
             realtimeSessionInitialized = true
             emitter.emit("realtime_session_configuration", fields: [
                 "source_event": type,

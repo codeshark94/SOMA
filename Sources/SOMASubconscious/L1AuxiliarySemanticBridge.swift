@@ -28,22 +28,6 @@ private struct L1AuxiliaryWorkerRequest: Encodable {
     let imageJPEGBase64: String
 }
 
-private struct L1AuxiliaryToolAdviceWorkerRequest: Encodable {
-    let type = "tool_advice"
-    let requestID: UInt64
-    let request: L1LiveToolAdviceRequest
-}
-
-struct L1AuxiliaryToolAdviceInference: Sendable {
-    let responseData: Data
-    let inferenceMS: Double
-}
-
-enum L1AuxiliaryToolAdviceInferenceOutcome: Sendable {
-    case success(L1AuxiliaryToolAdviceInference)
-    case failure(String)
-}
-
 private struct L1AuxiliaryWorkerEnvelope: Decodable {
     let type: String
     let state: String?
@@ -69,7 +53,6 @@ private struct L1AuxiliaryWorkerEnvelope: Decodable {
     let reaction: L1AuxiliaryReaction?
     let conversationValue: Double?
     let objectLabel: String?
-    let content: String?
     let inferenceMS: Double?
 }
 
@@ -82,17 +65,9 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         let context: L1AuxiliaryFrameContext
     }
 
-    private struct PendingToolAdvice: Sendable {
-        let request: L1LiveToolAdviceRequest
-        let completion: @Sendable (L1AuxiliaryToolAdviceInferenceOutcome) -> Void
-    }
-
-    private enum InFlight {
-        case visual(requestID: UInt64, context: L1AuxiliaryFrameContext)
-        case toolAdvice(
-            requestID: UInt64,
-            completion: @Sendable (L1AuxiliaryToolAdviceInferenceOutcome) -> Void
-        )
+    private struct InFlight {
+        let requestID: UInt64
+        let context: L1AuxiliaryFrameContext
     }
 
     private let queue = DispatchQueue(label: "soma.l1.auxiliary-vlm", qos: .utility)
@@ -111,7 +86,6 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private var interruptGate: L1AuxiliarySemanticInterruptGate
     private var temporalSituationGate = L1AuxiliaryTemporalSituationGate()
     private var pending: Pending?
-    private var pendingToolAdvice: PendingToolAdvice?
     private var inFlight: InFlight?
     private var ready = false
     private var accepting = true
@@ -225,7 +199,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
                 weakBridge.value?.consumeStderr(data)
             }
         }
-        onHealth("starting", "model=\(modelPath); transport=jsonl_visual_and_tool_advice; visual_mailbox_capacity=1; tool_mailbox_capacity=1")
+        onHealth("starting", "model=\(modelPath); transport=jsonl_visual_only; visual_mailbox_capacity=1")
     }
 
     private func handleTermination(_ completed: Process, generation: UInt64) {
@@ -239,9 +213,6 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         output = nil
         errorOutput = nil
         process = nil
-        if case let .toolAdvice(_, completion) = inFlight {
-            completion(.failure("e2b_worker_terminated"))
-        }
         inFlight = nil
         guard !intentionallyStopped, accepting else { return }
         let diagnostic = stderrBuffer
@@ -292,26 +263,6 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         queue.async { [weak self] in self?.drainSubmittedFrames() }
     }
 
-    /// Uses the already-loaded E2B process for current-turn tool selection.
-    /// Tool advice is served before the next replaceable visual refresh, but
-    /// never interrupts an inference that is already executing.
-    func submitToolAdvice(
-        _ request: L1LiveToolAdviceRequest,
-        completion: @escaping @Sendable (L1AuxiliaryToolAdviceInferenceOutcome) -> Void
-    ) {
-        queue.async { [weak self] in
-            guard let self, accepting else {
-                completion(.failure("e2b_worker_unavailable"))
-                return
-            }
-            if let superseded = pendingToolAdvice {
-                superseded.completion(.failure("superseded_by_newer_turn"))
-            }
-            pendingToolAdvice = PendingToolAdvice(request: request, completion: completion)
-            pump()
-        }
-    }
-
     func stop() {
         submissionLock.lock()
         acceptingSubmissions = false
@@ -322,11 +273,6 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             accepting = false
             intentionallyStopped = true
             pending = nil
-            pendingToolAdvice?.completion(.failure("e2b_worker_stopped"))
-            pendingToolAdvice = nil
-            if case let .toolAdvice(_, completion) = inFlight {
-                completion(.failure("e2b_worker_stopped"))
-            }
             inFlight = nil
             inferenceWatchdog?.cancel()
             inferenceWatchdog = nil
@@ -368,26 +314,11 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
 
     private func pump() {
         guard accepting, ready, inFlight == nil else { return }
-        if let pendingToolAdvice {
-            self.pendingToolAdvice = nil
-            requestSequence += 1
-            let requestID = requestSequence
-            inFlight = .toolAdvice(
-                requestID: requestID,
-                completion: pendingToolAdvice.completion
-            )
-            let request = L1AuxiliaryToolAdviceWorkerRequest(
-                requestID: requestID,
-                request: pendingToolAdvice.request
-            )
-            write(request, requestID: requestID)
-            return
-        }
         guard let pending else { return }
         self.pending = nil
         requestSequence += 1
         let requestID = requestSequence
-        inFlight = .visual(requestID: requestID, context: pending.context)
+        inFlight = InFlight(requestID: requestID, context: pending.context)
         let jpeg: Data? = autoreleasepool {
             let image = CIImage(cvPixelBuffer: pending.pixelBuffer.value)
                 .transformed(by: CGAffineTransform(scaleX: 0.4, y: 0.4))
@@ -425,14 +356,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
             try input.write(contentsOf: data)
             armInferenceWatchdog(requestID: requestID)
         } catch {
-            let completion: (@Sendable (L1AuxiliaryToolAdviceInferenceOutcome) -> Void)?
-            if case let .toolAdvice(_, callback) = inFlight {
-                completion = callback
-            } else {
-                completion = nil
-            }
             inFlight = nil
-            completion?(.failure("e2b_transport_error"))
             onHealth("transport_error", String(error.localizedDescription.prefix(200)))
             pump()
         }
@@ -442,15 +366,7 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
         inferenceWatchdog?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, accepting else { return }
-            let activeRequestID: UInt64?
-            switch inFlight {
-            case let .visual(id, _), let .toolAdvice(id, _): activeRequestID = id
-            case nil: activeRequestID = nil
-            }
-            guard activeRequestID == requestID else { return }
-            if case let .toolAdvice(_, completion) = inFlight {
-                completion(.failure("e2b_inference_timeout"))
-            }
+            guard inFlight?.requestID == requestID else { return }
             inFlight = nil
             ready = false
             onHealth(
@@ -466,9 +382,6 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
     private func handleProtocolMismatch(_ reason: String) {
         inferenceWatchdog?.cancel()
         inferenceWatchdog = nil
-        if case let .toolAdvice(_, completion) = inFlight {
-            completion(.failure(reason))
-        }
         inFlight = nil
         ready = false
         onHealth("protocol_error", "reason=\(reason); recovery=worker_restart")
@@ -534,12 +447,13 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
                 handleProtocolMismatch("incomplete_visual_result")
                 return
             }
-            guard case let .visual(expectedRequestID, requestContext) = inFlight,
-                  expectedRequestID == requestID,
-                  requestContext.captureNS == captureNS else {
+            guard let active = inFlight,
+                  active.requestID == requestID,
+                  active.context.captureNS == captureNS else {
                 handleProtocolMismatch("visual_result_request_mismatch")
                 return
             }
+            let requestContext = active.context
             inferenceWatchdog?.cancel()
             inferenceWatchdog = nil
             inFlight = nil
@@ -575,34 +489,10 @@ final class L1AuxiliarySemanticBridge: @unchecked Sendable {
                 onInterrupt(recommendation)
             }
             pump()
-        case "tool_advice_result":
-            guard let requestID = envelope.requestID,
-                  let content = envelope.content,
-                  let inferenceMS = envelope.inferenceMS,
-                  case let .toolAdvice(expectedRequestID, completion) = inFlight,
-                  requestID == expectedRequestID else {
-                handleProtocolMismatch("tool_advice_result_mismatch")
-                return
-            }
-            inferenceWatchdog?.cancel()
-            inferenceWatchdog = nil
-            inFlight = nil
-            completion(.success(L1AuxiliaryToolAdviceInference(
-                responseData: Data(content.utf8),
-                inferenceMS: inferenceMS
-            )))
-            pump()
         case "error":
             inferenceWatchdog?.cancel()
             inferenceWatchdog = nil
-            let completion: (@Sendable (L1AuxiliaryToolAdviceInferenceOutcome) -> Void)?
-            if case let .toolAdvice(_, callback) = inFlight {
-                completion = callback
-            } else {
-                completion = nil
-            }
             inFlight = nil
-            completion?(.failure(envelope.message ?? "e2b_worker_error"))
             onHealth("runtime_error", envelope.message ?? "worker_error")
             pump()
         default:

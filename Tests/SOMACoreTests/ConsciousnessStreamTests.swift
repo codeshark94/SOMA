@@ -39,6 +39,43 @@ final class ConsciousnessStreamTests: XCTestCase {
         XCTAssertTrue(queue.isEmpty)
     }
 
+    func testLiveToolAdvicePreemptsBackgroundWorkAndKeepsOnlyNewestTurn() {
+        var queue = L1ConsciousnessWorkQueue()
+        queue.enqueue(makeThoughtRequest(wakeKind: .periodic, revision: 4))
+        queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 5))
+        queue.enqueue(makeExecutiveRequest(revision: 5))
+        let first = makeLiveToolRequest(transcript: "Status report.")
+        let second = makeLiveToolRequest(transcript: "What can you see now?")
+
+        XCTAssertNil(queue.enqueue(first))
+        XCTAssertEqual(queue.enqueue(second)?.turnID, first.turnID)
+        XCTAssertTrue(queue.hasLiveToolAdvice)
+
+        guard case let .liveTool(live)? = queue.dequeue() else {
+            return XCTFail("live participant tool advice must preempt background cognition")
+        }
+        guard case .executive? = queue.dequeue() else {
+            return XCTFail("executive work must follow the live participant turn")
+        }
+        guard case .thought? = queue.dequeue() else {
+            return XCTFail("event thought must follow executive work")
+        }
+        XCTAssertEqual(live.turnID, second.turnID)
+    }
+
+    func testPreemptedExecutiveReturnsAheadOfReflectionWithoutDuplication() {
+        var queue = L1ConsciousnessWorkQueue()
+        let executive = makeExecutiveRequest(revision: 4)
+        let thought = makeThoughtRequest(wakeKind: .event, revision: 4)
+        queue.enqueue(thought)
+        queue.requeuePreempted(.executive(executive))
+        queue.requeuePreempted(.executive(executive))
+
+        XCTAssertEqual(queue.executiveCount, 1)
+        XCTAssertEqual(queue.dequeue(), .executive(executive))
+        XCTAssertEqual(queue.dequeue(), .thought(thought))
+    }
+
     func testPendingEventCoalescingIsIdempotentAndUsesNewestAuthority() {
         var queue = L1ConsciousnessWorkQueue()
         queue.enqueue(makeThoughtRequest(wakeKind: .event, revision: 5, evidenceID: "scene:5"))
@@ -415,6 +452,14 @@ final class ConsciousnessStreamTests: XCTestCase {
             context: .init(),
             availableActions: [.noAction, .resumeScanning],
             evidenceIDs: ["behavior:1"]
+        )
+    }
+
+    private func makeLiveToolRequest(transcript: String) -> L1LiveToolAdviceRequest {
+        L1LiveToolAdviceRequest(
+            threadID: "live-thread",
+            latestUserTranscript: transcript,
+            availableTools: ["get_activity_overview", "capture_view"]
         )
     }
 }

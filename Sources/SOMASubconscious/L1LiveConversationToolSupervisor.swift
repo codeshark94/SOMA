@@ -11,7 +11,7 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
     typealias AdviceHandler = @Sendable (L1LiveToolAdvice, String) -> Void
     typealias InferenceHandler = @Sendable (
         L1LiveToolAdviceRequest,
-        @escaping @Sendable (L1AuxiliaryToolAdviceInferenceOutcome) -> Void
+        @escaping @Sendable (Result<L1LiveToolAdvice, Error>) -> Void
     ) -> Void
 
     private struct PendingAdvice: Equatable {
@@ -49,7 +49,7 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
         self.onAdvice = onAdvice
         onHealth(
             "configured",
-            "backend=e2b_shared_mlx; scheduling=tool_advice_before_visual_refresh; execution=advisory_only"
+            "backend=primary_l1_31b; protocol=ollama_native_tool_calls; scheduling=live_tool_before_executive_event_periodic; execution=bounded_read_only_direct_or_advisory"
         )
     }
 
@@ -126,7 +126,7 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
                 speculativeAdvice = nil
                 currentTranscript = partial
             }
-            // The shared MLX worker is single-flight. Keep at most one
+            // The shared L1 transport is single-flight. Keep at most one
             // speculative request for a spoken turn and let a changed final
             // transcript supersede it after completion.
             guard !inferenceInFlight else { return }
@@ -205,8 +205,20 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
             availableTools: Array(L2CognitiveToolPolicy.knownToolNames),
             toolsAlreadyCalled: Array(successfulTools)
         )
+        if let advice = L1LiveEpistemicReflexRouter.route(request) {
+            let tool = advice.toolName ?? "none"
+            if currentTurnFinalized {
+                onHealth("reflex_route", "turn=\(turnID.uuidString.lowercased()); tool=\(tool); finalized=true")
+                apply(advice, latencyMS: 0)
+            } else {
+                speculativeAdvice = advice
+                onHealth("reflex_route", "turn=\(turnID.uuidString.lowercased()); tool=\(tool); finalized=false")
+            }
+            return
+        }
         inferenceInFlight = true
-        onHealth("started", "turn=\(turnID.uuidString.lowercased()); backend=e2b_shared_mlx")
+        let startedNS = DispatchTime.now().uptimeNanoseconds
+        onHealth("started", "turn=\(turnID.uuidString.lowercased()); backend=primary_l1_31b; protocol=ollama_native_tool_calls")
         infer(request) { [weak self] outcome in
             self?.queue.async { [weak self] in
                 guard let self, !stopped,
@@ -214,39 +226,31 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
                       currentTurnID == request.turnID,
                       activeThreadID == request.threadID else { return }
                 inferenceInFlight = false
-                guard case let .success(result) = outcome else {
+                let latencyMS = Double(DispatchTime.now().uptimeNanoseconds - startedNS) / 1_000_000
+                guard case let .success(advice) = outcome else {
                     let reason: String
-                    if case let .failure(message) = outcome {
-                        reason = message
+                    if case let .failure(error) = outcome {
+                        reason = error.localizedDescription
                     } else {
-                        reason = "e2b_inference_failed"
+                        reason = "primary_l1_inference_failed"
                     }
-                    onHealth("failed", "turn=\(turnID.uuidString.lowercased()); reason=\(String(reason.prefix(160)))")
+                    onHealth("failed", "turn=\(turnID.uuidString.lowercased()); reason=\(String(reason.prefix(160))); latency_ms=\(String(format: "%.1f", latencyMS))")
                     return
                 }
-                let latencyMS = result.inferenceMS
-                do {
-                    let advice = try L1LiveToolAdviceResponseDecoder.decode(
-                        result.responseData,
-                        for: request
-                    )
-                    guard request.latestUserTranscript == currentTranscript else {
-                        onHealth("held", "turn=\(turnID.uuidString.lowercased()); reason=transcript_advanced")
-                        if currentTurnFinalized {
-                            generation &+= 1
-                            submitCurrentTurn(generation: generation)
-                        }
-                        return
+                guard request.latestUserTranscript == currentTranscript else {
+                    onHealth("held", "turn=\(turnID.uuidString.lowercased()); reason=transcript_advanced")
+                    if currentTurnFinalized {
+                        generation &+= 1
+                        submitCurrentTurn(generation: generation)
                     }
-                    if !currentTurnFinalized {
-                        speculativeAdvice = advice
-                        onHealth("speculative_ready", "turn=\(turnID.uuidString.lowercased()); action=\(advice.action.rawValue); latency_ms=\(String(format: "%.1f", latencyMS))")
-                        return
-                    }
-                    apply(advice, latencyMS: latencyMS)
-                } catch {
-                    onHealth("failed", "turn=\(turnID.uuidString.lowercased()); reason=\(String(error.localizedDescription.prefix(200))); latency_ms=\(String(format: "%.1f", latencyMS))")
+                    return
                 }
+                if !currentTurnFinalized {
+                    speculativeAdvice = advice
+                    onHealth("speculative_ready", "turn=\(turnID.uuidString.lowercased()); action=\(advice.action.rawValue); latency_ms=\(String(format: "%.1f", latencyMS))")
+                    return
+                }
+                apply(advice, latencyMS: latencyMS)
             }
         }
     }

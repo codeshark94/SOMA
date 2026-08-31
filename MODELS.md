@@ -149,11 +149,11 @@ activates the checkpoint. The repository does not redistribute the model.
 
 This is L1's optional local semantic helper. A same-image three-request
 probe measured 1.47 s cold and 1.39 s warm-median inference with a 4.20 GB
-MLX-reported peak. It remains asynchronous advisory cognition and is never part
-of the L0 tracking or motor loop. The same persistent E2B process also evaluates
-current Live Voice turns for a validated one-tool advisory; these requests run
-before the next replaceable visual refresh without interrupting an inference in
-progress. It cannot execute tools or speak. MLX uses the Apple GPU and unified
+MLX-reported peak. It remains asynchronous visual advisory cognition and is never part
+of the L0 tracking, motor, or conversation-tool loop. Live Voice tool selection
+uses the primary `gemma4:31b-cloud` route through Ollama native `tools` and
+`message.tool_calls`; L2 validates the advice and retains execution authority.
+E2B cannot select or execute tools or speak. MLX uses the Apple GPU and unified
 memory, not the Neural Engine. The persistent launcher leaves it off by default because
 it adds multi-gigabyte unified-memory pressure without contributing to L0
 fixation or social decisions. Set `SOMA_ENABLE_L05_VLM=1` only for an explicit

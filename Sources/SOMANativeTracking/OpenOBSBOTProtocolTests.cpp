@@ -79,9 +79,11 @@ int main() {
     ));
 
     const auto tiny2Wake = wakeState(OBSBOTOpenDeviceProfile::tiny2Lite, true);
+    const auto tiny2Sleep = wakeState(OBSBOTOpenDeviceProfile::tiny2Lite, false);
     const auto tiny3Sleep = wakeState(OBSBOTOpenDeviceProfile::tiny3Lite, false);
     assert(tiny2Wake.command == 0xA0C2 && tiny2Wake.receiver == 0x02);
-    assert(tiny2Wake.payload == std::vector<uint8_t> {0});
+    assert(tiny2Wake.payload == (std::vector<uint8_t> {0, 0, 0, 0}));
+    assert(tiny2Sleep.payload == (std::vector<uint8_t> {1, 0, 0, 0}));
     assert(tiny3Sleep.command == 0xA0C2 && tiny3Sleep.receiver == 0x02);
     assert(tiny3Sleep.payload == (std::vector<uint8_t> {1, 0, 0, 0}));
 

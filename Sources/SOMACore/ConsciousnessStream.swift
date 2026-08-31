@@ -6,6 +6,7 @@ public enum L1ThoughtWakeKind: String, Codable, CaseIterable, Hashable, Sendable
 }
 
 public enum L1ConsciousnessWorkItem: Equatable, Sendable {
+    case liveTool(L1LiveToolAdviceRequest)
     case thought(L1ThoughtRequest)
     case executive(L1ExecutiveRequest)
 }
@@ -14,17 +15,32 @@ public enum L1ConsciousnessWorkItem: Equatable, Sendable {
 /// tests. Distinct executive intention episodes are retained in order; event
 /// and periodic reflection each coalesce to the newest workspace snapshot.
 public struct L1ConsciousnessWorkQueue: Equatable, Sendable {
+    private var liveToolAdvice: L1LiveToolAdviceRequest?
     private var executives: [L1ExecutiveRequest] = []
     private var eventThought: L1ThoughtRequest?
     private var periodicThought: L1ThoughtRequest?
 
     public init() {}
 
+    public var hasLiveToolAdvice: Bool { liveToolAdvice != nil }
     public var executiveCount: Int { executives.count }
     public var hasEventThought: Bool { eventThought != nil }
     public var hasPeriodicThought: Bool { periodicThought != nil }
     public var isEmpty: Bool {
-        executives.isEmpty && eventThought == nil && periodicThought == nil
+        liveToolAdvice == nil && executives.isEmpty && eventThought == nil && periodicThought == nil
+    }
+
+    /// Live conversation is the only human-turn workload in this queue. Keep
+    /// only its newest pending transcript and service it before background
+    /// executive or reflective cognition. The displaced request is returned
+    /// so its caller can be completed instead of left waiting.
+    @discardableResult
+    public mutating func enqueue(
+        _ request: L1LiveToolAdviceRequest
+    ) -> L1LiveToolAdviceRequest? {
+        let displaced = liveToolAdvice
+        liveToolAdvice = request
+        return displaced
     }
 
     public mutating func enqueue(
@@ -55,6 +71,10 @@ public struct L1ConsciousnessWorkQueue: Equatable, Sendable {
     }
 
     public mutating func dequeue() -> L1ConsciousnessWorkItem? {
+        if let liveToolAdvice {
+            self.liveToolAdvice = nil
+            return .liveTool(liveToolAdvice)
+        }
         if !executives.isEmpty { return .executive(executives.removeFirst()) }
         if let eventThought {
             self.eventThought = nil
@@ -67,7 +87,25 @@ public struct L1ConsciousnessWorkQueue: Equatable, Sendable {
         return nil
     }
 
+    /// Returns interrupted background cognition to the front of its semantic
+    /// lane. A newer coalesced snapshot or an already queued intention wins.
+    /// Live requests are replaceable and are therefore handled by `enqueue`.
+    public mutating func requeuePreempted(_ work: L1ConsciousnessWorkItem) {
+        switch work {
+        case let .liveTool(request):
+            _ = enqueue(request)
+        case let .thought(request):
+            enqueue(request)
+        case let .executive(request):
+            guard !executives.contains(where: { $0.intention.id == request.intention.id }) else {
+                return
+            }
+            executives.insert(request, at: 0)
+        }
+    }
+
     public mutating func removeAll() {
+        liveToolAdvice = nil
         executives.removeAll()
         eventThought = nil
         periodicThought = nil

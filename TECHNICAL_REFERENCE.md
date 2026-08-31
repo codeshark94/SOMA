@@ -123,6 +123,21 @@ current Live start request sends no model override, so the installed Codex
 app-server chooses the realtime model. Separate temporary Codex threads do
 support an explicit model and reasoning-effort override.
 
+The backing ephemeral Codex thread uses
+`model_auto_compact_token_limit=12000` with `body_after_prefix`, so accumulated
+spoken turns and tool results are compacted while the stable developer prefix
+remains intact. The compaction handoff retains the active goal, unresolved
+questions, corrections, commitments, tool outcomes, delegated task IDs, and
+newly stated person facts; it drops transcript repetition, stale perception,
+obsolete advice, and completed micro-steps. A `backing_context_compacted`
+diagnostic marks each actual compaction.
+
+Codex App Server V3's WebRTC data channel is not treated as the public Realtime
+API session contract. Its `session.started` event exposes only App Server session
+status, and a public-API `session.update` truncation envelope is rejected. SOMA
+therefore does not send that invalid control packet; context bounds live at the
+accepted backing-thread layer.
+
 `soma-codex-bridge`, `--local-speech-recognition`, and local
 `AVSpeechSynthesizer` remain an explicit diagnostic/fallback transport. They are
 not the persistent launcher's default and must not be described as GPT-Live.
@@ -502,9 +517,22 @@ measured E2B at 1.47 s cold and 1.39 s warm median. The checkpoint occupies
 3.3 GiB and reported a 4.20 GB MLX peak. The person-free fixture stayed
 `ambient / none`; broader labelled human and object evaluation remains open.
 The worker accepts only the pinned E2B checkpoint and has no Ollama fallback.
-The same process multiplexes visual semantics and current-turn Live Voice tool
-advice on one inference queue. Tool advice precedes the next replaceable visual
-refresh; it never interrupts active inference and it has no execution authority.
+It is a visual-only helper. Current-turn Live Voice tool selection runs on the
+primary 31B route through Ollama native function definitions and decodes
+`message.tool_calls`. It has highest priority in the primary L1 single-flight
+queue and safely preempts/requeues background L1 inference, while L2 retains
+authority over side effects and open-ended tool arguments. Three bounded
+current-state reads (`get_activity_overview`, `get_robot_body_state`, and
+`list_hermes_tasks`) may be executed directly by the active Live Voice host
+after a validated, transcript-grounded L1 recommendation; the actual result is
+injected into that same turn before the grounded answer.
+
+The former E2B JSON-advice route could spend roughly 2–4 seconds failing to
+extract its expected JSON before L2 continued without advice. A direct native
+tool-call probe on the installed primary route selected `get_activity_overview`
+for `Status report.` in 0.58 seconds. The runtime now uses that native envelope,
+allows at most one function, validates its exact transcript grounding, and
+rejects any argument outside the advisory contract.
 
 The selected `gemma4:31b-cloud` primary L1 situational model measured 0.79 s
 cold and 0.89 s warm median on the same fixture. Its active situation-stream

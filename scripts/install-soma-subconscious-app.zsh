@@ -250,7 +250,7 @@ soma_render_launch_agent \
 /bin/launchctl bootstrap "gui/$(id -u)" "$soma_menu_bar_plist"
 /bin/launchctl enable "gui/$(id -u)/com.soma.reactive-l0" >/dev/null 2>&1 || true
 if /bin/launchctl print "gui/$(id -u)/com.soma.reactive-l0" >/dev/null 2>&1; then
-  /bin/launchctl kickstart -k "gui/$(id -u)/com.soma.reactive-l0"
+  "$soma_root/scripts/soma.zsh" restart
 else
   /bin/launchctl bootstrap "gui/$(id -u)" "$soma_reactive_plist"
 fi

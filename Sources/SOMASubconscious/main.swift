@@ -86,17 +86,21 @@ func warmUpL1Model() {
 private final class GracefulShutdown: @unchecked Sendable {
     private let lock = NSLock()
     private var actions: [() -> Void] = []
-    private let source: DispatchSourceSignal
+    private var fired = false
+    private let sources: [DispatchSourceSignal]
 
     init(signals: [Int32]) {
         for sig in signals { signal(sig, SIG_IGN) }
-        let src = DispatchSource.makeSignalSource(
-            signal: signals[0],
-            queue: DispatchQueue.global(qos: .userInitiated)
-        )
-        self.source = src
-        src.setEventHandler { [weak self] in self?.fire() }
-        src.resume()
+        sources = signals.map { signalNumber in
+            DispatchSource.makeSignalSource(
+                signal: signalNumber,
+                queue: DispatchQueue.global(qos: .userInitiated)
+            )
+        }
+        for source in sources {
+            source.setEventHandler { [weak self] in self?.request() }
+            source.resume()
+        }
     }
 
     func onTerminate(_ action: @escaping () -> Void) {
@@ -105,8 +109,13 @@ private final class GracefulShutdown: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func fire() {
+    func request() {
         lock.lock()
+        guard !fired else {
+            lock.unlock()
+            return
+        }
+        fired = true
         let current = actions
         lock.unlock()
         current.forEach { $0() }
@@ -3812,7 +3821,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     /// inside perception and cannot independently open a Live Voice session.
     private let onL0FaceFixation: (String?, Bool, UInt64) -> Void
     private let externalCalibration: ExternalGimbalCalibration?
+    private let shutdownLock = NSLock()
     private var state: State = .running
+    private var shutdownVerification: Bool?
     private var gate = NativeHumanTrackingGate()
     private var nativeCommandID: String?
     /// Transport acknowledgement only means the device accepted a mode switch. It
@@ -4765,7 +4776,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         queue.async { [weak self] in self?.applyEmbodimentIntent(intent) }
     }
 
-    func stop() {
+    @discardableResult
+    func stop() -> Bool {
+        shutdownLock.lock()
+        defer { shutdownLock.unlock() }
         let shouldStop: Bool = queue.sync {
             if case .stopped = state { return false }
             let stopNS = monotonicNanoseconds()
@@ -4815,18 +4829,36 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             state = .stopped
             return true
         }
-        guard shouldStop else { return }
+        guard shouldStop else {
+            return queue.sync { shutdownVerification ?? false }
+        }
         if process.isRunning {
             if exited.wait(timeout: .now() + 7) == .timedOut {
                 process.terminate()
                 _ = exited.wait(timeout: .now() + 3)
             }
         }
-        runLifecycleShutdownIfNeeded()
+        let verified: Bool
+        if shutdownHelperURL != nil {
+            verified = runLifecycleShutdownIfNeeded()
+        } else {
+            verified = !process.isRunning && process.terminationStatus == 0
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "attention_gimbal_bridge",
+                state: verified
+                    ? "lifecycle_shutdown_completed"
+                    : "lifecycle_shutdown_failed",
+                message: "termination_status=\(process.terminationStatus); verified_park_sleep=\(verified)"
+            ))
+        }
+        queue.sync { shutdownVerification = verified }
+        return verified
     }
 
-    private func runLifecycleShutdownIfNeeded() {
-        guard let shutdownHelperURL else { return }
+    private func runLifecycleShutdownIfNeeded() -> Bool {
+        guard let shutdownHelperURL else { return false }
         let lifecycle = Process()
         lifecycle.executableURL = shutdownHelperURL
         var arguments = [
@@ -4855,6 +4887,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     : "lifecycle_shutdown_failed",
                 message: "termination_status=\(lifecycle.terminationStatus); verified_park_sleep=\(lifecycle.terminationStatus == 0)"
             ))
+            return lifecycle.terminationStatus == 0
         } catch {
             writer.write(RuntimeEvent(
                 event: "source.health",
@@ -4863,6 +4896,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 state: "lifecycle_shutdown_failed",
                 message: String(error.localizedDescription.prefix(192))
             ))
+            return false
         }
     }
 
@@ -12557,40 +12591,6 @@ private func run(_ options: Options) throws {
         importantRotationPolicy: options.importantRotationPolicy
     )
     defer { writer.close() }
-    // Memory watchdog: a detector/context leak once ballooned phys_footprint
-    // to ~57 GB (IOSurface growth). RSS-based checks would have missed it, so
-    // watch the kernel footprint and exit for launchd to restart us long
-    // before the system starts swapping. 12 GB is ~2x the steady-state
-    // footprint (models + buffers) and far below the leak trajectory.
-    let footprintLimitBytes: UInt64 = 12 * 1_000_000_000
-    Task {
-        var warningWasReported = false
-        while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
-            guard let memory = currentTaskMemorySnapshot() else { continue }
-            if memory.physicalFootprint <= 8 * 1_000_000_000 {
-                warningWasReported = false
-            } else if !warningWasReported {
-                warningWasReported = true
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: monotonicNanoseconds(),
-                    source: "memory_watchdog",
-                    state: "warning",
-                    message: memory.diagnosticMessage
-                ))
-            }
-            guard memory.physicalFootprint > footprintLimitBytes else { continue }
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "memory_watchdog",
-                state: "critical",
-                message: "\(memory.diagnosticMessage); limit=\(footprintLimitBytes / 1_000_000)MB; exiting_for_launchd_restart=true"
-            ))
-            exit(0)
-        }
-    }
     let liveDiagnostics = LiveDiagnosticsWriter(
         rootURL: options.outputURL.deletingLastPathComponent().deletingLastPathComponent()
     )
@@ -13125,10 +13125,42 @@ private func run(_ options: Options) throws {
     } else {
         attentionGimbalBridge = nil
     }
-    defer { attentionGimbalBridge?.stop() }
+    defer { _ = attentionGimbalBridge?.stop() }
     // On stop (menu bar "Stop SOMA" = launchctl bootout), turn off the camera's
     // built-in AI tracking and park the gimbal before the process exits.
-    termination.onTerminate { attentionGimbalBridge?.stop() }
+    termination.onTerminate { _ = attentionGimbalBridge?.stop() }
+    // Physical-footprint recovery is a controlled lifecycle transition. It
+    // must use the same park-and-sleep path as an operator restart instead of
+    // exiting underneath an active gimbal owner.
+    let footprintLimitBytes: UInt64 = 12 * 1_000_000_000
+    Task {
+        var warningWasReported = false
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard let memory = currentTaskMemorySnapshot() else { continue }
+            if memory.physicalFootprint <= 8 * 1_000_000_000 {
+                warningWasReported = false
+            } else if !warningWasReported {
+                warningWasReported = true
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "memory_watchdog",
+                    state: "warning",
+                    message: memory.diagnosticMessage
+                ))
+            }
+            guard memory.physicalFootprint > footprintLimitBytes else { continue }
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "memory_watchdog",
+                state: "critical",
+                message: "\(memory.diagnosticMessage); limit=\(footprintLimitBytes / 1_000_000)MB; graceful_launchd_restart=true"
+            ))
+            termination.request()
+        }
+    }
     let l1LanguageInstructions = L1LanguageInstructionCache(
         onHealth: { state, message in
             writer.write(RuntimeEvent(
@@ -13216,49 +13248,34 @@ private func run(_ options: Options) throws {
     let speechInteractionBox = SpeechInteractionBox()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     let liveVoiceBox = LiveVoiceLauncherBox()
-    let l1LiveToolSupervisor: L1LiveConversationToolSupervisor?
-    if let l1AuxiliarySemanticBridge {
-        l1LiveToolSupervisor = L1LiveConversationToolSupervisor(
-            infer: { request, completion in
-                l1AuxiliarySemanticBridge.submitToolAdvice(
-                    request,
-                    completion: completion
-                )
-            },
-            onHealth: { state, message in
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: monotonicNanoseconds(),
-                    source: "l1_live_tool",
-                    state: state,
-                    message: message
-                ))
-            },
-            onAdvice: { advice, transcript in
-                let injected = liveVoiceBox.launcher?.injectL1ToolAdvice(
-                    advice,
-                    forUserTranscript: transcript
-                ) ?? false
-                writer.write(RuntimeEvent(
-                    event: "l1.live_tool",
-                    monotonicNS: monotonicNanoseconds(),
-                    source: "l1_live_tool",
-                    state: injected ? "injection_requested" : "held",
-                    message: "turn=\(advice.turnID.uuidString.lowercased()); tool=\(advice.toolName ?? "none"); reason=\(injected ? "current_turn" : "stale_or_output_started")"
-                ))
-            }
-        )
-    } else {
-        l1LiveToolSupervisor = nil
-        writer.write(RuntimeEvent(
-            event: "source.health",
-            monotonicNS: monotonicNanoseconds(),
-            source: "l1_live_tool",
-            state: "disabled",
-            message: "e2b_worker_unavailable"
-        ))
-    }
-    defer { l1LiveToolSupervisor?.stop() }
+    let l1LiveToolSupervisor = L1LiveConversationToolSupervisor(
+        infer: { request, completion in
+            l1ThoughtRelay.submitLiveToolAdvice(request, completion: completion)
+        },
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_live_tool",
+                state: state,
+                message: message
+            ))
+        },
+        onAdvice: { advice, transcript in
+            let injected = liveVoiceBox.launcher?.injectL1ToolAdvice(
+                advice,
+                forUserTranscript: transcript
+            ) ?? false
+            writer.write(RuntimeEvent(
+                event: "l1.live_tool",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_live_tool",
+                state: injected ? "injection_requested" : "held",
+                message: "turn=\(advice.turnID.uuidString.lowercased()); tool=\(advice.toolName ?? "none"); reason=\(injected ? "current_turn" : "stale_or_output_started")"
+            ))
+        }
+    )
+    defer { l1LiveToolSupervisor.stop() }
     let hermesAgentDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/SOMA/hermes-agent", isDirectory: true)
     let hermesAgentKey = try OwnerOnlyInstallationSecret.loadOrCreate(
@@ -13331,7 +13348,7 @@ private func run(_ options: Options) throws {
                 ))
             case let .active(threadID, personEntityID):
                 l1LiveConversationState.begin()
-                if let threadID { l1LiveToolSupervisor?.begin(threadID: threadID) }
+                if let threadID { l1LiveToolSupervisor.begin(threadID: threadID) }
                 conversationContact.markConversationOpened(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
                 if let personEntityID {
@@ -13494,7 +13511,7 @@ private func run(_ options: Options) throws {
                     message: String(reason.prefix(192))
                 ))
             case .embodimentMCPReady:
-                l1LiveToolSupervisor?.setMCPAvailable(true)
+                l1LiveToolSupervisor.setMCPAvailable(true)
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
@@ -13519,7 +13536,7 @@ private func run(_ options: Options) throws {
                     message: String(reason.prefix(192))
                 ))
             case let .embodimentMCPUnavailable(reason):
-                l1LiveToolSupervisor?.setMCPAvailable(false)
+                l1LiveToolSupervisor.setMCPAvailable(false)
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
@@ -13528,7 +13545,7 @@ private func run(_ options: Options) throws {
                     message: String(reason.prefix(192))
                 ))
             case let .embodimentMCPCall(tool, status, error):
-                l1LiveToolSupervisor?.observeToolCall(tool: tool, status: status)
+                l1LiveToolSupervisor.observeToolCall(tool: tool, status: status)
                 writer.write(RuntimeEvent(
                     event: "l2.mcp",
                     monotonicNS: eventNS,
@@ -13563,7 +13580,7 @@ private func run(_ options: Options) throws {
                 ))
             case let .transcriptPartial(threadID, text):
                 if let threadID {
-                    l1LiveToolSupervisor?.observeUserPartial(
+                    l1LiveToolSupervisor.observeUserPartial(
                         threadID: threadID,
                         transcript: text
                     )
@@ -13590,12 +13607,12 @@ private func run(_ options: Options) throws {
                         at: eventNS
                     )
                     if role == .user {
-                        l1LiveToolSupervisor?.observeUserTurn(
+                        l1LiveToolSupervisor.observeUserTurn(
                             threadID: threadID,
                             transcript: text
                         )
                     } else {
-                        l1LiveToolSupervisor?.observeAssistantTurn(
+                        l1LiveToolSupervisor.observeAssistantTurn(
                             threadID: threadID,
                             transcript: text
                         )
@@ -13713,7 +13730,7 @@ private func run(_ options: Options) throws {
                 conversationContact.recordConversationActivity(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
             case let .ended(threadID, personEntityID, reason):
-                l1LiveToolSupervisor?.end(threadID: threadID)
+                l1LiveToolSupervisor.end(threadID: threadID)
                 l1LiveConversationState.end()
                 liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
@@ -13754,7 +13771,7 @@ private func run(_ options: Options) throws {
                     message: "task_id=\(taskID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
                 ))
             case let .failed(threadID, personEntityID, reason):
-                l1LiveToolSupervisor?.end(threadID: threadID)
+                l1LiveToolSupervisor.end(threadID: threadID)
                 l1LiveConversationState.end()
                 liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
@@ -14478,7 +14495,9 @@ private func run(_ options: Options) throws {
                     state: "graceful_shutdown_requested",
                     message: "origin=local_service_control; motion=park_then_sleep"
                 ))
-                attentionGimbalBridge?.stop()
+                if let attentionGimbalBridge, !attentionGimbalBridge.stop() {
+                    return .failure(RuntimeError.unavailable("Gimbal park and camera sleep could not be verified"))
+                }
                 return .success(())
             },
             conversationTerminationHandler: { sessionAuthorization in

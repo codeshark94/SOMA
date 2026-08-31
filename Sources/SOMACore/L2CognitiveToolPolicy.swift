@@ -213,7 +213,7 @@ public enum L2CognitiveToolPolicy {
     """
 
     public static func autonomy(for toolName: String) -> L2ToolAutonomy? {
-        switch toolName {
+        return switch toolName {
         case "get_robot_body_state", "get_activity_overview", "list_scene_entities", "get_spatial_map",
              "get_view_capture", "list_present_people", "list_identity_registry",
              "get_person_context", "recall_episodes", "list_information_needs":
@@ -271,6 +271,70 @@ public enum L2CognitiveToolPolicy {
             .hostComputer
         default:
             autonomy(for: toolName) == nil ? nil : .reversibleEmbodiment
+        }
+    }
+
+    /// Compact semantic descriptions for the primary L1 model's native
+    /// Ollama tool-selection pass. These describe when a function is useful;
+    /// L2 remains responsible for authoring its real MCP arguments.
+    public static func advisoryDescription(for toolName: String) -> String? {
+        guard knownToolNames.contains(toolName) else { return nil }
+        return switch toolName {
+        case "get_activity_overview":
+            L2TaskRoutingPolicy.activityOverviewToolDescription
+        case "get_robot_body_state":
+            L2TaskRoutingPolicy.embodimentStateToolDescription
+        case "observe_host_screen":
+            "Inspect the host Mac display only when the administrator explicitly asks what is visible on that screen."
+        case "control_host_computer":
+            "Perform one administrator-requested visible Mac UI action after observing the host screen."
+        case "capture_view":
+            "Acquire fresh OBSBOT camera evidence when the answer depends on what SOMA currently sees."
+        case "list_present_people":
+            "Read the currently observed people and their recognized identity bindings."
+        case "list_identity_registry":
+            "Read the registered identity roster when the administrator asks who SOMA knows."
+        case "get_person_context":
+            "Read stored context, preferences, rapport, and facts for a person relevant to the current turn."
+        case "recall_episodes":
+            "Search remembered interaction episodes when the participant asks about prior events or conversations."
+        case "list_information_needs":
+            "Read unresolved person-information motives when the conversation needs that memory context."
+        case "get_spatial_map":
+            "Read SOMA's spherical room map, remembered bearings, and reachable coverage."
+        case "list_scene_entities":
+            "Read the currently maintained camera-space entity map and semantic labels."
+        case "get_view_capture":
+            "Retrieve a previously requested short-lived camera capture by request ID."
+        case "delegate_hermes_task":
+            L2TaskRoutingPolicy.hermesDelegationToolDescription
+        case "get_hermes_task", "list_hermes_tasks":
+            "Read actual progress or completed results from delegated Hermes work."
+        case "continue_hermes_task":
+            "Continue an existing Hermes task only after an explicit administrator request."
+        case "cancel_hermes_task":
+            "Cancel an existing Hermes task only after an explicit administrator request."
+        case "resolve_hermes_report_offer":
+            "Record the participant's explicit accept or dismiss decision for a pending Hermes result report."
+        case "end_conversation":
+            "End the current voice conversation only when the participant explicitly asks to stop or be quiet."
+        case "set_preferred_language", "clear_preferred_language", "set_contact_preference",
+             "set_person_rapport", "set_person_fact", "remove_person_fact",
+             "record_information_need_answer":
+            "Update durable person memory only from an explicit fact, preference, correction, or answer in the current turn."
+        case "enroll_present_identity":
+            "Enroll a currently present person's identity only after explicit consent."
+        case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
+             "track_target", "orient_to", "set_exploration_policy", "set_camera_optical_zoom",
+             "express_gimbal", "release_embodiment":
+            "Use SOMA's reversible embodiment controls when they materially advance the current conversational goal."
+        case "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance",
+             "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure",
+             "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning",
+             "set_native_human_tracking_policy", "set_camera_field_of_view":
+            "Change this device setting only after an explicit participant request."
+        default:
+            "Select the SOMA MCP function named \(toolName) only when it is necessary for the latest participant turn."
         }
     }
 

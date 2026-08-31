@@ -2643,6 +2643,12 @@ final class L1DailyWorldMemoryRelay: @unchecked Sendable {
 /// Converts recognized-person observations into sparse L1 cycles. Identity
 /// evidence is a wake signal, not a command to speak. Repeated recognition is
 /// locally coalesced before Gemma is contacted, and a late response is ignored.
+private enum L1ThoughtStreamRelayError: LocalizedError {
+    case unavailable
+
+    var errorDescription: String? { "primary_l1_unavailable" }
+}
+
 final class L1ThoughtStreamRelay: @unchecked Sendable {
     private let lock = NSLock()
     private var stream: (any L1ThoughtStreaming)?
@@ -2706,6 +2712,17 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
             text: text,
             at: monotonicNS
         )
+    }
+
+    func submitLiveToolAdvice(
+        _ request: L1LiveToolAdviceRequest,
+        completion: @escaping @Sendable (Result<L1LiveToolAdvice, Error>) -> Void
+    ) {
+        guard let stream = currentStream() else {
+            completion(.failure(L1ThoughtStreamRelayError.unavailable))
+            return
+        }
+        stream.submitLiveToolAdvice(request, completion: completion)
     }
 
     private func currentStream() -> (any L1ThoughtStreaming)? {

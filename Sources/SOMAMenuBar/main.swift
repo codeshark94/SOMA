@@ -23,6 +23,11 @@ private enum SOMAPaths {
         .appendingPathComponent("Library/LaunchAgents/com.soma.menu-bar.plist")
     static let menuBarInstanceLock = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/SOMA/menu-bar.lock")
+    static let serviceControlExecutable = URL(
+        fileURLWithPath: ProcessInfo.processInfo.environment["SOMA_ROOT"]
+            ?? FileManager.default.currentDirectoryPath,
+        isDirectory: true
+    ).appendingPathComponent("scripts/soma.zsh")
 
     static var serviceTarget: String {
         "gui/\(getuid())/\(serviceLabel)"
@@ -450,7 +455,7 @@ private final class SOMAControlModel: ObservableObject {
         guard restart else {
             return (0, "SOMA is already running.")
         }
-        return runLaunchctl(["kickstart", "-k", SOMAPaths.serviceTarget])
+        return runProcess(at: SOMAPaths.serviceControlExecutable, arguments: ["restart"])
     }
 
     func stopSOMA() -> (status: Int32, output: String) {
@@ -458,11 +463,7 @@ private final class SOMAControlModel: ObservableObject {
             runtime = .empty
             return (0, "SOMA is already stopped.")
         }
-        let result = runLaunchctl([
-            "bootout",
-            "gui/\(getuid())",
-            SOMAPaths.servicePlist.path,
-        ])
+        let result = runProcess(at: SOMAPaths.serviceControlExecutable, arguments: ["stop"])
         if result.status == 0 {
             runtime = .empty
         }

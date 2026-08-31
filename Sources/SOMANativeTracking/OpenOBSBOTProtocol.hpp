@@ -98,16 +98,16 @@ inline std::optional<OpenOBSBOTFramedCommand> externalVelocity(
 }
 
 inline OpenOBSBOTFramedCommand wakeState(
-    OBSBOTOpenDeviceProfile profile,
+    OBSBOTOpenDeviceProfile,
     bool awake
 ) {
     std::vector<uint8_t> payload;
-    if (profile == OBSBOTOpenDeviceProfile::tiny3Lite) {
-        payload.reserve(4);
-        appendU32LE(payload, awake ? 0u : 1u);
-    } else {
-        payload.push_back(awake ? 0 : 1);
-    }
+    // Both supported products expose the V3 run-state command. The SDK's
+    // alternate two-byte DeviceRunStatus encoding belongs to legacy protocol
+    // transports, not to a particular camera model. The V3 firmware accepts
+    // a 32-bit 0=run / 1=sleep value; narrower payloads are ACKed but ignored.
+    payload.reserve(4);
+    appendU32LE(payload, awake ? 0u : 1u);
     return OpenOBSBOTFramedCommand {0xA0C2, 0x02, std::move(payload)};
 }
 

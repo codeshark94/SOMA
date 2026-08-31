@@ -785,6 +785,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 return false
             }
             let quote = advice.groundingQuote ?? ""
+            if L1LiveDirectReadOnlyToolPolicy.permits(tool) {
+                return send([
+                    "type": "execute_read_only_tool",
+                    "taskID": advice.turnID.uuidString.lowercased(),
+                    "tool": tool,
+                ])
+            }
             let instruction = """
             SOMA_L1_TOOL_ADVISORY
             This is private current-turn control context, not participant speech and not text to recite. L1 independently determined that the latest participant turn requires the SOMA MCP tool `\(tool)` before a grounded answer. The grounding phrase was: "\(quote)". If this exact tool has not already completed for the current turn, call it now, silently, and use its actual result before speaking. Do not substitute a verbal promise, inferred result, or another tool. If the call fails or is unavailable, report that concrete failure briefly. This advisory expires with the current participant turn.

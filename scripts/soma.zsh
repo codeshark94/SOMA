@@ -31,17 +31,7 @@ function soma_start() {
   print -r -- 'SOMA started.'
 }
 
-function soma_stop() {
-  if ! soma_loaded; then
-    print -r -- 'SOMA is already stopped.'
-    return
-  fi
-  # KeepAlive is required for unattended crash recovery, but an intentional
-  # stop must revoke restart authority before the runtime exits. Otherwise
-  # launchd can start a fresh camera owner in the interval between the
-  # graceful park/sleep acknowledgement and bootout, immediately waking the
-  # device that was just put to sleep.
-  /bin/launchctl disable "$soma_target" >/dev/null 2>&1 || true
+function soma_quiesce_runtime() {
   local graceful_shutdown=false
   if [[ -x "$soma_runtime_control" && -S "$soma_runtime_socket" ]]; then
     # The endpoint becomes available after the perception runtime has bound
@@ -56,13 +46,55 @@ function soma_stop() {
       sleep 1
     done
     if [[ "$graceful_shutdown" != true ]]; then
-      print -u2 -r -- 'SOMA graceful shutdown endpoint did not become ready; unloading the service directly.'
+      print -u2 -r -- 'SOMA did not confirm gimbal park and camera sleep; lifecycle transition cancelled.'
+      return 1
     fi
   else
-    print -u2 -r -- 'SOMA graceful shutdown endpoint is unavailable; unloading the service directly.'
+    print -u2 -r -- 'SOMA graceful shutdown endpoint is unavailable; lifecycle transition cancelled.'
+    return 1
+  fi
+}
+
+function soma_stop() {
+  if ! soma_loaded; then
+    print -r -- 'SOMA is already stopped.'
+    return
+  fi
+  # Disable KeepAlive before quiescing so launchd cannot wake a device between
+  # the verified sleep acknowledgement and bootout.
+  /bin/launchctl disable "$soma_target" >/dev/null 2>&1 || true
+  if ! soma_quiesce_runtime; then
+    /bin/launchctl enable "$soma_target" >/dev/null 2>&1 || true
+    return 1
   fi
   /bin/launchctl bootout "$soma_domain" "$soma_plist"
   print -r -- 'SOMA stopped.'
+}
+
+function soma_restart() {
+  if ! soma_loaded; then
+    soma_start
+    return
+  fi
+  local previous_pid
+  previous_pid=$(/bin/launchctl print "$soma_target" 2>/dev/null \
+    | /usr/bin/sed -n 's/^[[:space:]]*pid = //p' \
+    | /usr/bin/head -n 1)
+  soma_quiesce_runtime
+  /bin/launchctl kickstart -k "$soma_target"
+  local current_pid=''
+  for attempt in {1..50}; do
+    current_pid=$(/bin/launchctl print "$soma_target" 2>/dev/null \
+      | /usr/bin/sed -n 's/^[[:space:]]*pid = //p' \
+      | /usr/bin/head -n 1)
+    if [[ -n "$current_pid" && "$current_pid" != "$previous_pid" ]]; then
+      print -r -- "SOMA restarted after verified park and sleep (pid=$current_pid)."
+      return
+    fi
+    sleep 0.2
+  done
+  print -u2 -r -- 'SOMA restart did not produce a new runtime process.'
+  return 1
 }
 
 case "${1:-start}" in
@@ -76,12 +108,7 @@ case "${1:-start}" in
     ;;
   restart)
     (( $# == 1 )) || { print -u2 -r -- 'Usage: soma [start|stop|restart|status]'; exit 64; }
-    if soma_loaded; then
-      /bin/launchctl kickstart -k "$soma_target"
-      print -r -- 'SOMA restarted.'
-    else
-      soma_start
-    fi
+    soma_restart
     ;;
   status)
     (( $# == 1 )) || { print -u2 -r -- 'Usage: soma [start|stop|restart|status]'; exit 64; }

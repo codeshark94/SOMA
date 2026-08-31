@@ -151,9 +151,10 @@ the evidence dissipates or the context changes. This is an L1 reconsideration
 request, not a new periodic cadence or an L0 command.
 
 E2B cannot by itself select or suppress a target, change a face lock, claim the camera owner,
-move the gimbal, speak, identify a person, retrieve memory, or invoke L1. During
-an active Live Voice session it may return one validated current-turn tool
-advisory, but L2 retains tool authority and independently admits the result. The
+move the gimbal, speak, identify a person, retrieve memory, select a conversation
+tool, or invoke L1. During an active Live Voice session, the primary 31B L1 route
+may return one validated current-turn Ollama-native tool call, but L2 retains
+tool authority and independently admits the result. The
 shared MCP transport and running L0 arbiter accept the same leased semantic
 embodiment goals from L1 and L2—labels, attention priors, tracking, orientation,
 exploration, view alignment, and expression. The separately enabled motor
@@ -174,8 +175,9 @@ error/stall events and bounded RSS. The persistent LaunchAgent keeps direct MLX 
 234.34-second integrated smoke produced 48 semantic events, no interrupt false
 positive, and no auxiliary-worker runtime error. A longer thermal qualification remains an
 operational follow-up. Broader labelled human and object accuracy evaluation
-remains open. Visual inference and Live Voice tool advice share one prioritized,
-single-flight E2B worker. Ollama is not part of this local semantic runtime.
+remains open. The E2B worker is visual-only. The primary 31B Ollama transport
+uses one single-flight queue ordered as Live Voice tool selection, L1b executive,
+event L1a, then periodic L1a.
 
 The persistent runtime now separates bounded forensic detail from durable
 operational history. Full scalar evidence rotates at 128 MiB with eight retained

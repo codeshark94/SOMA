@@ -14,6 +14,10 @@ protocol L1ThoughtStreaming: AnyObject, Sendable {
         text: String,
         at monotonicNS: UInt64
     )
+    func submitLiveToolAdvice(
+        _ request: L1LiveToolAdviceRequest,
+        completion: @escaping @Sendable (Result<L1LiveToolAdvice, Error>) -> Void
+    )
     func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt)
     func stop()
 }
@@ -276,6 +280,13 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                 driveSignal: MentalDriveSignal(socialInterest: -0.25, interruptionPressure: -1)
             ))
         }
+    }
+
+    func submitLiveToolAdvice(
+        _ request: L1LiveToolAdviceRequest,
+        completion: @escaping @Sendable (Result<L1LiveToolAdvice, Error>) -> Void
+    ) {
+        reasoner.submitLiveToolAdvice(request) { result, _ in completion(result) }
     }
 
     func invalidateMemoryContext(for entityID: UUID) {
