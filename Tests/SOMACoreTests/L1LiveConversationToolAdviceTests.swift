@@ -90,6 +90,18 @@ import Testing
         #expect(L1LiveEpistemicReflexRouter.route(unrelated) == nil)
     }
 
+    @Test func currentCameraEvidenceClassifierIsPublicAndNarrow() {
+        #expect(L1LiveEpistemicReflexRouter.requiresCurrentCameraEvidence(
+            transcript: "나 지금 뭐 하고 있어?"
+        ))
+        #expect(L1LiveEpistemicReflexRouter.requiresCurrentCameraEvidence(
+            transcript: "Can you see me?"
+        ))
+        #expect(!L1LiveEpistemicReflexRouter.requiresCurrentCameraEvidence(
+            transcript: "Look, the plan is fine."
+        ))
+    }
+
     @Test func acceptsGroundedAvailableToolRecommendation() throws {
         let request = makeRequest(transcript: "지금 카메라에 뭐 보여?")
         let data = response(

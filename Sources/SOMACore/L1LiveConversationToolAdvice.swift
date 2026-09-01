@@ -291,7 +291,7 @@ public enum L1LiveEpistemicReflexRouter {
         guard !foldedTranscript.isEmpty else { return nil }
         if request.availableTools.contains("capture_view"),
            !request.toolsAlreadyCalled.contains("capture_view"),
-           isExplicitCurrentViewRequest(foldedTranscript) {
+           requiresCurrentCameraEvidence(transcript: foldedTranscript) {
             return L1LiveToolAdvice(
                 cycleID: request.cycleID,
                 threadID: request.threadID,
@@ -336,7 +336,8 @@ public enum L1LiveEpistemicReflexRouter {
     /// admits only an explicit request for what the robot camera sees now, so
     /// words such as "look" in an unrelated conversational turn cannot move or
     /// sample the camera. Reframing remains an L2-authored MCP action.
-    private static func isExplicitCurrentViewRequest(_ transcript: String) -> Bool {
+    public static func requiresCurrentCameraEvidence(transcript: String) -> Bool {
+        let transcript = fold(transcript)
         let exactRequests = [
             "whatdoyousee", "whatcanyousee", "whatsoncamera", "whatisoncamera",
             "canyouseeme", "doyouseeme", "howdoilook", "whoishere", "whoiswithme",

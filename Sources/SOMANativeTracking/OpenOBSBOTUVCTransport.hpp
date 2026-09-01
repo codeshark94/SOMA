@@ -11,6 +11,12 @@
 
 namespace soma {
 
+enum class OpenOBSBOTFunctionalRecoveryOutcome {
+    runStateRestored,
+    physicalReconnectRequired,
+    failed,
+};
+
 /// Direct macOS UVC/XU control transport. It owns only the USB control
 /// endpoint; AVFoundation remains free to own the video stream.
 class OpenOBSBOTUVCTransport final {
@@ -28,6 +34,8 @@ public:
     bool serviceRecovery(std::string &error) noexcept;
     bool commitRecovery() noexcept;
     void abortRecovery(int32_t ioReturn) noexcept;
+    void requestRecovery(int32_t reason) noexcept;
+    OpenOBSBOTFunctionalRecoveryOutcome verifyMotorResponse() noexcept;
     const char *name() const noexcept { return "open_uvc_xu"; }
     OBSBOTOpenDeviceProfile profile() const noexcept;
     OpenOBSBOTDeviceIdentity identity() const;

@@ -10,6 +10,7 @@ private struct Command: Decodable {
         case appendImage = "append_image"
         case appendText = "append_text"
         case appendInstruction = "append_instruction"
+        case beginVisualTurn = "begin_visual_turn"
         case stop
     }
 
@@ -126,6 +127,7 @@ private final class AppServerConnection: @unchecked Sendable {
     func request(
         method: String,
         params: [String: Any],
+        timeoutMilliseconds: Int? = nil,
         completion: @escaping ResponseHandler
     ) {
         let sendableParams = JSONDictionary(value: params)
@@ -138,11 +140,25 @@ private final class AppServerConnection: @unchecked Sendable {
                 "method": method,
                 "params": sendableParams.value,
             ])
+            if let timeoutMilliseconds, timeoutMilliseconds > 0 {
+                self.queue.asyncAfter(
+                    deadline: .now() + .milliseconds(timeoutMilliseconds)
+                ) {
+                    guard let handler = self.handlers.removeValue(forKey: requestID) else { return }
+                    handler(JSONDictionary(value: [
+                        "error": [
+                            "code": "request_timed_out",
+                            "message": "\(method) timed out",
+                        ],
+                    ]))
+                }
+            }
         }
     }
 
     func stop() {
         queue.sync {
+            handlers.removeAll()
             if let persistentWebSocket {
                 persistentWebSocket.cancel(with: .goingAway, reason: nil)
                 self.persistentWebSocket = nil
@@ -164,6 +180,11 @@ private final class AppServerConnection: @unchecked Sendable {
             return String(message.prefix(256))
         }
         return "request_failed"
+    }
+
+    static func responseTimedOut(_ response: [String: Any]) -> Bool {
+        guard let error = response["error"] as? [String: Any] else { return false }
+        return error["code"] as? String == "request_timed_out"
     }
 
     private static func validSessionCapability(_ value: String?) -> String? {
@@ -307,6 +328,13 @@ private struct AssistantPCMChunk {
 
 }
 
+private enum VisualTurnTransportPolicy {
+    static let captureTimeoutMilliseconds = 5_000
+    static let evidenceInjectionTimeoutMilliseconds = 3_000
+    static let cancellationTimeoutMilliseconds = 3_000
+    static let replacementPresentationTimeoutMilliseconds = 12_000
+}
+
 @MainActor
 private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate {
     private let emitter: JSONLineEmitter
@@ -358,6 +386,14 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var reportedEmbodimentMCPItemIDs: Set<String> = []
     private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
+    private var currentRealtimeResponseID: String?
+    private var visualResponseBarrier: LiveVoiceVisualResponseBarrier?
+    private var visualEvidenceInjectionInFlightEpisodeID: UUID?
+    private var deferredVisualEvidenceEpisodeID: UUID?
+    private var visualCancellationTimeoutWorkItem: DispatchWorkItem?
+    private var visualReplacementTimeoutWorkItem: DispatchWorkItem?
+    private var participantTurnSequence: UInt64 = 0
+    private var latestParticipantTranscript = ""
     private var observedRealtimeEventTypes: Set<String> = []
     private var finalizedTranscriptItemIDs: Set<String> = []
     private var finalizedTranscriptItemOrder: [String] = []
@@ -457,7 +493,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 // WebKit. Start them while the hidden audio frontend loads;
                 // the WebRTC offer is joined once both sides are ready.
                 break
-            case .appendAudio, .appendImage, .appendText, .appendInstruction, .stop:
+            case .appendAudio, .appendImage, .appendText, .appendInstruction,
+                 .beginVisualTurn, .stop:
                 pendingCommands.append(command)
                 return
             }
@@ -581,6 +618,32 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     }
                 }
             }
+        case .beginVisualTurn:
+            guard let transcript = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !transcript.isEmpty,
+                  let rawEpisodeID = command.taskID,
+                  let episodeID = UUID(uuidString: rawEpisodeID) else { return }
+            let normalizedTranscript = transcript
+                .split(whereSeparator: \.isWhitespace)
+                .joined(separator: " ")
+            guard normalizedTranscript == latestParticipantTranscript else {
+                emitter.emit("visual_turn_barrier", fields: [
+                    "state": "stale_advice_rejected",
+                    "task_id": rawEpisodeID,
+                    "reason": "participant_turn_advanced",
+                ])
+                return
+            }
+            beginCurrentVisualTurn(
+                episodeID: episodeID,
+                participantTurnSequence: participantTurnSequence,
+                transcript: normalizedTranscript,
+                source: "l1_capture_advice"
+            )
+            emitter.emit("l1_tool_advice_attached", fields: [
+                "turn_id": rawEpisodeID,
+                "tool": "capture_view",
+            ])
         case .stop:
             stop(reason: "control_stop")
         }
@@ -626,6 +689,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "effect_profile": body["effectProfile"] as? String ?? "none",
             ])
         case "output_speech_started":
+            if observeVisualPresentationStarted(responseID: nil) { return }
             observeAssistantOutputStarted()
         case "output_speech_ended":
             observeAssistantOutputEnded()
@@ -635,6 +699,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                   let channels = body["numChannels"] as? Int,
                   let samplesPerChannel = body["samplesPerChannel"] as? Int,
                   let decoded = Data(base64Encoded: encoded) else { return }
+            if observeVisualPresentationStarted(responseID: nil) { return }
             if body["startsOutput"] as? Bool == true {
                 observeAssistantOutputStarted()
             }
@@ -987,6 +1052,401 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
     }
 
+    private func beginCurrentVisualTurn(
+        episodeID: UUID,
+        participantTurnSequence: UInt64,
+        transcript: String,
+        source: String
+    ) {
+        guard let threadID, embodimentMCPAvailable else {
+            emitter.emit("visual_turn_barrier", fields: [
+                "state": "unavailable",
+                "task_id": episodeID.uuidString.lowercased(),
+                "reason": "embodiment_mcp_unavailable",
+            ])
+            return
+        }
+        let boundedTranscript = String(transcript.prefix(4_096))
+        if let current = visualResponseBarrier,
+           current.participantTurnSequence == participantTurnSequence {
+            emitter.emit("visual_turn_barrier", fields: [
+                "state": "already_armed",
+                "task_id": current.episodeID.uuidString.lowercased(),
+                "reason": source,
+            ])
+            return
+        }
+        if visualResponseBarrier?.presentationReleased == true {
+            completeCurrentVisualResponse()
+        }
+        if let current = visualResponseBarrier {
+            emitter.emit("visual_turn_barrier", fields: [
+                "state": "superseded",
+                "task_id": current.episodeID.uuidString.lowercased(),
+                "reason": "newer_participant_turn",
+            ])
+        }
+        visualCancellationTimeoutWorkItem?.cancel()
+        visualCancellationTimeoutWorkItem = nil
+        visualReplacementTimeoutWorkItem?.cancel()
+        visualReplacementTimeoutWorkItem = nil
+        let barrier = LiveVoiceVisualResponseBarrier(
+            episodeID: episodeID,
+            participantTurnSequence: participantTurnSequence,
+            transcript: boundedTranscript,
+            provisionalResponseID: currentRealtimeResponseID
+        )
+        visualResponseBarrier = barrier
+        emitter.emit("visual_turn_barrier", fields: [
+            "state": "armed",
+            "task_id": episodeID.uuidString.lowercased(),
+            "reason": source,
+        ])
+        applyVisualBarrierActions(barrier.initialActions, episodeID: episodeID, threadID: threadID)
+        scheduleVisualCancellationTimeout(episodeID: episodeID)
+    }
+
+    private func observeVisualResponseStarted(responseID: String?) -> Bool {
+        guard var barrier = visualResponseBarrier else { return false }
+        let actions = barrier.observeResponseStarted(responseID: responseID)
+        visualResponseBarrier = barrier
+        if let threadID {
+            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
+        }
+        return barrier.suppressesAssistantPresentation
+    }
+
+    private func observeVisualPresentationStarted(responseID: String?) -> Bool {
+        guard var barrier = visualResponseBarrier else { return false }
+        let actions = barrier.observePresentationStarted(responseID: responseID)
+        visualResponseBarrier = barrier
+        if let threadID {
+            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
+        }
+        if barrier.presentationReleased {
+            visualReplacementTimeoutWorkItem?.cancel()
+            visualReplacementTimeoutWorkItem = nil
+        }
+        return barrier.suppressesAssistantPresentation
+    }
+
+    private func observeVisualResponseEnded(responseID: String?) {
+        guard var barrier = visualResponseBarrier else { return }
+        let actions = barrier.observeResponseEnded(responseID: responseID)
+        visualResponseBarrier = barrier
+        if barrier.provisionalResponseSettled {
+            visualCancellationTimeoutWorkItem?.cancel()
+            visualCancellationTimeoutWorkItem = nil
+        }
+        if let threadID {
+            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
+        }
+    }
+
+    private func observeVisualCancellationSettled(episodeID: UUID) {
+        guard var barrier = visualResponseBarrier else { return }
+        guard barrier.episodeID == episodeID else { return }
+        let actions = barrier.observeProvisionalResponseSettled(cancellationAcknowledged: true)
+        visualResponseBarrier = barrier
+        visualCancellationTimeoutWorkItem?.cancel()
+        visualCancellationTimeoutWorkItem = nil
+        if let threadID {
+            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
+        }
+    }
+
+    private func completeCurrentVisualResponse() {
+        guard let barrier = visualResponseBarrier,
+              barrier.phase == .presentingReplacementResponse else { return }
+        cancelVisualTurnTimeouts()
+        visualResponseBarrier = nil
+        setVisualOutputGate(closed: false)
+        emitter.emit("visual_turn_barrier", fields: [
+            "state": "completed",
+            "task_id": barrier.episodeID.uuidString.lowercased(),
+            "reason": "single_grounded_response",
+        ])
+    }
+
+    private func cancelVisualTurnTimeouts() {
+        visualCancellationTimeoutWorkItem?.cancel()
+        visualCancellationTimeoutWorkItem = nil
+        visualReplacementTimeoutWorkItem?.cancel()
+        visualReplacementTimeoutWorkItem = nil
+    }
+
+    private func scheduleVisualCancellationTimeout(episodeID: UUID) {
+        visualCancellationTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.visualResponseBarrier?.episodeID == episodeID,
+                  self.visualResponseBarrier?.provisionalResponseSettled == false else { return }
+            self.fail(LiveVoiceError.webRTC("visual_response_cancellation_timed_out"))
+        }
+        visualCancellationTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(VisualTurnTransportPolicy.cancellationTimeoutMilliseconds),
+            execute: workItem
+        )
+    }
+
+    private func scheduleVisualReplacementTimeout(episodeID: UUID) {
+        visualReplacementTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.visualResponseBarrier?.episodeID == episodeID,
+                  self.visualResponseBarrier?.presentationReleased == false else { return }
+            self.fail(LiveVoiceError.webRTC("visual_replacement_response_timed_out"))
+        }
+        visualReplacementTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(
+                VisualTurnTransportPolicy.replacementPresentationTimeoutMilliseconds
+            ),
+            execute: workItem
+        )
+    }
+
+    private func applyVisualBarrierActions(
+        _ actions: [LiveVoiceVisualResponseBarrier.Action],
+        episodeID: UUID,
+        threadID: String
+    ) {
+        for action in actions {
+            switch action {
+            case .closeOutput:
+                setVisualOutputGate(closed: true, resetPresentation: true)
+            case .acquireEvidence:
+                if visualEvidenceInjectionInFlightEpisodeID != nil {
+                    deferredVisualEvidenceEpisodeID = episodeID
+                    emitter.emit("visual_turn_barrier", fields: [
+                        "state": "evidence_deferred",
+                        "task_id": episodeID.uuidString.lowercased(),
+                        "reason": "prior_injection_in_flight",
+                    ])
+                } else {
+                    acquireCurrentVisualEvidence(episodeID: episodeID, threadID: threadID)
+                }
+            case .cancelResponse:
+                sendRealtimeControlEvent(
+                    type: "response.cancel",
+                    episodeID: episodeID,
+                    failureIsFatal: true
+                )
+                sendRealtimeControlEvent(
+                    type: "output_audio_buffer.clear",
+                    episodeID: episodeID
+                )
+                emitter.emit("visual_turn_barrier", fields: [
+                    "state": "response_cancel_requested",
+                    "task_id": episodeID.uuidString.lowercased(),
+                    "reason": "awaiting_current_frame",
+                ])
+            case .requestResponse:
+                setVisualOutputGate(closed: true, resetPresentation: true)
+                currentRealtimeResponseID = nil
+                sendRealtimeControlEvent(
+                    type: "response.create",
+                    episodeID: episodeID,
+                    failureIsFatal: true
+                )
+                emitter.emit("visual_turn_barrier", fields: [
+                    "state": "response_requested",
+                    "task_id": episodeID.uuidString.lowercased(),
+                    "reason": "evidence_committed",
+                ])
+                scheduleVisualReplacementTimeout(episodeID: episodeID)
+            case .openOutput:
+                setVisualOutputGate(closed: false)
+                emitter.emit("visual_turn_barrier", fields: [
+                    "state": "presentation_released",
+                    "task_id": episodeID.uuidString.lowercased(),
+                    "reason": "replacement_response_started",
+                ])
+            }
+        }
+    }
+
+    private func sendRealtimeControlEvent(
+        type: String,
+        episodeID: UUID,
+        failureIsFatal: Bool = false
+    ) {
+        let event: [String: Any] = [
+            "type": type,
+            "event_id": "soma_\(episodeID.uuidString.lowercased())_\(type.replacingOccurrences(of: ".", with: "_"))",
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: event),
+              let literal = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("sendRealtimeControl(\(literal))") { [weak self] result, error in
+            guard error == nil, (result as? Bool) == true else {
+                guard let self else { return }
+                let reason = error?.localizedDescription ?? "data_channel_unavailable"
+                self.emitter.emit("visual_turn_barrier", fields: [
+                    "state": "control_rejected",
+                    "task_id": episodeID.uuidString.lowercased(),
+                    "reason": reason,
+                ])
+                if failureIsFatal {
+                    self.fail(LiveVoiceError.webRTC("visual_response_request_failed: \(reason)"))
+                }
+                return
+            }
+        }
+    }
+
+    private func setVisualOutputGate(closed: Bool, resetPresentation: Bool = false) {
+        if closed { selectedAudioOutput?.flush() }
+        webView.evaluateJavaScript(
+            "setVisualOutputGate(\(closed ? "true" : "false"), \(resetPresentation ? "true" : "false"))"
+        )
+    }
+
+    private func acquireCurrentVisualEvidence(episodeID: UUID, threadID: String) {
+        connection.request(
+            method: "mcpServer/tool/call",
+            params: [
+                "threadId": threadID,
+                "server": "soma_embodiment",
+                "tool": "capture_view",
+                "arguments": [:],
+            ],
+            timeoutMilliseconds: VisualTurnTransportPolicy.captureTimeoutMilliseconds
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.visualResponseBarrier?.episodeID == episodeID else { return }
+                let result = response.value["result"] as? [String: Any]
+                let failed = response.value["error"] != nil || (result?["isError"] as? Bool) == true
+                let content = result?["content"] as? [[String: Any]] ?? []
+                let text = content
+                    .compactMap { $0["text"] as? String }
+                    .joined(separator: "\n")
+                let imageDataURI = content.lazy.compactMap { item -> String? in
+                    guard item["type"] as? String == "image",
+                          let data = item["data"] as? String,
+                          !data.isEmpty else { return nil }
+                    let mimeType = (item["mimeType"] as? String)
+                        ?? (item["mime_type"] as? String)
+                        ?? "image/jpeg"
+                    return "data:\(mimeType);base64,\(data)"
+                }.first
+                let captureSucceeded = !failed && imageDataURI != nil
+                self.emitter.emit("embodiment_mcp_call", fields: [
+                    "tool": "capture_view",
+                    "status": captureSucceeded ? "completed" : "failed",
+                    "error": captureSucceeded
+                        ? ""
+                        : AppServerConnection.responseMessage(response.value),
+                    "item_id": episodeID.uuidString.lowercased(),
+                ])
+                self.injectCurrentVisualEvidence(
+                    episodeID: episodeID,
+                    threadID: threadID,
+                    imageDataURI: imageDataURI,
+                    captureText: text,
+                    captureSucceeded: captureSucceeded
+                )
+            }
+        }
+    }
+
+    private func injectCurrentVisualEvidence(
+        episodeID: UUID,
+        threadID: String,
+        imageDataURI: String?,
+        captureText: String,
+        captureSucceeded: Bool
+    ) {
+        guard let barrier = visualResponseBarrier,
+              barrier.episodeID == episodeID else { return }
+        var content: [[String: Any]] = [[
+            "type": "input_text",
+            "text": captureSucceeded
+                ? "SOMA_CURRENT_VISUAL_EVIDENCE \(episodeID.uuidString.lowercased())\nThis camera evidence was captured after the latest participant utterance and belongs only to that turn. Answer that utterance once using this evidence. Do not issue another capture_view call for the same turn.\n\(String(captureText.prefix(4_096)))"
+                : "SOMA_CURRENT_VISUAL_EVIDENCE_FAILURE \(episodeID.uuidString.lowercased())\nThe required fresh camera capture failed. Answer the latest participant utterance once and state the concrete sensor failure briefly; do not guess visual facts.",
+        ]]
+        if let imageDataURI {
+            content.append([
+                "type": "input_image",
+                "image_url": imageDataURI,
+                "detail": "low",
+            ])
+        }
+        let item: [String: Any] = [
+            "type": "message",
+            "role": "developer",
+            "content": content,
+        ]
+        guard visualEvidenceInjectionInFlightEpisodeID == nil else {
+            deferredVisualEvidenceEpisodeID = episodeID
+            return
+        }
+        visualEvidenceInjectionInFlightEpisodeID = episodeID
+        connection.request(
+            method: "thread/inject_items",
+            params: ["threadId": threadID, "items": [item]],
+            timeoutMilliseconds: VisualTurnTransportPolicy.evidenceInjectionTimeoutMilliseconds
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard var current = self.visualResponseBarrier,
+                      current.episodeID == episodeID else {
+                    self.emitter.emit("visual_turn_barrier", fields: [
+                        "state": "superseded_evidence_settled",
+                        "task_id": episodeID.uuidString.lowercased(),
+                        "reason": response.value["error"] == nil
+                            ? "newer_turn_waited_for_injection"
+                            : AppServerConnection.responseMessage(response.value),
+                    ])
+                    if AppServerConnection.responseTimedOut(response.value) {
+                        self.fail(LiveVoiceError.appServerResponse(
+                            "superseded_visual_evidence_injection_timed_out"
+                        ))
+                        return
+                    }
+                    self.finishVisualEvidenceInjection(episodeID: episodeID)
+                    return
+                }
+                guard response.value["error"] == nil else {
+                    self.emitter.emit("visual_turn_barrier", fields: [
+                        "state": "evidence_rejected",
+                        "task_id": episodeID.uuidString.lowercased(),
+                        "reason": AppServerConnection.responseMessage(response.value),
+                    ])
+                    self.finishVisualEvidenceInjection(episodeID: episodeID)
+                    self.fail(LiveVoiceError.appServerResponse(
+                        "visual_evidence_injection_failed: \(AppServerConnection.responseMessage(response.value))"
+                    ))
+                    return
+                }
+                let actions = current.observeEvidenceCommitted()
+                self.visualResponseBarrier = current
+                self.emitter.emit("visual_turn_barrier", fields: [
+                    "state": captureSucceeded ? "evidence_committed" : "failure_committed",
+                    "task_id": episodeID.uuidString.lowercased(),
+                    "reason": captureSucceeded ? "fresh_frame" : "capture_failed",
+                ])
+                self.finishVisualEvidenceInjection(episodeID: episodeID)
+                self.applyVisualBarrierActions(actions, episodeID: episodeID, threadID: threadID)
+            }
+        }
+    }
+
+    private func finishVisualEvidenceInjection(episodeID: UUID) {
+        guard visualEvidenceInjectionInFlightEpisodeID == episodeID else { return }
+        visualEvidenceInjectionInFlightEpisodeID = nil
+        guard let deferredEpisodeID = deferredVisualEvidenceEpisodeID,
+              let barrier = visualResponseBarrier,
+              barrier.episodeID == deferredEpisodeID,
+              let threadID else {
+            deferredVisualEvidenceEpisodeID = nil
+            return
+        }
+        deferredVisualEvidenceEpisodeID = nil
+        acquireCurrentVisualEvidence(episodeID: deferredEpisodeID, threadID: threadID)
+    }
+
     private func startRealtime(offerSDP: String) {
         guard let threadID else {
             fail(LiveVoiceError.webRTC("thread_not_ready"))
@@ -1161,6 +1621,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         case "thread/realtime/error":
             fail(LiveVoiceError.webRTC(params["message"] as? String ?? "realtime_error"))
         case "thread/realtime/outputAudio/delta":
+            if observeVisualPresentationStarted(responseID: Self.realtimeResponseID(in: params)) {
+                return
+            }
             observeAssistantOutputStarted()
             noteAssistantAudioActivity()
             if voiceMode.requiresProcessedPlayback,
@@ -1348,8 +1811,37 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         if type == "error" {
             let error = object["error"] as? [String: Any]
+            let eventID = (object["event_id"] as? String) ?? "unknown"
+            if eventID.hasPrefix("soma_"), eventID.hasSuffix("_response_cancel") {
+                if let episodeID = Self.visualEpisodeID(
+                    from: eventID,
+                    suffix: "_response_cancel"
+                ) {
+                    observeVisualCancellationSettled(episodeID: episodeID)
+                }
+                emitter.emit("visual_turn_barrier", fields: [
+                    "state": "cancel_not_required",
+                    "task_id": visualResponseBarrier?.episodeID.uuidString.lowercased() ?? "unknown",
+                    "reason": String(((error?["code"] as? String) ?? "no_active_response").prefix(128)),
+                ])
+                return
+            }
+            if eventID.hasPrefix("soma_"), eventID.hasSuffix("_output_audio_buffer_clear") {
+                emitter.emit("visual_turn_barrier", fields: [
+                    "state": "audio_clear_not_required",
+                    "task_id": visualResponseBarrier?.episodeID.uuidString.lowercased() ?? "unknown",
+                    "reason": String(((error?["code"] as? String) ?? "no_audio_to_clear").prefix(128)),
+                ])
+                return
+            }
+            if eventID.hasPrefix("soma_"), eventID.hasSuffix("_response_create") {
+                fail(LiveVoiceError.webRTC(
+                    "visual_response_create_failed: \((error?["message"] as? String) ?? "unknown")"
+                ))
+                return
+            }
             emitter.emit("realtime_protocol_error", fields: [
-                "event_id": String(((object["event_id"] as? String) ?? "unknown").prefix(128)),
+                "event_id": String(eventID.prefix(128)),
                 "code": String(((error?["code"] as? String) ?? "unknown").prefix(128)),
                 "message": String(((error?["message"] as? String) ?? "unknown").prefix(256)),
             ])
@@ -1367,10 +1859,15 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         if type.contains("response.cancelled") || type.contains("response.canceled") {
             selectedAudioOutput?.flush()
+            let responseID = Self.realtimeResponseID(in: object)
+            observeVisualResponseEnded(responseID: responseID)
             emitter.emit("response_interrupted")
             return
         }
         if type == "output_audio_buffer.started" || type.contains("response.output_audio.delta") {
+            if observeVisualPresentationStarted(responseID: Self.realtimeResponseID(in: object)) {
+                return
+            }
             observeAssistantOutputStarted()
             return
         }
@@ -1432,11 +1929,29 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         if type == "turn.created" || type.contains("response.created") {
+            let responseID = Self.realtimeResponseID(in: object)
+            currentRealtimeResponseID = responseID
+            if observeVisualResponseStarted(responseID: responseID) { return }
             emitter.emit("response_preparing")
             return
         }
         if type == "turn.completed" || type == "turn.finished" || type == "turn.done" ||
             type.contains("response.completed") || type.contains("response.done") {
+            let responseID = Self.realtimeResponseID(in: object)
+            if currentRealtimeResponseID == responseID { currentRealtimeResponseID = nil }
+            if let barrier = visualResponseBarrier,
+               barrier.ownsReplacementResponse(responseID) {
+                if barrier.presentationReleased {
+                    completeCurrentVisualResponse()
+                } else {
+                    fail(LiveVoiceError.webRTC(
+                        "visual_replacement_ended_without_audio_presentation"
+                    ))
+                    return
+                }
+            } else {
+                observeVisualResponseEnded(responseID: responseID)
+            }
             setCognitiveTurn(active: false)
             scheduleAssistantOutputEnd(after: 0.35)
             emitter.emit("response_completed")
@@ -1483,6 +1998,52 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             lastFallbackTranscript = (role, normalizedText, nowNS)
         }
 
+        if role == "assistant",
+           let barrier = visualResponseBarrier,
+           barrier.suppressesAssistantPresentation {
+            emitter.emit("visual_turn_barrier", fields: [
+                "state": "provisional_transcript_suppressed",
+                "task_id": barrier.episodeID.uuidString.lowercased(),
+                "reason": "fresh_evidence_not_committed",
+            ])
+            return
+        }
+
+        if role == "user" {
+            participantTurnSequence &+= 1
+            latestParticipantTranscript = normalizedText
+            if conversationControlClassifier.classify(normalizedText) == .endConversation {
+                emitter.emit("transcript_finalized", fields: [
+                    "thread_id": threadID ?? "",
+                    "role": role,
+                    "text": String(normalizedText.prefix(8_192)),
+                ])
+                emitter.emit("conversation_control_applied", fields: [
+                    "control": "end_conversation",
+                    "source": "final_participant_transcript",
+                ])
+                stop(reason: "participant_requested_end")
+                return
+            }
+            if L1LiveEpistemicReflexRouter.requiresCurrentCameraEvidence(
+                transcript: normalizedText
+            ) {
+                beginCurrentVisualTurn(
+                    episodeID: UUID(),
+                    participantTurnSequence: participantTurnSequence,
+                    transcript: normalizedText,
+                    source: "deterministic_current_view_intent"
+                )
+            } else if let barrier = visualResponseBarrier {
+                if barrier.presentationReleased {
+                    completeCurrentVisualResponse()
+                } else {
+                    fail(LiveVoiceError.webRTC("visual_turn_interrupted_by_new_participant_turn"))
+                    return
+                }
+            }
+        }
+
         emitter.emit("transcript_finalized", fields: [
             "thread_id": threadID ?? "",
             "role": role,
@@ -1491,13 +2052,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         if role == "user" {
             inputSpeechInProgress = false
             partialUserTranscript = ""
-            if conversationControlClassifier.classify(normalizedText) == .endConversation {
-                emitter.emit("conversation_control_applied", fields: [
-                    "control": "end_conversation",
-                    "source": "final_participant_transcript",
-                ])
-                stop(reason: "participant_requested_end")
-            }
         } else {
             scheduleAssistantOutputEnd(after: 0.35)
         }
@@ -1691,6 +2245,32 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         return String(session.keys.sorted().joined(separator: ",").prefix(512))
     }
 
+    private static func realtimeResponseID(in event: [String: Any]) -> String? {
+        let directKeys = ["response_id", "responseId", "turn_id", "turnId"]
+        for key in directKeys {
+            if let value = event[key] as? String,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return String(value.prefix(256))
+            }
+        }
+        for containerKey in ["response", "turn"] {
+            if let container = event[containerKey] as? [String: Any],
+               let value = container["id"] as? String,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return String(value.prefix(256))
+            }
+        }
+        return nil
+    }
+
+    private static func visualEpisodeID(from eventID: String, suffix: String) -> UUID? {
+        guard eventID.hasPrefix("soma_"), eventID.hasSuffix(suffix) else { return nil }
+        let start = eventID.index(eventID.startIndex, offsetBy: "soma_".count)
+        let end = eventID.index(eventID.endIndex, offsetBy: -suffix.count)
+        guard start < end else { return nil }
+        return UUID(uuidString: String(eventID[start..<end]))
+    }
+
     private func activateIfReady() {
         guard !activeEmitted,
               startRequestAccepted,
@@ -1807,7 +2387,12 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         assistantOutputEndWorkItem = nil
         embodimentMCPVerificationTimeoutWorkItem?.cancel()
         embodimentMCPVerificationTimeoutWorkItem = nil
+        cancelVisualTurnTimeouts()
         partialUserTranscript = ""
+        currentRealtimeResponseID = nil
+        visualResponseBarrier = nil
+        deferredVisualEvidenceEpisodeID = nil
+        setVisualOutputGate(closed: false, resetPresentation: true)
         observeAssistantOutputEnded()
         setCognitiveTurn(active: false)
         if let threadID {
@@ -1840,6 +2425,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     let inputWorklet = null;
     let outputContext = null;
     let outputWorklet = null;
+    let outputGate = null;
+    let visualOutputGateClosed = false;
     let outputSpeaking = false;
     let outputAboveCount = 0;
     let outputBelowCount = 0;
@@ -2007,6 +2594,29 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                   samples: new Float32Array(Math.max(1, Math.round(sampleRate * seconds))),
                   index: 0,
                 }));
+                this.port.onmessage = event => {
+                  if (event.data?.type === 'reset_presentation') this.resetPresentation();
+                };
+              }
+              resetPresentation() {
+                this.pending.fill(0);
+                this.pendingCount = 0;
+                this.pitchBuffer.fill(0);
+                this.pitchWrite = 0;
+                this.pitchSamplesWritten = 0;
+                this.pitchPhase = 0;
+                this.lowState = 0;
+                this.bassState = 0;
+                this.presenceState = 0;
+                this.envelope = 0;
+                this.echoOne.fill(0);
+                this.echoTwo.fill(0);
+                this.echoOneIndex = 0;
+                this.echoTwoIndex = 0;
+                for (const comb of this.reverb) {
+                  comb.samples.fill(0);
+                  comb.index = 0;
+                }
               }
               readPitch(delay) {
                 let position = this.pitchWrite - delay;
@@ -2111,13 +2721,16 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             },
           });
           outputSource.connect(outputWorklet);
+          outputGate = outputContext.createGain();
+          outputGate.gain.value = visualOutputGateClosed ? 0 : 1;
+          outputWorklet.connect(outputGate);
           if (nativePlayback) {
             const silentOutput = outputContext.createGain();
             silentOutput.gain.value = 0;
-            outputWorklet.connect(silentOutput);
+            outputGate.connect(silentOutput);
             silentOutput.connect(outputContext.destination);
           } else {
-            outputWorklet.connect(outputContext.destination);
+            outputGate.connect(outputContext.destination);
           }
           outputWorklet.port.onmessage = message => {
             if (message.data?.type !== 'reference') return;
@@ -2215,6 +2828,27 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
       }
       inputWorklet.port.postMessage({type: 'append', samples: destination}, [destination.buffer]);
+    }
+    function sendRealtimeControl(payload) {
+      if (!channel || channel.readyState !== 'open' || !payload || typeof payload.type !== 'string') {
+        return false;
+      }
+      channel.send(JSON.stringify(payload));
+      return true;
+    }
+    function setVisualOutputGate(closed, resetPresentation = false) {
+      visualOutputGateClosed = closed === true;
+      if (resetPresentation && outputWorklet) {
+        outputWorklet.port.postMessage({type: 'reset_presentation'});
+        outputSpeaking = false;
+        outputAboveCount = 0;
+        outputBelowCount = 0;
+      }
+      if (outputGate && outputContext) {
+        outputGate.gain.cancelScheduledValues(outputContext.currentTime);
+        outputGate.gain.setValueAtTime(visualOutputGateClosed ? 0 : 1, outputContext.currentTime);
+      }
+      return true;
     }
     function stopWebRTC() {
       if (channel) channel.close();

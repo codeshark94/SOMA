@@ -2,16 +2,159 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace soma {
+
+constexpr int32_t openOBSBOTFunctionalMotionStall = -7001;
+
+inline bool openOBSBOTRequiresFunctionalRecovery(int32_t reason) noexcept {
+    return reason == openOBSBOTFunctionalMotionStall;
+}
+
+/// A functional motor fault may only be cleared by observing a new USB device
+/// registry entry. Elapsed time and successful endpoint traffic are not
+/// evidence that the camera's motor controller has restarted.
+class OpenOBSBOTPhysicalReconnectLatch final {
+public:
+    void engage(uint64_t registryEntryID) noexcept {
+        engaged_ = true;
+        failedRegistryEntryID_ = registryEntryID;
+    }
+
+    bool observe(uint64_t registryEntryID) noexcept {
+        if (!engaged_ || registryEntryID == 0 || failedRegistryEntryID_ == 0
+            || registryEntryID == failedRegistryEntryID_) {
+            return false;
+        }
+        engaged_ = false;
+        failedRegistryEntryID_ = 0;
+        return true;
+    }
+
+    bool engaged() const noexcept { return engaged_; }
+    uint64_t failedRegistryEntryID() const noexcept { return failedRegistryEntryID_; }
+
+private:
+    bool engaged_ = false;
+    uint64_t failedRegistryEntryID_ = 0;
+};
+
+enum class OpenOBSBOTMotionObservation {
+    idle,
+    monitoring,
+    progress,
+    stalled,
+};
+
+/// Verifies that accepted velocity writes produce measured gimbal motion.
+/// USB control transfers can succeed while the camera firmware ignores the
+/// command, so transport success alone is not actuator success.
+class OpenOBSBOTMotionWatchdog final {
+public:
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+    void setIntent(
+        double pitchVelocity,
+        double panVelocity,
+        double pitchLimit,
+        double panLimit,
+        TimePoint now = Clock::now()
+    ) noexcept {
+        const double magnitude = std::hypot(pitchVelocity, panVelocity);
+        if (!std::isfinite(magnitude) || magnitude < minimumCommandDegreesPerSecond) {
+            clear();
+            return;
+        }
+        const bool directionChanged = active_
+            && (pitchVelocity_ * pitchVelocity + panVelocity_ * panVelocity) <= 0;
+        pitchVelocity_ = pitchVelocity;
+        panVelocity_ = panVelocity;
+        pitchLimit_ = std::abs(pitchLimit);
+        panLimit_ = std::abs(panLimit);
+        if (!active_ || directionChanged) {
+            active_ = true;
+            baseline_.reset();
+        }
+    }
+
+    OpenOBSBOTMotionObservation observe(
+        double pitch,
+        double pan,
+        TimePoint now = Clock::now()
+    ) noexcept {
+        if (!active_ || !std::isfinite(pitch) || !std::isfinite(pan)) {
+            return OpenOBSBOTMotionObservation::idle;
+        }
+        const bool pitchExpected = axisCanMove(pitch, pitchVelocity_, pitchLimit_);
+        const bool panExpected = axisCanMove(pan, panVelocity_, panLimit_);
+        if (!pitchExpected && !panExpected) {
+            baseline_.reset();
+            return OpenOBSBOTMotionObservation::idle;
+        }
+        if (!baseline_) {
+            baseline_ = Sample {pitch, pan, now};
+            return OpenOBSBOTMotionObservation::monitoring;
+        }
+        const double pitchDelta = pitchExpected ? pitch - baseline_->pitch : 0;
+        const double panDelta = panExpected ? pan - baseline_->pan : 0;
+        if (std::hypot(pitchDelta, panDelta) >= minimumObservedMotionDegrees) {
+            baseline_ = Sample {pitch, pan, now};
+            return OpenOBSBOTMotionObservation::progress;
+        }
+        if (now - baseline_->observedAt >= stallWindow) {
+            clear();
+            return OpenOBSBOTMotionObservation::stalled;
+        }
+        return OpenOBSBOTMotionObservation::monitoring;
+    }
+
+    void clear() noexcept {
+        active_ = false;
+        baseline_.reset();
+        pitchVelocity_ = 0;
+        panVelocity_ = 0;
+    }
+
+    bool active() const noexcept { return active_; }
+
+private:
+    struct Sample {
+        double pitch;
+        double pan;
+        TimePoint observedAt;
+    };
+
+    static bool axisCanMove(double position, double velocity, double limit) noexcept {
+        if (std::abs(velocity) < minimumCommandDegreesPerSecond) return false;
+        return !(limit > 0
+            && std::abs(position) >= limit - jointLimitMarginDegrees
+            && position * velocity > 0);
+    }
+
+    static constexpr double minimumCommandDegreesPerSecond = 4.0;
+    static constexpr double minimumObservedMotionDegrees = 0.35;
+    static constexpr double jointLimitMarginDegrees = 2.0;
+    static constexpr std::chrono::milliseconds stallWindow {700};
+
+    bool active_ = false;
+    double pitchVelocity_ = 0;
+    double panVelocity_ = 0;
+    double pitchLimit_ = 0;
+    double panLimit_ = 0;
+    std::optional<Sample> baseline_;
+};
 
 enum class OpenOBSBOTControlState {
     healthy,
     degraded,
     reconnecting,
     restoring,
+    awaitingPhysicalReconnect,
 };
 
 enum class OpenOBSBOTRecoveryAttemptOutcome {
@@ -62,6 +205,23 @@ public:
         ++consecutiveFailures_;
         state_ = OpenOBSBOTControlState::degraded;
         retryAt_ = now + retryDelay(consecutiveFailures_);
+    }
+
+    void notePhysicalReconnectRequired(
+        int32_t ioReturn,
+        TimePoint now = Clock::now()
+    ) noexcept {
+        lastIOReturn_ = ioReturn;
+        ++consecutiveFailures_;
+        state_ = OpenOBSBOTControlState::awaitingPhysicalReconnect;
+        retryAt_ = now;
+    }
+
+    bool noteDeviceReconnected(TimePoint now = Clock::now()) noexcept {
+        if (state_ != OpenOBSBOTControlState::awaitingPhysicalReconnect) return false;
+        state_ = OpenOBSBOTControlState::degraded;
+        retryAt_ = now;
+        return true;
     }
 
     bool beginRecovery(TimePoint now = Clock::now()) noexcept {
@@ -160,6 +320,8 @@ inline const char *openOBSBOTControlStateName(OpenOBSBOTControlState state) noex
     case OpenOBSBOTControlState::degraded: return "degraded";
     case OpenOBSBOTControlState::reconnecting: return "reconnecting";
     case OpenOBSBOTControlState::restoring: return "restoring";
+    case OpenOBSBOTControlState::awaitingPhysicalReconnect:
+        return "awaiting_physical_reconnect";
     }
     return "degraded";
 }

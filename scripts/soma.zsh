@@ -37,7 +37,7 @@ function soma_quiesce_runtime() {
     # The endpoint becomes available after the perception runtime has bound
     # its local socket. A launchd restart can make the socket pathname visible
     # just before accept() is ready, so retry the same idempotent lifecycle
-    # request instead of immediately cutting off the gimbal park sequence.
+    # request instead of immediately cutting off safe device quiescence.
     for attempt in {1..12}; do
       if "$soma_runtime_control" --runtime-shutdown --socket "$soma_runtime_socket"; then
         graceful_shutdown=true
@@ -46,7 +46,7 @@ function soma_quiesce_runtime() {
       sleep 1
     done
     if [[ "$graceful_shutdown" != true ]]; then
-      print -u2 -r -- 'SOMA did not confirm gimbal park and camera sleep; lifecycle transition cancelled.'
+      print -u2 -r -- 'SOMA did not confirm safe device quiescence; lifecycle transition cancelled.'
       return 1
     fi
   else
@@ -60,8 +60,8 @@ function soma_stop() {
     print -r -- 'SOMA is already stopped.'
     return
   fi
-  # Disable KeepAlive before quiescing so launchd cannot wake a device between
-  # the verified sleep acknowledgement and bootout.
+  # Disable KeepAlive before quiescing so launchd cannot wake the device
+  # between the lifecycle acknowledgement and bootout.
   /bin/launchctl disable "$soma_target" >/dev/null 2>&1 || true
   if ! soma_quiesce_runtime; then
     /bin/launchctl enable "$soma_target" >/dev/null 2>&1 || true
@@ -88,7 +88,7 @@ function soma_restart() {
       | /usr/bin/sed -n 's/^[[:space:]]*pid = //p' \
       | /usr/bin/head -n 1)
     if [[ -n "$current_pid" && "$current_pid" != "$previous_pid" ]]; then
-      print -r -- "SOMA restarted after verified park and sleep (pid=$current_pid)."
+      print -r -- "SOMA restarted after verified device quiescence (pid=$current_pid)."
       return
     fi
     sleep 0.2

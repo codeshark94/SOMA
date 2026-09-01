@@ -26,6 +26,7 @@ enum AppServerLiveVoiceEvent: Sendable {
     case hearingUser
     case visualContextAttached
     case visualContextRejected(reason: String)
+    case visualTurnBarrier(state: String, episodeID: UUID?, reason: String)
     case embodimentMCPReady
     case embodimentMCPUnavailable(reason: String)
     case hermesTaskResultAccepted(taskID: UUID)
@@ -787,6 +788,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                   L2CognitiveToolPolicy.knownToolNames.contains(tool) else {
                 return false
             }
+            if tool == "capture_view" {
+                return send([
+                    "type": "begin_visual_turn",
+                    "taskID": advice.turnID.uuidString.lowercased(),
+                    "data": String(transcript.prefix(4_096)),
+                    "tool": tool,
+                ])
+            }
             let quote = advice.groundingQuote ?? ""
             guard !assistantOutputStartedForTurn else { return false }
             let instruction = """
@@ -1109,6 +1118,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.visualContextAttached)
             case "visual_context_rejected":
                 onEvent(.visualContextRejected(reason: String((event.reason ?? "unknown").prefix(192))))
+            case "visual_turn_barrier":
+                onEvent(.visualTurnBarrier(
+                    state: String((event.state ?? "unknown").prefix(64)),
+                    episodeID: event.taskID.flatMap(UUID.init(uuidString:)),
+                    reason: String((event.reason ?? "unknown").prefix(192))
+                ))
             case "embodiment_mcp_ready":
                 onEvent(.embodimentMCPReady)
             case "embodiment_mcp_unavailable":
@@ -1587,7 +1602,7 @@ func testAppServerLiveVoiceLauncher() -> String {
              .inputBootstrapReplayed,
              .responseInterrupted, .interruptedAudioCleared, .proactiveOpeningTriggered,
              .proactiveOpeningExtraOutputSuppressed, .hermesReportOfferStarted, .hearingUser,
-             .visualContextAttached, .visualContextRejected,
+             .visualContextAttached, .visualContextRejected, .visualTurnBarrier,
              .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
              .hermesTaskResultAccepted, .hermesTaskResultRejected,
              .personContextUnavailable, .embodimentMCPCall,

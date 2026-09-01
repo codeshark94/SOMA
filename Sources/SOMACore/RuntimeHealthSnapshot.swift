@@ -17,6 +17,7 @@ public enum RuntimeHealthProjectionPolicy {
     /// states such as alignments, sampled waypoints, and inference detail.
     public static func retains(source: String, state: String) -> Bool {
         if source == "social_indicator" { return true }
+        if source == "obsbot_control_transport" { return true }
         if lifecycleStates.contains(state) { return true }
         return readinessFaults[source]?.contains(state) == true
     }

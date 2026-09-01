@@ -119,6 +119,47 @@ uint32_t usbLocationID(io_service_t device) noexcept {
         : 0;
 }
 
+uint64_t usbRegistryEntryID(io_service_t device) noexcept {
+    uint64_t entryID = 0;
+    return IORegistryEntryGetRegistryEntryID(device, &entryID) == kIOReturnSuccess
+        ? entryID
+        : 0;
+}
+
+uint64_t connectedDeviceRegistryEntryID(
+    OBSBOTOpenDeviceProfile profile,
+    const std::string &expectedSerial,
+    uint32_t expectedLocationID
+) noexcept {
+    CFMutableDictionaryRef matching = deviceMatchingDictionary(
+        open_obsbot_protocol::vendorID,
+        open_obsbot_protocol::productID(profile)
+    );
+    if (!matching) return 0;
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) != kIOReturnSuccess
+        || iterator == IO_OBJECT_NULL) {
+        return 0;
+    }
+    uint64_t matchedEntryID = 0;
+    size_t matchedCount = 0;
+    io_service_t candidate = IO_OBJECT_NULL;
+    while ((candidate = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        const std::string candidateSerial = usbSerial(candidate);
+        const uint32_t candidateLocationID = usbLocationID(candidate);
+        const bool identityMatches = !expectedSerial.empty()
+            ? candidateSerial == expectedSerial
+            : (expectedLocationID == 0 || candidateLocationID == expectedLocationID);
+        if (identityMatches) {
+            ++matchedCount;
+            matchedEntryID = usbRegistryEntryID(candidate);
+        }
+        IOObjectRelease(candidate);
+    }
+    IOObjectRelease(iterator);
+    return matchedCount == 1 ? matchedEntryID : 0;
+}
+
 size_t connectedDeviceCount(OBSBOTOpenDeviceProfile profile) noexcept {
     CFMutableDictionaryRef matching = deviceMatchingDictionary(
         open_obsbot_protocol::vendorID,
@@ -172,7 +213,7 @@ bool videoControlInterface(io_service_t device, uint8_t &interfaceNumber) noexce
     return found;
 }
 
-IOUSBDeviceInterface **openUSBDevice(io_service_t device, IOReturn &result) noexcept {
+IOUSBDeviceInterface187 **openUSBDevice(io_service_t device, IOReturn &result) noexcept {
     IOCFPlugInInterface **plugin = nullptr;
     SInt32 score = 0;
     result = IOCreatePlugInInterfaceForService(
@@ -183,10 +224,10 @@ IOUSBDeviceInterface **openUSBDevice(io_service_t device, IOReturn &result) noex
         &score
     );
     if (result != kIOReturnSuccess || !plugin) return nullptr;
-    IOUSBDeviceInterface **interface = nullptr;
+    IOUSBDeviceInterface187 **interface = nullptr;
     const HRESULT query = (*plugin)->QueryInterface(
         plugin,
-        CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID),
+        CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID187),
         reinterpret_cast<LPVOID *>(&interface)
     );
     (*plugin)->Release(plugin);
@@ -203,7 +244,7 @@ IOUSBDeviceInterface **openUSBDevice(io_service_t device, IOReturn &result) noex
 }
 
 IOReturn uvcControl(
-    IOUSBDeviceInterface **device,
+    IOUSBDeviceInterface187 **device,
     uint8_t interfaceNumber,
     uint8_t requestType,
     uint8_t request,
@@ -226,13 +267,15 @@ IOReturn uvcControl(
 } // namespace
 
 struct OpenOBSBOTUVCTransport::Storage {
-    IOUSBDeviceInterface **device = nullptr;
+    IOUSBDeviceInterface187 **device = nullptr;
     uint8_t videoControlInterface = 0;
     uint16_t sequence = 1;
     OBSBOTOpenDeviceProfile profile = OBSBOTOpenDeviceProfile::tiny2Lite;
     std::string serial;
     uint32_t locationID = 0;
+    uint64_t registryEntryID = 0;
     OpenOBSBOTRecoveryPolicy recovery;
+    OpenOBSBOTPhysicalReconnectLatch physicalReconnectLatch;
     uint64_t generation = 0;
     bool configured = false;
 };
@@ -313,10 +356,11 @@ bool OpenOBSBOTUVCTransport::openLocked(
     }
     const std::string serial = usbSerial(selected);
     const uint32_t locationID = usbLocationID(selected);
+    const uint64_t registryEntryID = usbRegistryEntryID(selected);
     uint8_t interfaceNumber = 0;
     const bool hasVideoControl = videoControlInterface(selected, interfaceNumber);
     IOReturn openResult = kIOReturnNoDevice;
-    IOUSBDeviceInterface **device = hasVideoControl ? openUSBDevice(selected, openResult) : nullptr;
+    IOUSBDeviceInterface187 **device = hasVideoControl ? openUSBDevice(selected, openResult) : nullptr;
     IOObjectRelease(selected);
     if (!hasVideoControl || !device) {
         error = !hasVideoControl
@@ -330,6 +374,7 @@ bool OpenOBSBOTUVCTransport::openLocked(
     storage_->profile = profile;
     storage_->serial = serial;
     storage_->locationID = locationID;
+    storage_->registryEntryID = registryEntryID;
     ioReturn = kIOReturnSuccess;
     return true;
 }
@@ -372,6 +417,22 @@ OpenOBSBOTRecoverySnapshot OpenOBSBOTUVCTransport::recoveryStatus() const noexce
 bool OpenOBSBOTUVCTransport::serviceRecovery(std::string &error) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!storage_->configured) return false;
+
+    if (storage_->physicalReconnectLatch.engaged()) {
+        const uint64_t currentEntryID = connectedDeviceRegistryEntryID(
+            storage_->profile,
+            storage_->serial,
+            storage_->locationID
+        );
+        if (!storage_->physicalReconnectLatch.observe(currentEntryID)) {
+            error = "functional motor fault is latched until the USB device is physically reconnected";
+            return false;
+        }
+        if (!storage_->recovery.noteDeviceReconnected()) {
+            error = "the physical reconnect latch and control recovery state diverged";
+            return false;
+        }
+    }
 
     const auto profile = storage_->profile;
     const std::string serial = storage_->serial;
@@ -459,6 +520,93 @@ void OpenOBSBOTUVCTransport::abortRecovery(int32_t ioReturn) noexcept {
     }
     closeLocked();
     storage_->recovery.noteFailure(ioReturn);
+}
+
+void OpenOBSBOTUVCTransport::requestRecovery(int32_t reason) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (reason == openOBSBOTFunctionalMotionStall) {
+        storage_->physicalReconnectLatch.engage(storage_->registryEntryID);
+        closeLocked();
+        storage_->recovery.notePhysicalReconnectRequired(reason);
+        return;
+    }
+    closeLocked();
+    storage_->recovery.noteFailure(reason);
+}
+
+OpenOBSBOTFunctionalRecoveryOutcome
+OpenOBSBOTUVCTransport::verifyMotorResponse() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto state = storage_->recovery.snapshot(storage_->generation).state;
+    if (!storage_->device
+        || (state != OpenOBSBOTControlState::healthy
+            && state != OpenOBSBOTControlState::restoring)) {
+        return OpenOBSBOTFunctionalRecoveryOutcome::failed;
+    }
+
+    const auto stop = open_obsbot_protocol::externalVelocity(storage_->profile, 0, 0);
+    const auto wake = open_obsbot_protocol::wakeState(storage_->profile, true);
+    if (!stop
+        || submitFrameDirectLocked(
+            stop->command,
+            stop->receiver,
+            stop->payload.data(),
+            stop->payload.size()
+        ) != kIOReturnSuccess
+        || submitFrameDirectLocked(
+            wake.command,
+            wake.receiver,
+            wake.payload.data(),
+            wake.payload.size()
+        ) != kIOReturnSuccess) {
+        return OpenOBSBOTFunctionalRecoveryOutcome::failed;
+    }
+
+    // Getter data can remain readable while the motor controller is wedged.
+    // Require a small measured movement and stop it immediately; never infer
+    // functional health from an acknowledgement or a plausible pose alone.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    double baselinePitch = 0;
+    double baselinePan = 0;
+    if (readAttitudeLocked(baselinePitch, baselinePan) == success) {
+        const float probePanVelocity = baselinePan >= 0 ? -5.0F : 5.0F;
+        const auto probe = open_obsbot_protocol::externalVelocity(
+            storage_->profile,
+            0,
+            probePanVelocity
+        );
+        if (probe
+            && submitFrameDirectLocked(
+                probe->command,
+                probe->receiver,
+                probe->payload.data(),
+                probe->payload.size()
+            ) == kIOReturnSuccess) {
+            const auto probeDeadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+            bool moved = false;
+            while (std::chrono::steady_clock::now() < probeDeadline) {
+                double pitch = 0;
+                double pan = 0;
+                if (readAttitudeLocked(pitch, pan) == success
+                    && std::hypot(pitch - baselinePitch, pan - baselinePan) >= 0.20) {
+                    moved = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            const bool stopped = submitFrameDirectLocked(
+                stop->command,
+                stop->receiver,
+                stop->payload.data(),
+                stop->payload.size()
+            ) == kIOReturnSuccess;
+            if (moved && stopped) {
+                return OpenOBSBOTFunctionalRecoveryOutcome::runStateRestored;
+            }
+        }
+    }
+    return OpenOBSBOTFunctionalRecoveryOutcome::physicalReconnectRequired;
 }
 
 OBSBOTOpenDeviceProfile OpenOBSBOTUVCTransport::profile() const noexcept {

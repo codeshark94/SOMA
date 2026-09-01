@@ -161,6 +161,21 @@ int main() {
 
     using RecoveryPolicy = soma::OpenOBSBOTRecoveryPolicy;
     using ControlState = soma::OpenOBSBOTControlState;
+    assert(soma::openOBSBOTRequiresFunctionalRecovery(
+        soma::openOBSBOTFunctionalMotionStall
+    ));
+    assert(!soma::openOBSBOTRequiresFunctionalRecovery(-1));
+
+    soma::OpenOBSBOTPhysicalReconnectLatch reconnectLatch;
+    reconnectLatch.engage(42);
+    assert(reconnectLatch.engaged());
+    assert(!reconnectLatch.observe(0));
+    assert(!reconnectLatch.observe(42));
+    assert(reconnectLatch.engaged());
+    assert(reconnectLatch.observe(43));
+    assert(!reconnectLatch.engaged());
+    assert(!reconnectLatch.observe(44));
+
     const RecoveryPolicy::TimePoint recoveryEpoch {};
     RecoveryPolicy recovery;
     recovery.noteHealthy(recoveryEpoch);
@@ -185,6 +200,24 @@ int main() {
     assert(recovery.snapshot(2, completionTime).consecutiveFailures == 0);
     assert(closeCount == 0);
 
+    RecoveryPolicy functionalRecovery;
+    functionalRecovery.noteHealthy(recoveryEpoch);
+    functionalRecovery.notePhysicalReconnectRequired(
+        soma::openOBSBOTFunctionalMotionStall,
+        recoveryEpoch
+    );
+    assert(functionalRecovery.snapshot(1, recoveryEpoch).state
+        == ControlState::awaitingPhysicalReconnect);
+    assert(!functionalRecovery.beginRecovery(
+        recoveryEpoch + std::chrono::hours(24 * 365)
+    ));
+    assert(functionalRecovery.noteDeviceReconnected(
+        recoveryEpoch + std::chrono::hours(24 * 365)
+    ));
+    assert(functionalRecovery.beginRecovery(
+        recoveryEpoch + std::chrono::hours(24 * 365)
+    ));
+
     RecoveryPolicy failingRecovery;
     failingRecovery.noteHealthy(recoveryEpoch);
     failingRecovery.noteFailure(-101, recoveryEpoch);
@@ -207,6 +240,31 @@ int main() {
     assert(!failingRecovery.beginRecovery(
         recoveryEpoch + std::chrono::milliseconds(499)
     ));
+
+    soma::OpenOBSBOTMotionWatchdog motionWatchdog;
+    motionWatchdog.setIntent(0, 12, 60, 118, recoveryEpoch);
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch)
+        == soma::OpenOBSBOTMotionObservation::monitoring);
+    motionWatchdog.setIntent(0, 12, 60, 118, recoveryEpoch + std::chrono::milliseconds(300));
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch + std::chrono::milliseconds(699))
+        == soma::OpenOBSBOTMotionObservation::monitoring);
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch + std::chrono::milliseconds(700))
+        == soma::OpenOBSBOTMotionObservation::stalled);
+
+    motionWatchdog.setIntent(0, 12, 60, 118, recoveryEpoch);
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch)
+        == soma::OpenOBSBOTMotionObservation::monitoring);
+    assert(motionWatchdog.observe(0, 2.5, recoveryEpoch + std::chrono::milliseconds(300))
+        == soma::OpenOBSBOTMotionObservation::progress);
+    assert(motionWatchdog.observe(0, 2.5, recoveryEpoch + std::chrono::milliseconds(900))
+        == soma::OpenOBSBOTMotionObservation::monitoring);
+
+    motionWatchdog.setIntent(0, 12, 60, 118, recoveryEpoch);
+    assert(motionWatchdog.observe(0, 117, recoveryEpoch)
+        == soma::OpenOBSBOTMotionObservation::idle);
+    motionWatchdog.setIntent(0, -12, 60, 118, recoveryEpoch);
+    assert(motionWatchdog.observe(0, 117, recoveryEpoch)
+        == soma::OpenOBSBOTMotionObservation::monitoring);
 
     completionTime = recoveryEpoch + std::chrono::milliseconds(510);
     attempt = soma::attemptOpenOBSBOTRecovery(

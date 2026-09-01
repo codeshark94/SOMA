@@ -3822,8 +3822,10 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private let onL0FaceFixation: (String?, Bool, UInt64) -> Void
     private let externalCalibration: ExternalGimbalCalibration?
     private let shutdownLock = NSLock()
+    private let controlRecoveryLock = NSLock()
     private var state: State = .running
     private var shutdownVerification: Bool?
+    private var controlRequiresPhysicalReconnect = false
     private var gate = NativeHumanTrackingGate()
     private var nativeCommandID: String?
     /// Transport acknowledgement only means the device accepted a mode switch. It
@@ -4089,6 +4091,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         deviceCapabilities?.supportsIndicatorEnableAndBrightness == true
     }
 
+    var awaitsPhysicalReconnect: Bool {
+        controlRecoveryLock.lock()
+        let required = controlRequiresPhysicalReconnect
+        controlRecoveryLock.unlock()
+        return required
+    }
+
     init(
         helperURL: URL,
         shutdownHelperURL: URL? = nil,
@@ -4272,6 +4281,13 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 result[String(pair[0])] = pair[1]
             }
             let state = values["state"].map(String.init) ?? "degraded"
+            controlRecoveryLock.lock()
+            if state == "healthy" {
+                controlRequiresPhysicalReconnect = false
+            } else if state == "awaiting_physical_reconnect" {
+                controlRequiresPhysicalReconnect = true
+            }
+            controlRecoveryLock.unlock()
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
@@ -4862,6 +4878,16 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     private func runLifecycleShutdownIfNeeded() -> Bool {
         guard let shutdownHelperURL else { return false }
+        if awaitsPhysicalReconnect {
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "attention_gimbal_bridge",
+                state: "lifecycle_shutdown_quiesced",
+                message: "physical_reconnect_required=true; park_sleep_commands_withheld=true"
+            ))
+            return true
+        }
         let lifecycle = Process()
         lifecycle.executableURL = shutdownHelperURL
         var arguments = [
@@ -12269,6 +12295,7 @@ private final class VisionWorker: @unchecked Sendable {
 private final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let stateLock = NSLock()
     private var accepting = true
+    private var lastVideoCallbackNS: UInt64 = 0
     private let worldModel: PredictiveWorldModel
     private let publisher: BeliefPublisher
     private let visionWorker: VisionWorker
@@ -12310,6 +12337,9 @@ private final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBuf
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
         let now = monotonicNanoseconds()
         if output === videoOutput, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            stateLock.lock()
+            lastVideoCallbackNS = now
+            stateLock.unlock()
             let exposureNS = hostAlignedPresentationTimestamp(
                 sampleBuffer: sampleBuffer,
                 fallbackNS: now
@@ -12355,6 +12385,14 @@ private final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBuf
         stateLock.lock()
         accepting = false
         stateLock.unlock()
+    }
+
+    func videoCaptureAgeNanoseconds(at now: UInt64) -> UInt64? {
+        stateLock.lock()
+        let observedNS = lastVideoCallbackNS
+        stateLock.unlock()
+        guard observedNS > 0, now >= observedNS else { return nil }
+        return now - observedNS
     }
 
     private var isAccepting: Bool {
@@ -13534,6 +13572,14 @@ private func run(_ options: Options) throws {
                     state: "visual_context_rejected",
                     message: String(reason.prefix(192))
                 ))
+            case let .visualTurnBarrier(state, episodeID, reason):
+                writer.write(RuntimeEvent(
+                    event: "l2.visual_turn",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: state,
+                    message: "episode_id=\(episodeID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
+                ))
             case .embodimentMCPReady:
                 l1LiveToolSupervisor.setMCPAvailable(true)
                 writer.write(RuntimeEvent(
@@ -13848,7 +13894,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=post_effect_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_context=session_opening_frame_only; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=post_effect_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_turn=current_frame_barrier_then_single_response; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -15334,11 +15380,39 @@ private func run(_ options: Options) throws {
     }
     var nextScenarioPhaseIndex = options.guidedScenario ? 1 : GuidedScenarioPhase.phases.count
     var nextTDOAPhaseIndex = calibrationRecorder == nil ? TDOACalibrationPhase.phases.count : 1
+    var captureStallReported = false
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "soma.subconscious.metrics"))
     timer.schedule(deadline: .now() + 1, repeating: 1)
     timer.setEventHandler {
         let now = monotonicNanoseconds()
         let elapsed = Double(now - startedNS) / 1_000_000_000
+        if elapsed >= 3,
+           let captureAgeNS = delegate.videoCaptureAgeNanoseconds(at: now),
+           captureAgeNS >= 5_000_000_000 {
+            if attentionGimbalBridge?.awaitsPhysicalReconnect == true {
+                if !captureStallReported {
+                    captureStallReported = true
+                    writer.write(RuntimeEvent(
+                        event: "source.health",
+                        monotonicNS: now,
+                        source: "video",
+                        state: "capture_stalled_awaiting_device_recovery",
+                        message: "last_video_frame_age_ms=\(captureAgeNS / 1_000_000); control_recovery=awaiting_physical_reconnect"
+                    ))
+                }
+            } else {
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: now,
+                    source: "video",
+                    state: "capture_stalled_restart_requested",
+                    message: "last_video_frame_age_ms=\(captureAgeNS / 1_000_000); rebuilding_capture_and_control_bindings"
+                ))
+                delegate.stopAccepting()
+                complete.signal()
+                return
+            }
+        }
         while nextScenarioPhaseIndex < GuidedScenarioPhase.phases.count,
               elapsed >= GuidedScenarioPhase.phases[nextScenarioPhaseIndex].startsAfterSeconds {
             let phase = GuidedScenarioPhase.phases[nextScenarioPhaseIndex]

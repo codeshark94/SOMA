@@ -7,6 +7,14 @@ final class RuntimeHealthSnapshotTests: XCTestCase {
         XCTAssertTrue(RuntimeHealthProjectionPolicy.retains(source: "face_neural_engine", state: "recovered"))
         XCTAssertTrue(RuntimeHealthProjectionPolicy.retains(source: "attention_gimbal_bridge", state: "stopped"))
         XCTAssertTrue(RuntimeHealthProjectionPolicy.retains(source: "social_indicator", state: "exploring"))
+        XCTAssertTrue(RuntimeHealthProjectionPolicy.retains(
+            source: "obsbot_control_transport",
+            state: "awaiting_physical_reconnect"
+        ))
+        XCTAssertTrue(RuntimeHealthProjectionPolicy.retains(
+            source: "obsbot_control_transport",
+            state: "healthy"
+        ))
         XCTAssertFalse(RuntimeHealthProjectionPolicy.retains(source: "l2_live_voice", state: "failed"))
         XCTAssertFalse(RuntimeHealthProjectionPolicy.retains(source: "face_identity", state: "alignments"))
         XCTAssertFalse(RuntimeHealthProjectionPolicy.retains(source: "attention_gimbal_bridge", state: "coverage_direction_sampled"))
