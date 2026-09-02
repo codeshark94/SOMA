@@ -38,3 +38,59 @@ public enum FaceTrackAssociation {
         return union > 0 ? intersection / union : 0
     }
 }
+
+public enum FaceIdentityTrackAuthority: Sendable {
+    case enrolled
+    case anonymous
+}
+
+public enum FaceIdentityTrackAction: Equatable, Sendable {
+    case reuse
+    case revalidate
+}
+
+/// Temporal identity continuity is evidence, not permanent authority. Enrolled
+/// identities may bridge short recognition gaps, but every track is periodically
+/// revalidated. Anonymous identities are never reused without a fresh match so
+/// that a registered person can immediately recover from an initial open-set miss.
+public struct FaceIdentityContinuityPolicy: Equatable, Sendable {
+    public let enrolledRevalidationMilliseconds: UInt64
+    public let enrolledMismatchGraceMilliseconds: UInt64
+
+    public init(
+        enrolledRevalidationMilliseconds: UInt64 = 1_000,
+        enrolledMismatchGraceMilliseconds: UInt64 = 2_500
+    ) {
+        precondition(enrolledRevalidationMilliseconds > 0)
+        precondition(enrolledMismatchGraceMilliseconds >= enrolledRevalidationMilliseconds)
+        self.enrolledRevalidationMilliseconds = enrolledRevalidationMilliseconds
+        self.enrolledMismatchGraceMilliseconds = enrolledMismatchGraceMilliseconds
+    }
+
+    public func action(
+        for authority: FaceIdentityTrackAuthority,
+        lastValidatedNS: UInt64,
+        at monotonicNS: UInt64
+    ) -> FaceIdentityTrackAction {
+        guard authority == .enrolled,
+              monotonicNS >= lastValidatedNS else {
+            return .revalidate
+        }
+        let interval = enrolledRevalidationMilliseconds.multipliedReportingOverflow(by: 1_000_000)
+        guard !interval.overflow,
+              monotonicNS - lastValidatedNS < interval.partialValue else {
+            return .revalidate
+        }
+        return .reuse
+    }
+
+    public func mayBridgeMismatch(
+        lastCorrelatedNS: UInt64,
+        at monotonicNS: UInt64
+    ) -> Bool {
+        guard monotonicNS >= lastCorrelatedNS else { return false }
+        let grace = enrolledMismatchGraceMilliseconds.multipliedReportingOverflow(by: 1_000_000)
+        guard !grace.overflow else { return false }
+        return monotonicNS - lastCorrelatedNS <= grace.partialValue
+    }
+}

@@ -258,7 +258,13 @@ public struct SmoothExplorationDynamics: Sendable {
     }
 
     private func slew(from current: Double, to desired: Double, maximumChange: Double) -> Double {
-        max(current - maximumChange, min(current + maximumChange, desired))
+        let next = max(current - maximumChange, min(current + maximumChange, desired))
+        // The motor protocol has an explicit neutral state. Never let a
+        // continuous exploration segment skip it when an axis reverses.
+        if current != 0, next != 0, current.sign != next.sign {
+            return 0
+        }
+        return next
     }
 }
 

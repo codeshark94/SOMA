@@ -69,6 +69,80 @@ final class KnownPersonContactTests: XCTestCase {
         XCTAssertLessThan(margin, matcher.calibration.minimumBestAlternativeMargin)
     }
 
+    func testRecognitionEvidenceDoesNotCombineDifferentFaceTracks() throws {
+        let person = UUID()
+        let known = try profile(person, [[1, 0, 0, 0], [0.99, 0.01, 0, 0]])
+        var matcher = FaceIdentityMatcher(calibration: try .init(
+            minimumCosineSimilarity: 0.75,
+            minimumBestAlternativeMargin: 0.10,
+            minimumObservationQuality: 0.60,
+            confirmationsRequired: 3,
+            evidenceWindowMilliseconds: 1_000
+        ))
+        let observation = try embedding([1, 0, 0, 0])
+        let firstFace = UUID()
+        let secondFace = UUID()
+
+        XCTAssertFalse(matcher.match(
+            observation,
+            profiles: [known],
+            evidenceTrackID: firstFace,
+            at: 0
+        ).isRecognized)
+        XCTAssertFalse(matcher.match(
+            observation,
+            profiles: [known],
+            evidenceTrackID: secondFace,
+            at: 0
+        ).isRecognized)
+        XCTAssertFalse(matcher.match(
+            observation,
+            profiles: [known],
+            evidenceTrackID: firstFace,
+            at: 200_000_000
+        ).isRecognized)
+        XCTAssertFalse(matcher.match(
+            observation,
+            profiles: [known],
+            evidenceTrackID: secondFace,
+            at: 200_000_000
+        ).isRecognized)
+
+        XCTAssertTrue(matcher.match(
+            observation,
+            profiles: [known],
+            evidenceTrackID: firstFace,
+            at: 400_000_000
+        ).isRecognized)
+    }
+
+    func testPeriodicRevalidationCanReconfirmBeforeMismatchGraceExpires() throws {
+        let person = UUID()
+        let known = try profile(person, [[1, 0, 0, 0], [0.99, 0.01, 0, 0]])
+        var matcher = FaceIdentityMatcher(calibration: try .init(
+            minimumCosineSimilarity: 0.75,
+            minimumBestAlternativeMargin: 0.10,
+            minimumObservationQuality: 0.60,
+            confirmationsRequired: 3,
+            evidenceWindowMilliseconds: 1_000
+        ))
+        let observation = try embedding([1, 0, 0, 0])
+        let trackID = UUID()
+        let policy = FaceIdentityContinuityPolicy()
+
+        XCTAssertFalse(matcher.match(observation, profiles: [known], evidenceTrackID: trackID, at: 0).isRecognized)
+        XCTAssertFalse(matcher.match(observation, profiles: [known], evidenceTrackID: trackID, at: 200_000_000).isRecognized)
+        XCTAssertTrue(matcher.match(observation, profiles: [known], evidenceTrackID: trackID, at: 400_000_000).isRecognized)
+
+        let lastConfirmedNS: UInt64 = 400_000_000
+        XCTAssertEqual(policy.action(for: .enrolled, lastValidatedNS: lastConfirmedNS, at: 1_400_000_000), .revalidate)
+        XCTAssertFalse(matcher.match(observation, profiles: [known], evidenceTrackID: trackID, at: 1_400_000_000).isRecognized)
+        XCTAssertEqual(policy.action(for: .enrolled, lastValidatedNS: lastConfirmedNS, at: 1_600_000_000), .revalidate)
+        XCTAssertFalse(matcher.match(observation, profiles: [known], evidenceTrackID: trackID, at: 1_600_000_000).isRecognized)
+        XCTAssertTrue(matcher.match(observation, profiles: [known], evidenceTrackID: trackID, at: 1_800_000_000).isRecognized)
+        XCTAssertTrue(policy.mayBridgeMismatch(lastCorrelatedNS: lastConfirmedNS, at: 1_800_000_000))
+    }
+
     func testUnknownFacesUseStablePerInstallOpaqueHandlesAfterConfirmation() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("soma-anonymous-face-\(UUID().uuidString)", isDirectory: true)
@@ -87,9 +161,9 @@ final class KnownPersonContactTests: XCTestCase {
             calibration: calibration
         )
         let face = try embedding([1, 0, 0, 0])
-        let first = try await registry.observe(face, at: 0, date: Date(timeIntervalSince1970: 1))
-        let second = try await registry.observe(face, at: 100_000_000, date: Date(timeIntervalSince1970: 1.1))
-        let third = try await registry.observe(face, at: 200_000_000, date: Date(timeIntervalSince1970: 1.2))
+        let first = try await registry.observe(face, at: 0, date: Date(timeIntervalSince1970: 1), persistenceApproved: true)
+        let second = try await registry.observe(face, at: 100_000_000, date: Date(timeIntervalSince1970: 1.1), persistenceApproved: true)
+        let third = try await registry.observe(face, at: 200_000_000, date: Date(timeIntervalSince1970: 1.2), persistenceApproved: true)
         XCTAssertEqual(first.handle, second.handle)
         XCTAssertEqual(second.handle, third.handle)
         XCTAssertFalse(first.isRecognized)
@@ -133,6 +207,103 @@ final class KnownPersonContactTests: XCTestCase {
         try await reopened.forget(handle)
         let remaining = await reopened.persistentHandles()
         XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testRejectedAnonymousPromotionNeverBecomesPersistent() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("soma-anonymous-review-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = try AnonymousFaceRegistry(
+            fileURL: directory.appendingPathComponent("anonymous.encjson"),
+            encryptionKey: .generate(),
+            calibration: try AnonymousFaceCalibration(
+                minimumCosineSimilarity: 0.80,
+                minimumBestAlternativeMargin: 0.10,
+                minimumObservationQuality: 0.60,
+                confirmationsRequired: 3
+            )
+        )
+        let face = try embedding([1, 0, 0, 0])
+        _ = try await registry.observe(face, at: 0, persistenceApproved: false)
+        _ = try await registry.observe(face, at: 100_000_000, persistenceApproved: false)
+        let rejected = try await registry.observe(face, at: 200_000_000, persistenceApproved: false)
+
+        XCTAssertEqual(rejected, .rejected)
+        let handlesAfterRejection = await registry.persistentHandles()
+        XCTAssertTrue(handlesAfterRejection.isEmpty)
+    }
+
+    func testAnonymousEnrollmentEvidenceDoesNotCombineDifferentFaceTracks() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("soma-anonymous-track-evidence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = try AnonymousFaceRegistry(
+            fileURL: directory.appendingPathComponent("anonymous.encjson"),
+            encryptionKey: .generate(),
+            calibration: try AnonymousFaceCalibration(
+                minimumCosineSimilarity: 0.80,
+                minimumBestAlternativeMargin: 0.10,
+                minimumObservationQuality: 0.60,
+                confirmationsRequired: 3
+            )
+        )
+        let face = try embedding([1, 0, 0, 0])
+        let firstTrack = UUID()
+        let secondTrack = UUID()
+
+        let first = try await registry.observe(face, at: 0, persistenceApproved: true, evidenceTrackID: firstTrack)
+        let other = try await registry.observe(face, at: 100_000_000, persistenceApproved: true, evidenceTrackID: secondTrack)
+        let second = try await registry.observe(face, at: 200_000_000, persistenceApproved: true, evidenceTrackID: firstTrack)
+        XCTAssertEqual(first, .candidate(handle: try XCTUnwrap(first.handle), confirmations: 1))
+        XCTAssertEqual(other, .candidate(handle: try XCTUnwrap(other.handle), confirmations: 1))
+        XCTAssertEqual(second, .candidate(handle: try XCTUnwrap(first.handle), confirmations: 2))
+
+        let recognized = try await registry.observe(face, at: 300_000_000, persistenceApproved: true, evidenceTrackID: firstTrack)
+        XCTAssertTrue(recognized.isRecognized)
+    }
+
+    func testAnonymousResetArchivesEncryptedStoreAndPreservesRecoveryCopy() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("soma-anonymous-reset-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("anonymous.encjson")
+        let key = CognitiveMemoryEncryptionKey.generate()
+        let calibration = try AnonymousFaceCalibration(
+            minimumCosineSimilarity: 0.80,
+            minimumBestAlternativeMargin: 0.10,
+            minimumObservationQuality: 0.60,
+            confirmationsRequired: 3
+        )
+        var registry: AnonymousFaceRegistry? = try AnonymousFaceRegistry(
+            fileURL: file,
+            encryptionKey: key,
+            calibration: calibration
+        )
+        let face = try embedding([1, 0, 0, 0])
+        _ = try await registry?.observe(face, at: 0, persistenceApproved: true)
+        _ = try await registry?.observe(face, at: 100_000_000, persistenceApproved: true)
+        _ = try await registry?.observe(face, at: 200_000_000, persistenceApproved: true)
+
+        XCTAssertThrowsError(try AnonymousFaceRegistry.archiveAndReset(
+            fileURL: file,
+            encryptionKey: key,
+            date: Date(timeIntervalSince1970: 1_700_000_000)
+        )) { error in
+            XCTAssertEqual(error as? AnonymousFaceRegistryError, .storeLocked)
+        }
+        registry = nil
+
+        let report = try AnonymousFaceRegistry.archiveAndReset(
+            fileURL: file,
+            encryptionKey: key,
+            date: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        XCTAssertEqual(report.removedClusterCount, 1)
+        XCTAssertNotNil(report.backupURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(report.backupURL).path))
+        let reopened = try AnonymousFaceRegistry(fileURL: file, encryptionKey: key, calibration: calibration)
+        let reopenedHandles = await reopened.persistentHandles()
+        XCTAssertTrue(reopenedHandles.isEmpty)
     }
 
     func testRawEmbeddingHashIsNotUsedAsAnonymousIdentity() async throws {
@@ -179,9 +350,9 @@ final class KnownPersonContactTests: XCTestCase {
         let front = try embedding([1, 0, 0, 0])
         let left = try embedding([0.94, 0.34, 0, 0])
         let right = try embedding([0.94, -0.34, 0, 0])
-        _ = try await registry.observe(front, at: 0)
-        _ = try await registry.observe(left, at: 100_000_000)
-        let recognized = try await registry.observe(right, at: 200_000_000)
+        _ = try await registry.observe(front, at: 0, persistenceApproved: true)
+        _ = try await registry.observe(left, at: 100_000_000, persistenceApproved: true)
+        let recognized = try await registry.observe(right, at: 200_000_000, persistenceApproved: true)
         let handle = try XCTUnwrap(recognized.handle)
         let references = try await registry.enrollmentReferences(for: handle)
         XCTAssertEqual(references.count, 3)
@@ -219,6 +390,157 @@ final class KnownPersonContactTests: XCTestCase {
         XCTAssertEqual(expandedReferenceCount, 3)
         XCTAssertNil(duplicateReferenceCount)
         XCTAssertEqual(updatedProfile?.references.count, 3)
+    }
+
+    func testExplicitEnrollmentMergeUpdatesExistingIdentityWithoutCreatingAnotherProfile() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("soma-known-merge-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entityID = UUID()
+        let file = directory.appendingPathComponent("profiles.encjson")
+        let key = CognitiveMemoryEncryptionKey.generate()
+        var store: FaceIdentityProfileStore? = try FaceIdentityProfileStore(
+            fileURL: file,
+            encryptionKey: key
+        )
+        try await store?.upsert(try LocalFaceIdentityProfile(
+            entityID: entityID,
+            consentScope: .persistent,
+            references: [
+                try embedding([1, 0, 0, 0]),
+                try embedding([0.95, 0.31, 0, 0]),
+            ]
+        ))
+        store = nil
+
+        let count = try FaceIdentityProfileStore.mergePersistentEnrollment(
+            fileURL: file,
+            encryptionKey: key,
+            entityID: entityID,
+            references: [
+                try embedding([0.95, -0.31, 0, 0]),
+                try embedding([0.95, 0, 0.31, 0]),
+            ]
+        )
+        let reopened = try FaceIdentityProfileStore(fileURL: file, encryptionKey: key)
+        let profiles = await reopened.profiles()
+
+        XCTAssertEqual(profiles.map(\.entityID), [entityID])
+        XCTAssertEqual(count, 4)
+        XCTAssertEqual(profiles.first?.references.count, 4)
+    }
+
+    func testExplicitEnrollmentMergeRejectsMissingDestinationAndActiveRuntime() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("soma-known-merge-guard-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("profiles.encjson")
+        let key = CognitiveMemoryEncryptionKey.generate()
+        let entityID = UUID()
+        var store: FaceIdentityProfileStore? = try FaceIdentityProfileStore(
+            fileURL: file,
+            encryptionKey: key
+        )
+        try await store?.upsert(try LocalFaceIdentityProfile(
+            entityID: entityID,
+            consentScope: .persistent,
+            references: [
+                try embedding([1, 0, 0, 0]),
+                try embedding([0.95, 0.31, 0, 0]),
+            ]
+        ))
+        let enrollment = [
+            try embedding([0.95, -0.31, 0, 0]),
+            try embedding([0.95, 0, 0.31, 0]),
+        ]
+
+        XCTAssertThrowsError(try FaceIdentityProfileStore.mergePersistentEnrollment(
+            fileURL: file,
+            encryptionKey: key,
+            entityID: entityID,
+            references: enrollment
+        )) { error in
+            XCTAssertEqual(error as? FaceIdentityProfileStoreError, .storeLocked)
+        }
+        store = nil
+
+        XCTAssertThrowsError(try FaceIdentityProfileStore.mergePersistentEnrollment(
+            fileURL: file,
+            encryptionKey: key,
+            entityID: UUID(),
+            references: enrollment
+        )) { error in
+            XCTAssertEqual(error as? FaceIdentityProfileStoreError, .profileNotFound)
+        }
+        let reopened = try FaceIdentityProfileStore(fileURL: file, encryptionKey: key)
+        let profiles = await reopened.profiles()
+        XCTAssertEqual(profiles.map(\.entityID), [entityID])
+    }
+
+    func testAnonymousEnrollmentConsumptionIsAtomicOnDestinationFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("soma-anonymous-consume-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("anonymous.encjson")
+        let key = CognitiveMemoryEncryptionKey.generate()
+        let calibration = try AnonymousFaceCalibration(
+            minimumCosineSimilarity: 0.80,
+            minimumBestAlternativeMargin: 0.10,
+            minimumObservationQuality: 0.60,
+            confirmationsRequired: 3,
+            maximumReferencesPerCluster: 4
+        )
+        var registry: AnonymousFaceRegistry? = try AnonymousFaceRegistry(
+            fileURL: file,
+            encryptionKey: key,
+            calibration: calibration
+        )
+        let trackID = UUID()
+        _ = try await registry?.observe(
+            try embedding([1, 0, 0, 0]),
+            at: 0,
+            persistenceApproved: true,
+            evidenceTrackID: trackID
+        )
+        _ = try await registry?.observe(
+            try embedding([0.94, 0.34, 0, 0]),
+            at: 100_000_000,
+            persistenceApproved: true,
+            evidenceTrackID: trackID
+        )
+        let recognized = try await registry?.observe(
+            try embedding([0.94, -0.34, 0, 0]),
+            at: 200_000_000,
+            persistenceApproved: true,
+            evidenceTrackID: trackID
+        )
+        let handle = try XCTUnwrap(recognized?.handle)
+
+        XCTAssertThrowsError(try AnonymousFaceRegistry.consumeEnrollment(
+            for: handle,
+            fileURL: file,
+            encryptionKey: key
+        ) { _ in () }) { error in
+            XCTAssertEqual(error as? AnonymousFaceRegistryError, .storeLocked)
+        }
+        registry = nil
+
+        XCTAssertThrowsError(try AnonymousFaceRegistry.consumeEnrollment(
+            for: handle,
+            fileURL: file,
+            encryptionKey: key
+        ) { _ in
+            throw FaceIdentityProfileStoreError.profileNotFound
+        }) { error in
+            XCTAssertEqual(error as? FaceIdentityProfileStoreError, .profileNotFound)
+        }
+        let reopened = try AnonymousFaceRegistry(
+            fileURL: file,
+            encryptionKey: key,
+            calibration: calibration
+        )
+        let remainingHandles = await reopened.persistentHandles()
+        XCTAssertEqual(remainingHandles, [handle])
     }
 
     func testReferenceSetReplacesRedundantViewWhenAtCapacity() throws {

@@ -558,38 +558,36 @@ bool parkAndSleep(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const s
         );
         return false;
     }
-    transport.disableHumanTracking();
-    transport.stopMotion();
-    const int centerResult = transport.center();
-    const auto deadline = Clock::now() + std::chrono::seconds(5);
-    bool arrived = false;
-    while (centerResult == 0 && Clock::now() < deadline) {
-        double pitch = 0;
-        double pan = 0;
-        if (transport.readAttitude(pitch, pan) == 0 && std::hypot(pitch, pan) <= 2.0) {
-            arrived = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    const int trackingResult = transport.disableHumanTracking();
+    const int stopResult = trackingResult == 0 ? transport.stopMotion() : -1;
+    const int centerResult = stopResult == 0 ? transport.center() : -1;
+    const bool arrived = trackingResult == 0 && stopResult == 0 && centerResult == 0;
     const int sleepResult = arrived ? transport.setAwake(false) : -1;
     bool sleeping = false;
+    soma::OpenOBSBOTPoseStabilityGate restStability;
     const auto sleepDeadline = Clock::now() + std::chrono::seconds(5);
     while (sleepResult == 0 && Clock::now() < sleepDeadline) {
         double pitch = 0;
         double pan = 0;
         if (transport.readAttitude(pitch, pan) == 0
             && soma::open_obsbot_protocol::isRestPose(pitch)) {
-            sleeping = true;
-            break;
+            if (restStability.observe(pitch, pan)) {
+                sleeping = true;
+                break;
+            }
+        } else {
+            restStability.reset();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     trace.event("camera.ack", arrived && sleeping ? "manual" : "fault",
                 arrived && sleeping ? "rest_pose_sleeping" : "rest_pose_timeout",
                 arrived && sleeping ? 0 : -1,
-                "center_result=" + std::to_string(centerResult)
+                "tracking_result=" + std::to_string(trackingResult)
+                    + "; stop_result=" + std::to_string(stopResult)
+                    + "; center_result=" + std::to_string(centerResult)
                     + "; sleep_result=" + std::to_string(sleepResult)
+                    + "; center_pose_verified=" + (arrived ? "true" : "false")
                     + "; sleep_pose_verified=" + (sleeping ? "true" : "false")
                     + "; transport=open_uvc_xu", commandID);
     return arrived && sleeping;
@@ -640,6 +638,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
         std::string commandID;
     };
     std::optional<ExternalVelocityIntent> externalVelocityIntent;
+    soma::OpenOBSBOTVelocityTransitionGuard velocityTransitionGuard;
     soma::OpenOBSBOTMotionWatchdog motionWatchdog;
     bool recenterRequested = false;
     std::optional<Clock::time_point> recenterDeadline;
@@ -684,6 +683,34 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
             if (disableResult != 0 || stopResult != 0) return -1;
         }
         return result;
+    };
+    struct ExternalVelocitySubmission {
+        int result;
+        soma::OpenOBSBOTVelocityTransition transition;
+    };
+    const auto submitExternalVelocity = [
+        &transport,
+        &trace,
+        &velocityTransitionGuard
+    ](float pitch, float pan, const std::string &commandID) {
+        auto transition = velocityTransitionGuard.apply(pitch, pan);
+        const int result = transport.setExternalVelocity(transition.pitch, transition.pan);
+        if (result == 0 && transition.neutralized()) {
+            trace.event(
+                "camera.ack",
+                "external",
+                "external_direction_neutralized",
+                0,
+                "requested_pitch=" + std::to_string(pitch)
+                    + "; requested_pan=" + std::to_string(pan)
+                    + "; neutralized_pitch=" + std::to_string(transition.pitchNeutralized)
+                    + "; neutralized_pan=" + std::to_string(transition.panNeutralized)
+                    + "; transport=open_uvc_xu",
+                commandID
+            );
+        }
+        if (result != 0) velocityTransitionGuard.clear();
+        return ExternalVelocitySubmission {result, transition};
     };
 
     while (!interrupted && Clock::now() < runtimeDeadline) {
@@ -731,6 +758,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
             pulseDeadline.reset();
             recenterRequested = false;
             recenterDeadline.reset();
+            velocityTransitionGuard.clear();
             motionWatchdog.clear();
 
             const auto functionalVerification = transport.verifyMotorResponse();
@@ -843,6 +871,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                     lastHeartbeat = Clock::now();
                     nativeTarget = requestedTarget;
                     externalVelocityIntent.reset();
+                    velocityTransitionGuard.clear();
                     motionWatchdog.clear();
                     if (externalControl) transport.stopMotion();
                     externalControl = false;
@@ -945,14 +974,18 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                     }
                     const bool controlHealthy = transport.recoveryStatus().state
                         == soma::OpenOBSBOTControlState::healthy;
-                    const int result = verb == "external_position" || !controlHealthy
-                        ? 0
-                        : transport.setExternalVelocity(pitch, pan);
+                    const auto submission = verb == "external_position" || !controlHealthy
+                        ? ExternalVelocitySubmission {
+                            0,
+                            soma::OpenOBSBOTVelocityTransition {pitch, pan, false, false, false},
+                        }
+                        : submitExternalVelocity(pitch, pan, commandID);
+                    const int result = submission.result;
                     externalControl = result == 0;
                     if (externalControl && controlHealthy && verb != "external_position") {
                         motionWatchdog.setIntent(
-                            pitch,
-                            pan,
+                            submission.transition.pitch,
+                            submission.transition.pan,
                             tiny3 ? 42.0 : 60.0,
                             tiny3 ? 85.0 : 118.0,
                             lastExternalCommand
@@ -978,6 +1011,9 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                                         : "external_rejected",
                                     result,
                                     "pitch=" + tokens[2] + "; pan=" + tokens[3]
+                                        + "; applied_pitch=" + std::to_string(submission.transition.pitch)
+                                        + "; applied_pan=" + std::to_string(submission.transition.pan)
+                                        + "; settling=" + std::to_string(submission.transition.settling)
                                         + "; transport=open_uvc_xu",
                                     commandID);
                     }
@@ -987,6 +1023,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                     recenterRequested = false;
                     recenterDeadline.reset();
                     externalVelocityIntent.reset();
+                    velocityTransitionGuard.clear();
                     motionWatchdog.clear();
                     nativeTracking = false;
                     externalControl = false;
@@ -1019,6 +1056,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                     nativeTrackingRequested = false;
                     nativeTarget.reset();
                     externalVelocityIntent.reset();
+                    velocityTransitionGuard.clear();
                     motionWatchdog.clear();
                     recenterRequested = true;
                     recenterDeadline = Clock::now() + std::chrono::seconds(5);
@@ -1038,30 +1076,17 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                     } else {
                         const int trackingResult = transport.disableHumanTracking();
                         const int stopResult = trackingResult == 0 ? transport.stopMotion() : -1;
-                        int result = -1;
-                        if (stopResult == 0 && tiny3) {
-                            result = transport.center();
-                        } else if (stopResult == 0) {
-                            positionTarget = PositionTarget {
-                                0,
-                                0,
-                                commandID,
-                                *recenterDeadline,
-                                true,
-                            };
-                            externalControl = true;
-                            result = 0;
-                        }
-                        if (result == 0 && tiny3) {
+                        const int result = stopResult == 0 ? transport.center() : -1;
+                        if (result == 0) {
                             recenterRequested = false;
                             recenterDeadline.reset();
                         }
                         trace.event("camera.ack", result == 0 ? "manual" : "fault",
-                                    result == 0
-                                        ? (tiny3 ? "center_accepted" : "center_feedback_started")
-                                        : "center_rejected",
+                                    result == 0 ? "center_arrived" : "center_rejected",
                                     result,
-                                    "transport=open_uvc_xu", commandID);
+                                    "physical_settle_verified=" + std::string(result == 0 ? "true" : "false")
+                                        + "; transport=open_uvc_xu",
+                                    commandID);
                     }
                 } else if (verb == "camera_zoom" && tokens.size() == 3) {
                     const int result = transport.setZoomFactor(std::stod(tokens[2]));
@@ -1122,6 +1147,9 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
             const auto attitude = controlHealthy
                 ? emitAttitude(transport)
                 : std::optional<GimbalAttitude> {};
+            if (attitude) {
+                velocityTransitionGuard.observe(attitude->pitch, attitude->pan);
+            }
             const bool feedbackHealthy = transport.recoveryStatus().state
                 == soma::OpenOBSBOTControlState::healthy;
             if (positionTarget && now >= positionTarget->deadline) {
@@ -1140,6 +1168,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                 );
                 positionTarget.reset();
                 externalControl = false;
+                velocityTransitionGuard.clear();
                 motionWatchdog.clear();
                 if (wasRecenter) {
                     recenterRequested = false;
@@ -1162,6 +1191,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                         );
                         positionTarget.reset();
                         externalControl = false;
+                        velocityTransitionGuard.clear();
                         motionWatchdog.clear();
                         if (wasRecenter) {
                             recenterRequested = false;
@@ -1179,7 +1209,12 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                     const float panVelocity = static_cast<float>(
                         panLimit * std::tanh(panError / 25.0)
                     );
-                    if (transport.setExternalVelocity(pitchVelocity, panVelocity) != 0) {
+                    const auto submission = submitExternalVelocity(
+                        pitchVelocity,
+                        panVelocity,
+                        positionTarget->commandID
+                    );
+                    if (submission.result != 0) {
                         if (transport.recoveryStatus().state == soma::OpenOBSBOTControlState::healthy) {
                             trace.event(
                                 "camera.ack", "fault", "external_position_feedback_failed", -1,
@@ -1191,8 +1226,8 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                         motionWatchdog.clear();
                     } else {
                         motionWatchdog.setIntent(
-                            pitchVelocity,
-                            panVelocity,
+                            submission.transition.pitch,
+                            submission.transition.pan,
                             tiny3 ? 42.0 : 60.0,
                             tiny3 ? 85.0 : 118.0,
                             now
@@ -1209,19 +1244,72 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
                 trace.event(
                     "camera.ack",
                     "fault",
-                    "functional_motion_stall",
+                    "functional_motion_stall_detected",
                     soma::openOBSBOTFunctionalMotionStall,
                     "pitch=" + std::to_string(attitude->pitch)
                         + "; pan=" + std::to_string(attitude->pan)
                         + "; accepted_writes_without_attitude_change=true"
+                        + "; measured_probe_pending=true"
                         + "; transport=open_uvc_xu",
                     stalledCommandID
                 );
                 nativeTracking = false;
+                nativeTrackingRequested = false;
+                nativeTarget.reset();
+                nativeCommandID.clear();
                 externalControl = false;
+                externalVelocityIntent.reset();
+                positionTarget.reset();
                 pulseDeadline.reset();
-                transport.requestRecovery(soma::openOBSBOTFunctionalMotionStall);
-                emitControlTransport(transport.recoveryStatus());
+                recenterRequested = false;
+                recenterDeadline.reset();
+                velocityTransitionGuard.clear();
+                motionWatchdog.clear();
+
+                const auto disposition = soma::openOBSBOTMotionStallDisposition(
+                    transport.verifyMotorResponse()
+                );
+                switch (disposition) {
+                case soma::OpenOBSBOTMotionStallDisposition::resumeAfterVerifiedProbe:
+                    heldMotorSignature.clear();
+                    trace.event(
+                        "camera.ack",
+                        "recovery",
+                        "functional_motion_stall_recovered",
+                        0,
+                        "measured_probe_motion=true; stale_motor_intent_expired=true"
+                            "; transport=open_uvc_xu",
+                        stalledCommandID
+                    );
+                    emitAttitude(transport);
+                    break;
+                case soma::OpenOBSBOTMotionStallDisposition::awaitPhysicalReconnect:
+                    trace.event(
+                        "camera.ack",
+                        "fault",
+                        "functional_motion_stall",
+                        soma::openOBSBOTFunctionalMotionStall,
+                        "measured_probe_motion=false; physical_reconnect_required=true"
+                            "; transport=open_uvc_xu",
+                        stalledCommandID
+                    );
+                    transport.requestRecovery(soma::openOBSBOTFunctionalMotionStall);
+                    emitControlTransport(transport.recoveryStatus());
+                    break;
+                case soma::OpenOBSBOTMotionStallDisposition::recoverControlEndpoint:
+                    trace.event(
+                        "camera.ack",
+                        "recovery",
+                        "functional_motion_probe_unavailable",
+                        -1,
+                        "endpoint_recovery_requested=true; stale_motor_intent_expired=true"
+                            "; transport=open_uvc_xu",
+                        stalledCommandID
+                    );
+                    transport.requestRecovery(-1);
+                    emitControlTransport(transport.recoveryStatus());
+                    break;
+                }
             }
             nextAttitude = now + std::chrono::milliseconds(20);
         }
@@ -1233,6 +1321,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
             externalVelocityIntent.reset();
             positionTarget.reset();
             pulseDeadline.reset();
+            velocityTransitionGuard.clear();
             motionWatchdog.clear();
         }
         if (nativeTrackingRequested && now - lastHeartbeat > std::chrono::milliseconds(750)) {
@@ -1259,6 +1348,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
             externalVelocityIntent.reset();
             positionTarget.reset();
             pulseDeadline.reset();
+            velocityTransitionGuard.clear();
             motionWatchdog.clear();
         }
         if (recenterDeadline && now >= *recenterDeadline) {
@@ -1267,6 +1357,7 @@ int runServer(soma::OpenOBSBOTUVCTransport &transport, Trace &trace, const Optio
         }
         indicator.tick();
     }
+    velocityTransitionGuard.clear();
     transport.disableHumanTracking();
     transport.stopMotion();
     return interrupted ? 130 : 0;

@@ -165,6 +165,60 @@ int main() {
         soma::openOBSBOTFunctionalMotionStall
     ));
     assert(!soma::openOBSBOTRequiresFunctionalRecovery(-1));
+    assert(soma::openOBSBOTMotionStallDisposition(
+        soma::OpenOBSBOTFunctionalRecoveryOutcome::runStateRestored
+    ) == soma::OpenOBSBOTMotionStallDisposition::resumeAfterVerifiedProbe);
+    assert(soma::openOBSBOTMotionStallDisposition(
+        soma::OpenOBSBOTFunctionalRecoveryOutcome::physicalReconnectRequired
+    ) == soma::OpenOBSBOTMotionStallDisposition::awaitPhysicalReconnect);
+    assert(soma::openOBSBOTMotionStallDisposition(
+        soma::OpenOBSBOTFunctionalRecoveryOutcome::failed
+    ) == soma::OpenOBSBOTMotionStallDisposition::recoverControlEndpoint);
+
+    soma::OpenOBSBOTPoseStabilityGate poseStability;
+    assert(!poseStability.observe(12, -30));
+    assert(!poseStability.observe(12.8, -30));
+    assert(!poseStability.observe(12.8, -30));
+    assert(poseStability.observe(12.8, -30));
+    poseStability.reset();
+    assert(!poseStability.observe(0, 0));
+    assert(!poseStability.observe(std::numeric_limits<double>::quiet_NaN(), 0));
+    assert(!poseStability.observe(0, 0));
+    assert(!poseStability.observe(0, 0));
+    assert(poseStability.observe(0, 0));
+
+    soma::OpenOBSBOTVelocityTransitionGuard velocityTransitionGuard;
+    auto guardedVelocity = velocityTransitionGuard.apply(-4.037f, -5.944f);
+    assert(!guardedVelocity.neutralized());
+    assert(guardedVelocity.pitch == -4.037f);
+    assert(guardedVelocity.pan == -5.944f);
+    guardedVelocity = velocityTransitionGuard.apply(-8.418f, 0.627f);
+    assert(!guardedVelocity.pitchNeutralized);
+    assert(guardedVelocity.panNeutralized);
+    assert(guardedVelocity.settling);
+    assert(guardedVelocity.pitch == 0);
+    assert(guardedVelocity.pan == 0);
+    guardedVelocity = velocityTransitionGuard.apply(-10.0f, 6.675f);
+    assert(guardedVelocity.settling);
+    assert(guardedVelocity.pitch == 0);
+    assert(guardedVelocity.pan == 0);
+    velocityTransitionGuard.observe(24, -68);
+    velocityTransitionGuard.observe(25, -70);
+    assert(velocityTransitionGuard.settling());
+    velocityTransitionGuard.observe(26, -71);
+    assert(velocityTransitionGuard.settling());
+    velocityTransitionGuard.observe(26, -71);
+    assert(velocityTransitionGuard.settling());
+    velocityTransitionGuard.observe(26, -71);
+    assert(!velocityTransitionGuard.settling());
+    guardedVelocity = velocityTransitionGuard.apply(-10.0f, 6.675f);
+    assert(!guardedVelocity.neutralized());
+    assert(!guardedVelocity.settling);
+    assert(guardedVelocity.pitch == -10.0f);
+    assert(guardedVelocity.pan == 6.675f);
+    velocityTransitionGuard.clear();
+    guardedVelocity = velocityTransitionGuard.apply(10.0f, -12.0f);
+    assert(!guardedVelocity.neutralized());
 
     soma::OpenOBSBOTPhysicalReconnectLatch reconnectLatch;
     reconnectLatch.engage(42);
@@ -265,6 +319,23 @@ int main() {
     motionWatchdog.setIntent(0, -12, 60, 118, recoveryEpoch);
     assert(motionWatchdog.observe(0, 117, recoveryEpoch)
         == soma::OpenOBSBOTMotionObservation::monitoring);
+
+    // A trajectory can reverse by rotating through small adjacent command
+    // changes. The new direction must begin a fresh measured-motion window
+    // instead of inheriting the previous direction's stall deadline.
+    motionWatchdog.clear();
+    motionWatchdog.setIntent(0, 12, 60, 118, recoveryEpoch);
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch)
+        == soma::OpenOBSBOTMotionObservation::monitoring);
+    motionWatchdog.setIntent(-4, 8, 60, 118, recoveryEpoch + std::chrono::milliseconds(300));
+    motionWatchdog.setIntent(-8, 1, 60, 118, recoveryEpoch + std::chrono::milliseconds(500));
+    motionWatchdog.setIntent(-10, -6, 60, 118, recoveryEpoch + std::chrono::milliseconds(650));
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch + std::chrono::milliseconds(700))
+        == soma::OpenOBSBOTMotionObservation::monitoring);
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch + std::chrono::milliseconds(1'399))
+        == soma::OpenOBSBOTMotionObservation::monitoring);
+    assert(motionWatchdog.observe(0, 2, recoveryEpoch + std::chrono::milliseconds(1'400))
+        == soma::OpenOBSBOTMotionObservation::stalled);
 
     completionTime = recoveryEpoch + std::chrono::milliseconds(510);
     attempt = soma::attemptOpenOBSBOTRecovery(

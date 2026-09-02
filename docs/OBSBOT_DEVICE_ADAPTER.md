@@ -53,6 +53,29 @@ reapplied once. Expired motion and recenter requests are not replayed. Recovery
 transitions include the raw macOS `IOReturn`, retry count, endpoint generation,
 and next-attempt delay in the actuator trace.
 
+Velocity direction changes are segmented at the device boundary. An axis that
+reaches neutral or requests the opposite sign first holds a zero-velocity
+segment until consecutive measured attitudes show that the physical gimbal has
+settled; only then can the next segment reach firmware. This invariant is
+applied to L0 exploration and to direct L1, L2, and MCP velocity requests. The
+bridge records `external_direction_neutralized` when it has to enforce the
+boundary itself.
+
+Accepted control transfers without measured attitude change are treated as a
+functional motor stall, not immediately as proof of a dead device. The bridge
+expires every motor intent and performs a bounded measured-motion probe. It
+resumes only after observed motion, requests endpoint recovery if the probe
+cannot run, and enters the physical-reconnect state only when the probe is
+accepted but produces no motion.
+
+Lifecycle transitions are also physical, not acknowledgement-driven. Every
+recenter path first submits zero velocity and waits for consecutive stable
+attitude samples. Recenter succeeds only after the centered pose is both
+reached and stable. Shutdown then issues sleep only after that proof and
+completes only after consecutive rest-pose samples. A failed tracking stop,
+motion stop, pose read, center, or rest verification holds the transition; it
+never advances to the next motor state.
+
 ## Supported products
 
 | Product | USB identity | Native control dependency |

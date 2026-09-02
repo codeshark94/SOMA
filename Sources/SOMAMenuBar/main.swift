@@ -17,8 +17,6 @@ private enum SOMAPaths {
             .appendingPathComponent("artifacts/subconscious/runtime", isDirectory: true).path,
         isDirectory: true)
     static let serviceLabel = "com.soma.reactive-l0"
-    static let servicePlist = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/LaunchAgents/com.soma.reactive-l0.plist")
     static let menuBarPlist = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents/com.soma.menu-bar.plist")
     static let menuBarInstanceLock = FileManager.default.homeDirectoryForCurrentUser
@@ -443,14 +441,7 @@ private final class SOMAControlModel: ObservableObject {
 
     func startSOMA(restart: Bool = false) -> (status: Int32, output: String) {
         if !isSOMALoaded() {
-            guard FileManager.default.fileExists(atPath: SOMAPaths.servicePlist.path) else {
-                return (1, "SOMA service definition is unavailable.")
-            }
-            return runLaunchctl([
-                "bootstrap",
-                "gui/\(getuid())",
-                SOMAPaths.servicePlist.path,
-            ])
+            return runProcess(at: SOMAPaths.serviceControlExecutable, arguments: ["start"])
         }
         guard restart else {
             return (0, "SOMA is already running.")

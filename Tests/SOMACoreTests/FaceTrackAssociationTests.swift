@@ -22,4 +22,29 @@ final class FaceTrackAssociationTests: XCTestCase {
 
         XCTAssertNil(FaceTrackAssociation.score(previous: previous, current: current))
     }
+
+    func testAnonymousIdentityAlwaysRequiresFreshRecognition() {
+        let policy = FaceIdentityContinuityPolicy()
+        XCTAssertEqual(
+            policy.action(for: .anonymous, lastValidatedNS: 900_000_000, at: 1_000_000_000),
+            .revalidate
+        )
+    }
+
+    func testEnrolledIdentityIsPeriodicallyRevalidatedAndHasBoundedGrace() {
+        let policy = FaceIdentityContinuityPolicy(
+            enrolledRevalidationMilliseconds: 1_000,
+            enrolledMismatchGraceMilliseconds: 2_500
+        )
+        XCTAssertEqual(
+            policy.action(for: .enrolled, lastValidatedNS: 500_000_000, at: 1_000_000_000),
+            .reuse
+        )
+        XCTAssertEqual(
+            policy.action(for: .enrolled, lastValidatedNS: 0, at: 1_000_000_000),
+            .revalidate
+        )
+        XCTAssertTrue(policy.mayBridgeMismatch(lastCorrelatedNS: 0, at: 2_500_000_000))
+        XCTAssertFalse(policy.mayBridgeMismatch(lastCorrelatedNS: 0, at: 2_500_000_001))
+    }
 }

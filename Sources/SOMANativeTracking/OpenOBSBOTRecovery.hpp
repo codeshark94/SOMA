@@ -11,9 +11,154 @@ namespace soma {
 
 constexpr int32_t openOBSBOTFunctionalMotionStall = -7001;
 
+enum class OpenOBSBOTFunctionalRecoveryOutcome {
+    runStateRestored,
+    physicalReconnectRequired,
+    failed,
+};
+
+enum class OpenOBSBOTMotionStallDisposition {
+    resumeAfterVerifiedProbe,
+    awaitPhysicalReconnect,
+    recoverControlEndpoint,
+};
+
+inline OpenOBSBOTMotionStallDisposition openOBSBOTMotionStallDisposition(
+    OpenOBSBOTFunctionalRecoveryOutcome outcome
+) noexcept {
+    switch (outcome) {
+    case OpenOBSBOTFunctionalRecoveryOutcome::runStateRestored:
+        return OpenOBSBOTMotionStallDisposition::resumeAfterVerifiedProbe;
+    case OpenOBSBOTFunctionalRecoveryOutcome::physicalReconnectRequired:
+        return OpenOBSBOTMotionStallDisposition::awaitPhysicalReconnect;
+    case OpenOBSBOTFunctionalRecoveryOutcome::failed:
+        return OpenOBSBOTMotionStallDisposition::recoverControlEndpoint;
+    }
+    return OpenOBSBOTMotionStallDisposition::recoverControlEndpoint;
+}
+
 inline bool openOBSBOTRequiresFunctionalRecovery(int32_t reason) noexcept {
     return reason == openOBSBOTFunctionalMotionStall;
 }
+
+struct OpenOBSBOTVelocityTransition {
+    float pitch = 0;
+    float pan = 0;
+    bool pitchNeutralized = false;
+    bool panNeutralized = false;
+    bool settling = false;
+
+    bool neutralized() const noexcept {
+        return pitchNeutralized || panNeutralized;
+    }
+};
+
+/// Converts a stream of attitude samples into physical-settle evidence. A
+/// command acknowledgement cannot advance a lifecycle transition; the gimbal
+/// must remain within the measured motion envelope for consecutive samples.
+class OpenOBSBOTPoseStabilityGate final {
+public:
+    bool observe(double pitch, double pan) noexcept {
+        if (!std::isfinite(pitch) || !std::isfinite(pan)) {
+            reset();
+            return false;
+        }
+        if (!lastPose_) {
+            lastPose_ = PoseSample {pitch, pan};
+            return false;
+        }
+        const double motion = std::hypot(
+            pitch - lastPose_->pitch,
+            pan - lastPose_->pan
+        );
+        lastPose_ = PoseSample {pitch, pan};
+        if (motion <= settledMotionDegrees) {
+            ++stablePoseIntervals_;
+        } else {
+            stablePoseIntervals_ = 0;
+        }
+        return stablePoseIntervals_ >= requiredStablePoseIntervals;
+    }
+
+    void reset() noexcept {
+        stablePoseIntervals_ = 0;
+        lastPose_.reset();
+    }
+
+private:
+    struct PoseSample {
+        double pitch;
+        double pan;
+    };
+
+    size_t stablePoseIntervals_ = 0;
+    std::optional<PoseSample> lastPose_;
+    static constexpr double settledMotionDegrees = 0.35;
+    static constexpr size_t requiredStablePoseIntervals = 2;
+};
+
+/// Enforces the motor boundary invariant that an axis must pass through a
+/// neutral command before its velocity changes sign. Higher-level controllers
+/// normally slew through zero, but this guard also covers direct L1/L2/MCP
+/// commands before they reach the device firmware.
+class OpenOBSBOTVelocityTransitionGuard final {
+public:
+    OpenOBSBOTVelocityTransition apply(float pitch, float pan) noexcept {
+        if (settling_) {
+            return OpenOBSBOTVelocityTransition {0, 0, false, false, true};
+        }
+        OpenOBSBOTVelocityTransition transition {
+            pitch,
+            pan,
+            crossesZero(previousPitch_, pitch),
+            crossesZero(previousPan_, pan),
+            false,
+        };
+        const bool pitchStopped = previousPitch_ != 0 && pitch == 0;
+        const bool panStopped = previousPan_ != 0 && pan == 0;
+        if (transition.neutralized() || pitchStopped || panStopped) {
+            transition.pitchNeutralized = transition.pitchNeutralized || pitchStopped;
+            transition.panNeutralized = transition.panNeutralized || panStopped;
+            transition.pitch = 0;
+            transition.pan = 0;
+            transition.settling = true;
+            settling_ = true;
+            poseStability_.reset();
+        }
+        previousPitch_ = transition.pitch;
+        previousPan_ = transition.pan;
+        return transition;
+    }
+
+    void observe(double pitch, double pan) noexcept {
+        if (!settling_) return;
+        if (poseStability_.observe(pitch, pan)) {
+            settling_ = false;
+            poseStability_.reset();
+        }
+    }
+
+    void clear() noexcept {
+        previousPitch_ = 0;
+        previousPan_ = 0;
+        settling_ = false;
+        poseStability_.reset();
+    }
+
+    bool settling() const noexcept { return settling_; }
+
+private:
+    static bool crossesZero(float previous, float requested) noexcept {
+        return std::isfinite(previous) && std::isfinite(requested)
+            && previous != 0 && requested != 0
+            && std::signbit(previous) != std::signbit(requested);
+    }
+
+    float previousPitch_ = 0;
+    float previousPan_ = 0;
+    bool settling_ = false;
+    OpenOBSBOTPoseStabilityGate poseStability_;
+};
 
 /// A functional motor fault may only be cleared by observing a new USB device
 /// registry entry. Elapsed time and successful endpoint traffic are not
@@ -70,8 +215,13 @@ public:
             clear();
             return;
         }
-        const bool directionChanged = active_
-            && (pitchVelocity_ * pitchVelocity + panVelocity_ * panVelocity) <= 0;
+        // Smooth controllers rotate the velocity vector over several small
+        // updates. Comparing only adjacent commands misses a gradual reversal
+        // and carries the old stall deadline into a new movement episode.
+        // Compare against the intent that established the measured baseline.
+        const bool directionChanged = baseline_
+            && (baseline_->pitchVelocity * pitchVelocity
+                + baseline_->panVelocity * panVelocity) <= 0;
         pitchVelocity_ = pitchVelocity;
         panVelocity_ = panVelocity;
         pitchLimit_ = std::abs(pitchLimit);
@@ -97,13 +247,13 @@ public:
             return OpenOBSBOTMotionObservation::idle;
         }
         if (!baseline_) {
-            baseline_ = Sample {pitch, pan, now};
+            baseline_ = Sample {pitch, pan, pitchVelocity_, panVelocity_, now};
             return OpenOBSBOTMotionObservation::monitoring;
         }
         const double pitchDelta = pitchExpected ? pitch - baseline_->pitch : 0;
         const double panDelta = panExpected ? pan - baseline_->pan : 0;
         if (std::hypot(pitchDelta, panDelta) >= minimumObservedMotionDegrees) {
-            baseline_ = Sample {pitch, pan, now};
+            baseline_ = Sample {pitch, pan, pitchVelocity_, panVelocity_, now};
             return OpenOBSBOTMotionObservation::progress;
         }
         if (now - baseline_->observedAt >= stallWindow) {
@@ -126,6 +276,8 @@ private:
     struct Sample {
         double pitch;
         double pan;
+        double pitchVelocity;
+        double panVelocity;
         TimePoint observedAt;
     };
 

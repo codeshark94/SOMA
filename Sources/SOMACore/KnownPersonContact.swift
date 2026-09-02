@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 public enum FaceIdentityError: Error, Equatable, Sendable {
     case invalidEmbedding
@@ -247,6 +248,19 @@ public struct LocalFaceIdentityProfile: Codable, Equatable, Sendable {
 public enum FaceIdentityProfileStoreError: Error, Equatable, Sendable {
     case corruptStore
     case tooManyProfiles
+    case profileNotFound
+    case storeLocked
+}
+
+extension FaceIdentityProfileStoreError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .corruptStore: "The known face profile store is corrupt."
+        case .tooManyProfiles: "The known face profile store is full."
+        case .profileNotFound: "The destination face profile does not exist."
+        case .storeLocked: "Stop SOMA before maintaining known face profiles."
+        }
+    }
 }
 
 private struct FaceIdentityProfileEnvelope: Codable {
@@ -260,6 +274,34 @@ private struct FaceIdentityProfileSnapshot: Codable {
     let profiles: [LocalFaceIdentityProfile]
 }
 
+private final class FaceIdentityProfileStoreLock: @unchecked Sendable {
+    private let descriptor: Int32
+
+    init(storeURL: URL, exclusive: Bool) throws {
+        let directory = storeURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let lockURL = storeURL.appendingPathExtension("lock")
+        let opened = Darwin.open(lockURL.path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR)
+        guard opened >= 0 else { throw FaceIdentityProfileStoreError.storeLocked }
+        descriptor = opened
+        _ = Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR)
+        let operation = exclusive ? LOCK_EX | LOCK_NB : LOCK_SH | LOCK_NB
+        guard flock(descriptor, operation) == 0 else {
+            Darwin.close(descriptor)
+            throw FaceIdentityProfileStoreError.storeLocked
+        }
+    }
+
+    deinit {
+        flock(descriptor, LOCK_UN)
+        Darwin.close(descriptor)
+    }
+}
+
 /// Encrypted local storage for consented recognition references. The caller
 /// owns root-key provisioning; neither embeddings nor the key are written to
 /// traces, remote context, or the cognitive-memory journal.
@@ -269,10 +311,12 @@ public actor FaceIdentityProfileStore {
 
     private let fileURL: URL
     private let key: SymmetricKey
+    private let storeLock: FaceIdentityProfileStoreLock
     private var profilesByEntity: [UUID: LocalFaceIdentityProfile]
 
     public init(fileURL: URL, encryptionKey: CognitiveMemoryEncryptionKey) throws {
         self.fileURL = fileURL
+        storeLock = try FaceIdentityProfileStoreLock(storeURL: fileURL, exclusive: false)
         key = SymmetricKey(data: encryptionKey.rawRepresentation)
         profilesByEntity = try Self.load(fileURL: fileURL, key: key)
     }
@@ -322,15 +366,57 @@ public actor FaceIdentityProfileStore {
         return references.count
     }
 
+    /// Explicitly binds a verified multi-view enrollment set to an existing
+    /// persistent identity while holding an exclusive maintenance lock.
+    public static func mergePersistentEnrollment(
+        fileURL: URL,
+        encryptionKey: CognitiveMemoryEncryptionKey,
+        entityID: UUID,
+        references enrollmentReferences: [LocalFaceEmbedding]
+    ) throws -> Int {
+        guard enrollmentReferences.count >= 2 else {
+            throw FaceIdentityError.invalidProfile
+        }
+        let storeLock = try FaceIdentityProfileStoreLock(storeURL: fileURL, exclusive: true)
+        defer { withExtendedLifetime(storeLock) {} }
+        let key = SymmetricKey(data: encryptionKey.rawRepresentation)
+        var profiles = try load(fileURL: fileURL, key: key)
+        guard let profile = profiles[entityID] else {
+            throw FaceIdentityProfileStoreError.profileNotFound
+        }
+        guard profile.consentScope == .persistent else {
+            throw FaceIdentityError.invalidProfile
+        }
+        var references = profile.references
+        for reference in enrollmentReferences {
+            _ = LocalFaceReferenceSet.retain(reference, in: &references, maximumCount: 24)
+        }
+        profiles[entityID] = try LocalFaceIdentityProfile(
+            entityID: entityID,
+            consentScope: .persistent,
+            references: references
+        )
+        try persist(profiles: profiles, fileURL: fileURL, key: key)
+        return references.count
+    }
+
     public func remove(entityID: UUID) throws {
         guard profilesByEntity.removeValue(forKey: entityID) != nil else { return }
         try persist()
     }
 
     private func persist() throws {
+        try Self.persist(profiles: profilesByEntity, fileURL: fileURL, key: key)
+    }
+
+    private static func persist(
+        profiles: [UUID: LocalFaceIdentityProfile],
+        fileURL: URL,
+        key: SymmetricKey
+    ) throws {
         let snapshot = FaceIdentityProfileSnapshot(
             schemaVersion: Self.currentSchemaVersion,
-            profiles: profiles()
+            profiles: profiles.values.sorted { $0.entityID.uuidString < $1.entityID.uuidString }
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -451,7 +537,8 @@ public enum FaceIdentityDecision: Equatable, Sendable {
 /// time, preventing one camera frame from assigning person memory.
 public struct FaceIdentityMatcher: Sendable {
     public let calibration: FaceIdentityCalibration
-    private var evidence: [(entityID: UUID, observedNS: UInt64)] = []
+    private var evidenceByTrack: [UUID: [(entityID: UUID, observedNS: UInt64)]] = [:]
+    private static let untrackedEvidenceID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
 
     public init(calibration: FaceIdentityCalibration) {
         self.calibration = calibration
@@ -460,6 +547,20 @@ public struct FaceIdentityMatcher: Sendable {
     public mutating func match(
         _ observation: LocalFaceEmbedding,
         profiles: [LocalFaceIdentityProfile],
+        at monotonicNS: UInt64
+    ) -> FaceIdentityDecision {
+        match(
+            observation,
+            profiles: profiles,
+            evidenceTrackID: Self.untrackedEvidenceID,
+            at: monotonicNS
+        )
+    }
+
+    public mutating func match(
+        _ observation: LocalFaceEmbedding,
+        profiles: [LocalFaceIdentityProfile],
+        evidenceTrackID: UUID,
         at monotonicNS: UInt64
     ) -> FaceIdentityDecision {
         expireEvidence(at: monotonicNS)
@@ -485,13 +586,21 @@ public struct FaceIdentityMatcher: Sendable {
             // Still correlated with a known identity (above the floor): treat it
             // as a known candidate rather than falling through to anonymous.
             // Anonymous is reserved for faces clearly uncorrelated with knowns.
-            guard best.1 >= calibration.minimumCorrelationFloor else { return .unknown }
+            guard best.1 >= calibration.minimumCorrelationFloor else {
+                evidenceByTrack.removeValue(forKey: evidenceTrackID)
+                return .unknown
+            }
+            if evidenceByTrack[evidenceTrackID]?.last?.entityID != best.0 {
+                evidenceByTrack.removeValue(forKey: evidenceTrackID)
+            }
             return .candidate(entityID: best.0, similarity: best.1, alternativeMargin: margin)
         }
+        var evidence = evidenceByTrack[evidenceTrackID] ?? []
         if let previous = evidence.last, previous.entityID != best.0 {
             evidence.removeAll(keepingCapacity: true)
         }
         evidence.append((best.0, monotonicNS))
+        evidenceByTrack[evidenceTrackID] = evidence
         let confirmations = evidence.count { $0.entityID == best.0 }
         guard confirmations >= calibration.confirmationsRequired else {
             return .candidate(entityID: best.0, similarity: best.1, alternativeMargin: margin)
@@ -505,14 +614,19 @@ public struct FaceIdentityMatcher: Sendable {
     }
 
     public mutating func reset() {
-        evidence.removeAll(keepingCapacity: true)
+        evidenceByTrack.removeAll(keepingCapacity: true)
     }
 
     private mutating func expireEvidence(at monotonicNS: UInt64) {
         let windowNS = calibration.evidenceWindowMilliseconds.multipliedReportingOverflow(by: 1_000_000)
         guard !windowNS.overflow else { return }
-        evidence.removeAll {
-            monotonicNS < $0.observedNS || monotonicNS - $0.observedNS > windowNS.partialValue
+        for key in Array(evidenceByTrack.keys) {
+            evidenceByTrack[key]?.removeAll {
+                monotonicNS < $0.observedNS || monotonicNS - $0.observedNS > windowNS.partialValue
+            }
+            if evidenceByTrack[key]?.isEmpty == true {
+                evidenceByTrack.removeValue(forKey: key)
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public enum AnonymousFaceRegistryError: Error, Equatable, Sendable {
@@ -7,6 +8,20 @@ public enum AnonymousFaceRegistryError: Error, Equatable, Sendable {
     case invalidHandle
     case unknownHandle
     case insufficientEnrollmentEvidence
+    case storeLocked
+}
+
+extension AnonymousFaceRegistryError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .corruptStore: "The anonymous face store is corrupt."
+        case .invalidCalibration: "The anonymous face calibration is invalid."
+        case .invalidHandle: "The anonymous face handle is invalid."
+        case .unknownHandle: "The anonymous face handle is not registered."
+        case .insufficientEnrollmentEvidence: "The anonymous face lacks enough enrollment evidence."
+        case .storeLocked: "Stop SOMA before maintaining the anonymous face store."
+        }
+    }
 }
 
 /// A per-install pseudonym. It is derived from a random internal cluster ID,
@@ -87,6 +102,16 @@ public enum AnonymousFaceDecision: Equatable, Sendable {
     }
 }
 
+public struct AnonymousFaceResetReport: Equatable, Sendable {
+    public let removedClusterCount: Int
+    public let backupURL: URL?
+
+    public init(removedClusterCount: Int, backupURL: URL?) {
+        self.removedClusterCount = removedClusterCount
+        self.backupURL = backupURL
+    }
+}
+
 private struct AnonymousFaceCluster: Codable {
     let clusterID: UUID
     let handle: AnonymousFaceHandle
@@ -98,6 +123,7 @@ private struct AnonymousFaceCluster: Codable {
 
 private struct PendingAnonymousFaceCluster {
     let clusterID: UUID
+    let evidenceTrackID: UUID
     let handle: AnonymousFaceHandle
     var references: [LocalFaceEmbedding]
     let firstSeenAt: Date
@@ -117,17 +143,47 @@ private struct AnonymousFaceSnapshot: Codable {
     let clusters: [AnonymousFaceCluster]
 }
 
+private final class AnonymousFaceStoreLock: @unchecked Sendable {
+    private let descriptor: Int32
+
+    init(storeURL: URL, exclusive: Bool) throws {
+        let directory = storeURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let lockURL = storeURL.appendingPathExtension("lock")
+        let opened = Darwin.open(lockURL.path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR)
+        guard opened >= 0 else { throw AnonymousFaceRegistryError.storeLocked }
+        descriptor = opened
+        _ = Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR)
+        let operation = exclusive ? LOCK_EX | LOCK_NB : LOCK_SH | LOCK_NB
+        guard flock(descriptor, operation) == 0 else {
+            Darwin.close(descriptor)
+            throw AnonymousFaceRegistryError.storeLocked
+        }
+    }
+
+    deinit {
+        flock(descriptor, LOCK_UN)
+        Darwin.close(descriptor)
+    }
+}
+
 /// Local open-set clustering for people who have not supplied an identity.
 /// A cluster becomes durable only after repeated, compatible observations.
 /// Stored prototypes are encrypted; callers receive only an opaque HMAC
 /// handle and never the biometric vector or the internal UUID.
 public actor AnonymousFaceRegistry {
     public static let currentSchemaVersion = 1
+    private static let untrackedEvidenceID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
 
     private let fileURL: URL
     private let encryptionKey: SymmetricKey
     private let handleKey: SymmetricKey
     private let calibration: AnonymousFaceCalibration
+    private let storeLock: AnonymousFaceStoreLock
     private var clustersByID: [UUID: AnonymousFaceCluster]
     private var pending: [PendingAnonymousFaceCluster] = []
     private var lastPersistedAtByID: [UUID: Date] = [:]
@@ -139,6 +195,7 @@ public actor AnonymousFaceRegistry {
     ) throws {
         self.fileURL = fileURL
         self.calibration = calibration
+        storeLock = try AnonymousFaceStoreLock(storeURL: fileURL, exclusive: false)
         self.encryptionKey = SymmetricKey(data: encryptionKey.rawRepresentation)
         let derived = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: encryptionKey.rawRepresentation),
@@ -156,7 +213,9 @@ public actor AnonymousFaceRegistry {
     public func observe(
         _ embedding: LocalFaceEmbedding,
         at monotonicNS: UInt64,
-        date: Date = Date()
+        date: Date = Date(),
+        persistenceApproved: Bool = false,
+        evidenceTrackID: UUID? = nil
     ) throws -> AnonymousFaceDecision {
         guard embedding.quality >= calibration.minimumObservationQuality else {
             return .rejected
@@ -183,7 +242,11 @@ public actor AnonymousFaceRegistry {
         }
         if case .ambiguous = classify(persistedScores) { return .rejected }
 
-        let pendingScores = scores(for: embedding, pending: pending)
+        let evidenceTrackID = evidenceTrackID ?? Self.untrackedEvidenceID
+        let pendingScores = scores(
+            for: embedding,
+            pending: pending.filter { $0.evidenceTrackID == evidenceTrackID }
+        )
         if case let .confident(clusterID, _) = classify(pendingScores),
            let index = pending.firstIndex(where: { $0.clusterID == clusterID }) {
             pending[index].confirmations += 1
@@ -191,6 +254,10 @@ public actor AnonymousFaceRegistry {
             pending[index].lastSeenAt = date
             appendReference(embedding, to: &pending[index].references)
             if pending[index].confirmations >= calibration.confirmationsRequired {
+                guard persistenceApproved else {
+                    pending.remove(at: index)
+                    return .rejected
+                }
                 let promoted = AnonymousFaceCluster(
                     clusterID: pending[index].clusterID,
                     handle: pending[index].handle,
@@ -221,6 +288,7 @@ public actor AnonymousFaceRegistry {
         let handle = try makeHandle(clusterID: clusterID)
         pending.append(PendingAnonymousFaceCluster(
             clusterID: clusterID,
+            evidenceTrackID: evidenceTrackID,
             handle: handle,
             references: [embedding],
             firstSeenAt: date,
@@ -259,11 +327,76 @@ public actor AnonymousFaceRegistry {
         return cluster.references
     }
 
+    /// Runs one stopped-runtime enrollment migration while holding the
+    /// anonymous store exclusively. The source handle is removed only after
+    /// the destination operation succeeds.
+    public static func consumeEnrollment<Result>(
+        for handle: AnonymousFaceHandle,
+        fileURL: URL,
+        encryptionKey: CognitiveMemoryEncryptionKey,
+        operation: ([LocalFaceEmbedding]) throws -> Result
+    ) throws -> Result {
+        let storeLock = try AnonymousFaceStoreLock(storeURL: fileURL, exclusive: true)
+        defer { withExtendedLifetime(storeLock) {} }
+        let key = SymmetricKey(data: encryptionKey.rawRepresentation)
+        var clusters = try load(fileURL: fileURL, key: key)
+        guard let source = clusters.values.first(where: { $0.handle == handle }) else {
+            throw AnonymousFaceRegistryError.unknownHandle
+        }
+        guard source.references.count >= 2 else {
+            throw AnonymousFaceRegistryError.insufficientEnrollmentEvidence
+        }
+        let result = try operation(source.references)
+        clusters.removeValue(forKey: source.clusterID)
+        try persist(clusters: Array(clusters.values), fileURL: fileURL, key: key)
+        return result
+    }
+
     public func forget(_ handle: AnonymousFaceHandle) throws {
         let ids = clustersByID.values.filter { $0.handle == handle }.map(\.clusterID)
         guard !ids.isEmpty else { return }
         ids.forEach { clustersByID.removeValue(forKey: $0) }
         try persist()
+    }
+
+    /// Rebuilds anonymous identity state without touching explicitly enrolled
+    /// profiles. An exclusive store lock makes maintenance fail instead of
+    /// racing a running identity worker. The encrypted previous store remains
+    /// as an owner-only, timestamped backup.
+    public static func archiveAndReset(
+        fileURL: URL,
+        encryptionKey: CognitiveMemoryEncryptionKey,
+        date: Date = Date()
+    ) throws -> AnonymousFaceResetReport {
+        let storeLock = try AnonymousFaceStoreLock(storeURL: fileURL, exclusive: true)
+        defer { withExtendedLifetime(storeLock) {} }
+        let key = SymmetricKey(data: encryptionKey.rawRepresentation)
+        let clusters = try load(fileURL: fileURL, key: key)
+        let removedCount = clusters.count
+        guard removedCount > 0 || FileManager.default.fileExists(atPath: fileURL.path) else {
+            return AnonymousFaceResetReport(removedClusterCount: 0, backupURL: nil)
+        }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let stamp = formatter.string(from: date)
+            .replacingOccurrences(of: ":", with: "-")
+        let backupURL = fileURL
+            .deletingPathExtension()
+            .appendingPathExtension("pre-reset-\(stamp).encjson")
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            try FileManager.default.copyItem(at: fileURL, to: backupURL)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: backupURL.path
+            )
+        }
+
+        try persist(clusters: [], fileURL: fileURL, key: key)
+        return AnonymousFaceResetReport(
+            removedClusterCount: removedCount,
+            backupURL: FileManager.default.fileExists(atPath: backupURL.path) ? backupURL : nil
+        )
     }
 
     private enum MatchClassification {
@@ -367,15 +500,27 @@ public actor AnonymousFaceRegistry {
     }
 
     private func persist() throws {
+        try Self.persist(
+            clusters: Array(clustersByID.values),
+            fileURL: fileURL,
+            key: encryptionKey
+        )
+    }
+
+    private static func persist(
+        clusters: [AnonymousFaceCluster],
+        fileURL: URL,
+        key: SymmetricKey
+    ) throws {
         let snapshot = AnonymousFaceSnapshot(
             schemaVersion: Self.currentSchemaVersion,
-            clusters: clustersByID.values.sorted { $0.handle.rawValue < $1.handle.rawValue }
+            clusters: clusters.sorted { $0.handle.rawValue < $1.handle.rawValue }
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .millisecondsSince1970
         let plaintext = try encoder.encode(snapshot)
-        let sealed = try AES.GCM.seal(plaintext, using: encryptionKey)
+        let sealed = try AES.GCM.seal(plaintext, using: key)
         guard let combined = sealed.combined else {
             throw AnonymousFaceRegistryError.corruptStore
         }

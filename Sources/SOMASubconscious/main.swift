@@ -126,14 +126,6 @@ private final class GracefulShutdown: @unchecked Sendable {
     }
 }
 
-/// Mutable holder for the anonymous-registration review gate. The FaceIdentity
-/// runtime consults `approve()` before surfacing a new anonymous identity; the
-/// reviewer is installed once L1 setup is ready and otherwise defaults to allow.
-final class AnonymousReviewBox: @unchecked Sendable {
-    var reviewer: @Sendable () -> Bool = { true }
-    func approve() -> Bool { reviewer() }
-}
-
 /// Accumulates L1's model-driven curiosity (information needs / topic goals)
 /// about the interaction target and broader context, periodically collects
 /// current web material on those topics via Ollama's hosted web_search, and
@@ -247,10 +239,6 @@ final class L1CuriosityCollector: @unchecked Sendable {
     }
 }
 
-/// Synchronous L1 review of the current frame: asks the local Gemma model
-/// whether the primary face is a real human worth tracking as an anonymous
-/// identity. Runs only when a brand-new anonymous identity is about to be
-/// created, so the blocking wait is rare and acceptable.
 func l1PersonContextSummary(_ provider: L1MemoryContextProvider, for entityID: UUID) -> String {
     let semaphore = DispatchSemaphore(value: 0)
     let box = SynchronousResultBox<String>()
@@ -669,67 +657,6 @@ func performL1SpaceClassification(jpeg: Data) -> String {
     semaphore.wait()
     if case let .success(value)? = box.get() { return value }
     return #"{"ok":false}"#
-}
-
-func performL1AnonymousReview(
-    frameURL: URL,
-    onHealth: @escaping (String, String) -> Void
-) -> Bool {
-    guard FileManager.default.isReadableFile(atPath: frameURL.path),
-          let imageData = try? Data(contentsOf: frameURL),
-          imageData.count > 0,
-          imageData.count <= 2 * 1_024 * 1_024 else {
-        // No frame to review: fall back to allowing the identity.
-        return true
-    }
-    let prompt = """
-    Look at this current camera frame. Is the primary face a real human person who should be \
-    tracked as an anonymous identity — not a photograph, screen, reflection, or non-human object? \
-    If it is clearly a real person, set register_anonymous_identity to true. If it is noise, \
-    ambiguous, or not clearly a real living person, set it to false. \
-    Reply with strict JSON only: {"register_anonymous_identity":true} or {"register_anonymous_identity":false}.
-    """
-    let body: [String: Any] = [
-        "model": "gemma4:31b-cloud",
-        "prompt": prompt,
-        "images": [imageData.base64EncodedString()],
-        "stream": false,
-        "format": "json",
-        "options": ["temperature": 0.2, "num_predict": 32]
-    ]
-    guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return true }
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.timeoutInterval = 20
-    guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return true }
-    request.httpBody = payload
-
-    let semaphore = DispatchSemaphore(value: 0)
-    let resultBox = SynchronousResultBox<(decision: Bool, healthMessage: String)>()
-    URLSession.shared.dataTask(with: request) { data, response, error in
-        defer { semaphore.signal() }
-        guard error == nil,
-              let data,
-              let outer = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = outer["response"] as? String,
-              let contentData = content.data(using: .utf8),
-              let parsed = try? JSONSerialization.jsonObject(with: contentData) as? [String: Any],
-              let register = parsed["register_anonymous_identity"] as? Bool else {
-            resultBox.set(.success((true, error?.localizedDescription ?? "malformed_response")))
-            return
-        }
-        resultBox.set(.success((register, register ? "approved" : "declined")))
-    }.resume()
-    semaphore.wait()
-    let result: (decision: Bool, healthMessage: String)
-    if case let .success(value)? = resultBox.get() {
-        result = value
-    } else {
-        result = (true, "unavailable")
-    }
-    onHealth("reviewed", "decision=\(result.healthMessage)")
-    return result.decision
 }
 
 private enum RuntimeError: LocalizedError {
@@ -11427,7 +11354,6 @@ private final class VisionWorker: @unchecked Sendable {
         onIdentityPresenceEvidence: (@Sendable (Bool, UInt64) -> Void)? = nil,
         onVisualSpeakerEvidence: (@Sendable ([VisualSpeakerFrameEvidence], UInt64) -> Void)? = nil,
         onFatalVisionFailure: (() -> Void)? = nil,
-        anonymousReviewProvider: @escaping @Sendable () -> Bool = { true },
         pupilCenteringThreshold: Double = 1.0,
         expectedDirectPupilOffsetY: Double = 0
     ) {
@@ -11534,8 +11460,7 @@ private final class VisionWorker: @unchecked Sendable {
                         inferenceMS: inferenceMS
                     ))
                     onIdentityDecision?(decision, rect, isPrimaryFace, observedNS)
-                },
-                anonymousReviewProvider: anonymousReviewProvider
+                }
             )
         } catch {
             faceIdentityRuntime = nil
@@ -12116,7 +12041,7 @@ private final class VisionWorker: @unchecked Sendable {
                             Self.faceEvidenceMatches(evidence.evidence.rect, $0)
                         }
                 }
-                .map { $0.evidence.alignment }
+                .map { $0.evidence.alignment.allowingAnonymousPersistence() }
         } else {
             identityAlignments = verifiedNeuralFaces
                 .sorted {
@@ -12133,7 +12058,7 @@ private final class VisionWorker: @unchecked Sendable {
                                 && Self.faceEvidenceMatches(evidence.evidence.rect, identityFace.rect)
                         }
                         .max(by: { $0.observedNS < $1.observedNS })?
-                        .evidence.alignment
+                        .evidence.alignment.allowingAnonymousPersistence()
                 }
         }
         writer.write(RuntimeEvent(
@@ -13900,23 +13825,6 @@ private func run(_ options: Options) throws {
         liveVoiceLauncher = nil
     }
     defer { liveVoiceLauncher?.stop() }
-    // Gate for promoting a face to a registered anonymous identity: L1 reviews
-    // the current frame and decides whether it is a real person worth tracking.
-    let anonymousReviewBox = AnonymousReviewBox()
-    anonymousReviewBox.reviewer = {
-        guard let frame = l1CurrentFrameRelay.currentResource(at: monotonicNanoseconds()) else {
-            return true
-        }
-        return performL1AnonymousReview(frameURL: URL(fileURLWithPath: frame.localPath), onHealth: { state, message in
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "l1_anonymous_review",
-                state: state,
-                message: message
-            ))
-        })
-    }
     let l1EmbodimentRelay = L1EmbodimentToolRelay()
     defer { l1EmbodimentRelay.stop() }
     let l1EmbodimentTools = L1EmbodimentToolGateway(relay: l1EmbodimentRelay)
@@ -14861,7 +14769,6 @@ private func run(_ options: Options) throws {
         onFatalVisionFailure: {
             complete.signal()
         },
-        anonymousReviewProvider: { anonymousReviewBox.approve() },
         pupilCenteringThreshold: somaEnvDouble("SOMA_L0_EYE_CONTACT_PUPIL_THRESHOLD", default: 0.9),
         expectedDirectPupilOffsetY: SOMACameraVerticalPlacement(
             rawValue: somaEnvString("SOMA_L0_CAMERA_VERTICAL_PLACEMENT", default: "eye_level")
@@ -16282,7 +16189,9 @@ private func printUsage() {
     print("       soma-subconscious --live-voice-test")
     print("       soma-subconscious --hermes-agent-test")
     print("       soma-subconscious --face-identity-status")
+    print("       soma-subconscious --archive-reset-anonymous-faces")
     print("       soma-subconscious --promote-anonymous-face <anon_handle>")
+    print("       soma-subconscious --rebind-administrator-face <anon_handle>")
     print("       soma-subconscious --remove-face-identity <entity_uuid>")
 }
 
@@ -16373,6 +16282,21 @@ if somaArguments.first == "--speech-recognition-status" {
         fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
         Foundation.exit(EXIT_FAILURE)
     }
+} else if somaArguments.first == "--archive-reset-anonymous-faces" {
+    guard somaArguments.count == 1 else {
+        fputs("soma-subconscious: --archive-reset-anonymous-faces takes no additional arguments\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        let report = try await FaceIdentityRuntime.archiveAndResetAnonymousIdentities()
+        print("anonymous_clusters_removed=\(report.removedClusterCount)")
+        print("backup=\(report.backupURL?.path ?? "none")")
+        print("known_profiles=preserved")
+        Foundation.exit(EXIT_SUCCESS)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
 } else if somaArguments.first == "--promote-anonymous-face" {
     guard somaArguments.count == 2,
           let handle = try? AnonymousFaceHandle(rawValue: somaArguments[1]) else {
@@ -16384,6 +16308,30 @@ if somaArguments.first == "--speech-recognition-status" {
         print("entity_id=\(result.entityID.uuidString.lowercased())")
         print("references=\(result.referenceCount)")
         print("profile=encrypted_local_v2")
+        Foundation.exit(EXIT_SUCCESS)
+    } catch {
+        fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+} else if somaArguments.first == "--rebind-administrator-face" {
+    guard somaArguments.count == 2,
+          let handle = try? AnonymousFaceHandle(rawValue: somaArguments[1]) else {
+        fputs("soma-subconscious: --rebind-administrator-face requires an anon handle\n", stderr)
+        Foundation.exit(EXIT_FAILURE)
+    }
+    do {
+        let settings = try SOMAControlSettingsStore().load()
+        guard let administrator = settings.administrator else {
+            fputs("soma-subconscious: no administrator identity is configured\n", stderr)
+            Foundation.exit(EXIT_FAILURE)
+        }
+        let referenceCount = try await FaceIdentityRuntime.bindAnonymousIdentity(
+            handle: handle,
+            to: administrator.entityID
+        )
+        print("entity_id=\(administrator.entityID.uuidString.lowercased())")
+        print("references=\(referenceCount)")
+        print("anonymous_handle=removed")
         Foundation.exit(EXIT_SUCCESS)
     } catch {
         fputs("soma-subconscious: \(error.localizedDescription)\n", stderr)

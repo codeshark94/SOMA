@@ -10,6 +10,31 @@ struct FaceAlignmentEvidence: Sendable {
     let leftEye: CGPoint
     let rightEye: CGPoint
     let nose: CGPoint
+    let anonymousPersistenceEligible: Bool
+
+    init(
+        rect: SOMACore.NormalizedRect,
+        leftEye: CGPoint,
+        rightEye: CGPoint,
+        nose: CGPoint,
+        anonymousPersistenceEligible: Bool = false
+    ) {
+        self.rect = rect
+        self.leftEye = leftEye
+        self.rightEye = rightEye
+        self.nose = nose
+        self.anonymousPersistenceEligible = anonymousPersistenceEligible
+    }
+
+    func allowingAnonymousPersistence() -> Self {
+        Self(
+            rect: rect,
+            leftEye: leftEye,
+            rightEye: rightEye,
+            nose: nose,
+            anonymousPersistenceEligible: true
+        )
+    }
 }
 
 struct FaceIdentityReferenceCounts: Sendable {
@@ -17,17 +42,17 @@ struct FaceIdentityReferenceCounts: Sendable {
     let anonymousClusterReferenceCounts: [Int]
 }
 
-/// A short-lived face track used to lock identity across frames. Once a face
-/// at a screen location is recognized as a known (enrolled) person, the track
-/// holds that identity and re-emits it without re-matching — so a transient
-/// recognition dip (confidence fluctuating just under the matcher threshold)
-/// never flips the identity back to anonymous/pseudonymous. The track is
-/// dropped only when the face is genuinely absent for a while, at which point
-/// the next face is a fresh identification.
+/// A short-lived geometric face track. Recognition evidence and bounded
+/// continuity belong to this track, so observations from different visible
+/// people cannot combine into an identity decision. Enrolled identities are
+/// periodically revalidated and lose authority after the mismatch grace.
 private struct FaceTrack: Sendable {
+    let trackID: UUID
     var rect: NormalizedRect
-    let identity: FaceIdentityRuntimeDecision
+    var identity: FaceIdentityRuntimeDecision?
     var lastSeenNS: UInt64
+    var lastValidatedNS: UInt64
+    var lastCorrelatedNS: UInt64
 }
 
 enum FaceIdentityRuntimeDecision: Sendable {
@@ -244,10 +269,6 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     private let anonymousRegistry: AnonymousFaceRegistry
     private let onHealth: @Sendable (String, String) -> Void
     private let onDecision: @Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64, Double) -> Void
-    /// Gate for promoting a face to a registered anonymous identity. L1 reviews
-    /// the frame and returns true only when it judges the face a real person
-    /// worth tracking (rejects noise / non-human objects).
-    private let anonymousReviewProvider: @Sendable () -> Bool
     private var profileSnapshot: [LocalFaceIdentityProfile] = []
     private var matcher: FaceIdentityMatcher
     private var pending: WorkItem?
@@ -256,19 +277,14 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     private var nextAcceptedNS: UInt64 = 0
     /// Face tracks for identity continuity. Accessed only on `queue`.
     private var faceTracks: [FaceTrack] = []
-
-    /// A locked identity is held while the same face location keeps reappearing;
-    /// the track is dropped only after this much genuine absence. Generous so a
-    /// recognized identity is not re-evaluated (and risked as anonymous) during
-    /// a brief occlusion or glance away.
+    private let continuityPolicy = FaceIdentityContinuityPolicy()
     private static let trackLossNS: UInt64 = 5_000_000_000
 
     init(
         modelURL: URL = FaceIdentityRuntime.defaultModelURL(),
         dataDirectoryURL: URL = FaceIdentityRuntime.defaultDataDirectoryURL(),
         onHealth: @escaping @Sendable (String, String) -> Void,
-        onDecision: @escaping @Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64, Double) -> Void,
-        anonymousReviewProvider: @escaping @Sendable () -> Bool = { true }
+        onDecision: @escaping @Sendable (FaceIdentityRuntimeDecision, SOMACore.NormalizedRect, Bool, UInt64, Double) -> Void
     ) throws {
         let key = try OwnerOnlyInstallationSecret.loadOrCreate(
             in: dataDirectoryURL,
@@ -285,13 +301,9 @@ final class FaceIdentityRuntime: @unchecked Sendable {
             calibration: try Self.anonymousCalibration()
         )
         matcher = FaceIdentityMatcher(calibration: try FaceIdentityCalibration(
-            // Enrolled (known) bar at 0.62: the administrator's similarity
-            // fluctuates 0.65-0.79, so a higher bar made it intermittently fall
-            // through to the anonymous registry (caught as "anonymous"). 0.62
-            // keeps the known person reliably recognized; the track lock then
-            // holds the identity across transient dips. The Dyson false positive
-            // was anonymous, not known, so it is filtered by the anonymous
-            // threshold (0.70), not this one.
+            // Known-profile matching deliberately uses a lower acceptance bar
+            // than open-set anonymous clustering. Track-scoped confirmation and
+            // periodic revalidation provide the temporal evidence boundary.
             minimumCosineSimilarity: 0.62,
             minimumBestAlternativeMargin: 0.10,
             minimumObservationQuality: 0.52,
@@ -304,7 +316,6 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         ))
         self.onHealth = onHealth
         self.onDecision = onDecision
-        self.anonymousReviewProvider = anonymousReviewProvider
         onHealth(
             "configured",
             String(format: "model=%@; dimensions=512; compute_units=%@; prewarm_ms=%.3f; max_hz=5; profiles=encrypted_local_v2; unknowns=hmac_pseudonymous; installation_key=owner_only_file",
@@ -359,6 +370,7 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     }
 
     private func process(_ item: WorkItem) {
+        pruneFaceTracks(at: item.monotonicNS)
         var claimedTrackIndices = Set<Int>()
         for (index, alignment) in item.alignments.enumerated() {
             process(
@@ -379,38 +391,45 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         claimedTrackIndices: inout Set<Int>
     ) {
         let started = DispatchTime.now().uptimeNanoseconds
-        pruneFaceTracks(at: monotonicNS)
-
-        // Identity continuity: if this face location is already covered by a
-        // locked track, hold its identity and skip re-matching entirely. A
-        // stable face must not be re-verified every frame.
-        if let trackIndex = faceTrackIndex(
+        let existingTrackIndex = faceTrackIndex(
             matching: alignment.rect,
             excluding: claimedTrackIndices
-        ) {
-            claimedTrackIndices.insert(trackIndex)
-            var track = faceTracks[trackIndex]
-            track.lastSeenNS = monotonicNS
-            track.rect = alignment.rect
-            faceTracks[trackIndex] = track
-            switch track.identity {
-            case .known, .anonymous:
+        )
+        let trackIndex: Int
+        if let existingTrackIndex {
+            trackIndex = existingTrackIndex
+            faceTracks[trackIndex].lastSeenNS = monotonicNS
+            faceTracks[trackIndex].rect = alignment.rect
+        } else {
+            trackIndex = appendFaceTrack(rect: alignment.rect, identity: nil, at: monotonicNS)
+        }
+        claimedTrackIndices.insert(trackIndex)
+
+        if let identity = faceTracks[trackIndex].identity {
+            if continuityPolicy.action(
+                for: .enrolled,
+                lastValidatedNS: faceTracks[trackIndex].lastValidatedNS,
+                at: monotonicNS
+            ) == .reuse {
                 onDecision(
-                    track.identity,
+                    identity,
                     alignment.rect,
                     isPrimaryFace,
                     monotonicNS,
                     0
                 )
-            case .knownCandidate, .unknownCandidate:
-                break
+                return
             }
-            return
         }
 
         do {
             let embedding = try embedder.embed(pixelBuffer: pixelBuffer, alignment: alignment)
-            let known = matcher.match(embedding, profiles: profileSnapshot, at: monotonicNS)
+            let known = matcher.match(
+                embedding,
+                profiles: profileSnapshot,
+                evidenceTrackID: faceTracks[trackIndex].trackID,
+                at: monotonicNS
+            )
             let inferenceMS = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
             switch known {
             case let .recognized(entityID, similarity, _, confirmations):
@@ -419,11 +438,9 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                     similarity: similarity,
                     confirmations: confirmations
                 )
-                claimedTrackIndices.insert(appendFaceTrack(
-                    rect: alignment.rect,
-                    identity: decision,
-                    at: monotonicNS
-                ))
+                faceTracks[trackIndex].identity = decision
+                faceTracks[trackIndex].lastValidatedNS = monotonicNS
+                faceTracks[trackIndex].lastCorrelatedNS = monotonicNS
                 onDecision(
                     decision,
                     alignment.rect,
@@ -433,26 +450,58 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                 )
                 retainKnownView(entityID: entityID, embedding: embedding)
             case let .candidate(entityID, similarity, _):
-                onDecision(
-                    .knownCandidate(entityID: entityID, similarity: similarity),
-                    alignment.rect,
-                    isPrimaryFace,
-                    monotonicNS,
-                    inferenceMS
-                )
-                // A known identity seen at low correlation (e.g. a new angle or
-                // lighting) is exactly the view that should enrich the profile:
-                // retain it so future recognition of this person is stronger.
-                retainKnownView(entityID: entityID, embedding: embedding)
+                if knownEntityID(faceTracks[trackIndex].identity) == entityID,
+                   let identity = faceTracks[trackIndex].identity,
+                   continuityPolicy.mayBridgeMismatch(
+                    lastCorrelatedNS: faceTracks[trackIndex].lastCorrelatedNS,
+                    at: monotonicNS
+                   ) {
+                    onDecision(
+                        identity,
+                        alignment.rect,
+                        isPrimaryFace,
+                        monotonicNS,
+                        inferenceMS
+                    )
+                } else {
+                    faceTracks[trackIndex].identity = nil
+                    faceTracks[trackIndex].lastValidatedNS = monotonicNS
+                    onDecision(
+                        .knownCandidate(entityID: entityID, similarity: similarity),
+                        alignment.rect,
+                        isPrimaryFace,
+                        monotonicNS,
+                        inferenceMS
+                    )
+                }
             case .unknown:
+                if let identity = faceTracks[trackIndex].identity,
+                   continuityPolicy.mayBridgeMismatch(
+                    lastCorrelatedNS: faceTracks[trackIndex].lastCorrelatedNS,
+                    at: monotonicNS
+                   ) {
+                    onDecision(
+                        identity,
+                        alignment.rect,
+                        isPrimaryFace,
+                        monotonicNS,
+                        inferenceMS
+                    )
+                    return
+                }
+                faceTracks[trackIndex].identity = nil
+                faceTracks[trackIndex].lastValidatedNS = monotonicNS
                 let semaphore = DispatchSemaphore(value: 0)
                 let resultBox = SynchronousResultBox<Result<AnonymousFaceDecision, Error>>()
                 let observedNS = monotonicNS
+                let evidenceTrackID = faceTracks[trackIndex].trackID
                 Task { [anonymousRegistry] in
                     do {
                         resultBox.set(.success(try await anonymousRegistry.observe(
                             embedding,
-                            at: observedNS
+                            at: observedNS,
+                            persistenceApproved: alignment.anonymousPersistenceEligible,
+                            evidenceTrackID: evidenceTrackID
                         )))
                     } catch {
                         resultBox.set(.failure(error))
@@ -470,32 +519,12 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                         inferenceMS
                     )
                 case let .success(.recognized(handle, similarity, observations)):
-                    // Only a brand-new promotion (first recognition, observations
-                    // still at the confirmation threshold) goes through L1 review
-                    // before being surfaced as an anonymous identity. Already
-                    // registered clusters have been reviewed and skip the gate.
-                    let isNewPromotion = observations <= 3
-                    guard !isNewPromotion || anonymousReviewProvider() else {
-                        onDecision(
-                            .unknownCandidate(handle: handle, confirmations: observations),
-                            alignment.rect,
-                            isPrimaryFace,
-                            monotonicNS,
-                            inferenceMS
-                        )
-                        break
-                    }
                     let decision = FaceIdentityRuntimeDecision.anonymous(
                         entityID: Self.pseudonymousEntityID(for: handle),
                         handle: handle,
                         similarity: similarity,
                         observations: observations
                     )
-                    claimedTrackIndices.insert(appendFaceTrack(
-                        rect: alignment.rect,
-                        identity: decision,
-                        at: monotonicNS
-                    ))
                     onDecision(
                         decision,
                         alignment.rect,
@@ -521,7 +550,7 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     private func pruneFaceTracks(at monotonicNS: UInt64) {
         faceTracks.removeAll {
             monotonicNS >= $0.lastSeenNS &&
-            monotonicNS - $0.lastSeenNS > Self.trackLossNS
+                monotonicNS - $0.lastSeenNS > Self.trackLossNS
         }
     }
 
@@ -546,16 +575,31 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         return bestIndex
     }
 
-    /// Locks a newly recognized face into a fresh track so later frames hold
-    /// the identity. Older unmatched tracks expire through genuine absence.
+    /// Adds a geometric track before recognition so all identity evidence is
+    /// scoped to one continuously associated face. Unmatched tracks expire
+    /// through genuine absence.
     @discardableResult
     private func appendFaceTrack(
         rect: SOMACore.NormalizedRect,
-        identity: FaceIdentityRuntimeDecision,
+        identity: FaceIdentityRuntimeDecision?,
         at monotonicNS: UInt64
     ) -> Int {
-        faceTracks.append(FaceTrack(rect: rect, identity: identity, lastSeenNS: monotonicNS))
+        faceTracks.append(FaceTrack(
+            trackID: UUID(),
+            rect: rect,
+            identity: identity,
+            lastSeenNS: monotonicNS,
+            lastValidatedNS: monotonicNS,
+            lastCorrelatedNS: identity == nil ? 0 : monotonicNS
+        ))
         return faceTracks.index(before: faceTracks.endIndex)
+    }
+
+    private func knownEntityID(_ decision: FaceIdentityRuntimeDecision?) -> UUID? {
+        switch decision {
+        case let .some(.known(entityID, _, _)): entityID
+        case .some(.knownCandidate), .some(.anonymous), .some(.unknownCandidate), .none: nil
+        }
     }
 
     /// Profile enrichment is deliberately asynchronous to the latest-one
@@ -654,6 +698,29 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         return (profile.entityID, references.count)
     }
 
+    static func bindAnonymousIdentity(
+        handle: AnonymousFaceHandle,
+        to entityID: UUID,
+        dataDirectoryURL: URL = FaceIdentityRuntime.defaultDataDirectoryURL()
+    ) async throws -> Int {
+        let key = try OwnerOnlyInstallationSecret.loadOrCreate(
+            in: dataDirectoryURL,
+            filename: "installation-key-v2.bin"
+        )
+        return try AnonymousFaceRegistry.consumeEnrollment(
+            for: handle,
+            fileURL: dataDirectoryURL.appendingPathComponent("anonymous-v2.encjson"),
+            encryptionKey: key
+        ) { references in
+            try FaceIdentityProfileStore.mergePersistentEnrollment(
+                fileURL: dataDirectoryURL.appendingPathComponent("known-v2.encjson"),
+                encryptionKey: key,
+                entityID: entityID,
+                references: references
+            )
+        }
+    }
+
     static func removeKnownIdentity(
         entityID: UUID,
         dataDirectoryURL: URL = FaceIdentityRuntime.defaultDataDirectoryURL()
@@ -694,6 +761,19 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         )
     }
 
+    static func archiveAndResetAnonymousIdentities(
+        dataDirectoryURL: URL = FaceIdentityRuntime.defaultDataDirectoryURL()
+    ) async throws -> AnonymousFaceResetReport {
+        let key = try OwnerOnlyInstallationSecret.loadOrCreate(
+            in: dataDirectoryURL,
+            filename: "installation-key-v2.bin"
+        )
+        return try AnonymousFaceRegistry.archiveAndReset(
+            fileURL: dataDirectoryURL.appendingPathComponent("anonymous-v2.encjson"),
+            encryptionKey: key
+        )
+    }
+
     static func pseudonymousEntityID(for handle: AnonymousFaceHandle) -> UUID {
         let digest = Array(SHA256.hash(data: Data(handle.rawValue.utf8)))
         var bytes = Array(digest.prefix(16))
@@ -709,9 +789,8 @@ final class FaceIdentityRuntime: @unchecked Sendable {
 
     private static func anonymousCalibration() throws -> AnonymousFaceCalibration {
         try AnonymousFaceCalibration(
-            // 0.70 keeps recurring anonymous people (who usually match their own
-            // embedding well above 0.7) while rejecting face-like objects such
-            // as a Dyson purifier, which only cleared the old 0.58 bar at ~0.65.
+            // Open-set identities require stronger similarity than enrolled
+            // profiles because they have no prior identity authority.
             minimumCosineSimilarity: 0.70,
             minimumBestAlternativeMargin: 0.08,
             minimumObservationQuality: 0.52,

@@ -758,13 +758,52 @@ int OpenOBSBOTUVCTransport::stopMotion() noexcept {
 
 int OpenOBSBOTUVCTransport::center() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
+    double settledPitch = 0;
+    double settledPan = 0;
+    const auto waitForStablePose = [this, &settledPitch, &settledPan](
+        std::chrono::steady_clock::time_point deadline,
+        const auto &acceptPose
+    ) noexcept {
+        OpenOBSBOTPoseStabilityGate stability;
+        while (std::chrono::steady_clock::now() < deadline) {
+            double pitch = 0;
+            double pan = 0;
+            if (readAttitudeLocked(pitch, pan) != success) return false;
+            settledPitch = pitch;
+            settledPan = pan;
+            if (!acceptPose(pitch, pan)) {
+                stability.reset();
+            } else if (stability.observe(pitch, pan)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+
+    if (setExternalVelocityLocked(0, 0) != success
+        || !waitForStablePose(
+            std::chrono::steady_clock::now() + std::chrono::seconds(2),
+            [](double, double) { return true; }
+        )) {
+        return failure;
+    }
+    if (std::hypot(settledPitch, settledPan) <= 2.0) return success;
+
     if (const auto command = open_obsbot_protocol::firmwareRecenter(storage_->profile)) {
-        return sendFrame(
+        if (sendFrame(
             command->command,
             command->receiver,
             command->payload.data(),
             command->payload.size()
+        ) != success) {
+            return failure;
+        }
+        const bool centered = waitForStablePose(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            [](double pitch, double pan) { return std::hypot(pitch, pan) <= 2.0; }
         );
+        return centered ? success : failure;
     }
     // The Tiny 2 recenter frame is acknowledged but inert on Tiny 2 Lite.
     // Close the loop on the device's live UVC pose instead of treating that
@@ -775,7 +814,13 @@ int OpenOBSBOTUVCTransport::center() noexcept {
         double pan = 0;
         if (readAttitudeLocked(pitch, pan) != success) break;
         if (std::hypot(pitch, pan) <= 2.0) {
-            return setExternalVelocityLocked(0, 0);
+            if (setExternalVelocityLocked(0, 0) != success) return failure;
+            return waitForStablePose(
+                std::chrono::steady_clock::now() + std::chrono::seconds(2),
+                [](double settledPitch, double settledPan) {
+                    return std::hypot(settledPitch, settledPan) <= 2.0;
+                }
+            ) ? success : failure;
         }
         const float pitchVelocity = static_cast<float>(std::clamp(-pitch * 1.6, -60.0, 60.0));
         const float panVelocity = static_cast<float>(std::clamp(-pan * 1.6, -80.0, 80.0));
