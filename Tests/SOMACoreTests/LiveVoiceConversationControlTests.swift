@@ -55,25 +55,70 @@ struct LiveVoiceConversationControlTests {
     }
 
     @Test
-    func realtimeWaitsForBoundedEmbodimentCapabilitySnapshot() {
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+    func localTransportPreparationOverlapsCapabilitySnapshot() {
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
             webViewReady: true,
             threadReady: true,
+            transportAlreadyStarted: false
+        ))
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
+            webViewReady: true,
+            threadReady: false,
+            transportAlreadyStarted: false
+        ) == false)
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
+            webViewReady: true,
+            threadReady: true,
+            transportAlreadyStarted: true
+        ) == false)
+    }
+
+    @Test
+    func remoteRealtimeWaitsForOfferAndBoundedCapabilitySnapshot() {
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+            offerReady: true,
             capabilityVerificationFinished: false,
             realtimeAlreadyStarted: false
         ) == false)
         #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
-            webViewReady: true,
-            threadReady: true,
+            offerReady: true,
             capabilityVerificationFinished: true,
             realtimeAlreadyStarted: false
         ))
         #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
-            webViewReady: true,
-            threadReady: true,
+            offerReady: false,
+            capabilityVerificationFinished: true,
+            realtimeAlreadyStarted: false
+        ) == false)
+        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+            offerReady: true,
             capabilityVerificationFinished: true,
             realtimeAlreadyStarted: true
         ) == false)
+    }
+
+    @Test
+    func openingAudioWaitsForRemoteSessionAndInputTrackThenPlaysOnce() {
+        var gate = LiveVoiceOpeningAudioPlayoutGate()
+        let beforeActive = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
+        #expect(beforeActive == false)
+        gate.observeSessionActive()
+        let beforeInput = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
+        #expect(beforeInput == false)
+        gate.observeInputTrackReady()
+        let empty = gate.authorizePlayoutIfReady(hasBufferedAudio: false)
+        #expect(empty == false)
+        let submitted = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
+        #expect(submitted)
+        let duplicate = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
+        #expect(duplicate == false)
+    }
+
+    @Test
+    func openingAudioAddsAStableServerVADOffsetBoundary() {
+        #expect(LiveVoiceOpeningAudioPolicy.trailingSilenceSampleCount(sampleRate: 48_000) == 23_040)
+        #expect(LiveVoiceOpeningAudioPolicy.trailingSilenceSampleCount(sampleRate: 24_000) == 11_520)
+        #expect(LiveVoiceOpeningAudioPolicy.trailingSilenceSampleCount(sampleRate: 7_999) == nil)
     }
 
     @Test

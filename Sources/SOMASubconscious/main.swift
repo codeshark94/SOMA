@@ -13312,6 +13312,22 @@ private func run(_ options: Options) throws {
         ) { event in
             let eventNS = monotonicNanoseconds()
             switch event {
+            case .localHelperPrepared:
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "local_helper_ready",
+                    message: "idle_realtime=false; idle_model_turn=false"
+                ))
+            case let .localHelperUnavailable(reason):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "local_helper_unavailable",
+                    message: reason
+                ))
             case let .launchRequested(authorization, _):
                 l1LiveConversationState.begin()
                 liveCameraFrameRelay?.setEnabled(true)
@@ -13361,18 +13377,42 @@ private func run(_ options: Options) throws {
                     state: "input_streaming",
                     message: "audio_worklet_to_webrtc"
                 ))
-            case let .inputBootstrapReplayed(durationMilliseconds, peakDBFS, maximumGainDB):
+            case let .inputBootstrapSubmitted(
+                itemID,
+                durationMilliseconds,
+                trailingSilenceMilliseconds,
+                peakDBFS,
+                maximumGainDB
+            ):
                 writer.write(RuntimeEvent(
                     event: "source.health",
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
-                    state: "opening_audio_replayed",
+                    state: "opening_audio_submitted",
                     message: String(
-                        format: "duration_ms=%.1f; input_peak_dbfs=%.1f; max_gain_db=%.1f",
+                        format: "item_id=%@; route=ordered_webrtc_input_track; duration_ms=%.1f; trailing_silence_ms=%.1f; input_peak_dbfs=%.1f; max_gain_db=%.1f",
+                        itemID.uuidString.lowercased(),
                         durationMilliseconds,
+                        trailingSilenceMilliseconds,
                         peakDBFS,
                         maximumGainDB
                     )
+                ))
+            case let .inputBootstrapQueued(itemID):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "opening_audio_queued",
+                    message: "item_id=\(itemID.uuidString.lowercased()); audio_worklet_accepted=true"
+                ))
+            case let .inputBootstrapPlayed(itemID):
+                writer.write(RuntimeEvent(
+                    event: "source.health",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "opening_audio_played",
+                    message: "item_id=\(itemID.uuidString.lowercased()); webrtc_track_drained=true"
                 ))
             case let .outputPlaybackReady(mode, route, effectProfile):
                 writer.write(RuntimeEvent(
@@ -13814,12 +13854,13 @@ private func run(_ options: Options) throws {
         }
         liveVoiceBox.launcher = launcher
         liveVoiceLauncher = launcher
+        launcher.prewarm()
         writer.write(RuntimeEvent(
             event: "source.health",
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; app_server=persistent_local_broker; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=post_effect_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_replay; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_turn=current_frame_barrier_then_single_response; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_session_start; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; opening_input=ordered_webrtc_track_with_explicit_vad_offset; app_server=persistent_local_broker; local_helper=prewarming_without_realtime; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=post_effect_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_playout; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_turn=current_frame_barrier_then_single_response; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_capability_snapshot_joined_before_realtime; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil

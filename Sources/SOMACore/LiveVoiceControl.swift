@@ -64,6 +64,56 @@ public enum LiveVoiceOpeningOrigin: Equatable, Sendable {
     case proactive
 }
 
+/// Releases one captured opening utterance only after the remote realtime
+/// session and its WebRTC audio track are both active. This keeps prerecorded
+/// PCM on the same transport as the rest of the participant's live speech.
+public struct LiveVoiceOpeningAudioPlayoutGate: Equatable, Sendable {
+    public private(set) var sessionActive = false
+    public private(set) var inputTrackReady = false
+    public private(set) var playoutAuthorized = false
+
+    public init() {}
+
+    public mutating func observeSessionActive() {
+        sessionActive = true
+    }
+
+    public mutating func observeInputTrackReady() {
+        inputTrackReady = true
+    }
+
+    public mutating func authorizePlayoutIfReady(hasBufferedAudio: Bool) -> Bool {
+        guard hasBufferedAudio,
+              sessionActive,
+              inputTrackReady,
+              !playoutAuthorized else { return false }
+        playoutAuthorized = true
+        return true
+    }
+
+    public mutating func reset() {
+        sessionActive = false
+        inputTrackReady = false
+        playoutAuthorized = false
+    }
+}
+
+public enum LiveVoiceOpeningAudioPolicy {
+    /// Server-side turn detection needs an explicit acoustic offset after a
+    /// buffered utterance. A finite silent tail on the WebRTC input track
+    /// provides that boundary without converting or resynthesizing speech.
+    public static let trailingSilenceMilliseconds = 480
+
+    public static func trailingSilenceSampleCount(sampleRate: Int) -> Int? {
+        guard (8_000...96_000).contains(sampleRate) else { return nil }
+        let product = sampleRate.multipliedReportingOverflow(
+            by: trailingSilenceMilliseconds
+        )
+        guard !product.overflow else { return nil }
+        return product.partialValue / 1_000
+    }
+}
+
 /// Classifies server-side realtime events that prove participant audio reached
 /// the conversation backend. Transcript text may arrive later on the canonical
 /// App Server notification stream, so admission must not depend on the data
@@ -91,14 +141,25 @@ public enum LiveVoiceRealtimeEventSemantics {
 public enum LiveVoiceEmbodimentStartupPolicy {
     public static let verificationTimeoutMilliseconds: UInt64 = 5_000
 
-    public static func permitsRealtimeStart(
+    /// Local microphone/WebRTC offer preparation is safe to overlap with the
+    /// capability snapshot because it does not create a remote Realtime
+    /// session or consume a model turn.
+    public static func permitsTransportPreparation(
         webViewReady: Bool,
         threadReady: Bool,
+        transportAlreadyStarted: Bool
+    ) -> Bool {
+        webViewReady && threadReady && !transportAlreadyStarted
+    }
+
+    /// The remote session still waits for the bounded capability snapshot so
+    /// its initial tool and instruction view cannot race MCP initialization.
+    public static func permitsRealtimeStart(
+        offerReady: Bool,
         capabilityVerificationFinished: Bool,
         realtimeAlreadyStarted: Bool
     ) -> Bool {
-        webViewReady
-            && threadReady
+        offerReady
             && capabilityVerificationFinished
             && !realtimeAlreadyStarted
     }

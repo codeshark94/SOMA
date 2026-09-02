@@ -7,6 +7,7 @@ private struct Command: Decodable {
     enum Kind: String, Decodable {
         case start
         case appendAudio = "append_audio"
+        case appendOpeningAudio = "append_opening_audio"
         case appendImage = "append_image"
         case appendText = "append_text"
         case appendInstruction = "append_instruction"
@@ -31,6 +32,7 @@ private struct Command: Decodable {
     let data: String?
     let sampleRate: Int?
     let samplesPerChannel: Int?
+    let itemID: String?
     let taskID: String?
     let tool: String?
 }
@@ -370,8 +372,14 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var appServerStarted = false
     private var embodimentMCPAvailable = false
     private var embodimentMCPVerificationFinished = false
+    private var embodimentBodyCheckFinished = false
+    private var embodimentBodyCheckAvailable = false
+    private var embodimentBodyCheckFailureReason: String?
+    private var personContextCheckFinished = false
     private var personContextAvailable = false
     private var webRTCStarted = false
+    private var pendingOfferSDP: String?
+    private var realtimeStartRequested = false
     private var webRTCConnected = false
     private var realtimeSessionInitialized = false
     private var activeEmitted = false
@@ -493,7 +501,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 // WebKit. Start them while the hidden audio frontend loads;
                 // the WebRTC offer is joined once both sides are ready.
                 break
-            case .appendAudio, .appendImage, .appendText, .appendInstruction,
+            case .appendAudio, .appendOpeningAudio, .appendImage, .appendText, .appendInstruction,
                  .beginVisualTurn, .stop:
                 pendingCommands.append(command)
                 return
@@ -554,6 +562,44 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "appendPCM16(\(literal), \(sampleRate), \(samplesPerChannel))"
             ) { [weak self] _, error in
                 if let error { self?.fail(LiveVoiceError.webRTC(error.localizedDescription)) }
+            }
+        case .appendOpeningAudio:
+            guard threadID != nil,
+                  let data = command.data,
+                  data.utf8.count <= 4 * 1_048_576,
+                  let sampleRate = command.sampleRate,
+                  (8_000...96_000).contains(sampleRate),
+                  let samplesPerChannel = command.samplesPerChannel,
+                  (1...1_500_000).contains(samplesPerChannel),
+                  let itemID = command.itemID,
+                  UUID(uuidString: itemID) != nil,
+                  let decoded = Data(base64Encoded: data),
+                  decoded.count == samplesPerChannel * MemoryLayout<Int16>.size else {
+                emitter.emit("opening_audio_rejected", fields: [
+                    "reason": "invalid_opening_audio_payload",
+                ])
+                return
+            }
+            guard let encoded = try? JSONEncoder().encode(data),
+                  let literal = String(data: encoded, encoding: .utf8),
+                  let encodedItemID = try? JSONEncoder().encode(itemID),
+                  let itemLiteral = String(data: encodedItemID, encoding: .utf8) else { return }
+            webView.evaluateJavaScript(
+                "appendPCM16(\(literal), \(sampleRate), \(samplesPerChannel), \(itemLiteral))"
+            ) { [weak self] result, error in
+                guard let self, !self.stopping else { return }
+                guard error == nil, (result as? Bool) == true else {
+                    self.emitter.emit("opening_audio_rejected", fields: [
+                        "item_id": itemID,
+                        "reason": error?.localizedDescription ?? "webrtc_input_track_unavailable",
+                    ])
+                    return
+                }
+                self.emitter.emit("opening_audio_queued", fields: [
+                    "item_id": itemID,
+                    "sample_rate": sampleRate,
+                    "samples_per_channel": samplesPerChannel,
+                ])
             }
         case .appendText:
             guard let threadID,
@@ -651,6 +697,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webViewReady = true
+        guard !stopping else { return }
         if threadID != nil {
             startWebRTCIfNeeded()
         }
@@ -663,6 +710,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
+        guard !stopping else { return }
         guard let body = message.body as? [String: Any],
               let event = body["event"] as? String else { return }
         switch event {
@@ -671,7 +719,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 fail(LiveVoiceError.webRTC("offer_missing_sdp"))
                 return
             }
-            startRealtime(offerSDP: sdp)
+            pendingOfferSDP = sdp
+            startRealtimeIfReady()
         case "connected":
             webRTCConnected = true
             activateIfReady()
@@ -761,7 +810,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             appServerURL: appServerURL
         ) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.stopping else { return }
                 switch result {
                 case .success:
                     self.emitter.emit("app_server_ready")
@@ -774,6 +823,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func startThread() {
+        guard !stopping else { return }
         // When admin-only is enabled, only the local administrator gets the
         // configured Codex sandbox; every other participant is restricted to
         // read-only so a guest cannot create/delete files or touch sensitive
@@ -797,7 +847,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             params: params
         ) { [weak self] response in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.stopping else { return }
                 guard response.value["error"] == nil,
                       let result = response.value["result"] as? [String: Any],
                       let thread = result["thread"] as? [String: Any],
@@ -809,6 +859,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 }
                 self.threadID = threadID
                 self.emitter.emit("thread_ready", fields: ["thread_id": threadID])
+                // Preparing the local offer does not open Realtime. Overlap it
+                // with the bounded MCP snapshot, then join both at
+                // startRealtimeIfReady().
+                self.startWebRTCIfNeeded()
                 self.armEmbodimentMCPVerificationTimeout()
                 self.verifyEmbodimentMCP(for: threadID)
             }
@@ -840,7 +894,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             params: ["threadId": threadID, "detail": "toolsAndAuthOnly"]
         ) { [weak self] response in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self,
+                      !self.stopping,
+                      !self.embodimentMCPVerificationFinished else { return }
                 let statuses = (response.value["result"] as? [String: Any])?["data"] as? [[String: Any]] ?? []
                 let server = statuses.first { $0["name"] as? String == "soma_embodiment" }
                 let tools = server?["tools"] as? [String: Any]
@@ -864,7 +920,18 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     )
                     return
                 }
+                self.embodimentBodyCheckFinished = false
+                self.embodimentBodyCheckAvailable = false
+                self.embodimentBodyCheckFailureReason = nil
+                self.personContextCheckFinished = self.personContextReference == nil
+                self.personContextAvailable = false
                 self.verifyEmbodimentCapability(for: threadID)
+                if let personEntityID = self.personContextReference {
+                    self.verifyPersonContextCapability(
+                        for: threadID,
+                        personEntityID: personEntityID
+                    )
+                }
             }
         }
     }
@@ -884,16 +951,15 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ]
         ) { [weak self] response in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self,
+                      !self.stopping,
+                      !self.embodimentMCPVerificationFinished else { return }
                 let result = response.value["result"] as? [String: Any]
                 let toolFailed = (result?["isError"] as? Bool) == true
-                self.embodimentMCPAvailable = response.value["error"] == nil && !toolFailed
-                if self.embodimentMCPAvailable {
-                    if let personEntityID = self.personContextReference {
-                        self.verifyPersonContextCapability(for: threadID, personEntityID: personEntityID)
-                    } else {
-                        self.finishEmbodimentMCPVerification(available: true)
-                    }
+                self.embodimentBodyCheckAvailable = response.value["error"] == nil && !toolFailed
+                self.embodimentBodyCheckFinished = true
+                if self.embodimentBodyCheckAvailable {
+                    self.embodimentBodyCheckFailureReason = nil
                 } else {
                     let reason: String
                     if response.value["error"] != nil {
@@ -905,8 +971,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     } else {
                         reason = "capability_preflight_failed"
                     }
-                    self.finishEmbodimentMCPVerification(available: false, reason: reason)
+                    self.embodimentBodyCheckFailureReason = reason
                 }
+                self.finishParallelEmbodimentVerificationIfReady()
             }
         }
     }
@@ -927,10 +994,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ]
         ) { [weak self] response in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self,
+                      !self.stopping,
+                      !self.embodimentMCPVerificationFinished else { return }
                 let result = response.value["result"] as? [String: Any]
                 let toolFailed = (result?["isError"] as? Bool) == true
                 self.personContextAvailable = response.value["error"] == nil && !toolFailed
+                self.personContextCheckFinished = true
                 if self.personContextAvailable {
                     self.emitter.emit("person_context_ready")
                 } else {
@@ -948,13 +1018,24 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                         "reason": String(reason.prefix(192)),
                     ])
                 }
-                self.finishEmbodimentMCPVerification(available: true)
+                self.finishParallelEmbodimentVerificationIfReady()
             }
         }
     }
 
+    private func finishParallelEmbodimentVerificationIfReady() {
+        guard !stopping,
+              embodimentBodyCheckFinished,
+              personContextCheckFinished,
+              !embodimentMCPVerificationFinished else { return }
+        finishEmbodimentMCPVerification(
+            available: embodimentBodyCheckAvailable,
+            reason: embodimentBodyCheckFailureReason
+        )
+    }
+
     private func finishEmbodimentMCPVerification(available: Bool, reason: String? = nil) {
-        guard !embodimentMCPVerificationFinished else { return }
+        guard !stopping, !embodimentMCPVerificationFinished else { return }
         embodimentMCPVerificationTimeoutWorkItem?.cancel()
         embodimentMCPVerificationTimeoutWorkItem = nil
         embodimentMCPAvailable = available
@@ -966,7 +1047,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "reason": String((reason ?? "capability_preflight_failed").prefix(192)),
             ])
         }
-        startWebRTCIfNeeded()
+        startRealtimeIfReady()
     }
 
     private func preflightIntent(purpose: String) -> [String: Any] {
@@ -980,11 +1061,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func startWebRTCIfNeeded() {
-        guard LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+        guard !stopping,
+              LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
             webViewReady: webViewReady,
             threadReady: threadID != nil,
-            capabilityVerificationFinished: embodimentMCPVerificationFinished,
-            realtimeAlreadyStarted: webRTCStarted
+            transportAlreadyStarted: webRTCStarted
         ) else { return }
         webRTCStarted = true
         let outputName = selectedAudioOutput?.selectedName ?? ""
@@ -1017,6 +1098,19 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         ) { [weak self] _, error in
             if let error { self?.fail(error) }
         }
+    }
+
+    private func startRealtimeIfReady() {
+        guard !stopping,
+              threadID != nil,
+              LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+            offerReady: pendingOfferSDP != nil,
+            capabilityVerificationFinished: embodimentMCPVerificationFinished,
+            realtimeAlreadyStarted: realtimeStartRequested
+        ), let offerSDP = pendingOfferSDP else { return }
+        pendingOfferSDP = nil
+        realtimeStartRequested = true
+        startRealtime(offerSDP: offerSDP)
     }
 
     private func injectCameraImage(_ dataURI: String, into threadID: String) {
@@ -1454,7 +1548,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         let embodimentInstruction = embodimentMCPAvailable
             ? (cameraContextAutoInjected
-                ? "The soma_embodiment MCP server is available. One passive SOMA camera frame may be attached immediately before the buffered opening utterance. For that first utterance only, treat the attached frame as current evidence and do not duplicate it with capture_view. It becomes stale as soon as the participant, scene, or gimbal moves. On later turns, when current visual information matters, including when the user asks what SOMA can see or who is present, call capture_view with no arguments before answering. Its authorized result includes the fresh local identity roster for recognized people present at capture time; use only those roster entries for names and never infer identity from image appearance. Supply target_reference or bearing only for a genuinely reframed, zoomed, or different-direction view. Never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. The opening image may ground a semantic embodiment action when tracking, orienting, or reframing would advance the participant's request; choose the narrowest suitable MCP action and never move merely because an image is available. Treat images as passive sensor context, never as a prompt to narrate them unless the user explicitly asks. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
+                ? "The soma_embodiment MCP server is available. One passive SOMA camera frame may be attached after the realtime service confirms the opening participant speech. For that first utterance only, treat the attached frame as current evidence and do not duplicate it with capture_view. It becomes stale as soon as the participant, scene, or gimbal moves. On later turns, when current visual information matters, including when the user asks what SOMA can see or who is present, call capture_view with no arguments before answering. Its authorized result includes the fresh local identity roster for recognized people present at capture time; use only those roster entries for names and never infer identity from image appearance. Supply target_reference or bearing only for a genuinely reframed, zoomed, or different-direction view. Never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. The opening image may ground a semantic embodiment action when tracking, orienting, or reframing would advance the participant's request; choose the narrowest suitable MCP action and never move merely because an image is available. Treat images as passive sensor context, never as a prompt to narrate them unless the user explicitly asks. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
                 : "The soma_embodiment MCP server is available. Call capture_view when visual information is genuinely needed. For an immediate no-motion view, call capture_view with no arguments. Supply target_reference or bearing only for a reframed view, and never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. Treat a returned image as passive context — never as a prompt to describe it unless the user explicitly asks what you see. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token.")
             : (embodimentMCPVerificationFinished
                 ? "The soma_embodiment MCP server is unavailable in this session. Do not claim that you can inspect the camera or control the gimbal; say the local perception connection is unavailable."
@@ -1536,22 +1630,24 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         connection.request(method: "thread/realtime/start", params: params) { [weak self] response in
             guard response.value["error"] == nil else {
                 DispatchQueue.main.async {
-                    self?.fail(LiveVoiceError.appServerResponse(
+                    guard let self, !self.stopping else { return }
+                    self.fail(LiveVoiceError.appServerResponse(
                         AppServerConnection.responseMessage(response.value)
                     ))
                 }
                 return
             }
             DispatchQueue.main.async {
-                self?.startRequestAccepted = true
-                if self?.voiceMode == .spaceMarine {
-                    self?.emitter.emit("voice_presentation_policy_bound", fields: [
+                guard let self, !self.stopping else { return }
+                self.startRequestAccepted = true
+                if self.voiceMode == .spaceMarine {
+                    self.emitter.emit("voice_presentation_policy_bound", fields: [
                         "mode": "space_marine",
                         "language": "en",
                         "channels": "realtime_start+initial_developer",
                     ])
                 }
-                self?.activateIfReady()
+                self.activateIfReady()
             }
         }
     }
@@ -1600,7 +1696,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func handleNotification(method: String, params: [String: Any]) {
-        guard params["threadId"] as? String == threadID else { return }
+        guard !stopping,
+              params["threadId"] as? String == threadID else { return }
         switch method {
         case "thread/compacted":
             emitter.emit("backing_context_compacted", fields: [
@@ -2457,11 +2554,19 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 const maximum = Math.floor(sampleRate * 12);
                 while (this.queued + samples.length > maximum && this.buffers.length > 0) {
                   const removed = this.buffers.shift();
-                  this.queued -= removed.length - this.offset;
+                  this.queued -= removed.samples.length - this.offset;
+                  if (removed.itemID) {
+                    this.port.postMessage({type: 'rejected', itemID: removed.itemID, reason: 'input_queue_overflow'});
+                  }
                   this.offset = 0;
                 }
-                if (samples.length > maximum) samples = samples.slice(samples.length - maximum);
-                this.buffers.push(samples);
+                if (samples.length > maximum) {
+                  if (event.data.itemID) {
+                    this.port.postMessage({type: 'rejected', itemID: event.data.itemID, reason: 'input_too_long'});
+                  }
+                  return;
+                }
+                this.buffers.push({samples, itemID: event.data.itemID || ''});
                 this.queued += samples.length;
               };
             }
@@ -2470,7 +2575,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
               output.fill(0);
               let written = 0;
               while (written < output.length && this.buffers.length > 0) {
-                const buffer = this.buffers[0];
+                const entry = this.buffers[0];
+                const buffer = entry.samples;
                 const count = Math.min(output.length - written, buffer.length - this.offset);
                 output.set(buffer.subarray(this.offset, this.offset + count), written);
                 written += count;
@@ -2479,6 +2585,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 if (this.offset >= buffer.length) {
                   this.buffers.shift();
                   this.offset = 0;
+                  if (entry.itemID) {
+                    this.port.postMessage({type: 'drained', itemID: entry.itemID});
+                  }
                 }
               }
               this.deliveredSinceReport += written;
@@ -2503,6 +2612,15 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         inputWorklet.connect(inputDestination);
         inputWorklet.port.onmessage = event => {
           if (event.data?.type === 'progress') send('audio_input_progress');
+          if (event.data?.type === 'drained') {
+            send('opening_audio_drained', {itemID: event.data.itemID});
+          }
+          if (event.data?.type === 'rejected') {
+            send('opening_audio_rejected', {
+              itemID: event.data.itemID,
+              reason: event.data.reason || 'audio_worklet_rejected',
+            });
+          }
         };
         peer = new RTCPeerConnection();
         channel = peer.createDataChannel('oai-events');
@@ -2802,8 +2920,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         send('error', {message: String(error)});
       }
     }
-    function appendPCM16(base64, sampleRate, sampleCount) {
-      if (!inputContext || !inputWorklet || sampleCount <= 0) return;
+    function appendPCM16(base64, sampleRate, sampleCount, itemID = '') {
+      if (!inputContext || !inputWorklet || sampleCount <= 0) return false;
       const binary = atob(base64);
       if (binary.length !== sampleCount * 2) throw new Error('pcm16_size_mismatch');
       const source = new Float32Array(sampleCount);
@@ -2827,7 +2945,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
           destination[index] = source[lower] * (1 - fraction) + source[upper] * fraction;
         }
       }
-      inputWorklet.port.postMessage({type: 'append', samples: destination}, [destination.buffer]);
+      inputWorklet.port.postMessage(
+        {type: 'append', samples: destination, itemID},
+        [destination.buffer]
+      );
+      return true;
     }
     function sendRealtimeControl(payload) {
       if (!channel || channel.readyState !== 'open' || !payload || typeof payload.type !== 'string') {
@@ -2920,6 +3042,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     data: nil,
                     sampleRate: nil,
                     samplesPerChannel: nil,
+                    itemID: nil,
                     taskID: nil,
                     tool: nil
                 ))

@@ -2,10 +2,20 @@ import Foundation
 import SOMACore
 
 enum AppServerLiveVoiceEvent: Sendable {
+    case localHelperPrepared
+    case localHelperUnavailable(reason: String)
     case launchRequested(authorization: String, personEntityID: UUID?)
     case active(threadID: String?, personEntityID: UUID?)
     case inputTransportStarted
-    case inputBootstrapReplayed(durationMilliseconds: Double, peakDBFS: Double, maximumGainDB: Double)
+    case inputBootstrapSubmitted(
+        itemID: UUID,
+        durationMilliseconds: Double,
+        trailingSilenceMilliseconds: Double,
+        peakDBFS: Double,
+        maximumGainDB: Double
+    )
+    case inputBootstrapQueued(itemID: UUID)
+    case inputBootstrapPlayed(itemID: UUID)
     case outputPlaybackReady(mode: String, route: String, effectProfile: String)
     case audioPlayoutSourceSelected(source: String)
     case audioPlayoutStatus(
@@ -70,6 +80,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let data: String?
     let sampleRate: Int?
     let samplesPerChannel: Int?
+    let itemID: String?
     let numChannels: Int?
     let resetReference: Bool?
     let mode: String?
@@ -97,6 +108,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case data
         case sampleRate = "sample_rate"
         case samplesPerChannel = "samples_per_channel"
+        case itemID = "item_id"
         case numChannels = "num_channels"
         case resetReference = "reset_reference"
         case mode
@@ -165,12 +177,21 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var process: Process?
     private var input: FileHandle?
     private var outputBuffer = Data()
+    private var helperProcessGeneration: UInt64 = 0
+    private var helperReady = false
+    private var helperPrewarmFailureCount = 0
+    private var helperPrewarmWorkItem: DispatchWorkItem?
     private var speakerEpisodeAudio = LiveVoiceTimestampedEpisodeBuffer<CapturedLiveAudio>(
         detectorHistoryNS: 2_000_000_000,
         maximumEpisodeDurationNS: 12_000_000_000
     )
     private var speakerEpisodeInProgress = false
     private var initiatingTurn: [BufferedLiveAudio] = []
+    private var pendingOpeningAudio: [BufferedLiveAudio] = []
+    private var pendingLiveAudio: [BufferedLiveAudio] = []
+    private var openingAudioPlayoutGate = LiveVoiceOpeningAudioPlayoutGate()
+    private var pendingOpeningAudioItemID: UUID?
+    private var liveInputTrackReady = false
     private var capturingInitiatingTurn = false
     private var inputLeveler = LiveVoiceInputLeveler()
     private var duplexCaptureGate = LiveVoiceDuplexCaptureGate()
@@ -246,6 +267,18 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.persistentSessionAuthorizer = persistentSessionAuthorizer
         cameraContextAutoInjection = somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: true)
         self.onEvent = onEvent
+    }
+
+    /// Warms only the local executable, audio output graph, and hidden
+    /// WebView. The helper does not connect to App Server or create a Realtime
+    /// session until it receives a session-specific start command.
+    func prewarm() {
+        queue.async { [weak self] in
+            guard let self, !stopped else { return }
+            if let reason = ensureLocalHelperRunning() {
+                recordHelperPrewarmFailure(reason: reason)
+            }
+        }
     }
 
     func canStartHermesReportOffer(at monotonicNS: UInt64) -> Bool {
@@ -674,6 +707,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         speakerEpisodeAudio.end(keepingCapacity: keepingAudioCapacity)
         speakerEpisodeInProgress = false
         initiatingTurn.removeAll(keepingCapacity: keepingAudioCapacity)
+        pendingOpeningAudio.removeAll(keepingCapacity: keepingAudioCapacity)
+        pendingLiveAudio.removeAll(keepingCapacity: keepingAudioCapacity)
+        openingAudioPlayoutGate.reset()
+        pendingOpeningAudioItemID = nil
+        liveInputTrackReady = false
         capturingInitiatingTurn = false
         inputLeveler.reset()
         resetDuplexCaptureState()
@@ -725,6 +763,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 : nil
             stopped = true
             generation &+= 1
+            helperPrewarmWorkItem?.cancel()
+            helperPrewarmWorkItem = nil
             _ = send(["type": "stop"], reportFailure: false)
             input = nil
             if let process, process.isRunning { process.terminate() }
@@ -867,6 +907,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         at monotonicNS: UInt64
     ) {
         inputTransportReported = false
+        pendingOpeningAudio.removeAll(keepingCapacity: true)
+        pendingLiveAudio.removeAll(keepingCapacity: true)
+        openingAudioPlayoutGate.reset()
+        pendingOpeningAudioItemID = nil
+        liveInputTrackReady = false
         openingVisualContextAttached = false
         awaitingAssistantResponse = false
         latestUserTranscriptNS = nil
@@ -902,75 +947,16 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         } else {
             persistentEndpoint = nil
         }
-        guard let helperURL = helperURL() else {
+        if let reason = ensureLocalHelperRunning() {
             gate.fail(at: monotonicNS)
             resetSessionEphemera(keepingAudioCapacity: false)
             onEvent(.failed(
                 threadID: nil,
                 personEntityID: personEntityID,
-                reason: "live_voice_helper_not_found"
+                reason: reason
             ))
             return
         }
-        let process = Process()
-        let inputPipe = Pipe()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.executableURL = helperURL
-        process.arguments = [
-            "--cwd", projectDirectory,
-            "--voice", voice.rawValue,
-            "--voice-mode", voiceMode.rawValue,
-        ]
-        if let audioOutputDeviceUID {
-            process.arguments?.append(contentsOf: ["--output-device-uid", audioOutputDeviceUID])
-        }
-        process.standardInput = inputPipe
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let self else { return }
-            queue.async { self.consume(data) }
-        }
-        errorPipe.fileHandleForReading.readabilityHandler = { handle in
-            _ = handle.availableData
-        }
-        process.terminationHandler = { [weak self] process in
-            guard let self else { return }
-            queue.async {
-                guard self.process === process, !self.stopped else { return }
-                self.process = nil
-                self.input = nil
-                self.active = false
-                self.gate.fail(at: DispatchTime.now().uptimeNanoseconds)
-                let threadID = self.activeThreadID
-                let personEntityID = self.activePersonEntityID
-                self.activeThreadID = nil
-                self.activePersonEntityID = nil
-                self.activeSessionCapability = nil
-                self.resetSessionEphemera(keepingAudioCapacity: false)
-                self.onEvent(.failed(
-                    threadID: threadID,
-                    personEntityID: personEntityID,
-                    reason: "live_voice_helper_exited_\(process.terminationStatus)"
-                ))
-            }
-        }
-        do {
-            try process.run()
-        } catch {
-            gate.fail(at: monotonicNS)
-            resetSessionEphemera(keepingAudioCapacity: false)
-            onEvent(.failed(
-                threadID: nil,
-                personEntityID: personEntityID,
-                reason: String(error.localizedDescription.prefix(192))
-            ))
-            return
-        }
-        self.process = process
-        input = inputPipe.fileHandleForWriting
         activePersonEntityID = personEntityID
         activeSessionCapability = sessionCapability
         generation &+= 1
@@ -1022,6 +1008,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 continue
             }
             switch event.event {
+            case "ready":
+                guard !helperReady else { continue }
+                helperReady = true
+                helperPrewarmFailureCount = 0
+                helperPrewarmWorkItem?.cancel()
+                helperPrewarmWorkItem = nil
+                onEvent(.localHelperPrepared)
             case "active":
                 guard !active else { continue }
                 active = true
@@ -1030,46 +1023,43 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 }
                 activeThreadID = event.threadID
                 gate.observeActive()
+                openingAudioPlayoutGate.observeSessionActive()
                 let activeNS = DispatchTime.now().uptimeNanoseconds
                 armInactivityTimeout(at: activeNS)
-                armInitialTranscriptTimeout(at: activeNS)
-                let buffered = initiatingTurn
+                pendingOpeningAudio.append(contentsOf: initiatingTurn)
                 if !requireVerifiedSpeakerForEveryTurn || !speakerEpisodeInProgress {
                     speakerEpisodeAudio.end()
                 }
                 initiatingTurn.removeAll(keepingCapacity: true)
                 capturingInitiatingTurn = false
-                // A direct first-turn visual question needs the current frame
-                // before its audio is interpreted, not after transcription has
-                // already begun.
-                if !buffered.isEmpty {
-                    enqueueOpeningCameraImageIfEnabled()
-                    let durationMilliseconds = Double(buffered.reduce(0) { $0 &+ $1.durationNS }) / 1_000_000
-                    let peakDBFS = buffered.map(\.inputPeakDBFS).max() ?? -.infinity
-                    let maximumGainDB = buffered.map(\.appliedGainDB).max() ?? 0
-                    onEvent(.inputBootstrapReplayed(
-                        durationMilliseconds: durationMilliseconds,
-                        peakDBFS: peakDBFS,
-                        maximumGainDB: maximumGainDB
-                    ))
-                }
-                var submittedOpeningAudio = false
-                for chunk in buffered {
-                    submittedOpeningAudio = send(chunk) || submittedOpeningAudio
-                }
-                if submittedOpeningAudio {
-                    initialTurnValidation.observeInitialAudioSubmitted()
-                }
+                submitPendingOpeningAudioIfReady()
                 onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
+            case "audio_input_ready":
+                liveInputTrackReady = true
+                openingAudioPlayoutGate.observeInputTrackReady()
+                let buffered = pendingLiveAudio
+                pendingLiveAudio.removeAll(keepingCapacity: true)
+                for chunk in buffered { _ = sendBufferedAudio(chunk) }
+                submitPendingOpeningAudioIfReady()
             case "audio_input_progress":
-                initialTurnValidation.observeInitialAudioTransportProgress()
-                if initialTurnValidation.permitsAssistantResponse {
-                    initialTranscriptTimer?.cancel()
-                    initialTranscriptTimer = nil
-                }
                 guard !inputTransportReported else { continue }
                 inputTransportReported = true
                 onEvent(.inputTransportStarted)
+            case "opening_audio_queued":
+                guard let rawItemID = event.itemID,
+                      let itemID = UUID(uuidString: rawItemID),
+                      itemID == pendingOpeningAudioItemID else { continue }
+                onEvent(.inputBootstrapQueued(itemID: itemID))
+            case "opening_audio_drained":
+                guard let rawItemID = event.itemID,
+                      let itemID = UUID(uuidString: rawItemID),
+                      itemID == pendingOpeningAudioItemID else { continue }
+                pendingOpeningAudioItemID = nil
+                initialTurnValidation.observeInitialAudioTransportProgress()
+                armInitialTranscriptTimeout(at: DispatchTime.now().uptimeNanoseconds)
+                onEvent(.inputBootstrapPlayed(itemID: itemID))
+            case "opening_audio_rejected":
+                failCurrent(reason: event.reason ?? "opening_audio_rejected")
             case "output_playback_ready":
                 onEvent(.outputPlaybackReady(
                     mode: String((event.mode ?? "unknown").prefix(64)),
@@ -1287,13 +1277,23 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 activePersonEntityID = nil
                 activeSessionCapability = nil
                 resetSessionEphemera(keepingAudioCapacity: false)
+                scheduleHelperPrewarm()
                 onEvent(.ended(
                     threadID: threadID,
                     personEntityID: personEntityID,
                     reason: String((event.reason ?? "session_ended").prefix(128))
                 ))
             case "failed", "audio_rejected":
-                failCurrent(reason: event.reason ?? event.event)
+                let reason = event.reason ?? event.event
+                if active || gate.phase == .starting {
+                    failCurrent(reason: reason)
+                } else {
+                    if let process, process.isRunning { process.terminate() }
+                    process = nil
+                    input = nil
+                    helperReady = false
+                    recordHelperPrewarmFailure(reason: reason)
+                }
             default:
                 break
             }
@@ -1314,6 +1314,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activePersonEntityID = nil
         activeSessionCapability = nil
         resetSessionEphemera(keepingAudioCapacity: false)
+        scheduleHelperPrewarm()
         onEvent(.failed(
             threadID: threadID,
             personEntityID: personEntityID,
@@ -1322,9 +1323,13 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     }
 
     private func confirmInitialParticipantInput() {
+        let shouldAttachOpeningVisualContext = initialTurnValidation.isUnconfirmedParticipantOpening
         initialTurnValidation.confirmParticipantInput()
         initialTranscriptTimer?.cancel()
         initialTranscriptTimer = nil
+        if shouldAttachOpeningVisualContext {
+            enqueueOpeningCameraImageIfEnabled()
+        }
     }
 
     private func armInitialTranscriptTimeout(at monotonicNS: UInt64) {
@@ -1444,6 +1449,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         activePersonEntityID = nil
         activeSessionCapability = nil
         resetSessionEphemera(keepingAudioCapacity: false)
+        scheduleHelperPrewarm()
         onEvent(.ended(
             threadID: threadID,
             personEntityID: personEntityID,
@@ -1454,12 +1460,82 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 
     @discardableResult
     private func send(_ chunk: BufferedLiveAudio) -> Bool {
+        guard liveInputTrackReady else {
+            pendingLiveAudio.append(chunk)
+            return false
+        }
+        return sendBufferedAudio(chunk)
+    }
+
+    @discardableResult
+    private func sendBufferedAudio(_ chunk: BufferedLiveAudio) -> Bool {
         send([
             "type": "append_audio",
             "data": chunk.data,
             "sampleRate": chunk.sampleRate,
             "samplesPerChannel": chunk.samplesPerChannel,
         ])
+    }
+
+    private func submitPendingOpeningAudioIfReady() {
+        guard openingAudioPlayoutGate.authorizePlayoutIfReady(
+            hasBufferedAudio: !pendingOpeningAudio.isEmpty
+        ) else { return }
+        let buffered = pendingOpeningAudio
+        pendingOpeningAudio.removeAll(keepingCapacity: true)
+        guard let sampleRate = buffered.first?.sampleRate,
+              buffered.allSatisfy({ $0.sampleRate == sampleRate }),
+              let trailingSilenceSamples = LiveVoiceOpeningAudioPolicy
+                .trailingSilenceSampleCount(sampleRate: sampleRate) else {
+            failCurrent(reason: "opening_audio_format_mismatch")
+            return
+        }
+        var pcm = Data()
+        pcm.reserveCapacity(
+            buffered.reduce(0) { $0 + ($1.samplesPerChannel * MemoryLayout<Int16>.size) }
+                + trailingSilenceSamples * MemoryLayout<Int16>.size
+        )
+        for chunk in buffered {
+            guard let decoded = Data(base64Encoded: chunk.data),
+                  decoded.count == chunk.samplesPerChannel * MemoryLayout<Int16>.size else {
+                failCurrent(reason: "opening_audio_decode_failed")
+                return
+            }
+            pcm.append(decoded)
+        }
+        pcm.append(Data(count: trailingSilenceSamples * MemoryLayout<Int16>.size))
+        let totalSamples = pcm.count / MemoryLayout<Int16>.size
+        guard totalSamples > trailingSilenceSamples,
+              totalSamples <= 1_500_000 else {
+            failCurrent(reason: "opening_audio_duration_out_of_range")
+            return
+        }
+        let durationMilliseconds = Double(buffered.reduce(0) { $0 &+ $1.durationNS }) / 1_000_000
+        let peakDBFS = buffered.map(\.inputPeakDBFS).max() ?? -.infinity
+        let maximumGainDB = buffered.map(\.appliedGainDB).max() ?? 0
+        let itemID = UUID()
+        pendingOpeningAudioItemID = itemID
+        guard send([
+            "type": "append_opening_audio",
+            "data": pcm.base64EncodedString(),
+            "sampleRate": sampleRate,
+            "samplesPerChannel": totalSamples,
+            "itemID": itemID.uuidString.lowercased(),
+        ]) else {
+            pendingOpeningAudioItemID = nil
+            failCurrent(reason: "opening_audio_transport_failed")
+            return
+        }
+        initialTurnValidation.observeInitialAudioSubmitted()
+        onEvent(.inputBootstrapSubmitted(
+            itemID: itemID,
+            durationMilliseconds: durationMilliseconds,
+            trailingSilenceMilliseconds: Double(
+                LiveVoiceOpeningAudioPolicy.trailingSilenceMilliseconds
+            ),
+            peakDBFS: peakDBFS,
+            maximumGainDB: maximumGainDB
+        ))
     }
 
     /// One opening frame grounds a user-initiated conversation without making
@@ -1531,6 +1607,116 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         return samples
     }
 
+    /// Returns nil on success or a bounded diagnostic reason on failure.
+    private func ensureLocalHelperRunning() -> String? {
+        if let process, process.isRunning, input != nil {
+            return nil
+        }
+        guard let helperURL = helperURL() else {
+            return "live_voice_helper_not_found"
+        }
+
+        let process = Process()
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.executableURL = helperURL
+        process.arguments = [
+            "--cwd", projectDirectory,
+            "--voice", voice.rawValue,
+            "--voice-mode", voiceMode.rawValue,
+        ]
+        if let audioOutputDeviceUID {
+            process.arguments?.append(contentsOf: ["--output-device-uid", audioOutputDeviceUID])
+        }
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        helperProcessGeneration &+= 1
+        helperReady = false
+        let processGeneration = helperProcessGeneration
+        outputBuffer.removeAll(keepingCapacity: true)
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let self else { return }
+            queue.async {
+                guard self.helperProcessGeneration == processGeneration,
+                      self.process != nil else { return }
+                self.consume(data)
+            }
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            _ = handle.availableData
+        }
+        process.terminationHandler = { [weak self] process in
+            guard let self else { return }
+            queue.async {
+                guard self.helperProcessGeneration == processGeneration,
+                      self.process === process,
+                      !self.stopped else { return }
+                let sessionWasStartingOrActive = self.active || self.gate.phase != .inactive
+                let threadID = self.activeThreadID
+                let personEntityID = self.activePersonEntityID
+                self.process = nil
+                self.input = nil
+                self.active = false
+                self.activeThreadID = nil
+                self.activePersonEntityID = nil
+                self.activeSessionCapability = nil
+                self.helperReady = false
+                self.resetSessionEphemera(keepingAudioCapacity: false)
+                if sessionWasStartingOrActive {
+                    self.gate.fail(at: DispatchTime.now().uptimeNanoseconds)
+                    self.onEvent(.failed(
+                        threadID: threadID,
+                        personEntityID: personEntityID,
+                        reason: "live_voice_helper_exited_\(process.terminationStatus)"
+                    ))
+                    self.scheduleHelperPrewarm()
+                } else {
+                    self.recordHelperPrewarmFailure(
+                        reason: "live_voice_helper_exited_\(process.terminationStatus)"
+                    )
+                }
+            }
+        }
+        do {
+            try process.run()
+        } catch {
+            return String(error.localizedDescription.prefix(192))
+        }
+        self.process = process
+        input = inputPipe.fileHandleForWriting
+        return nil
+    }
+
+    private func scheduleHelperPrewarm(afterMilliseconds: Int = 350) {
+        guard !stopped else { return }
+        helperPrewarmWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !stopped, gate.phase == .inactive else { return }
+            helperPrewarmWorkItem = nil
+            if let reason = ensureLocalHelperRunning() {
+                recordHelperPrewarmFailure(reason: reason)
+            }
+        }
+        helperPrewarmWorkItem = work
+        queue.asyncAfter(deadline: .now() + .milliseconds(afterMilliseconds), execute: work)
+    }
+
+    private func recordHelperPrewarmFailure(reason: String) {
+        guard !stopped else { return }
+        helperReady = false
+        helperPrewarmFailureCount += 1
+        onEvent(.localHelperUnavailable(reason: String(reason.prefix(192))))
+        let retryDelaysMilliseconds = [750, 1_500, 3_000, 6_000, 12_000]
+        guard helperPrewarmFailureCount <= retryDelaysMilliseconds.count else { return }
+        scheduleHelperPrewarm(
+            afterMilliseconds: retryDelaysMilliseconds[helperPrewarmFailureCount - 1]
+        )
+    }
+
     private func helperURL() -> URL? {
         let fileManager = FileManager.default
         if let override = ProcessInfo.processInfo.environment["SOMA_LIVE_VOICE_HELPER"],
@@ -1597,9 +1783,10 @@ func testAppServerLiveVoiceLauncher() -> String {
         case let .failed(_, _, reason):
             result.fail(reason)
             semaphore.signal()
-        case .launchRequested, .inputTransportStarted, .outputPlaybackReady,
+        case .localHelperPrepared, .localHelperUnavailable,
+             .launchRequested, .inputTransportStarted, .outputPlaybackReady,
              .audioPlayoutSourceSelected, .audioPlayoutStatus,
-             .inputBootstrapReplayed,
+             .inputBootstrapSubmitted, .inputBootstrapQueued, .inputBootstrapPlayed,
              .responseInterrupted, .interruptedAudioCleared, .proactiveOpeningTriggered,
              .proactiveOpeningExtraOutputSuppressed, .hermesReportOfferStarted, .hearingUser,
              .visualContextAttached, .visualContextRejected, .visualTurnBarrier,
