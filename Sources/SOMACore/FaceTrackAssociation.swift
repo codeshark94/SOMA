@@ -30,6 +30,22 @@ public enum FaceTrackAssociation {
         return min(max(0.60 * overlap + 0.28 * motionConsistency + 0.12 * scaleConsistency, 0), 1)
     }
 
+    /// Preserves one continuously visible face across camera-induced image
+    /// reprojection. This is intentionally valid only when the caller has
+    /// independently established that exactly one face was visible in both
+    /// observations; position alone is then not identity evidence, while a
+    /// sharp scale discontinuity still indicates a different observation.
+    public static func isPlausibleSingleVisibleContinuation(
+        previous: NormalizedRect,
+        current: NormalizedRect
+    ) -> Bool {
+        let previousArea = previous.width * previous.height
+        let currentArea = current.width * current.height
+        let largerArea = max(previousArea, currentArea)
+        guard largerArea > 0 else { return false }
+        return min(previousArea, currentArea) / largerArea >= 0.45
+    }
+
     private static func iou(_ lhs: NormalizedRect, _ rhs: NormalizedRect) -> Double {
         let interX = max(0, min(lhs.x + lhs.width, rhs.x + rhs.width) - max(lhs.x, rhs.x))
         let interY = max(0, min(lhs.y + lhs.height, rhs.y + rhs.height) - max(lhs.y, rhs.y))

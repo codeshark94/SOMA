@@ -13630,12 +13630,8 @@ private func run(_ options: Options) throws {
                     message: reason
                 ))
             case let .transcriptPartial(threadID, text):
-                if let threadID {
-                    l1LiveToolSupervisor.observeUserPartial(
-                        threadID: threadID,
-                        transcript: text
-                    )
-                }
+                _ = threadID
+                _ = text
             case let .transcriptFinalized(threadID, role, text):
                 if role == .user {
                     // A finalized user transcript is the first reliable proof

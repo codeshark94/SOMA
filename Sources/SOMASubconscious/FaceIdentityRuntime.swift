@@ -53,6 +53,7 @@ private struct FaceTrack: Sendable {
     var lastSeenNS: UInt64
     var lastValidatedNS: UInt64
     var lastCorrelatedNS: UInt64
+    var wasSoleVisibleFace: Bool
 }
 
 enum FaceIdentityRuntimeDecision: Sendable {
@@ -279,6 +280,7 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     private var faceTracks: [FaceTrack] = []
     private let continuityPolicy = FaceIdentityContinuityPolicy()
     private static let trackLossNS: UInt64 = 5_000_000_000
+    private static let singleFaceContinuationNS: UInt64 = 750_000_000
 
     init(
         modelURL: URL = FaceIdentityRuntime.defaultModelURL(),
@@ -308,7 +310,8 @@ final class FaceIdentityRuntime: @unchecked Sendable {
             minimumBestAlternativeMargin: 0.10,
             minimumObservationQuality: 0.52,
             confirmationsRequired: 3,
-            evidenceWindowMilliseconds: 1_000,
+            evidenceWindowMilliseconds: 3_000,
+            correlatedConfirmationsRequired: 6,
             // A face still correlated with a known identity (>= 0.55) is a known
             // candidate, never anonymous — anonymous is only for faces clearly
             // uncorrelated with every known person.
@@ -372,11 +375,13 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     private func process(_ item: WorkItem) {
         pruneFaceTracks(at: item.monotonicNS)
         var claimedTrackIndices = Set<Int>()
+        let hasSingleVisibleFace = item.alignments.count == 1
         for (index, alignment) in item.alignments.enumerated() {
             process(
                 pixelBuffer: item.pixelBuffer,
                 alignment: alignment,
                 isPrimaryFace: index == 0,
+                hasSingleVisibleFace: hasSingleVisibleFace,
                 at: item.monotonicNS,
                 claimedTrackIndices: &claimedTrackIndices
             )
@@ -387,21 +392,30 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         pixelBuffer: CVPixelBuffer,
         alignment: FaceAlignmentEvidence,
         isPrimaryFace: Bool,
+        hasSingleVisibleFace: Bool,
         at monotonicNS: UInt64,
         claimedTrackIndices: inout Set<Int>
     ) {
         let started = DispatchTime.now().uptimeNanoseconds
         let existingTrackIndex = faceTrackIndex(
             matching: alignment.rect,
-            excluding: claimedTrackIndices
+            excluding: claimedTrackIndices,
+            allowSingleVisibleContinuation: hasSingleVisibleFace,
+            at: monotonicNS
         )
         let trackIndex: Int
         if let existingTrackIndex {
             trackIndex = existingTrackIndex
             faceTracks[trackIndex].lastSeenNS = monotonicNS
             faceTracks[trackIndex].rect = alignment.rect
+            faceTracks[trackIndex].wasSoleVisibleFace = hasSingleVisibleFace
         } else {
-            trackIndex = appendFaceTrack(rect: alignment.rect, identity: nil, at: monotonicNS)
+            trackIndex = appendFaceTrack(
+                rect: alignment.rect,
+                identity: nil,
+                wasSoleVisibleFace: hasSingleVisibleFace,
+                at: monotonicNS
+            )
         }
         claimedTrackIndices.insert(trackIndex)
 
@@ -558,7 +572,9 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     /// can be assigned to only one detected face in a frame.
     private func faceTrackIndex(
         matching rect: SOMACore.NormalizedRect,
-        excluding claimedTrackIndices: Set<Int>
+        excluding claimedTrackIndices: Set<Int>,
+        allowSingleVisibleContinuation: Bool,
+        at monotonicNS: UInt64
     ) -> Int? {
         var bestIndex: Int?
         var bestScore = -Double.infinity
@@ -572,7 +588,22 @@ final class FaceIdentityRuntime: @unchecked Sendable {
                 bestIndex = index
             }
         }
-        return bestIndex
+        if let bestIndex { return bestIndex }
+        guard allowSingleVisibleContinuation else { return nil }
+
+        return faceTracks.indices
+            .filter { index in
+                let track = faceTracks[index]
+                return !claimedTrackIndices.contains(index)
+                    && monotonicNS >= track.lastSeenNS
+                    && monotonicNS - track.lastSeenNS <= Self.singleFaceContinuationNS
+                    && track.wasSoleVisibleFace
+                    && FaceTrackAssociation.isPlausibleSingleVisibleContinuation(
+                        previous: track.rect,
+                        current: rect
+                    )
+            }
+            .max { faceTracks[$0].lastSeenNS < faceTracks[$1].lastSeenNS }
     }
 
     /// Adds a geometric track before recognition so all identity evidence is
@@ -582,6 +613,7 @@ final class FaceIdentityRuntime: @unchecked Sendable {
     private func appendFaceTrack(
         rect: SOMACore.NormalizedRect,
         identity: FaceIdentityRuntimeDecision?,
+        wasSoleVisibleFace: Bool,
         at monotonicNS: UInt64
     ) -> Int {
         faceTracks.append(FaceTrack(
@@ -590,7 +622,8 @@ final class FaceIdentityRuntime: @unchecked Sendable {
             identity: identity,
             lastSeenNS: monotonicNS,
             lastValidatedNS: monotonicNS,
-            lastCorrelatedNS: identity == nil ? 0 : monotonicNS
+            lastCorrelatedNS: identity == nil ? 0 : monotonicNS,
+            wasSoleVisibleFace: wasSoleVisibleFace
         ))
         return faceTracks.index(before: faceTracks.endIndex)
     }

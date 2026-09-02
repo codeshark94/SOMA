@@ -479,6 +479,12 @@ public struct FaceIdentityCalibration: Equatable, Sendable {
     public let minimumObservationQuality: Double
     public let confirmationsRequired: Int
     public let evidenceWindowMilliseconds: UInt64
+    /// Repeated, unambiguous correlations below the single-frame acceptance
+    /// threshold may establish an enrolled identity, but require substantially
+    /// more observations than strong matches. This lets a stable face track
+    /// accumulate evidence across viewpoint and lighting changes without
+    /// turning one weak resemblance into identity authority.
+    public let correlatedConfirmationsRequired: Int
     /// A face whose best match to a known identity is at or above this floor is
     /// treated as a known candidate (never anonymous), even when it is below
     /// `minimumCosineSimilarity`. Anonymous registration is reserved for faces
@@ -491,6 +497,7 @@ public struct FaceIdentityCalibration: Equatable, Sendable {
         minimumObservationQuality: Double,
         confirmationsRequired: Int = 3,
         evidenceWindowMilliseconds: UInt64 = 700,
+        correlatedConfirmationsRequired: Int = 6,
         minimumCorrelationFloor: Double = 0.55
     ) throws {
         guard minimumCosineSimilarity.isFinite,
@@ -501,6 +508,7 @@ public struct FaceIdentityCalibration: Equatable, Sendable {
               (0 ... 1).contains(minimumObservationQuality),
               (2 ... 12).contains(confirmationsRequired),
               evidenceWindowMilliseconds > 0,
+              (confirmationsRequired ... 32).contains(correlatedConfirmationsRequired),
               minimumCorrelationFloor.isFinite,
               (-1 ... 1).contains(minimumCorrelationFloor) else {
             throw FaceIdentityError.invalidCalibration
@@ -510,6 +518,7 @@ public struct FaceIdentityCalibration: Equatable, Sendable {
         self.minimumObservationQuality = minimumObservationQuality
         self.confirmationsRequired = confirmationsRequired
         self.evidenceWindowMilliseconds = evidenceWindowMilliseconds
+        self.correlatedConfirmationsRequired = correlatedConfirmationsRequired
         self.minimumCorrelationFloor = minimumCorrelationFloor
     }
 }
@@ -537,7 +546,13 @@ public enum FaceIdentityDecision: Equatable, Sendable {
 /// time, preventing one camera frame from assigning person memory.
 public struct FaceIdentityMatcher: Sendable {
     public let calibration: FaceIdentityCalibration
-    private var evidenceByTrack: [UUID: [(entityID: UUID, observedNS: UInt64)]] = [:]
+    private struct Evidence: Sendable {
+        let entityID: UUID
+        let observedNS: UInt64
+        let strong: Bool
+    }
+
+    private var evidenceByTrack: [UUID: [Evidence]] = [:]
     private static let untrackedEvidenceID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
 
     public init(calibration: FaceIdentityCalibration) {
@@ -581,28 +596,33 @@ public struct FaceIdentityMatcher: Sendable {
         guard let best = scores.first else { return .unknown }
         let alternative = scores.dropFirst().first?.1 ?? -1
         let margin = best.1 - alternative
-        guard best.1 >= calibration.minimumCosineSimilarity,
-              margin >= calibration.minimumBestAlternativeMargin else {
+        let marginAccepted = margin >= calibration.minimumBestAlternativeMargin
+        let strong = best.1 >= calibration.minimumCosineSimilarity && marginAccepted
+        if !strong {
             // Still correlated with a known identity (above the floor): treat it
             // as a known candidate rather than falling through to anonymous.
             // Anonymous is reserved for faces clearly uncorrelated with knowns.
             guard best.1 >= calibration.minimumCorrelationFloor else {
-                evidenceByTrack.removeValue(forKey: evidenceTrackID)
                 return .unknown
             }
-            if evidenceByTrack[evidenceTrackID]?.last?.entityID != best.0 {
-                evidenceByTrack.removeValue(forKey: evidenceTrackID)
+            guard marginAccepted else {
+                return .candidate(
+                    entityID: best.0,
+                    similarity: best.1,
+                    alternativeMargin: margin
+                )
             }
-            return .candidate(entityID: best.0, similarity: best.1, alternativeMargin: margin)
         }
         var evidence = evidenceByTrack[evidenceTrackID] ?? []
         if let previous = evidence.last, previous.entityID != best.0 {
             evidence.removeAll(keepingCapacity: true)
         }
-        evidence.append((best.0, monotonicNS))
+        evidence.append(Evidence(entityID: best.0, observedNS: monotonicNS, strong: strong))
         evidenceByTrack[evidenceTrackID] = evidence
-        let confirmations = evidence.count { $0.entityID == best.0 }
-        guard confirmations >= calibration.confirmationsRequired else {
+        let confirmations = evidence.count
+        let strongConfirmations = evidence.count(where: { $0.strong })
+        guard strongConfirmations >= calibration.confirmationsRequired
+                || confirmations >= calibration.correlatedConfirmationsRequired else {
             return .candidate(entityID: best.0, similarity: best.1, alternativeMargin: margin)
         }
         return .recognized(

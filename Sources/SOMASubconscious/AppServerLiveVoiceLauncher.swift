@@ -840,7 +840,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             guard !assistantOutputStartedForTurn else { return false }
             let instruction = """
             SOMA_L1_TOOL_ADVISORY
-            This is private current-turn control context, not participant speech and not text to recite. L1 independently determined that the latest participant turn requires the SOMA MCP tool `\(tool)` before a grounded answer. The grounding phrase was: "\(quote)". If this exact tool has not already completed for the current turn, call it now, silently, and use its actual result before speaking. Do not substitute a verbal promise, inferred result, or another tool. If the call fails or is unavailable, report that concrete failure briefly. This advisory expires with the current participant turn.
+            This is private current-turn control context, not participant speech and not text to recite. L1 independently determined that the latest participant turn requires the SOMA MCP tool `\(tool)` before a grounded answer. The grounding phrase was: "\(quote)". Hand this exact participant turn to backing Codex and require it to call `\(tool)` silently before composing the sole final response. The realtime presentation model must emit no acknowledgement or parallel answer. Do not substitute a verbal promise, inferred result, or another tool. If the call fails or is unavailable, the sole final response must report that concrete failure briefly. This advisory expires with the current participant turn.
             """
             return send([
                 "type": "append_instruction",

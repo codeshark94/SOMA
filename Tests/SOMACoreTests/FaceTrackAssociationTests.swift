@@ -23,6 +23,26 @@ final class FaceTrackAssociationTests: XCTestCase {
         XCTAssertNil(FaceTrackAssociation.score(previous: previous, current: current))
     }
 
+    func testSingleVisibleFaceCanContinueAcrossCameraReprojection() {
+        let previous = NormalizedRect(x: 0.05, y: 0.20, width: 0.18, height: 0.28)
+        let current = NormalizedRect(x: 0.75, y: 0.20, width: 0.18, height: 0.28)
+
+        XCTAssertTrue(FaceTrackAssociation.isPlausibleSingleVisibleContinuation(
+            previous: previous,
+            current: current
+        ))
+    }
+
+    func testSingleVisibleContinuationRejectsSharpScaleDiscontinuity() {
+        let previous = NormalizedRect(x: 0.05, y: 0.20, width: 0.25, height: 0.35)
+        let current = NormalizedRect(x: 0.75, y: 0.20, width: 0.08, height: 0.10)
+
+        XCTAssertFalse(FaceTrackAssociation.isPlausibleSingleVisibleContinuation(
+            previous: previous,
+            current: current
+        ))
+    }
+
     func testAnonymousIdentityAlwaysRequiresFreshRecognition() {
         let policy = FaceIdentityContinuityPolicy()
         XCTAssertEqual(

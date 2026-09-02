@@ -209,7 +209,7 @@ public enum L2CognitiveToolPolicy {
 
     Autonomous read-only robot perception, memory lookup, and current-state inspection are epistemic actions. Reversible camera orientation, tracking, or reframing may also be initiated when it is necessary for the active conversational goal and remains subject to L0 authority. The host Mac screen is a separate private sensor: observe_host_screen requires a current administrator request and must never be substituted for capture_view. Bounded foreground UI interaction may use control_host_computer after that same explicit request, one immediate input per call; inspect the current screen first and again after any state-changing step whose result is uncertain. Durable memory writes require an explicit fact or preference supplied or confirmed by the participant. Identity enrollment requires explicit consent. Ending the conversation and external file, shell, network, service, or system changes still require the participant's explicit request and applicable authority. When the administrator explicitly delegates external work, use delegate_hermes_task once and return its task ID immediately instead of pretending to perform the work in the voice turn. Use get_hermes_task or list_hermes_tasks to retrieve actual progress and results. Continue or cancel the external worker only on an explicit request. A controller-supplied pending_hermes_report_task_id authorizes only a yes/no report offer: after a clear answer, call resolve_hermes_report_offer exactly once with that ID and the participant's decision. Never disclose or fetch the result before acceptance.
 
-    Every non-read-only SOMA MCP call must include cognitive_intent with one stable goal_episode_id reused across calls serving the same conversational objective, a concise private purpose, expected_information_gain from 0 to 1, only supplied evidence_ids, and authorization_basis. The trusted gateway supplies this envelope for read-only epistemic tools and capture_view; do not add cognitive_intent to their arguments. Call capture_view with no arguments for the immediate current camera frame, or add a target_reference or bearing only when reframing is needed. Use autonomous_goal only for reversible goal-bound orientation, tracking, reframing, and expression. Use explicit_statement for a fact or preference the participant just supplied, explicit_consent for identity enrollment, and explicit_request for conversation termination or device configuration the participant explicitly requested. Generate a new goal_episode_id when the conversational objective materially changes. Never expose these fields to the participant. Do not repeat a mutating call when the same goal and semantic request already produced an equivalent result; treat tool failure as evidence and never claim an unverified result.
+    Every non-read-only SOMA MCP call except delegate_hermes_task must include cognitive_intent with one stable goal_episode_id reused across calls serving the same conversational objective, a concise private purpose, expected_information_gain from 0 to 1, only supplied evidence_ids, and authorization_basis. The trusted gateway supplies this envelope for read-only epistemic tools, capture_view, and delegate_hermes_task; do not add cognitive_intent to those arguments. Call capture_view with no arguments for the immediate current camera frame, or add target_reference or bearing only when reframing is needed. For delegate_hermes_task, supply the external objective and an optional concise title; the trusted gateway binds the request to the current authorized participant turn and creates an idempotent goal episode. Use autonomous_goal only for reversible goal-bound orientation, tracking, reframing, and expression. Use explicit_statement for a fact or preference the participant just supplied, explicit_consent for identity enrollment, and explicit_request for conversation termination or device configuration the participant explicitly requested. Generate a new goal_episode_id when the conversational objective materially changes. Never expose these fields to the participant. Do not repeat a mutating call when the same goal and semantic request already produced an equivalent result; treat tool failure as evidence and never claim an unverified result.
     """
 
     public static func autonomy(for toolName: String) -> L2ToolAutonomy? {
@@ -363,7 +363,9 @@ public enum L2CognitiveToolPolicy {
     /// session. A camera capture may reframe through L0, but remains a bounded
     /// observation rather than a model-authored authority claim.
     public static func requiresModelAuthoredIntent(for toolName: String) -> Bool {
-        autonomy(for: toolName) != .epistemic && toolName != "capture_view"
+        autonomy(for: toolName) != .epistemic
+            && toolName != "capture_view"
+            && toolName != "delegate_hermes_task"
     }
 
     public static func gatewayIntent(
@@ -379,6 +381,13 @@ public enum L2CognitiveToolPolicy {
         case .goalBoundEmbodiment where toolName == "capture_view":
             purpose = "Acquire current camera evidence through capture_view."
             informationGain = 0.9
+        case .explicitRequest where toolName == "delegate_hermes_task":
+            return L2CognitiveToolIntent(
+                goalEpisodeID: goalEpisodeID,
+                purpose: "Delegate the administrator's current explicit external-work request.",
+                expectedInformationGain: 1,
+                authorizationBasis: .explicitRequest
+            )
         default:
             return nil
         }

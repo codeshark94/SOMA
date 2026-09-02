@@ -81,7 +81,7 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_robot_body_state"))
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_activity_overview"))
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "capture_view"))
-        XCTAssertTrue(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "delegate_hermes_task"))
+        XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "delegate_hermes_task"))
         XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "get_robot_body_state"))
         XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "capture_view"))
         XCTAssertTrue(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "set_person_fact"))
@@ -93,7 +93,9 @@ final class HermesAgentTaskTests: XCTestCase {
         let captureGateway = L2CognitiveToolPolicy.gatewayIntent(for: "capture_view")
         XCTAssertEqual(captureGateway?.authorizationBasis, .autonomousGoal)
         XCTAssertEqual(captureGateway?.expectedInformationGain, 0.9)
-        XCTAssertNil(L2CognitiveToolPolicy.gatewayIntent(for: "delegate_hermes_task"))
+        let delegationGateway = L2CognitiveToolPolicy.gatewayIntent(for: "delegate_hermes_task")
+        XCTAssertEqual(delegationGateway?.authorizationBasis, .explicitRequest)
+        XCTAssertEqual(delegationGateway?.expectedInformationGain, 1)
     }
 
     func testTaskRoutingSeparatesHostWorkFromRobotEmbodiment() {

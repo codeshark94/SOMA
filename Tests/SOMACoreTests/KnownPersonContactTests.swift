@@ -143,6 +143,116 @@ final class KnownPersonContactTests: XCTestCase {
         XCTAssertTrue(policy.mayBridgeMismatch(lastCorrelatedNS: lastConfirmedNS, at: 1_800_000_000))
     }
 
+    func testRepeatedCorrelatedObservationsCanEstablishKnownIdentity() throws {
+        let person = UUID()
+        let known = try profile(person, [[1, 0, 0, 0], [0.99, 0.01, 0, 0]])
+        var matcher = FaceIdentityMatcher(calibration: try .init(
+            minimumCosineSimilarity: 0.75,
+            minimumBestAlternativeMargin: 0.10,
+            minimumObservationQuality: 0.60,
+            confirmationsRequired: 3,
+            evidenceWindowMilliseconds: 3_000,
+            correlatedConfirmationsRequired: 8,
+            minimumCorrelationFloor: 0.55
+        ))
+        let correlated = try embedding([0.60, 0.80, 0, 0])
+        let trackID = UUID()
+
+        for index in 0..<7 {
+            let result = matcher.match(
+                correlated,
+                profiles: [known],
+                evidenceTrackID: trackID,
+                at: UInt64(index) * 250_000_000
+            )
+            XCTAssertFalse(result.isRecognized)
+        }
+        let recognized = matcher.match(
+            correlated,
+            profiles: [known],
+            evidenceTrackID: trackID,
+            at: 1_750_000_000
+        )
+        XCTAssertEqual(recognized.entityID, person)
+        XCTAssertTrue(recognized.isRecognized)
+    }
+
+    func testAmbiguousRepeatedObservationsNeverAccumulateIdentityAuthority() throws {
+        let first = UUID()
+        let second = UUID()
+        let profiles = [
+            try profile(first, [[1, 0, 0, 0], [0.99, 0.01, 0, 0]]),
+            try profile(second, [[0.98, 0.20, 0, 0], [0.97, 0.24, 0, 0]]),
+        ]
+        var matcher = FaceIdentityMatcher(calibration: try .init(
+            minimumCosineSimilarity: 0.75,
+            minimumBestAlternativeMargin: 0.10,
+            minimumObservationQuality: 0.60,
+            confirmationsRequired: 3,
+            evidenceWindowMilliseconds: 3_000,
+            correlatedConfirmationsRequired: 8,
+            minimumCorrelationFloor: 0.55
+        ))
+        let ambiguous = try embedding([0.99, 0.10, 0, 0])
+        let trackID = UUID()
+
+        for index in 0..<12 {
+            let result = matcher.match(
+                ambiguous,
+                profiles: profiles,
+                evidenceTrackID: trackID,
+                at: UInt64(index) * 200_000_000
+            )
+            XCTAssertFalse(result.isRecognized)
+        }
+    }
+
+    func testUninformativeFrameDoesNotEraseCorrelatedIdentityEvidence() throws {
+        let person = UUID()
+        let known = try profile(person, [[1, 0, 0, 0], [0.99, 0.01, 0, 0]])
+        var matcher = FaceIdentityMatcher(calibration: try .init(
+            minimumCosineSimilarity: 0.75,
+            minimumBestAlternativeMargin: 0.10,
+            minimumObservationQuality: 0.60,
+            confirmationsRequired: 3,
+            evidenceWindowMilliseconds: 3_000,
+            correlatedConfirmationsRequired: 6,
+            minimumCorrelationFloor: 0.55
+        ))
+        let correlated = try embedding([0.60, 0.80, 0, 0])
+        let uninformative = try embedding([0, 1, 0, 0])
+        let trackID = UUID()
+
+        for index in 0..<3 {
+            XCTAssertFalse(matcher.match(
+                correlated,
+                profiles: [known],
+                evidenceTrackID: trackID,
+                at: UInt64(index) * 250_000_000
+            ).isRecognized)
+        }
+        XCTAssertFalse(matcher.match(
+            uninformative,
+            profiles: [known],
+            evidenceTrackID: trackID,
+            at: 800_000_000
+        ).isRecognized)
+        for index in 3..<5 {
+            XCTAssertFalse(matcher.match(
+                correlated,
+                profiles: [known],
+                evidenceTrackID: trackID,
+                at: UInt64(index) * 250_000_000 + 200_000_000
+            ).isRecognized)
+        }
+        XCTAssertTrue(matcher.match(
+            correlated,
+            profiles: [known],
+            evidenceTrackID: trackID,
+            at: 1_500_000_000
+        ).isRecognized)
+    }
+
     func testUnknownFacesUseStablePerInstallOpaqueHandlesAfterConfirmation() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("soma-anonymous-face-\(UUID().uuidString)", isDirectory: true)

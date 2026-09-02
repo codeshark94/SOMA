@@ -33,8 +33,6 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
     private var currentTurnArchived = false
     private var successfulTools = Set<String>()
     private var pendingAdvice: PendingAdvice?
-    private var speculativeAdvice: L1LiveToolAdvice?
-    private var partialDebounce: DispatchWorkItem?
     private var inferenceInFlight = false
     private var generation: UInt64 = 0
     private var stopped = false
@@ -49,7 +47,7 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
         self.onAdvice = onAdvice
         onHealth(
             "configured",
-            "backend=primary_l1_31b; protocol=ollama_native_tool_calls; scheduling=live_tool_before_executive_event_periodic; execution=advisory_only_l2_owned"
+            "backend=primary_l1_31b; protocol=ollama_native_tool_calls; input=finalized_participant_turn_only; scheduling=live_tool_before_executive_event_periodic; execution=advisory_only_l2_owned"
         )
     }
 
@@ -77,75 +75,9 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
                   activeThreadID == threadID else { return }
             let normalized = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalized.isEmpty else { return }
-            partialDebounce?.cancel()
-            partialDebounce = nil
             let finalTranscript = String(normalized.prefix(4_096))
-            if currentTurnID == nil || currentTurnFinalized {
-                beginTurn(transcript: finalTranscript, finalized: true)
-                submitCurrentTurn(generation: generation)
-                return
-            }
-            currentTurnFinalized = true
-            if currentTranscript != finalTranscript {
-                speculativeAdvice = nil
-                currentTranscript = finalTranscript
-                archiveCurrentTurnIfNeeded()
-                // A deterministic current-state route must not wait behind a
-                // speculative model call launched from an incomplete partial.
-                // Invalidate that result and classify the authoritative final
-                // transcript immediately.
-                generation &+= 1
-                inferenceInFlight = false
-                submitCurrentTurn(generation: generation)
-                return
-            }
-            archiveCurrentTurnIfNeeded()
-            if let advice = speculativeAdvice {
-                speculativeAdvice = nil
-                apply(advice)
-            } else if !inferenceInFlight {
-                generation &+= 1
-                submitCurrentTurn(generation: generation)
-            }
-        }
-    }
-
-    /// Starts speculative L1 inference while the participant is still
-    /// speaking. Advice is never delivered from a partial transcript; it is
-    /// retained only when the finalized transcript exactly matches the last
-    /// accumulated partial. A changed final transcript is rerun once after the
-    /// existing request finishes so streaming deltas cannot flood the model.
-    func observeUserPartial(threadID: String, transcript: String) {
-        queue.async { [weak self] in
-            guard let self, !stopped, mcpAvailable,
-                  activeThreadID == threadID else { return }
-            let partial = String(
-                transcript.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_096)
-            )
-            guard partial.count >= 2 else { return }
-            if currentTurnID == nil || currentTurnFinalized {
-                beginTurn(transcript: partial, finalized: false)
-            } else if currentTranscript != partial {
-                speculativeAdvice = nil
-                currentTranscript = partial
-            }
-            // The shared L1 transport is single-flight. Keep at most one
-            // speculative request for a spoken turn and let a changed final
-            // transcript supersede it after completion.
-            guard !inferenceInFlight else { return }
-            partialDebounce?.cancel()
-            let expectedTurnID = currentTurnID
-            let expectedTranscript = currentTranscript
-            let work = DispatchWorkItem { [weak self] in
-                guard let self, !stopped,
-                      !currentTurnFinalized,
-                      currentTurnID == expectedTurnID,
-                      currentTranscript == expectedTranscript else { return }
-                generation &+= 1
-                submitCurrentTurn(generation: generation)
-            }
-            partialDebounce = work
-            queue.asyncAfter(deadline: .now() + .milliseconds(180), execute: work)
+            beginTurn(transcript: finalTranscript)
+            submitCurrentTurn(generation: generation)
         }
     }
 
@@ -210,13 +142,8 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
         )
         if let advice = L1LiveEpistemicReflexRouter.route(request) {
             let tool = advice.toolName ?? "none"
-            if currentTurnFinalized {
-                onHealth("reflex_route", "turn=\(turnID.uuidString.lowercased()); tool=\(tool); finalized=true")
-                apply(advice, latencyMS: 0)
-            } else {
-                speculativeAdvice = advice
-                onHealth("reflex_route", "turn=\(turnID.uuidString.lowercased()); tool=\(tool); finalized=false")
-            }
+            onHealth("reflex_route", "turn=\(turnID.uuidString.lowercased()); tool=\(tool); finalized=true")
+            apply(advice, latencyMS: 0)
             return
         }
         inferenceInFlight = true
@@ -248,11 +175,6 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
                     }
                     return
                 }
-                if !currentTurnFinalized {
-                    speculativeAdvice = advice
-                    onHealth("speculative_ready", "turn=\(turnID.uuidString.lowercased()); action=\(advice.action.rawValue); latency_ms=\(String(format: "%.1f", latencyMS))")
-                    return
-                }
                 apply(advice, latencyMS: latencyMS)
             }
         }
@@ -265,19 +187,16 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
         }
     }
 
-    private func beginTurn(transcript: String, finalized: Bool) {
+    private func beginTurn(transcript: String) {
         generation &+= 1
         inferenceInFlight = false
-        partialDebounce?.cancel()
-        partialDebounce = nil
         currentTurnID = UUID()
         currentTranscript = transcript
-        currentTurnFinalized = finalized
+        currentTurnFinalized = true
         currentTurnArchived = false
         successfulTools.removeAll(keepingCapacity: true)
         pendingAdvice = nil
-        speculativeAdvice = nil
-        if finalized { archiveCurrentTurnIfNeeded() }
+        archiveCurrentTurnIfNeeded()
     }
 
     private func archiveCurrentTurnIfNeeded() {
@@ -309,15 +228,12 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
     }
 
     private func resetTurn() {
-        partialDebounce?.cancel()
-        partialDebounce = nil
         currentTurnID = nil
         currentTranscript = ""
         currentTurnFinalized = false
         currentTurnArchived = false
         successfulTools.removeAll(keepingCapacity: false)
         pendingAdvice = nil
-        speculativeAdvice = nil
     }
 
     private func armFulfillmentCheck(for expected: PendingAdvice) {

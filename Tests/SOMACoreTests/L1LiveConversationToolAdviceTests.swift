@@ -207,6 +207,17 @@ import Testing
         #expect(advice.toolName == nil)
     }
 
+    @Test func HermesDelegationUsesTrustedGatewayIntentEnvelope() throws {
+        #expect(!L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "delegate_hermes_task"))
+        let goalID = UUID()
+        let intent = try #require(L2CognitiveToolPolicy.gatewayIntent(
+            for: "delegate_hermes_task",
+            goalEpisodeID: goalID
+        ))
+        #expect(intent.goalEpisodeID == goalID)
+        #expect(intent.authorizationBasis == .explicitRequest)
+    }
+
     @Test func rejectsMultipleNativeToolCalls() {
         let request = makeRequest(transcript: "상태랑 카메라를 확인해")
         let calls: [[String: Any]] = [
