@@ -395,7 +395,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var assistantOutputEndWorkItem: DispatchWorkItem?
     private var embodimentMCPVerificationTimeoutWorkItem: DispatchWorkItem?
     private var pendingTransportClosureReason: String?
-    private var assistantSpeechObservedInCurrentTurn = false
+    private var assistantSpeechObservedSequences: Set<UInt64> = []
     private var reportedEmbodimentMCPItemIDs: Set<String> = []
     private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
@@ -410,6 +410,14 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var latestParticipantTranscript = ""
     private var lastWireParticipantTranscript: (text: String, turnID: String?, epoch: UInt64)?
     private var currentBackingTurnID: String?
+    private var backingTurnSequenceByID: [String: UInt64] = [:]
+    private var pendingBackingTurnHydrationIDs: Set<String> = []
+    private var handledBackingTurnIDs: Set<String> = []
+    private var handledBackingTurnOrder: [String] = []
+    private var managedResponseInFlightSequences: Set<UInt64> = []
+    private var managedResponseDeliveredSequences: Set<UInt64> = []
+    private var responseDeadlineWorkItem: DispatchWorkItem?
+    private var responseDeadlineSequence: UInt64?
     private var externalWorkResponseOwnerSequence: UInt64?
     private var observedRealtimeEventTypes: Set<String> = []
     private var finalizedTranscriptItemIDs: Set<String> = []
@@ -641,35 +649,21 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 }
             }
         case .acceptExternalWork:
-            guard let threadID,
-                  let text = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
+            guard let text = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !text.isEmpty,
                   text.utf8.count <= 8_192,
                   let taskID = command.taskID,
                   UUID(uuidString: taskID) != nil else { return }
             externalWorkResponseOwnerSequence = participantTurnSequence
             interruptBackingTurnIfOwnedByExternalWork()
-            connection.request(
-                method: "thread/realtime/appendSpeech",
-                params: [
-                    "threadId": threadID,
-                    "text": text,
-                ]
-            ) { [weak self] response in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    if response.value["error"] == nil {
-                        self.emitter.emit("hermes_delegation_ack_spoken", fields: [
-                            "task_id": taskID,
-                        ])
-                    } else {
-                        self.emitter.emit("hermes_delegation_ack_rejected", fields: [
-                            "task_id": taskID,
-                            "reason": AppServerConnection.responseMessage(response.value),
-                        ])
-                    }
-                }
-            }
+            appendManagedHandoffSpeech(
+                text,
+                sequence: participantTurnSequence,
+                kind: "external_work_ack",
+                taskID: taskID,
+                successEvent: "hermes_delegation_ack_spoken",
+                failureEvent: "hermes_delegation_ack_rejected"
+            )
         case .appendInstruction:
             guard let threadID,
                   let text = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1819,7 +1813,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                   let turnID = turn["id"] as? String,
                   !turnID.isEmpty else { return }
             currentBackingTurnID = turnID
-            emitter.emit("backing_turn_started", fields: ["turn_id": String(turnID.prefix(128))])
+            backingTurnSequenceByID[turnID] = participantTurnSequence
+            emitter.emit("backing_turn_started", fields: [
+                "turn_id": String(turnID.prefix(128)),
+                "turn_sequence": participantTurnSequence,
+            ])
             interruptBackingTurnIfOwnedByExternalWork()
         case "turn/completed":
             handleCompletedTurn(params)
@@ -1830,12 +1828,116 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
 
     private func handleCompletedTurn(_ params: [String: Any]) {
         guard let turn = params["turn"] as? [String: Any],
-              let items = turn["items"] as? [[String: Any]] else { return }
-        if let turnID = turn["id"] as? String, currentBackingTurnID == turnID {
+              let turnID = turn["id"] as? String,
+              !turnID.isEmpty else { return }
+        if currentBackingTurnID == turnID {
             currentBackingTurnID = nil
         }
-        let assistantSpeechObserved = assistantSpeechObservedInCurrentTurn
-        assistantSpeechObservedInCurrentTurn = false
+        let sequence = backingTurnSequenceByID.removeValue(forKey: turnID)
+            ?? participantTurnSequence
+        guard !handledBackingTurnIDs.contains(turnID),
+              !pendingBackingTurnHydrationIDs.contains(turnID) else { return }
+        let status = LiveVoiceBackingTurnStatus(protocolValue: turn["status"] as? String)
+        let errorMessage = (turn["error"] as? [String: Any])?["message"] as? String
+        let items = turn["items"] as? [[String: Any]] ?? []
+        let itemsView = turn["itemsView"] as? String
+        if itemsView != "full" && (itemsView != nil || items.isEmpty) {
+            hydrateCompletedTurn(
+                turnID: turnID,
+                sequence: sequence,
+                status: status,
+                errorMessage: errorMessage,
+                fallbackItems: items
+            )
+            return
+        }
+        processCompletedTurn(
+            turnID: turnID,
+            sequence: sequence,
+            status: status,
+            errorMessage: errorMessage,
+            items: items
+        )
+    }
+
+    private func hydrateCompletedTurn(
+        turnID: String,
+        sequence: UInt64,
+        status: LiveVoiceBackingTurnStatus,
+        errorMessage: String?,
+        fallbackItems: [[String: Any]]
+    ) {
+        guard let threadID else {
+            processCompletedTurn(
+                turnID: turnID,
+                sequence: sequence,
+                status: status,
+                errorMessage: errorMessage,
+                items: fallbackItems
+            )
+            return
+        }
+        pendingBackingTurnHydrationIDs.insert(turnID)
+        let fallback = JSONDictionary(value: ["items": fallbackItems])
+        connection.request(
+            method: "thread/items/list",
+            params: [
+                "threadId": threadID,
+                "turnId": turnID,
+                "limit": 200,
+                "sortDirection": "asc",
+            ],
+            timeoutMilliseconds: 2_000
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.pendingBackingTurnHydrationIDs.remove(turnID)
+                let result = response.value["result"] as? [String: Any]
+                let entries = result?["data"] as? [[String: Any]] ?? []
+                let hydratedItems = entries.compactMap { $0["item"] as? [String: Any] }
+                self.emitter.emit("backing_turn_hydrated", fields: [
+                    "turn_id": String(turnID.prefix(128)),
+                    "turn_sequence": sequence,
+                    "item_count": hydratedItems.count,
+                    "fallback_used": hydratedItems.isEmpty,
+                ])
+                let fallbackItems = fallback.value["items"] as? [[String: Any]] ?? []
+                self.processCompletedTurn(
+                    turnID: turnID,
+                    sequence: sequence,
+                    status: status,
+                    errorMessage: errorMessage,
+                    items: hydratedItems.isEmpty ? fallbackItems : hydratedItems
+                )
+            }
+        }
+    }
+
+    private func processCompletedTurn(
+        turnID: String,
+        sequence: UInt64,
+        status: LiveVoiceBackingTurnStatus,
+        errorMessage: String?,
+        items: [[String: Any]]
+    ) {
+        guard handledBackingTurnIDs.insert(turnID).inserted else { return }
+        handledBackingTurnOrder.append(turnID)
+        if handledBackingTurnOrder.count > 256 {
+            for expired in handledBackingTurnOrder.prefix(64) {
+                handledBackingTurnIDs.remove(expired)
+            }
+            handledBackingTurnOrder.removeFirst(64)
+        }
+        guard sequence == participantTurnSequence else {
+            emitter.emit("backing_turn_response_held", fields: [
+                "turn_id": String(turnID.prefix(128)),
+                "turn_sequence": sequence,
+                "current_sequence": participantTurnSequence,
+                "reason": "participant_turn_advanced",
+            ])
+            return
+        }
+        let assistantSpeechObserved = assistantSpeechObservedSequences.contains(sequence)
         var successfulHermesDelegation = false
         var authorizationFailure: MCPToolCompletionDiagnostic?
         for item in items where item["type"] as? String == "mcpToolCall" {
@@ -1848,9 +1950,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 emitDiagnostic: true
             ) || successfulHermesDelegation
         }
-        let agentMessage = items.reversed().first { item in
-            item["type"] as? String == "agentMessage"
-        }?["text"] as? String
+        let agentMessages = items.filter { $0["type"] as? String == "agentMessage" }
+        let agentMessage = agentMessages.reversed().first { item in
+            item["phase"] as? String == "final_answer"
+        }?["text"] as? String ?? agentMessages.last?["text"] as? String
         let normalizedAgentMessage = agentMessage?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let managedResponse = normalizedAgentMessage?.isEmpty == false
@@ -1858,14 +1961,34 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             : authorizationFailure.map { _ in
                 MCPToolAuthorizationFailureResponse.phrase(languageTag: preferredLanguageTag)
             }
+        let workItemTypes: Set<String> = [
+            "mcpToolCall", "commandExecution", "fileChange", "dynamicToolCall",
+            "functionCallOutput", "collabAgentToolCall",
+        ]
+        let containsAuthoritativeBackingWork = items.contains {
+            guard let type = $0["type"] as? String else { return false }
+            return workItemTypes.contains(type)
+        }
+        let itemFailed = items.contains { item in
+            guard let itemStatus = item["status"] as? String else { return false }
+            return itemStatus == "failed" || itemStatus == "declined"
+        }
+        let effectiveStatus: LiveVoiceBackingTurnStatus =
+            status == .completed && itemFailed ? .failed : status
         switch LiveVoiceHandoffResponsePolicy.disposition(
             hasAgentMessage: managedResponse?.isEmpty == false,
             realtimeResponseSpoken: assistantSpeechObserved,
-            successfulExternalDelegation: successfulHermesDelegation
+            successfulExternalDelegation: successfulHermesDelegation,
+            containsAuthoritativeBackingWork: containsAuthoritativeBackingWork,
+            turnStatus: effectiveStatus
         ) {
         case .appendFinalSpeech:
             if let managedResponse {
-                appendManagedHandoffSpeech(managedResponse)
+                appendManagedHandoffSpeech(
+                    managedResponse,
+                    sequence: sequence,
+                    kind: authorizationFailure == nil ? "backing_final" : "authorization_denial"
+                )
                 if authorizationFailure != nil, normalizedAgentMessage?.isEmpty != false {
                     emitter.emit("managed_authorization_denial_spoken", fields: [
                         "tool": authorizationFailure?.tool ?? "unknown",
@@ -1873,12 +1996,34 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 }
             }
         case .retainExistingRealtimeResponse:
+            cancelResponseDeadline(for: sequence)
             emitter.emit("managed_handoff_response_held", fields: [
                 "reason": "realtime_response_already_spoken",
+                "turn_sequence": sequence,
             ])
-        case .externalDelegationOwnsResponse, .noResponse:
-            break
+        case .externalDelegationOwnsResponse:
+            cancelResponseDeadline(for: sequence)
+        case let .appendRecoverySpeech(kind):
+            let recovery = authorizationFailure.map { _ in
+                MCPToolAuthorizationFailureResponse.phrase(languageTag: preferredLanguageTag)
+            } ?? LiveVoiceTurnRecoveryResponse.phrase(
+                kind: kind,
+                languageTag: preferredLanguageTag
+            )
+            appendManagedHandoffSpeech(
+                recovery,
+                sequence: sequence,
+                kind: "recovery_\(String(describing: kind))"
+            )
         }
+        emitter.emit("backing_turn_completed", fields: [
+            "turn_id": String(turnID.prefix(128)),
+            "turn_sequence": sequence,
+            "status": effectiveStatus.rawValue,
+            "item_count": items.count,
+            "authoritative_work": containsAuthoritativeBackingWork,
+            "error": String((errorMessage ?? "").prefix(256)),
+        ])
     }
 
     private func interruptBackingTurnIfOwnedByExternalWork() {
@@ -1907,27 +2052,147 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
     }
 
-    private func appendManagedHandoffSpeech(_ text: String) {
-        guard let threadID,
-              !text.isEmpty else { return }
+    private func appendManagedHandoffSpeech(
+        _ text: String,
+        sequence: UInt64,
+        kind: String,
+        attempt: Int = 0,
+        taskID: String? = nil,
+        successEvent: String = "managed_handoff_response_spoken",
+        failureEvent: String = "managed_handoff_response_rejected"
+    ) {
+        guard !text.isEmpty,
+              sequence == participantTurnSequence,
+              !managedResponseDeliveredSequences.contains(sequence) else { return }
+        guard let threadID else {
+            emitter.emit(failureEvent, fields: [
+                "reason": "live_voice_thread_unavailable",
+                "turn_sequence": sequence,
+                "kind": kind,
+            ])
+            fail(LiveVoiceError.appServerResponse("live_voice_thread_unavailable"))
+            return
+        }
+        if attempt == 0 {
+            guard managedResponseInFlightSequences.insert(sequence).inserted else { return }
+        }
         connection.request(
             method: "thread/realtime/appendSpeech",
             params: [
                 "threadId": threadID,
                 "text": String(text.prefix(8_192)),
-            ]
+            ],
+            timeoutMilliseconds: 2_000
         ) { [weak self] response in
             DispatchQueue.main.async {
                 guard let self else { return }
+                let taskFields: [String: Any] = taskID.map { ["task_id": $0] } ?? [:]
+                guard sequence == self.participantTurnSequence else {
+                    self.managedResponseInFlightSequences.remove(sequence)
+                    self.emitter.emit("managed_handoff_response_held", fields: [
+                        "turn_sequence": sequence,
+                        "kind": kind,
+                        "reason": "participant_turn_advanced",
+                    ])
+                    return
+                }
                 if response.value["error"] == nil {
-                    self.emitter.emit("managed_handoff_response_spoken")
-                } else {
-                    self.emitter.emit("managed_handoff_response_rejected", fields: [
+                    self.managedResponseInFlightSequences.remove(sequence)
+                    self.managedResponseDeliveredSequences.insert(sequence)
+                    self.cancelResponseDeadline(for: sequence)
+                    self.emitter.emit(successEvent, fields: taskFields.merging([
+                        "turn_sequence": sequence,
+                        "kind": kind,
+                        "attempt": attempt + 1,
+                    ]) { _, new in new })
+                } else if attempt == 0, sequence == self.participantTurnSequence {
+                    self.emitter.emit("managed_handoff_response_retrying", fields: [
+                        "turn_sequence": sequence,
+                        "kind": kind,
                         "reason": AppServerConnection.responseMessage(response.value),
                     ])
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                        self?.appendManagedHandoffSpeech(
+                            text,
+                            sequence: sequence,
+                            kind: kind,
+                            attempt: 1,
+                            taskID: taskID,
+                            successEvent: successEvent,
+                            failureEvent: failureEvent
+                        )
+                    }
+                } else {
+                    self.managedResponseInFlightSequences.remove(sequence)
+                    self.emitter.emit(failureEvent, fields: taskFields.merging([
+                        "reason": AppServerConnection.responseMessage(response.value),
+                        "turn_sequence": sequence,
+                        "kind": kind,
+                    ]) { _, new in new })
+                    self.fail(LiveVoiceError.appServerResponse(
+                        AppServerConnection.responseMessage(response.value)
+                    ))
                 }
             }
         }
+    }
+
+    private func armResponseDeadline(for sequence: UInt64) {
+        responseDeadlineWorkItem?.cancel()
+        responseDeadlineSequence = sequence
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.stopping,
+                  self.responseDeadlineSequence == sequence,
+                  self.participantTurnSequence == sequence,
+                  !self.assistantSpeechObservedSequences.contains(sequence),
+                  !self.managedResponseDeliveredSequences.contains(sequence),
+                  !self.managedResponseInFlightSequences.contains(sequence),
+                  self.externalWorkResponseOwnerSequence != sequence else { return }
+            self.responseDeadlineWorkItem = nil
+            self.responseDeadlineSequence = nil
+            self.emitter.emit("response_deadline_expired", fields: [
+                "turn_sequence": sequence,
+                "deadline_ms": 20_000,
+            ])
+            let recovery = LiveVoiceTurnRecoveryResponse.phrase(
+                kind: .timedOut,
+                languageTag: self.preferredLanguageTag
+            )
+            if let threadID = self.threadID,
+               let turnID = self.currentBackingTurnID,
+               self.backingTurnSequenceByID[turnID] == sequence {
+                self.currentBackingTurnID = nil
+                self.connection.request(
+                    method: "turn/interrupt",
+                    params: ["threadId": threadID, "turnId": turnID],
+                    timeoutMilliseconds: 1_500
+                ) { [weak self] _ in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self?.appendManagedHandoffSpeech(
+                            recovery,
+                            sequence: sequence,
+                            kind: "recovery_timedOut"
+                        )
+                    }
+                }
+            } else {
+                self.appendManagedHandoffSpeech(
+                    recovery,
+                    sequence: sequence,
+                    kind: "recovery_timedOut"
+                )
+            }
+        }
+        responseDeadlineWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: workItem)
+    }
+
+    private func cancelResponseDeadline(for sequence: UInt64) {
+        guard responseDeadlineSequence == sequence else { return }
+        responseDeadlineWorkItem?.cancel()
+        responseDeadlineWorkItem = nil
+        responseDeadlineSequence = nil
     }
 
     /// App Server emits tool completion before the enclosing turn completes.
@@ -2150,7 +2415,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
 
     private func observeInputSpeechStarted() {
         guard !inputSpeechInProgress else { return }
-        assistantSpeechObservedInCurrentTurn = false
         setCognitiveTurn(active: true)
         inputSpeechInProgress = true
         emitter.emit("input_speech_started")
@@ -2260,9 +2524,31 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
 
         if role == "user" {
             participantTurnSequence &+= 1
+            if participantTurnSequence > 64 {
+                let minimumRetainedSequence = participantTurnSequence - 64
+                assistantSpeechObservedSequences = assistantSpeechObservedSequences.filter {
+                    $0 >= minimumRetainedSequence
+                }
+                managedResponseInFlightSequences = managedResponseInFlightSequences.filter {
+                    $0 >= minimumRetainedSequence
+                }
+                managedResponseDeliveredSequences = managedResponseDeliveredSequences.filter {
+                    $0 >= minimumRetainedSequence
+                }
+                backingTurnSequenceByID = backingTurnSequenceByID.filter {
+                    $0.value >= minimumRetainedSequence
+                }
+            }
+            responseDeadlineWorkItem?.cancel()
+            responseDeadlineWorkItem = nil
+            responseDeadlineSequence = nil
             if let externalWorkResponseOwnerSequence,
                externalWorkResponseOwnerSequence != participantTurnSequence {
                 self.externalWorkResponseOwnerSequence = nil
+            }
+            if let currentBackingTurnID,
+               backingTurnSequenceByID[currentBackingTurnID] == 0 {
+                backingTurnSequenceByID[currentBackingTurnID] = participantTurnSequence
             }
             latestParticipantTranscript = normalizedText
             if conversationControlClassifier.classify(normalizedText) == .endConversation {
@@ -2295,6 +2581,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     return
                 }
             }
+            armResponseDeadline(for: participantTurnSequence)
         }
 
         emitter.emit("transcript_finalized", fields: [
@@ -2311,7 +2598,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private func observeAssistantOutputStarted() {
-        assistantSpeechObservedInCurrentTurn = true
+        assistantSpeechObservedSequences.insert(participantTurnSequence)
+        cancelResponseDeadline(for: participantTurnSequence)
         assistantOutputEndWorkItem?.cancel()
         assistantOutputEndWorkItem = nil
         guard !assistantOutputActive else { return }
@@ -2610,6 +2898,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         assistantOutputEndWorkItem = nil
         embodimentMCPVerificationTimeoutWorkItem?.cancel()
         embodimentMCPVerificationTimeoutWorkItem = nil
+        responseDeadlineWorkItem?.cancel()
+        responseDeadlineWorkItem = nil
+        responseDeadlineSequence = nil
         cancelVisualTurnTimeouts()
         partialUserTranscript = ""
         currentRealtimeResponseID = nil

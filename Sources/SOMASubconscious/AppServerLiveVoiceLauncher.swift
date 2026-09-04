@@ -49,6 +49,10 @@ enum AppServerLiveVoiceEvent: Sendable {
     case embodimentMCPCall(tool: String, status: String, error: String?)
     case l1ToolAdviceAttached(tool: String)
     case l1ToolAdviceRejected(tool: String, reason: String)
+    case backingTurnStarted(turnID: String, sequence: UInt64)
+    case backingTurnCompleted(turnID: String, sequence: UInt64, status: String, error: String?)
+    case managedResponse(state: String, sequence: UInt64, kind: String, reason: String?)
+    case responseDeadlineExpired(sequence: UInt64)
     case inputAccepted(characters: Int)
     case realtimeEventType(type: String)
     case inputTranscriptionFailed(reason: String)
@@ -96,6 +100,9 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let queuedDurationMilliseconds: Double?
     let underruns: Int?
     let type: String?
+    let turnID: String?
+    let turnSequence: UInt64?
+    let kind: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -124,6 +131,9 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case queuedDurationMilliseconds = "queued_ms"
         case underruns
         case type
+        case turnID = "turn_id"
+        case turnSequence = "turn_sequence"
+        case kind
     }
 }
 
@@ -1228,6 +1238,28 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     tool: String((event.tool ?? "unknown").prefix(96)),
                     reason: String((event.reason ?? "unknown").prefix(192))
                 ))
+            case "backing_turn_started":
+                onEvent(.backingTurnStarted(
+                    turnID: String((event.turnID ?? "unknown").prefix(128)),
+                    sequence: event.turnSequence ?? 0
+                ))
+            case "backing_turn_completed":
+                onEvent(.backingTurnCompleted(
+                    turnID: String((event.turnID ?? "unknown").prefix(128)),
+                    sequence: event.turnSequence ?? 0,
+                    status: String((event.status ?? "unknown").prefix(48)),
+                    error: event.error.map { String($0.prefix(192)) }
+                ))
+            case "managed_handoff_response_spoken", "managed_handoff_response_rejected",
+                 "managed_handoff_response_retrying", "managed_handoff_response_held":
+                onEvent(.managedResponse(
+                    state: event.event,
+                    sequence: event.turnSequence ?? 0,
+                    kind: String((event.kind ?? "unknown").prefix(64)),
+                    reason: event.reason.map { String($0.prefix(192)) }
+                ))
+            case "response_deadline_expired":
+                onEvent(.responseDeadlineExpired(sequence: event.turnSequence ?? 0))
             case "input_transcript_ready":
                 if (event.characters ?? 0) > 0 {
                     confirmInitialParticipantInput()
@@ -1874,6 +1906,8 @@ func testAppServerLiveVoiceLauncher() -> String {
              .hermesTaskResultAccepted, .hermesTaskResultRejected,
              .personContextUnavailable, .embodimentMCPCall,
              .l1ToolAdviceAttached, .l1ToolAdviceRejected,
+             .backingTurnStarted, .backingTurnCompleted,
+             .managedResponse, .responseDeadlineExpired,
              .inputAccepted, .realtimeEventType, .inputTranscriptionFailed,
              .transcriptPartial, .transcriptFinalized, .preparingResponse, .responseStarted,
              .assistantSpeechStarted, .assistantSpeechEnded,

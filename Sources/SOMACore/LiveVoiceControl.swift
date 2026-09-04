@@ -267,28 +267,120 @@ public enum LiveVoiceEmbodimentStartupPolicy {
 }
 
 public enum LiveVoiceHandoffResponseDisposition: Equatable, Sendable {
-    case noResponse
     case appendFinalSpeech
+    case appendRecoverySpeech(LiveVoiceTurnRecoveryKind)
     case retainExistingRealtimeResponse
     case externalDelegationOwnsResponse
 }
 
-/// Gives every participant turn one audible response owner. Backing Codex
-/// results are spoken only when Realtime has remained silent; task delegation
-/// acknowledgements retain their dedicated controller path.
+public enum LiveVoiceBackingTurnStatus: String, Equatable, Sendable {
+    case completed
+    case interrupted
+    case failed
+    case inProgress = "inProgress"
+
+    public init(protocolValue: String?) {
+        self = protocolValue.flatMap(Self.init(rawValue:)) ?? .failed
+    }
+}
+
+public enum LiveVoiceTurnRecoveryKind: Equatable, Sendable {
+    case failed
+    case interrupted
+    case emptyResult
+    case timedOut
+}
+
+/// A deterministic voice-safe terminal response for infrastructure paths that
+/// cannot produce their own agent message. This is deliberately separate from
+/// model wording so a failed turn can never become silence.
+public enum LiveVoiceTurnRecoveryResponse {
+    public static func phrase(
+        kind: LiveVoiceTurnRecoveryKind,
+        languageTag: String?
+    ) -> String {
+        let language = languageTag?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return switch (languagePrefix(language), kind) {
+        case ("ko", .failed):
+            "요청을 처리하는 중 오류가 발생했습니다."
+        case ("ko", .interrupted):
+            "요청 처리가 중단됐습니다."
+        case ("ko", .emptyResult):
+            "요청은 들었지만 처리 결과를 만들지 못했습니다."
+        case ("ko", .timedOut):
+            "요청 처리가 지연되어 중단했습니다."
+        case ("zh", .failed):
+            "处理请求时发生了错误。"
+        case ("zh", .interrupted):
+            "请求处理已中断。"
+        case ("zh", .emptyResult):
+            "我收到了请求，但未能生成处理结果。"
+        case ("zh", .timedOut):
+            "请求处理超时，已停止。"
+        case ("ja", .failed):
+            "リクエストの処理中にエラーが発生しました。"
+        case ("ja", .interrupted):
+            "リクエストの処理が中断されました。"
+        case ("ja", .emptyResult):
+            "リクエストは受け取りましたが、処理結果を生成できませんでした。"
+        case ("ja", .timedOut):
+            "リクエストの処理がタイムアウトしたため停止しました。"
+        case (_, .failed):
+            "I encountered an error while processing that request."
+        case (_, .interrupted):
+            "That request was interrupted before it finished."
+        case (_, .emptyResult):
+            "I received the request but could not produce a result."
+        case (_, .timedOut):
+            "That request took too long, so I stopped it."
+        }
+    }
+
+    private static func languagePrefix(_ value: String) -> String {
+        if value.hasPrefix("ko") { return "ko" }
+        if value.hasPrefix("zh") { return "zh" }
+        if value.hasPrefix("ja") { return "ja" }
+        return "en"
+    }
+}
+
+/// Gives every participant turn an audible response owner. A grounded result
+/// remains deliverable after a realtime preamble when tools performed work;
+/// task delegation acknowledgements retain their dedicated controller path.
 public enum LiveVoiceHandoffResponsePolicy {
     public static func disposition(
         hasAgentMessage: Bool,
         realtimeResponseSpoken: Bool,
-        successfulExternalDelegation: Bool
+        successfulExternalDelegation: Bool,
+        containsAuthoritativeBackingWork: Bool,
+        turnStatus: LiveVoiceBackingTurnStatus
     ) -> LiveVoiceHandoffResponseDisposition {
         if successfulExternalDelegation {
             return .externalDelegationOwnsResponse
         }
-        guard hasAgentMessage else { return .noResponse }
-        return realtimeResponseSpoken
-            ? .retainExistingRealtimeResponse
-            : .appendFinalSpeech
+        if hasAgentMessage {
+            // A realtime utterance made before a tool-backed result is only a
+            // presentation preamble. The grounded Codex result must still be
+            // delivered. With no backing work, retain the already-spoken
+            // realtime answer so two equivalent answers are not voiced.
+            if realtimeResponseSpoken && !containsAuthoritativeBackingWork {
+                return .retainExistingRealtimeResponse
+            }
+            return .appendFinalSpeech
+        }
+        if realtimeResponseSpoken {
+            return .retainExistingRealtimeResponse
+        }
+        return switch turnStatus {
+        case .failed, .inProgress:
+            .appendRecoverySpeech(.failed)
+        case .interrupted:
+            .appendRecoverySpeech(.interrupted)
+        case .completed:
+            .appendRecoverySpeech(.emptyResult)
+        }
     }
 }
 

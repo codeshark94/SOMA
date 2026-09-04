@@ -13774,6 +13774,38 @@ private func run(_ options: Options) throws {
                     state: "rejected",
                     message: "tool=\(tool); reason=\(reason)"
                 ))
+            case let .backingTurnStarted(turnID, sequence):
+                writer.write(RuntimeEvent(
+                    event: "l2.turn",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "backing_started",
+                    message: "sequence=\(sequence); turn_id=\(turnID)"
+                ))
+            case let .backingTurnCompleted(turnID, sequence, status, error):
+                writer.write(RuntimeEvent(
+                    event: "l2.turn",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "backing_\(status)",
+                    message: "sequence=\(sequence); turn_id=\(turnID); error=\(error ?? "none")"
+                ))
+            case let .managedResponse(state, sequence, kind, reason):
+                writer.write(RuntimeEvent(
+                    event: "l2.turn",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: state,
+                    message: "sequence=\(sequence); kind=\(kind); reason=\(reason ?? "none")"
+                ))
+            case let .responseDeadlineExpired(sequence):
+                writer.write(RuntimeEvent(
+                    event: "l2.turn",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "response_deadline_expired",
+                    message: "sequence=\(sequence); recovery=spoken"
+                ))
             case let .inputAccepted(characters):
                 attentionGimbalBridge?.ingestLiveVoiceTurnAccepted()
                 writer.write(RuntimeEvent(

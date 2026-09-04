@@ -185,22 +185,56 @@ struct LiveVoiceConversationControlTests {
         #expect(LiveVoiceHandoffResponsePolicy.disposition(
             hasAgentMessage: true,
             realtimeResponseSpoken: false,
-            successfulExternalDelegation: false
+            successfulExternalDelegation: false,
+            containsAuthoritativeBackingWork: false,
+            turnStatus: .completed
         ) == .appendFinalSpeech)
         #expect(LiveVoiceHandoffResponsePolicy.disposition(
             hasAgentMessage: true,
             realtimeResponseSpoken: true,
-            successfulExternalDelegation: false
+            successfulExternalDelegation: false,
+            containsAuthoritativeBackingWork: false,
+            turnStatus: .completed
         ) == .retainExistingRealtimeResponse)
         #expect(LiveVoiceHandoffResponsePolicy.disposition(
             hasAgentMessage: true,
             realtimeResponseSpoken: false,
-            successfulExternalDelegation: true
+            successfulExternalDelegation: true,
+            containsAuthoritativeBackingWork: true,
+            turnStatus: .completed
         ) == .externalDelegationOwnsResponse)
         #expect(LiveVoiceHandoffResponsePolicy.disposition(
             hasAgentMessage: false,
             realtimeResponseSpoken: false,
-            successfulExternalDelegation: false
-        ) == .noResponse)
+            successfulExternalDelegation: false,
+            containsAuthoritativeBackingWork: false,
+            turnStatus: .completed
+        ) == .appendRecoverySpeech(.emptyResult))
+        #expect(LiveVoiceHandoffResponsePolicy.disposition(
+            hasAgentMessage: true,
+            realtimeResponseSpoken: true,
+            successfulExternalDelegation: false,
+            containsAuthoritativeBackingWork: true,
+            turnStatus: .completed
+        ) == .appendFinalSpeech)
+        #expect(LiveVoiceHandoffResponsePolicy.disposition(
+            hasAgentMessage: false,
+            realtimeResponseSpoken: false,
+            successfulExternalDelegation: false,
+            containsAuthoritativeBackingWork: true,
+            turnStatus: .failed
+        ) == .appendRecoverySpeech(.failed))
+    }
+
+    @Test
+    func failedBackingTurnsHaveLocalizedAudibleRecovery() {
+        #expect(LiveVoiceTurnRecoveryResponse.phrase(
+            kind: .failed,
+            languageTag: "ko-KR"
+        ) == "요청을 처리하는 중 오류가 발생했습니다.")
+        #expect(LiveVoiceTurnRecoveryResponse.phrase(
+            kind: .timedOut,
+            languageTag: "en-US"
+        ) == "That request took too long, so I stopped it.")
     }
 }
