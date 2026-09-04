@@ -10,6 +10,7 @@ private struct Command: Decodable {
         case appendOpeningAudio = "append_opening_audio"
         case appendImage = "append_image"
         case appendText = "append_text"
+        case acceptExternalWork = "accept_external_work"
         case appendInstruction = "append_instruction"
         case beginVisualTurn = "begin_visual_turn"
         case stop
@@ -35,6 +36,11 @@ private struct Command: Decodable {
     let itemID: String?
     let taskID: String?
     let tool: String?
+}
+
+private enum FinalizedTranscriptOrigin: Equatable {
+    case realtimeWire
+    case appServer
 }
 
 private final class JSONLineEmitter: @unchecked Sendable {
@@ -390,7 +396,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var embodimentMCPVerificationTimeoutWorkItem: DispatchWorkItem?
     private var pendingTransportClosureReason: String?
     private var assistantSpeechObservedInCurrentTurn = false
-    private var handledHermesDelegationTurnIDs: Set<String> = []
     private var reportedEmbodimentMCPItemIDs: Set<String> = []
     private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
@@ -401,7 +406,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var visualCancellationTimeoutWorkItem: DispatchWorkItem?
     private var visualReplacementTimeoutWorkItem: DispatchWorkItem?
     private var participantTurnSequence: UInt64 = 0
+    private var participantAudioEpoch: UInt64 = 0
     private var latestParticipantTranscript = ""
+    private var lastWireParticipantTranscript: (text: String, turnID: String?, epoch: UInt64)?
+    private var currentBackingTurnID: String?
+    private var externalWorkResponseOwnerSequence: UInt64?
     private var observedRealtimeEventTypes: Set<String> = []
     private var finalizedTranscriptItemIDs: Set<String> = []
     private var finalizedTranscriptItemOrder: [String] = []
@@ -501,7 +510,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 // WebKit. Start them while the hidden audio frontend loads;
                 // the WebRTC offer is joined once both sides are ready.
                 break
-            case .appendAudio, .appendOpeningAudio, .appendImage, .appendText, .appendInstruction,
+            case .appendAudio, .appendOpeningAudio, .appendImage, .appendText, .acceptExternalWork,
+                 .appendInstruction,
                  .beginVisualTurn, .stop:
                 pendingCommands.append(command)
                 return
@@ -628,6 +638,36 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.pendingHermesReportTaskID = taskID
+                }
+            }
+        case .acceptExternalWork:
+            guard let threadID,
+                  let text = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty,
+                  text.utf8.count <= 8_192,
+                  let taskID = command.taskID,
+                  UUID(uuidString: taskID) != nil else { return }
+            externalWorkResponseOwnerSequence = participantTurnSequence
+            interruptBackingTurnIfOwnedByExternalWork()
+            connection.request(
+                method: "thread/realtime/appendSpeech",
+                params: [
+                    "threadId": threadID,
+                    "text": text,
+                ]
+            ) { [weak self] response in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if response.value["error"] == nil {
+                        self.emitter.emit("hermes_delegation_ack_spoken", fields: [
+                            "task_id": taskID,
+                        ])
+                    } else {
+                        self.emitter.emit("hermes_delegation_ack_rejected", fields: [
+                            "task_id": taskID,
+                            "reason": AppServerConnection.responseMessage(response.value),
+                        ])
+                    }
                 }
             }
         case .appendInstruction:
@@ -1571,7 +1611,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             personContextInstruction = "No persistent person context is attached to this interaction. Do not claim stored knowledge about the participant and do not guess."
         }
         let identityManagementInstruction = embodimentMCPAvailable
-            ? "For an administrator's explicit request to register a person who is currently present, first call list_present_people. Enroll only one anonymous entry that the administrator unambiguously identifies in the current scene; then call enroll_present_identity with confirmed_by_user=true. Do not enroll a historical, absent, ambiguous, or merely detected face. After a successful enrollment, persist only identity facts the administrator explicitly supplied, such as a name or their stated relationship, with set_person_fact. Do not claim registration is complete until each required tool result succeeds."
+            ? "For the current participant's explicit request to register their own face, call enroll_present_identity with the supplied person_context_reference and confirmed_by_user=true; self-enrollment does not require administrator authority or list_present_people. An administrator registering another currently present person must first call list_present_people and select only the one anonymous entry unambiguously identified in the current scene. Never enroll a historical, absent, ambiguous, or merely detected face. After successful enrollment, persist only identity facts explicitly supplied by that person or the administrator, such as a name or stated relationship, with the person-context tools. Do not claim registration or memory is complete until every required tool result succeeds."
             : ""
         let stopConversationInstruction = """
         Action contract for ending this Live Voice session: before producing any spoken response, inspect the participant's latest actual speech. When they explicitly ask to end this conversation, stop listening, stop talking, be quiet, or turn the voice session off, treat it as an execution request rather than a conversational prompt. If end_conversation is available, your only valid next action is to call it immediately and silently. A spoken confirmation, farewell, promise to do it, or request to wait is a failure: do not emit audio before that tool call. The tool closes only this current Live Voice session.
@@ -1765,7 +1805,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             emitFinalizedTranscript(
                 role: role,
                 text: text,
-                itemID: (params["itemId"] as? String) ?? (params["item_id"] as? String)
+                itemID: (params["itemId"] as? String) ?? (params["item_id"] as? String),
+                origin: .appServer
             )
         case "thread/realtime/closed":
             stop(reason: params["reason"] as? String ?? "realtime_closed")
@@ -1773,6 +1814,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             if let item = params["item"] as? [String: Any] {
                 _ = inspectEmbodimentMCPItem(item, emitDiagnostic: true)
             }
+        case "turn/started":
+            guard let turn = params["turn"] as? [String: Any],
+                  let turnID = turn["id"] as? String,
+                  !turnID.isEmpty else { return }
+            currentBackingTurnID = turnID
+            emitter.emit("backing_turn_started", fields: ["turn_id": String(turnID.prefix(128))])
+            interruptBackingTurnIfOwnedByExternalWork()
         case "turn/completed":
             handleCompletedTurn(params)
         default:
@@ -1783,10 +1831,18 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private func handleCompletedTurn(_ params: [String: Any]) {
         guard let turn = params["turn"] as? [String: Any],
               let items = turn["items"] as? [[String: Any]] else { return }
+        if let turnID = turn["id"] as? String, currentBackingTurnID == turnID {
+            currentBackingTurnID = nil
+        }
         let assistantSpeechObserved = assistantSpeechObservedInCurrentTurn
         assistantSpeechObservedInCurrentTurn = false
         var successfulHermesDelegation = false
+        var authorizationFailure: MCPToolCompletionDiagnostic?
         for item in items where item["type"] as? String == "mcpToolCall" {
+            if let diagnostic = MCPToolCompletionDiagnostic.parse(item),
+               diagnostic.isAuthorizationFailure {
+                authorizationFailure = diagnostic
+            }
             successfulHermesDelegation = inspectEmbodimentMCPItem(
                 item,
                 emitDiagnostic: true
@@ -1797,14 +1853,24 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }?["text"] as? String
         let normalizedAgentMessage = agentMessage?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let managedResponse = normalizedAgentMessage?.isEmpty == false
+            ? normalizedAgentMessage
+            : authorizationFailure.map { _ in
+                MCPToolAuthorizationFailureResponse.phrase(languageTag: preferredLanguageTag)
+            }
         switch LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: normalizedAgentMessage?.isEmpty == false,
+            hasAgentMessage: managedResponse?.isEmpty == false,
             realtimeResponseSpoken: assistantSpeechObserved,
             successfulExternalDelegation: successfulHermesDelegation
         ) {
         case .appendFinalSpeech:
-            if let normalizedAgentMessage {
-                appendManagedHandoffSpeech(normalizedAgentMessage)
+            if let managedResponse {
+                appendManagedHandoffSpeech(managedResponse)
+                if authorizationFailure != nil, normalizedAgentMessage?.isEmpty != false {
+                    emitter.emit("managed_authorization_denial_spoken", fields: [
+                        "tool": authorizationFailure?.tool ?? "unknown",
+                    ])
+                }
             }
         case .retainExistingRealtimeResponse:
             emitter.emit("managed_handoff_response_held", fields: [
@@ -1813,27 +1879,32 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         case .externalDelegationOwnsResponse, .noResponse:
             break
         }
-        guard successfulHermesDelegation,
-              let turnID = turn["id"] as? String,
-              !turnID.isEmpty else { return }
-        let alreadyHandled = handledHermesDelegationTurnIDs.contains(turnID)
-        if !alreadyHandled {
-            if handledHermesDelegationTurnIDs.count >= 64 {
-                handledHermesDelegationTurnIDs.removeAll(keepingCapacity: true)
+    }
+
+    private func interruptBackingTurnIfOwnedByExternalWork() {
+        guard externalWorkResponseOwnerSequence == participantTurnSequence,
+              let threadID,
+              let turnID = currentBackingTurnID else { return }
+        currentBackingTurnID = nil
+        connection.request(
+            method: "turn/interrupt",
+            params: ["threadId": threadID, "turnId": turnID]
+        ) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if response.value["error"] == nil {
+                    self.emitter.emit("backing_turn_interrupted", fields: [
+                        "turn_id": String(turnID.prefix(128)),
+                        "response_owner": "l1_external_work",
+                    ])
+                } else {
+                    self.emitter.emit("backing_turn_interrupt_rejected", fields: [
+                        "turn_id": String(turnID.prefix(128)),
+                        "reason": AppServerConnection.responseMessage(response.value),
+                    ])
+                }
             }
-            handledHermesDelegationTurnIDs.insert(turnID)
         }
-        guard HermesDelegationAcknowledgementPolicy.shouldInject(
-            successfulDelegation: true,
-            assistantSpeechObserved: assistantSpeechObserved,
-            alreadyHandled: alreadyHandled
-        ) else {
-            if !alreadyHandled {
-                emitter.emit("hermes_delegation_ack_satisfied", fields: ["turn_id": turnID])
-            }
-            return
-        }
-        triggerHermesDelegationAcknowledgement(turnID: turnID)
     }
 
     private func appendManagedHandoffSpeech(_ text: String) {
@@ -1953,11 +2024,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ])
             return
         }
+        if type.contains("speech_started") {
+            participantAudioEpoch &+= 1
+            observeInputSpeechStarted()
+            return
+        }
         if LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(type: type) {
             observeInputSpeechStarted()
-        }
-        if type.contains("speech_started") {
-            return
         }
         if type.contains("speech_stopped") {
             inputSpeechInProgress = false
@@ -2001,29 +2074,36 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         if type == "conversation.item.input_audio_transcription.completed" ||
             type == "input_transcript.completed" {
+            if let transcript = LiveVoiceWireTranscriptParser.parse(object) {
+                acceptWireParticipantTranscript(transcript)
+                return
+            }
             let text = (object["transcript"] as? String) ?? (object["text"] as? String) ?? ""
             guard !text.isEmpty else { return }
-            emitter.emit("input_transcript_ready", fields: ["characters": min(text.count, 65_535)])
-            emitFinalizedTranscript(
-                role: "user",
+            acceptWireParticipantTranscript(.init(
                 text: text,
-                itemID: (object["item_id"] as? String) ?? (object["itemId"] as? String)
-            )
+                itemID: (object["item_id"] as? String) ?? (object["itemId"] as? String),
+                turnID: (object["turn_id"] as? String) ?? (object["turnId"] as? String),
+                source: .inputTranscript,
+                authoritative: true
+            ))
             return
         }
         if type == "input_transcript.added" {
-            // This event is already sufficient remote evidence for admission.
-            // Codex publishes the canonical transcript text separately via
-            // thread/realtime/transcript/done; opportunistically forward text
-            // only when this transport version also places it at the top level.
-            let text = (object["transcript"] as? String) ?? (object["text"] as? String) ?? ""
-            guard !text.isEmpty else { return }
-            emitter.emit("input_transcript_ready", fields: ["characters": min(text.count, 65_535)])
-            emitFinalizedTranscript(
-                role: "user",
-                text: text,
-                itemID: (object["item_id"] as? String) ?? (object["itemId"] as? String)
-            )
+            guard let transcript = LiveVoiceWireTranscriptParser.parse(object) else { return }
+            observeWireParticipantTranscriptDelta(transcript)
+            return
+        }
+        if type == "delegation.created" {
+            guard let transcript = LiveVoiceWireTranscriptParser.parse(object) else {
+                let item = object["item"] as? [String: Any]
+                emitter.emit("input_transcript_authority_missing", fields: [
+                    "event_keys": object.keys.sorted().joined(separator: ","),
+                    "item_keys": item?.keys.sorted().joined(separator: ",") ?? "none",
+                ])
+                return
+            }
+            acceptWireParticipantTranscript(transcript)
             return
         }
         if type == "conversation.item.input_audio_transcription.failed" ||
@@ -2076,12 +2156,75 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         emitter.emit("input_speech_started")
     }
 
-    private func emitFinalizedTranscript(role: String, text: String, itemID: String?) {
+    private func observeWireParticipantTranscriptDelta(_ transcript: LiveVoiceWireTranscript) {
+        guard !transcript.authoritative else {
+            acceptWireParticipantTranscript(transcript)
+            return
+        }
+        emitter.emit("transcript_partial", fields: [
+            "thread_id": threadID ?? "",
+            "text": transcript.text,
+            "item_id": transcript.itemID ?? "",
+            "source": transcript.source.rawValue,
+        ])
+    }
+
+    private func acceptWireParticipantTranscript(_ transcript: LiveVoiceWireTranscript) {
+        guard transcript.authoritative else {
+            observeWireParticipantTranscriptDelta(transcript)
+            return
+        }
+        if transcript.source == .delegation,
+           let prior = lastWireParticipantTranscript,
+           prior.epoch == participantAudioEpoch,
+           ((transcript.turnID != nil && prior.turnID == transcript.turnID)
+                || prior.text == transcript.text) {
+            if prior.text != transcript.text {
+                emitter.emit("input_transcript_reconciled", fields: [
+                    "turn_id": transcript.turnID ?? "unknown",
+                    "prior_characters": prior.text.count,
+                    "authoritative_characters": transcript.text.count,
+                ])
+            }
+            return
+        }
+        emitter.emit("input_transcript_ready", fields: [
+            "characters": min(transcript.text.count, 65_535),
+            "source": transcript.source.rawValue,
+            "authoritative": transcript.authoritative,
+        ])
+        lastWireParticipantTranscript = (
+            transcript.text,
+            transcript.turnID,
+            participantAudioEpoch
+        )
+        emitFinalizedTranscript(
+            role: "user",
+            text: transcript.text,
+            itemID: transcript.itemID,
+            origin: .realtimeWire
+        )
+    }
+
+    private func emitFinalizedTranscript(
+        role: String,
+        text: String,
+        itemID: String?,
+        origin: FinalizedTranscriptOrigin = .realtimeWire
+    ) {
         let normalizedText = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
         guard !normalizedText.isEmpty else { return }
+
+        if role == "user",
+           origin == .appServer,
+           let lastWireParticipantTranscript,
+           lastWireParticipantTranscript.epoch == participantAudioEpoch,
+           lastWireParticipantTranscript.text == normalizedText {
+            return
+        }
 
         if let itemID, !itemID.isEmpty {
             guard finalizedTranscriptItemIDs.insert(itemID).inserted else { return }
@@ -2117,6 +2260,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
 
         if role == "user" {
             participantTurnSequence &+= 1
+            if let externalWorkResponseOwnerSequence,
+               externalWorkResponseOwnerSequence != participantTurnSequence {
+                self.externalWorkResponseOwnerSequence = nil
+            }
             latestParticipantTranscript = normalizedText
             if conversationControlClassifier.classify(normalizedText) == .endConversation {
                 emitter.emit("transcript_finalized", fields: [
@@ -2420,36 +2567,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.emitter.emit("proactive_opening_triggered")
-            }
-        }
-    }
-
-    private func triggerHermesDelegationAcknowledgement(turnID: String) {
-        guard let threadID else { return }
-        let event = HermesDelegationAcknowledgement.controllerEvent(
-            languageTag: preferredLanguageTag
-        )
-        connection.request(
-            method: "thread/realtime/appendText",
-            params: [
-                "threadId": threadID,
-                "text": String(event.prefix(2_048)),
-                "role": "user",
-            ]
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if response.value["error"] != nil {
-                    self.emitter.emit("hermes_delegation_ack_rejected", fields: [
-                        "turn_id": turnID,
-                        "reason": AppServerConnection.responseMessage(response.value),
-                    ])
-                    return
-                }
-                self.emitter.emit("hermes_delegation_ack_triggered", fields: [
-                    "turn_id": turnID,
-                    "language": self.preferredLanguageTag ?? "und",
-                ])
             }
         }
     }

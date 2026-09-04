@@ -135,6 +135,107 @@ public enum LiveVoiceRealtimeEventSemantics {
     }
 }
 
+public enum LiveVoiceWireTranscriptSource: String, Equatable, Sendable {
+    case inputTranscript = "input_transcript"
+    case delegation
+}
+
+/// A participant transcript recovered directly from the V3 realtime wire.
+/// Frameless transcript additions are provisional display deltas. A client
+/// delegation carries the authoritative utterance as `input_text` content.
+/// Keeping the wire identity lets the conversation host reconcile later
+/// app-server transcript notifications without creating a second turn.
+public struct LiveVoiceWireTranscript: Equatable, Sendable {
+    public let text: String
+    public let itemID: String?
+    public let turnID: String?
+    public let source: LiveVoiceWireTranscriptSource
+    public let authoritative: Bool
+
+    public init(
+        text: String,
+        itemID: String?,
+        turnID: String?,
+        source: LiveVoiceWireTranscriptSource,
+        authoritative: Bool
+    ) {
+        self.text = text
+        self.itemID = itemID
+        self.turnID = turnID
+        self.source = source
+        self.authoritative = authoritative
+    }
+}
+
+public enum LiveVoiceWireTranscriptParser {
+    public static func parse(_ event: [String: Any]) -> LiveVoiceWireTranscript? {
+        guard let type = event["type"] as? String else { return nil }
+        switch type {
+        case "input_transcript.added", "input_transcript.completed":
+            let item = event["item"] as? [String: Any]
+            guard let text = normalizedText(
+                (item?["text"] as? String)
+                    ?? (event["transcript"] as? String)
+                    ?? (event["text"] as? String)
+            ) else { return nil }
+            return LiveVoiceWireTranscript(
+                text: text,
+                itemID: identifier(item?["id"] ?? event["item_id"] ?? event["itemId"]),
+                turnID: identifier(
+                    item?["user_bidi_turn_id"]
+                        ?? event["user_bidi_turn_id"]
+                        ?? event["turn_id"]
+                        ?? event["turnId"]
+                ),
+                source: .inputTranscript,
+                authoritative: type == "input_transcript.completed"
+            )
+        case "delegation.created":
+            guard let item = event["item"] as? [String: Any],
+                  let text = delegationText(item) else {
+                return nil
+            }
+            return LiveVoiceWireTranscript(
+                text: text,
+                itemID: identifier(item["id"]),
+                turnID: identifier(item["user_bidi_turn_id"]),
+                source: .delegation,
+                authoritative: true
+            )
+        default:
+            return nil
+        }
+    }
+
+    private static func delegationText(_ item: [String: Any]) -> String? {
+        if let legacy = normalizedText(item["input_transcript"] as? String) {
+            return legacy
+        }
+        guard let content = item["content"] as? [[String: Any]] else { return nil }
+        let combined = content
+            .filter { ($0["type"] as? String) == "input_text" }
+            .compactMap { $0["text"] as? String }
+            .joined()
+        return normalizedText(combined)
+    }
+
+    private static func normalizedText(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { return nil }
+        return String(normalized.prefix(8_192))
+    }
+
+    private static func identifier(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : String(normalized.prefix(256))
+    }
+}
+
 /// Realtime snapshots their available tools and startup instructions when the
 /// session begins. The bounded capability barrier prevents the first spoken
 /// turn from racing ahead with an "initializing" view of embodiment.

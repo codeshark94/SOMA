@@ -1430,7 +1430,7 @@ private final class EmbodimentMCPServer {
         [
             tool("list_present_people", "Administrator-only: compare recently observed faces with local registered identities and return the current non-biometric presence projection. Unknown people remain unnamed.", objectSchema([:], required: []), readOnly: true),
             tool("list_identity_registry", "Administrator-only: list locally registered person-context records, including explicit name, language, rapport, and facts but never face embeddings or raw transcripts.", objectSchema([:], required: []), readOnly: true),
-            tool("enroll_present_identity", "Administrator-only: promote one currently present, already-confirmed anonymous identity into a persistent local face-recognition profile. Call only after explicit consent or confirmation from the person; then store their explicitly stated name/language with the person-context tools.", objectSchema([
+            tool("enroll_present_identity", "Promote one currently present, already-confirmed anonymous identity into a persistent local face-recognition profile after explicit consent. A participant may enroll only their own session-bound person_entity_id; an administrator may enroll another currently present person. Then store only explicitly stated name or language facts with the person-context tools.", objectSchema([
                 "person_entity_id": uuidSchema(),
                 "confirmed_by_user": ["type": "boolean", "const": true],
             ], required: ["person_entity_id", "confirmed_by_user"])),

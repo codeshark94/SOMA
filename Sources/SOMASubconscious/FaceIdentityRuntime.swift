@@ -358,6 +358,24 @@ final class FaceIdentityRuntime: @unchecked Sendable {
         queue.sync {}
     }
 
+    func reloadProfiles() {
+        Task { [weak self, profileStore] in
+            do {
+                try await profileStore.reloadFromDisk()
+                let profiles = await profileStore.profiles()
+                self?.queue.async { [weak self] in
+                    guard let self else { return }
+                    profileSnapshot = profiles
+                    onHealth("profiles_reloaded", "known_profiles=\(profiles.count); source=consented_enrollment")
+                }
+            } catch {
+                self?.queue.async { [weak self] in
+                    self?.onHealth("profile_reload_rejected", String(error.localizedDescription.prefix(192)))
+                }
+            }
+        }
+    }
+
     private func drain() {
         while true {
             lock.lock()

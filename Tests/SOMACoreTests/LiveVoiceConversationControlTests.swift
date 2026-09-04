@@ -55,6 +55,65 @@ struct LiveVoiceConversationControlTests {
     }
 
     @Test
+    func framelessNestedTranscriptAdditionIsProvisional() throws {
+        let event: [String: Any] = [
+            "type": "input_transcript.added",
+            "item": [
+                "id": "input-item-a",
+                "text": "  오늘   시장 동향을 조사해 줘.  ",
+                "user_bidi_turn_id": "bidi-turn-a",
+            ],
+        ]
+        let transcript = try #require(LiveVoiceWireTranscriptParser.parse(event))
+        #expect(transcript.text == "오늘 시장 동향을 조사해 줘.")
+        #expect(transcript.itemID == "input-item-a")
+        #expect(transcript.turnID == "bidi-turn-a")
+        #expect(transcript.source == .inputTranscript)
+        #expect(transcript.authoritative == false)
+    }
+
+    @Test
+    func framelessDelegationCarriesAuthoritativeTranscript() throws {
+        let event: [String: Any] = [
+            "type": "delegation.created",
+            "item": [
+                "id": "delegation-a",
+                "target": "client",
+                "input_transcript": "오늘 시장 동향을 조사해 줘.",
+                "user_bidi_turn_id": "bidi-turn-a",
+            ],
+        ]
+        let transcript = try #require(LiveVoiceWireTranscriptParser.parse(event))
+        #expect(transcript.text == "오늘 시장 동향을 조사해 줘.")
+        #expect(transcript.itemID == "delegation-a")
+        #expect(transcript.turnID == "bidi-turn-a")
+        #expect(transcript.source == .delegation)
+        #expect(transcript.authoritative)
+    }
+
+    @Test
+    func currentFramelessDelegationConcatenatesInputTextContent() throws {
+        let event: [String: Any] = [
+            "type": "delegation.created",
+            "item": [
+                "id": "delegation-current",
+                "type": "delegation",
+                "target": "client",
+                "content": [
+                    ["type": "input_text", "text": "오늘 시장 동향을 "],
+                    ["type": "input_text", "text": "조사해 줘."],
+                    ["type": "output_text", "text": "ignored"],
+                ],
+            ],
+        ]
+        let transcript = try #require(LiveVoiceWireTranscriptParser.parse(event))
+        #expect(transcript.text == "오늘 시장 동향을 조사해 줘.")
+        #expect(transcript.itemID == "delegation-current")
+        #expect(transcript.source == .delegation)
+        #expect(transcript.authoritative)
+    }
+
+    @Test
     func localTransportPreparationOverlapsCapabilitySnapshot() {
         #expect(LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
             webViewReady: true,

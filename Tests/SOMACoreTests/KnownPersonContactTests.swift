@@ -237,6 +237,14 @@ final class KnownPersonContactTests: XCTestCase {
             evidenceTrackID: trackID,
             at: 800_000_000
         ).isRecognized)
+        guard case .candidate = matcher.match(
+            uninformative,
+            profiles: [known],
+            evidenceTrackID: trackID,
+            at: 850_000_000
+        ) else {
+            return XCTFail("recent known evidence must continue to outrank anonymous identity")
+        }
         for index in 3..<5 {
             XCTAssertFalse(matcher.match(
                 correlated,
@@ -251,6 +259,27 @@ final class KnownPersonContactTests: XCTestCase {
             evidenceTrackID: trackID,
             at: 1_500_000_000
         ).isRecognized)
+    }
+
+    func testDuplicateIdentityPolicyRequiresBroadMutualSimilarity() throws {
+        let first = [
+            try embedding([1, 0, 0, 0]),
+            try embedding([0.98, 0.20, 0, 0]),
+            try embedding([0.96, -0.28, 0, 0]),
+        ]
+        let duplicate = [
+            try embedding([0.99, 0.04, 0, 0]),
+            try embedding([0.97, 0.22, 0, 0]),
+            try embedding([0.95, -0.30, 0, 0]),
+        ]
+        let oneCoincidentalMatch = [
+            try embedding([1, 0, 0, 0]),
+            try embedding([0, 1, 0, 0]),
+            try embedding([0, 0, 1, 0]),
+        ]
+
+        XCTAssertTrue(FaceIdentityDuplicatePolicy.shouldMerge(first, duplicate))
+        XCTAssertFalse(FaceIdentityDuplicatePolicy.shouldMerge(first, oneCoincidentalMatch))
     }
 
     func testUnknownFacesUseStablePerInstallOpaqueHandlesAfterConfirmation() async throws {
@@ -500,6 +529,28 @@ final class KnownPersonContactTests: XCTestCase {
         XCTAssertEqual(expandedReferenceCount, 3)
         XCTAssertNil(duplicateReferenceCount)
         XCTAssertEqual(updatedProfile?.references.count, 3)
+    }
+
+    func testRunningProfileStoreCanReloadAConsentedEnrollment() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("soma-known-reload-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entityID = UUID()
+        let file = directory.appendingPathComponent("profiles.encjson")
+        let key = CognitiveMemoryEncryptionKey.generate()
+        let runningStore = try FaceIdentityProfileStore(fileURL: file, encryptionKey: key)
+        let enrollmentStore = try FaceIdentityProfileStore(fileURL: file, encryptionKey: key)
+        try await enrollmentStore.upsert(try LocalFaceIdentityProfile(
+            entityID: entityID,
+            consentScope: .persistent,
+            references: [embedding([1, 0, 0, 0]), embedding([0.98, 0.02, 0, 0])]
+        ))
+
+        let profileBeforeReload = await runningStore.profile(for: entityID)
+        XCTAssertNil(profileBeforeReload)
+        try await runningStore.reloadFromDisk()
+        let profileAfterReload = await runningStore.profile(for: entityID)
+        XCTAssertEqual(profileAfterReload?.references.count, 2)
     }
 
     func testExplicitEnrollmentMergeUpdatesExistingIdentityWithoutCreatingAnotherProfile() async throws {

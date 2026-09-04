@@ -329,6 +329,14 @@ public actor FaceIdentityProfileStore {
         profilesByEntity[entityID]
     }
 
+    /// Refreshes this runtime actor after a consented enrollment performed by
+    /// the local control plane. The profile matcher otherwise keeps the
+    /// startup snapshot until process restart even though the encrypted file
+    /// has already been updated.
+    public func reloadFromDisk() throws {
+        profilesByEntity = try Self.load(fileURL: fileURL, key: key)
+    }
+
     public func upsert(_ profile: LocalFaceIdentityProfile) throws {
         if profilesByEntity[profile.entityID] == nil,
            profilesByEntity.count >= Self.maximumProfiles {
@@ -550,6 +558,8 @@ public struct FaceIdentityMatcher: Sendable {
         let entityID: UUID
         let observedNS: UInt64
         let strong: Bool
+        let similarity: Double
+        let alternativeMargin: Double
     }
 
     private var evidenceByTrack: [UUID: [Evidence]] = [:]
@@ -580,7 +590,7 @@ public struct FaceIdentityMatcher: Sendable {
     ) -> FaceIdentityDecision {
         expireEvidence(at: monotonicNS)
         guard observation.quality >= calibration.minimumObservationQuality else {
-            return .unknown
+            return retainedCandidate(for: evidenceTrackID) ?? .unknown
         }
         let scores = profiles.compactMap { profile -> (UUID, Double)? in
             let compatible = profile.references.filter {
@@ -593,7 +603,9 @@ public struct FaceIdentityMatcher: Sendable {
             guard let similarity = similarities.max() else { return nil }
             return (profile.entityID, similarity)
         }.sorted { $0.1 > $1.1 }
-        guard let best = scores.first else { return .unknown }
+        guard let best = scores.first else {
+            return retainedCandidate(for: evidenceTrackID) ?? .unknown
+        }
         let alternative = scores.dropFirst().first?.1 ?? -1
         let margin = best.1 - alternative
         let marginAccepted = margin >= calibration.minimumBestAlternativeMargin
@@ -603,7 +615,7 @@ public struct FaceIdentityMatcher: Sendable {
             // as a known candidate rather than falling through to anonymous.
             // Anonymous is reserved for faces clearly uncorrelated with knowns.
             guard best.1 >= calibration.minimumCorrelationFloor else {
-                return .unknown
+                return retainedCandidate(for: evidenceTrackID) ?? .unknown
             }
             guard marginAccepted else {
                 return .candidate(
@@ -617,7 +629,13 @@ public struct FaceIdentityMatcher: Sendable {
         if let previous = evidence.last, previous.entityID != best.0 {
             evidence.removeAll(keepingCapacity: true)
         }
-        evidence.append(Evidence(entityID: best.0, observedNS: monotonicNS, strong: strong))
+        evidence.append(Evidence(
+            entityID: best.0,
+            observedNS: monotonicNS,
+            strong: strong,
+            similarity: best.1,
+            alternativeMargin: margin
+        ))
         evidenceByTrack[evidenceTrackID] = evidence
         let confirmations = evidence.count
         let strongConfirmations = evidence.count(where: { $0.strong })
@@ -635,6 +653,15 @@ public struct FaceIdentityMatcher: Sendable {
 
     public mutating func reset() {
         evidenceByTrack.removeAll(keepingCapacity: true)
+    }
+
+    private func retainedCandidate(for evidenceTrackID: UUID) -> FaceIdentityDecision? {
+        guard let evidence = evidenceByTrack[evidenceTrackID]?.last else { return nil }
+        return .candidate(
+            entityID: evidence.entityID,
+            similarity: evidence.similarity,
+            alternativeMargin: evidence.alternativeMargin
+        )
     }
 
     private mutating func expireEvidence(at monotonicNS: UInt64) {

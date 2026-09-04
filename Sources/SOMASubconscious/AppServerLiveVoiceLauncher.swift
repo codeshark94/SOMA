@@ -39,6 +39,9 @@ enum AppServerLiveVoiceEvent: Sendable {
     case visualTurnBarrier(state: String, episodeID: UUID?, reason: String)
     case embodimentMCPReady
     case embodimentMCPUnavailable(reason: String)
+    case hermesDelegationAcknowledgementRequested(taskID: UUID)
+    case hermesDelegationAcknowledgementSpoken(taskID: UUID)
+    case hermesDelegationAcknowledgementRejected(taskID: UUID?, reason: String)
     case hermesTaskResultAccepted(taskID: UUID)
     case hermesTaskResultRejected(taskID: UUID?, reason: String)
     case personContextReady
@@ -215,6 +218,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     /// This stays only with the corresponding helper process. It prevents an
     /// older local MCP child from ending a newer participant's conversation.
     private var activeSessionCapability: String?
+    private var activePreferredLanguageTag: String?
+    private var activeInteractionAuthority: SOMAInteractionAuthority?
     private var openingVisualContextAttached = false
     private var awaitingAssistantResponse = false
     private var latestUserTranscriptNS: UInt64?
@@ -227,6 +232,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private var proactiveOpeningDelivered = false
     private var pendingHermesReportOfferTaskID: UUID?
     private var hermesResultAwaitingConfirmation = Set<UUID>()
+    private var acknowledgedHermesTaskIDs = Set<UUID>()
 
     init(
         projectDirectory: String? = nil,
@@ -310,7 +316,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningText: nil,
                 personEntityID: personEntityID,
-                personContextReference: context?.personContextAvailable == true ? context?.personEntityID : nil,
+                personContextReference: context?.personEntityID,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
             )
@@ -345,7 +351,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 languageStartInstruction: context?.languageStartInstruction,
                 proactiveOpeningText: String(exactOpening.prefix(1_024)),
                 personEntityID: personEntityID,
-                personContextReference: context?.personContextAvailable == true ? context?.personEntityID : nil,
+                personContextReference: context?.personEntityID,
                 interactionAuthority: context?.interactionAuthority,
                 at: monotonicNS
             )
@@ -385,7 +391,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     languageTag: context.preferredLanguageTag
                 ),
                 personEntityID: personEntityID,
-                personContextReference: context.personContextAvailable ? context.personEntityID : nil,
+                personContextReference: context.personEntityID,
                 interactionAuthority: context.interactionAuthority,
                 at: monotonicNS
             )
@@ -723,6 +729,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         proactiveOpeningAwaitingParticipant = false
         proactiveOpeningDelivered = false
         pendingHermesReportOfferTaskID = nil
+        activePreferredLanguageTag = nil
+        activeInteractionAuthority = nil
     }
 
     private static func splitCapturedAudio(
@@ -807,6 +815,64 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     func deliverHermesTaskResult(_ task: HermesAgentTask) -> Bool {
         queue.sync {
             sendHermesTaskResult(task)
+        }
+    }
+
+    /// A task acceptance is a controller fact. Speak it at the exact durable
+    /// task boundary instead of waiting for the requesting model turn to end.
+    func acknowledgeHermesTaskAccepted(
+        taskID: UUID,
+        operation: HermesAgentTaskOperation,
+        deduplicated: Bool
+    ) -> Bool {
+        queue.sync {
+            let alreadyHandled = acknowledgedHermesTaskIDs.contains(taskID)
+            guard HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
+                operation: operation,
+                deduplicated: deduplicated,
+                sessionActive: active,
+                alreadyHandled: alreadyHandled
+            ) else { return false }
+            if acknowledgedHermesTaskIDs.count >= 128 {
+                acknowledgedHermesTaskIDs.removeAll(keepingCapacity: true)
+            }
+            acknowledgedHermesTaskIDs.insert(taskID)
+            let sent = send([
+                "type": "accept_external_work",
+                "taskID": taskID.uuidString.lowercased(),
+                "data": HermesDelegationAcknowledgement.phrase(
+                    languageTag: activePreferredLanguageTag
+                ),
+            ])
+            if sent {
+                onEvent(.hermesDelegationAcknowledgementRequested(taskID: taskID))
+            } else {
+                acknowledgedHermesTaskIDs.remove(taskID)
+                onEvent(.hermesDelegationAcknowledgementRejected(
+                    taskID: taskID,
+                    reason: "live_voice_control_transport_unavailable"
+                ))
+            }
+            return sent
+        }
+    }
+
+    /// Validates the current participant turn before L1 dispatches external
+    /// work directly. This is the same administrator/session boundary used by
+    /// the MCP path; L1 receives no general-purpose local execution authority.
+    func authorizesL1ExternalWork(
+        _ advice: L1LiveToolAdvice,
+        forUserTranscript transcript: String
+    ) -> Bool {
+        queue.sync {
+            hermesAgentDelegationEnabled && L1LiveExternalWorkDispatchPolicy.permits(
+                advice: advice,
+                transcript: transcript,
+                activeTranscript: latestUserTranscript,
+                sessionActive: active && activeThreadID == advice.threadID && awaitingAssistantResponse,
+                administratorAuthorized: activeInteractionAuthority == .administrator,
+                assistantOutputStarted: assistantOutputStartedForTurn
+            )
         }
     }
 
@@ -964,6 +1030,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let effectivePreferredLanguageTag = voiceMode.forcesEnglish
             ? "en"
             : (preferredLanguageTag ?? "")
+        activePreferredLanguageTag = effectivePreferredLanguageTag
+        activeInteractionAuthority = interactionAuthority
         let effectiveLanguageStartInstruction = voiceMode.forcesEnglish
             ? ""
             : (languageStartInstruction ?? "")
@@ -1118,6 +1186,15 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 onEvent(.embodimentMCPReady)
             case "embodiment_mcp_unavailable":
                 onEvent(.embodimentMCPUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
+            case "hermes_delegation_ack_spoken":
+                if let rawID = event.taskID, let taskID = UUID(uuidString: rawID) {
+                    onEvent(.hermesDelegationAcknowledgementSpoken(taskID: taskID))
+                }
+            case "hermes_delegation_ack_rejected":
+                onEvent(.hermesDelegationAcknowledgementRejected(
+                    taskID: event.taskID.flatMap(UUID.init(uuidString:)),
+                    reason: String((event.reason ?? "unknown").prefix(192))
+                ))
             case "hermes_task_result_accepted":
                 if let rawID = event.taskID, let taskID = UUID(uuidString: rawID) {
                     hermesResultAwaitingConfirmation.remove(taskID)
@@ -1791,6 +1868,9 @@ func testAppServerLiveVoiceLauncher() -> String {
              .proactiveOpeningExtraOutputSuppressed, .hermesReportOfferStarted, .hearingUser,
              .visualContextAttached, .visualContextRejected, .visualTurnBarrier,
              .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
+             .hermesDelegationAcknowledgementRequested,
+             .hermesDelegationAcknowledgementSpoken,
+             .hermesDelegationAcknowledgementRejected,
              .hermesTaskResultAccepted, .hermesTaskResultRejected,
              .personContextUnavailable, .embodimentMCPCall,
              .l1ToolAdviceAttached, .l1ToolAdviceRejected,

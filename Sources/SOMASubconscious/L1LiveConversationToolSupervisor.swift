@@ -47,7 +47,7 @@ final class L1LiveConversationToolSupervisor: @unchecked Sendable {
         self.onAdvice = onAdvice
         onHealth(
             "configured",
-            "backend=primary_l1_31b; protocol=ollama_native_tool_calls; input=finalized_participant_turn_only; scheduling=live_tool_before_executive_event_periodic; execution=advisory_only_l2_owned"
+            "backend=primary_l1_31b; protocol=ollama_native_tool_calls; input=realtime_wire_participant_turn; scheduling=live_tool_before_executive_event_periodic; execution=external_work_controller_other_tools_l2"
         )
     }
 

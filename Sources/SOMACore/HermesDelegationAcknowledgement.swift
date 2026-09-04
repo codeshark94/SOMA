@@ -22,22 +22,22 @@ public enum HermesDelegationAcknowledgement {
         }
     }
 
-    public static func controllerEvent(languageTag: String?) -> String {
-        let language = languageTag.flatMap(PersonContextFormat.normalizedLanguageTag) ?? "und"
-        return """
-        ⟦SOMA_HERMES_DELEGATION_ACCEPTED language=\(language) delivery=once_then_listen⟧
-        \(phrase(languageTag: languageTag))
-        ⟦/SOMA_HERMES_DELEGATION_ACCEPTED⟧
-        """
-    }
 }
 
 public enum HermesDelegationAcknowledgementPolicy {
-    public static func shouldInject(
-        successfulDelegation: Bool,
-        assistantSpeechObserved: Bool,
+    /// Acceptance speech belongs to the durable task transition, not to the
+    /// model turn that happened to request it.
+    public static func shouldSpeakAcceptance(
+        operation: HermesAgentTaskOperation,
+        deduplicated: Bool,
+        sessionActive: Bool,
         alreadyHandled: Bool
     ) -> Bool {
-        successfulDelegation && !assistantSpeechObserved && !alreadyHandled
+        switch operation {
+        case .submit, .continueTask:
+            sessionActive && !deduplicated && !alreadyHandled
+        case .get, .list, .cancel, .markReportOffered, .resolveReportOffer, .markReported:
+            false
+        }
     }
 }

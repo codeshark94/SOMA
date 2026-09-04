@@ -198,26 +198,27 @@ or persisting raw tool payloads.
 The host display is a separate sensor from the OBSBOT camera. After an explicit
 administrator request, L2 can acquire one short-lived main-display image and
 perform a bounded foreground UI action, one pointer, scroll, text, or
-supported-key action per call. These are
-two high-level MCP tools rather than separate mouse and keyboard tool families.
-They require the current administrator capability and a fresh participant turn;
-screen pixels and typed text are not written to the cognitive trace. Multi-step
-computer work, shell access, files, repositories, services, and research remain
-Hermes tasks so the live conversation does not become an unbounded desktop
-automation loop. This channel remains available when gimbal motion is disabled;
-physical camera authority is negotiated separately.
+supported-key action per call. These are two high-level MCP tools rather than
+separate mouse and keyboard tool families. They require the current
+administrator capability and a fresh participant turn; screen pixels and typed
+text are not written to the cognitive trace. A single simple local command or
+bounded host inspection can run in the backing Codex turn. Work that must
+continue across turns, supervise a process, modify a repository, or perform
+sustained research belongs to Hermes. This channel remains available when
+gimbal motion is disabled; physical camera authority is negotiated separately.
 
 Hermes is the worker for external jobs that can proceed independently of the
-spoken exchange. When delegation is enabled, L2 separates direct conversation
-and SOMA embodiment from explicit administrator work involving the host Mac,
-files, repositories, coding, services, or research; the administrator does not
-need to name Hermes. L2 submits one bounded objective, receives a durable task
-ID immediately, acknowledges the accepted handoff aloud, and continues the
-spoken conversation without waiting. The acknowledgement never reads the
-internal task ID. If the model finishes the successful tool turn silently, the
-Live Voice controller emits the same one-time acknowledgement in the person's
-preferred language; an acknowledgement already spoken by the model is not
-duplicated. The owner-only SOMA runtime starts a Hermes Agent session,
+spoken exchange. When delegation is enabled, L2 keeps direct conversation,
+SOMA embodiment, and bounded current-turn host actions in the backing Codex
+session, while long-running or multi-step administrator work is delegated; the
+administrator does not need to name Hermes. L2 submits one bounded objective,
+receives a durable task ID immediately, acknowledges the accepted handoff
+aloud, and continues the spoken conversation without waiting. The
+acknowledgement never reads the internal task ID. If the model finishes the
+successful tool turn silently, the Live Voice controller emits the same
+one-time acknowledgement in the person's preferred language; an acknowledgement
+already spoken by the model is not duplicated. The owner-only SOMA runtime
+starts a Hermes Agent session,
 stores the task state and result in an encrypted bounded checkpoint, and
 retrieves the real completion event. If the same L2 conversation is still open,
 the result is returned as trusted controller context and L2 reports it in the
@@ -432,9 +433,11 @@ Codex installation. Motion stays disabled until `.env` explicitly enables it
 and the connected device has a valid calibration. Use `scripts/soma.zsh stop`,
 `start`, `restart`, or `status` for subsequent service control.
 
-Administrator enrollment captures the display name and face together, persists
-their shared entity ID, and restarts L0 so the encrypted profile is loaded
-immediately. If the lens is mounted above or below the participant's eyes, set
+Consented identity enrollment captures the display name and present person's
+face together, persists their shared entity ID, and reloads the running identity
+matcher without restarting L0. A participant can enroll their own current
+identity; enrolling or modifying another identity requires administrator
+authority. If the lens is mounted above or below the participant's eyes, set
 **Camera height** under **L0 — Perception & attention** before judging eye-contact
 accuracy; the correction shifts the expected vertical eye ray while preserving
 the downward-gaze rejection boundary.

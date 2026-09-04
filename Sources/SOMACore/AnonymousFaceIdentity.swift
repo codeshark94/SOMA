@@ -112,6 +112,43 @@ public struct AnonymousFaceResetReport: Equatable, Sendable {
     }
 }
 
+/// Conservative biometric-set comparison used only while an explicitly
+/// confirmed enrollment is being consolidated. Both reference sets must
+/// broadly agree; one coincidentally similar frame cannot merge identities.
+public enum FaceIdentityDuplicatePolicy {
+    public static let referenceSimilarity = 0.90
+    public static let minimumCoverage = 0.60
+
+    public static func shouldMerge(
+        _ lhs: [LocalFaceEmbedding],
+        _ rhs: [LocalFaceEmbedding]
+    ) -> Bool {
+        guard lhs.count >= 2, rhs.count >= 2 else { return false }
+        return coverage(of: lhs, by: rhs) >= minimumCoverage
+            && coverage(of: rhs, by: lhs) >= minimumCoverage
+    }
+
+    private static func coverage(
+        of source: [LocalFaceEmbedding],
+        by references: [LocalFaceEmbedding]
+    ) -> Double {
+        let compatible = source.filter { observation in
+            references.contains {
+                $0.modelID == observation.modelID
+                    && $0.modelRevision == observation.modelRevision
+                    && $0.values.count == observation.values.count
+            }
+        }
+        guard !compatible.isEmpty else { return 0 }
+        let matches = compatible.count { observation in
+            references.compactMap { try? observation.cosineSimilarity(to: $0) }
+                .max()
+                .map { $0 >= referenceSimilarity } ?? false
+        }
+        return Double(matches) / Double(compatible.count)
+    }
+}
+
 private struct AnonymousFaceCluster: Codable {
     let clusterID: UUID
     let handle: AnonymousFaceHandle
@@ -346,8 +383,25 @@ public actor AnonymousFaceRegistry {
         guard source.references.count >= 2 else {
             throw AnonymousFaceRegistryError.insufficientEnrollmentEvidence
         }
-        let result = try operation(source.references)
-        clusters.removeValue(forKey: source.clusterID)
+        let duplicateIDs = clusters.values.compactMap { candidate -> UUID? in
+            candidate.clusterID == source.clusterID
+                || FaceIdentityDuplicatePolicy.shouldMerge(source.references, candidate.references)
+                ? candidate.clusterID
+                : nil
+        }
+        var consolidatedReferences: [LocalFaceEmbedding] = []
+        for clusterID in duplicateIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard let cluster = clusters[clusterID] else { continue }
+            for reference in cluster.references {
+                _ = LocalFaceReferenceSet.retain(
+                    reference,
+                    in: &consolidatedReferences,
+                    maximumCount: 24
+                )
+            }
+        }
+        let result = try operation(consolidatedReferences)
+        duplicateIDs.forEach { clusters.removeValue(forKey: $0) }
         try persist(clusters: Array(clusters.values), fileURL: fileURL, key: key)
         return result
     }

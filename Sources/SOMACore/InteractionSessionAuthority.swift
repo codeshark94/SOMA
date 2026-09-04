@@ -18,6 +18,10 @@ public enum SOMASessionCapabilityScope: Equatable, Sendable {
     /// administrator's registered-person memory. This never includes face
     /// embeddings, raw frames, or transcript text.
     case identityRoster
+    /// Enrolls one currently present anonymous face under the requested local
+    /// identity. A participant may enroll only their own capability-bound
+    /// identity; an administrator may enroll another present participant.
+    case identityEnrollment(UUID)
     case identityManagement
     /// External work may read or change resources outside SOMA's embodied
     /// sensor loop, so only the local administrator can delegate or inspect it.
@@ -49,6 +53,7 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
     case expired
     case personContextDenied
     case identityRosterDenied
+    case identityEnrollmentDenied
     case identityManagementDenied
     case externalTaskDelegationDenied
     case hostScreenObservationDenied
@@ -63,7 +68,8 @@ public enum SOMASessionCapabilityError: Error, Equatable, LocalizedError {
         case .expired: "The SOMA interaction capability has expired"
         case .personContextDenied: "This session may access only its own person context"
         case .identityRosterDenied: "Only the local administrator may read the identity roster"
-        case .identityManagementDenied: "Only the local administrator may enroll or remove local identities"
+        case .identityEnrollmentDenied: "This session may enroll only its own present identity"
+        case .identityManagementDenied: "Only the local administrator may manage other local identities"
         case .externalTaskDelegationDenied: "Only the local administrator may delegate or inspect external tasks"
         case .hostScreenObservationDenied: "Only the local administrator may observe the host screen"
         case .hostInputControlDenied: "Only the local administrator may control host input"
@@ -191,6 +197,10 @@ public final class SOMASessionCapabilityStore: @unchecked Sendable {
             return grant.authority == .administrator
                 ? .success(())
                 : .failure(.identityRosterDenied)
+        case let .identityEnrollment(personEntityID):
+            return grant.authority == .administrator || grant.personEntityID == personEntityID
+                ? .success(())
+                : .failure(.identityEnrollmentDenied)
         case .identityManagement:
             return grant.authority == .administrator
                 ? .success(())

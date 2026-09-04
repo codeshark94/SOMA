@@ -37,7 +37,8 @@ public enum EmbodimentMotorIntent: Equatable, Sendable {
     )
     case opticalZoom(
         requestID: String,
-        factor: Double
+        factor: Double,
+        expiresAtNS: UInt64
     )
     case audioCaptureMode(
         requestID: String,
@@ -141,7 +142,11 @@ public struct EmbodimentMotorCoordinator: Sendable {
 
         if case let .setOpticalZoom(goal) = request.operation,
            decision.status == .accepted {
-            return .opticalZoom(requestID: request.requestID, factor: goal.factor)
+            return .opticalZoom(
+                requestID: request.requestID,
+                factor: goal.factor,
+                expiresAtNS: request.lease.expiresAtNS
+            )
         }
 
         if case let .setAudioCaptureMode(goal) = request.operation,
@@ -450,8 +455,8 @@ public struct EmbodimentMotorCoordinator: Sendable {
             return "capture|\(requestID)|\(reference ?? "none")|\(sceneID ?? "none")|\(bucket(bearing.azimuthDegrees))|\(bucket(bearing.elevationDegrees))|\(bucket(fieldOfView))|\(expiresAtNS)"
         case let .captureCurrent(requestID, fieldOfView, expiresAtNS):
             return "capture_current|\(requestID)|\(bucket(fieldOfView))|\(expiresAtNS)"
-        case let .opticalZoom(requestID, factor):
-            return "optical_zoom|\(requestID)|\(bucket(factor))"
+        case let .opticalZoom(requestID, factor, expiresAtNS):
+            return "optical_zoom|\(requestID)|\(bucket(factor))|\(expiresAtNS)"
         case let .audioCaptureMode(requestID, mode):
             return "audio_capture_mode|\(requestID)|\(mode.rawValue)"
         case let .audioInputGain(requestID, percent):

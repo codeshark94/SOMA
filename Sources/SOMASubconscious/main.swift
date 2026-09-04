@@ -2150,6 +2150,27 @@ private final class L1AuxiliaryHumanVerdictRelay: @unchecked Sendable {
     }
 }
 
+/// Refreshes the live matcher after the control plane persists a consented
+/// identity. Enrollment and frame processing are initialized in opposite
+/// dependency order, so this relay keeps either side from owning the other.
+private final class FaceIdentityProfileReloadRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: (@Sendable () -> Void)?
+
+    func reload() {
+        lock.lock()
+        let active = sink
+        lock.unlock()
+        active?()
+    }
+
+    func attach(_ sink: @escaping @Sendable () -> Void) {
+        lock.lock()
+        self.sink = sink
+        lock.unlock()
+    }
+}
+
 private struct L1AuxiliarySemanticTraceEvent: Encodable, Sendable {
     let event = "l1.auxiliary.semantic"
     let requestID: UInt64
@@ -2338,7 +2359,7 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             framingWidth = nil
             framingHeight = nil
             self.expiresAtNS = expiresAtNS
-        case let .opticalZoom(requestID, factor):
+        case let .opticalZoom(requestID, factor, expiresAtNS):
             self.requestID = requestID
             action = "optical_zoom"
             reason = String(format: "factor=%.3f", factor)
@@ -2352,7 +2373,7 @@ private struct EmbodimentMotorTraceEvent: Encodable, Sendable {
             framingCenterY = nil
             framingWidth = nil
             framingHeight = nil
-            expiresAtNS = nil
+            self.expiresAtNS = expiresAtNS
         case let .audioCaptureMode(requestID, mode):
             self.requestID = requestID
             action = "audio_capture_mode"
@@ -3781,6 +3802,9 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var idleExplorationGate: IdleExplorationGate?
     private var externalCommandID: String?
     private var helperReady = false
+    private var opticalZoomLeaseGeneration = 0
+    private var activeOpticalZoomLease: (requestID: String, expiresAtNS: UInt64)?
+    private var wideOpticalZoomReconciled = false
     private var deviceProfile: OBSBOTDeviceProfile?
     private var deviceContract: OBSBOTDeviceContract?
     private var deviceCapabilities: OBSBOTDeviceCapabilities?
@@ -4209,12 +4233,18 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             }
             let state = values["state"].map(String.init) ?? "degraded"
             controlRecoveryLock.lock()
+            let wasAwaitingPhysicalReconnect = controlRequiresPhysicalReconnect
             if state == "healthy" {
                 controlRequiresPhysicalReconnect = false
             } else if state == "awaiting_physical_reconnect" {
                 controlRequiresPhysicalReconnect = true
             }
             controlRecoveryLock.unlock()
+            if state == "awaiting_physical_reconnect" {
+                wideOpticalZoomReconciled = false
+            } else if state == "healthy", wasAwaitingPhysicalReconnect {
+                reconcileWideOpticalZoom(reason: "control_transport_recovered")
+            }
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: monotonicNanoseconds(),
@@ -4287,6 +4317,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                     at: monotonicNanoseconds(),
                     reason: "capabilities_ready"
                 )
+                reconcileWideOpticalZoom(reason: "capabilities_ready")
             }
             let firmware = contract.firmware ?? "unknown"
             writer.write(RuntimeEvent(
@@ -4405,6 +4436,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 at: monotonicNanoseconds(),
                 reason: "bridge_startup"
             )
+            reconcileWideOpticalZoom(reason: "bridge_startup")
             explorationEligibleAfterNS = monotonicNanoseconds() + 3_000_000_000
             if supportsBasicIndicatorControl {
                 let indicatorEnableCommandID = nextCommandID(prefix: "indicator-enable")
@@ -4753,6 +4785,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
             // command. Clear it even when no local lease survived a previous
             // process so the next launch begins from an unowned motor state.
             disableFirmwareSoundFollowing(at: stopNS, reason: "runtime_stopping")
+            restoreWideOpticalZoom(reason: "runtime_stopping")
             let commandID = nextCommandID(prefix: "shutdown")
             send(shutdownHelperURL == nil
                 ? "shutdown \(commandID)"
@@ -6970,6 +7003,56 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         )
     }
 
+    private func reconcileWideOpticalZoom(reason: String) {
+        guard helperReady, deviceContract != nil, !wideOpticalZoomReconciled else { return }
+        wideOpticalZoomReconciled = true
+        restoreWideOpticalZoom(reason: reason)
+    }
+
+    private func restoreWideOpticalZoom(reason: String) {
+        opticalZoomLeaseGeneration += 1
+        activeOpticalZoomLease = nil
+        guard helperReady else { return }
+        let commandID = nextCommandID(prefix: "optical-zoom-wide")
+        send("camera_zoom \(commandID) 1.0000")
+        writer.write(RuntimeEvent(
+            event: "source.health",
+            monotonicNS: monotonicNanoseconds(),
+            source: "obsbot_camera_optics",
+            state: "wide_zoom_requested",
+            message: "request_id=\(commandID); reason=\(String(reason.prefix(96)))"
+        ))
+    }
+
+    private func scheduleOpticalZoomExpiry(
+        requestID: String,
+        expiresAtNS: UInt64,
+        generation: Int
+    ) {
+        let now = monotonicNanoseconds()
+        let remainingNS = expiresAtNS > now ? expiresAtNS - now : 0
+        let boundedDelay = Int(min(remainingNS, UInt64(Int.max)))
+        queue.asyncAfter(deadline: .now() + .nanoseconds(boundedDelay)) { [weak self] in
+            guard let self,
+                  generation == opticalZoomLeaseGeneration,
+                  let activeOpticalZoomLease,
+                  activeOpticalZoomLease.requestID == requestID,
+                  activeOpticalZoomLease.expiresAtNS == expiresAtNS else {
+                return
+            }
+            let observedNS = monotonicNanoseconds()
+            guard observedNS >= expiresAtNS else {
+                scheduleOpticalZoomExpiry(
+                    requestID: requestID,
+                    expiresAtNS: expiresAtNS,
+                    generation: generation
+                )
+                return
+            }
+            restoreWideOpticalZoom(reason: "inspection_lease_expired")
+        }
+    }
+
     private func applyEmbodimentIntent(_ intent: EmbodimentMotorIntent) {
         let now = monotonicNanoseconds()
         if !allowsMotorControl {
@@ -7043,7 +7126,7 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 cameraPose: poseStore.current(maximumAgeNS: 600_000_000) ?? poseStore.lastKnown(),
                 at: now
             )
-        case let .opticalZoom(requestID, factor):
+        case let .opticalZoom(requestID, factor, expiresAtNS):
             guard helperReady else {
                 writer.write(RuntimeEvent(
                     event: "source.health",
@@ -7054,14 +7137,32 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 ))
                 return
             }
+            opticalZoomLeaseGeneration += 1
+            let generation = opticalZoomLeaseGeneration
+            if factor <= 1.000_1 {
+                activeOpticalZoomLease = nil
+            } else if now < expiresAtNS {
+                activeOpticalZoomLease = (requestID, expiresAtNS)
+            } else {
+                activeOpticalZoomLease = nil
+                restoreWideOpticalZoom(reason: "expired_before_application")
+                return
+            }
             send(String(format: "camera_zoom %@ %.4f", requestID, factor))
             writer.write(RuntimeEvent(
                 event: "source.health",
                 monotonicNS: now,
                 source: "obsbot_camera_optics",
                 state: "optical_zoom_requested",
-                message: String(format: "request_id=%@; requested_factor=%.3f", String(requestID.prefix(96)), factor)
+                message: String(format: "request_id=%@; requested_factor=%.3f; lease_expires_ns=%llu", String(requestID.prefix(96)), factor, expiresAtNS)
             ))
+            if factor > 1.000_1 {
+                scheduleOpticalZoomExpiry(
+                    requestID: requestID,
+                    expiresAtNS: expiresAtNS,
+                    generation: generation
+                )
+            }
         case let .audioCaptureMode(requestID, mode):
             guard let firmwareMode = deviceContract?.firmwareAudioMode(for: mode) else {
                 writer.write(RuntimeEvent(
@@ -11515,6 +11616,10 @@ private final class VisionWorker: @unchecked Sendable {
         faceIdentityRuntime?.stop()
     }
 
+    func reloadFaceIdentityProfiles() {
+        faceIdentityRuntime?.reloadProfiles()
+    }
+
     private func workLoop() {
         while true {
             wake.wait()
@@ -12681,6 +12786,7 @@ private func run(_ options: Options) throws {
     let panoramaStatus = PanoramaMapStatusStore()
     let auxiliaryWakeRelay = L1AuxiliaryWakeRelay()
     let auxiliaryHumanVerdictRelay = L1AuxiliaryHumanVerdictRelay()
+    let faceIdentityProfileReloadRelay = FaceIdentityProfileReloadRelay()
     let l1AuxiliaryBridgeBox = L1AuxiliaryBridgeBox()
     let poseStoreBox = PoseStoreBox()
     let memoryContextBox = MemoryContextBox()
@@ -13225,34 +13331,6 @@ private func run(_ options: Options) throws {
     let speechInteractionBox = SpeechInteractionBox()
     let liveVoiceLauncher: AppServerLiveVoiceLauncher?
     let liveVoiceBox = LiveVoiceLauncherBox()
-    let l1LiveToolSupervisor = L1LiveConversationToolSupervisor(
-        infer: { request, completion in
-            l1ThoughtRelay.submitLiveToolAdvice(request, completion: completion)
-        },
-        onHealth: { state, message in
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "l1_live_tool",
-                state: state,
-                message: message
-            ))
-        },
-        onAdvice: { advice, transcript in
-            let injected = liveVoiceBox.launcher?.injectL1ToolAdvice(
-                advice,
-                forUserTranscript: transcript
-            ) ?? false
-            writer.write(RuntimeEvent(
-                event: "l1.live_tool",
-                monotonicNS: monotonicNanoseconds(),
-                source: "l1_live_tool",
-                state: injected ? "injection_requested" : "held",
-                message: "turn=\(advice.turnID.uuidString.lowercased()); tool=\(advice.toolName ?? "none"); reason=\(injected ? "current_turn" : "stale_or_output_started")"
-            ))
-        }
-    )
-    defer { l1LiveToolSupervisor.stop() }
     let hermesAgentDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/SOMA/hermes-agent", isDirectory: true)
     let hermesAgentKey = try OwnerOnlyInstallationSecret.loadOrCreate(
@@ -13290,6 +13368,74 @@ private func run(_ options: Options) throws {
         }
     )
     defer { hermesAgentCoordinator.stop() }
+    let l1LiveToolSupervisor = L1LiveConversationToolSupervisor(
+        infer: { request, completion in
+            l1ThoughtRelay.submitLiveToolAdvice(request, completion: completion)
+        },
+        onHealth: { state, message in
+            writer.write(RuntimeEvent(
+                event: "source.health",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_live_tool",
+                state: state,
+                message: message
+            ))
+        },
+        onAdvice: { advice, transcript in
+            if liveVoiceBox.launcher?.authorizesL1ExternalWork(
+                advice,
+                forUserTranscript: transcript
+            ) == true {
+                let result = hermesAgentCoordinator.handle(.init(
+                    operation: .submit,
+                    goalEpisodeID: advice.turnID,
+                    title: String(transcript.prefix(160)),
+                    objective: transcript
+                ))
+                if case let .success(value) = result,
+                   let task = value.task {
+                    _ = liveVoiceBox.launcher?.acknowledgeHermesTaskAccepted(
+                        taskID: task.id,
+                        operation: .submit,
+                        deduplicated: value.deduplicated
+                    )
+                    writer.write(RuntimeEvent(
+                        event: "l1.live_tool",
+                        monotonicNS: monotonicNanoseconds(),
+                        source: "l1_live_tool",
+                        state: "executed",
+                        message: "turn=\(advice.turnID.uuidString.lowercased()); tool=delegate_hermes_task; task_id=\(task.id.uuidString.lowercased()); owner=l1_controller; deduplicated=\(value.deduplicated)"
+                    ))
+                    return
+                }
+                let reason: String
+                if case let .failure(error) = result {
+                    reason = error.localizedDescription
+                } else {
+                    reason = "hermes_task_missing_after_submit"
+                }
+                writer.write(RuntimeEvent(
+                    event: "l1.live_tool",
+                    monotonicNS: monotonicNanoseconds(),
+                    source: "l1_live_tool",
+                    state: "execution_failed",
+                    message: "turn=\(advice.turnID.uuidString.lowercased()); tool=delegate_hermes_task; reason=\(String(reason.prefix(192)))"
+                ))
+            }
+            let injected = liveVoiceBox.launcher?.injectL1ToolAdvice(
+                advice,
+                forUserTranscript: transcript
+            ) ?? false
+            writer.write(RuntimeEvent(
+                event: "l1.live_tool",
+                monotonicNS: monotonicNanoseconds(),
+                source: "l1_live_tool",
+                state: injected ? "injection_requested" : "held",
+                message: "turn=\(advice.turnID.uuidString.lowercased()); tool=\(advice.toolName ?? "none"); reason=\(injected ? "current_turn" : "stale_or_output_started")"
+            ))
+        }
+    )
+    defer { l1LiveToolSupervisor.stop() }
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(
             voice: controlSettings.realtimeVoice,
@@ -13493,6 +13639,30 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "proactive_opening_extra_output_suppressed",
                     message: "session_terminated_before_participant_turn"
+                ))
+            case let .hermesDelegationAcknowledgementRequested(taskID):
+                writer.write(RuntimeEvent(
+                    event: "hermes.task",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "acceptance_speech_requested",
+                    message: "task_id=\(taskID.uuidString.lowercased()); owner=controller"
+                ))
+            case let .hermesDelegationAcknowledgementSpoken(taskID):
+                writer.write(RuntimeEvent(
+                    event: "hermes.task",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "acceptance_spoken",
+                    message: "task_id=\(taskID.uuidString.lowercased()); exactly_once=true"
+                ))
+            case let .hermesDelegationAcknowledgementRejected(taskID, reason):
+                writer.write(RuntimeEvent(
+                    event: "hermes.task",
+                    monotonicNS: eventNS,
+                    source: "l2_live_voice",
+                    state: "acceptance_speech_rejected",
+                    message: "task_id=\(taskID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
                 ))
             case let .hermesReportOfferStarted(taskID):
                 let resolution = hermesAgentCoordinator.handle(.init(
@@ -14460,6 +14630,7 @@ private func run(_ options: Options) throws {
                         state: "persistent_profile_created",
                         message: "references=\(result.referenceCount); metadata_disclosure=person_context_only"
                     ))
+                    faceIdentityProfileReloadRelay.reload()
                     return .success(.init(
                         personEntityID: result.entityID,
                         referenceCount: result.referenceCount
@@ -14582,6 +14753,13 @@ private func run(_ options: Options) throws {
                 let result = hermesAgentCoordinator.handle(request)
                 if case let .success(value) = result {
                     let task = value.task ?? value.tasks.first
+                    if let task {
+                        _ = liveVoiceBox.launcher?.acknowledgeHermesTaskAccepted(
+                            taskID: task.id,
+                            operation: request.operation,
+                            deduplicated: value.deduplicated
+                        )
+                    }
                     writer.write(RuntimeEvent(
                         event: "hermes.task",
                         monotonicNS: monotonicNanoseconds(),
@@ -14811,6 +14989,9 @@ private func run(_ options: Options) throws {
             rawValue: somaEnvString("SOMA_L0_CAMERA_VERTICAL_PLACEMENT", default: "eye_level")
         )?.expectedDirectPupilOffsetY ?? 0
     )
+    faceIdentityProfileReloadRelay.attach { [weak visionWorker] in
+        visionWorker?.reloadFaceIdentityProfiles()
+    }
     let eventImportanceModel = EventImportanceModel()
     let speechInteraction: LocalSpeechInteractionCoordinator?
     if let localeIdentifier = options.localSpeechLocaleIdentifier,

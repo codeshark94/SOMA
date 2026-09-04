@@ -742,7 +742,10 @@ public final class EmbodimentShadowSocketServer: @unchecked Sendable {
                       request.confirmedByUser else {
                     throw EmbodimentIPCError.malformedMessage
                 }
-                try authorize(command.sessionAuthorization, scope: .identityManagement)
+                try authorize(
+                    command.sessionAuthorization,
+                    scope: .identityEnrollment(request.personEntityID)
+                )
                 switch identityEnrollmentProvider(request) {
                 case let .success(result):
                     writeReply(.init(ok: true, identityEnrollment: result), to: clientFD)

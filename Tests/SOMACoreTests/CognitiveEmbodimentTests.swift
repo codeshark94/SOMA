@@ -463,6 +463,7 @@ final class CognitiveEmbodimentTests: XCTestCase {
         for scope in [
             SOMASessionCapabilityScope.personContext(registeredPerson),
             .identityRoster,
+            .identityEnrollment(registeredPerson),
             .identityManagement,
         ] {
             switch store.authorize(token: administratorToken, scope: scope, at: 1_000_000_001) {
@@ -480,6 +481,72 @@ final class CognitiveEmbodimentTests: XCTestCase {
         case .failure(.identityManagementDenied): break
         case let .failure(error): XCTFail("wrong identity-management error: \(error)")
         }
+        switch store.authorize(
+            token: participantToken,
+            scope: .identityEnrollment(registeredPerson),
+            at: 1_000_000_001
+        ) {
+        case .success: break
+        case let .failure(error): XCTFail("participant could not enroll their own identity: \(error)")
+        }
+        switch store.authorize(
+            token: participantToken,
+            scope: .identityEnrollment(UUID()),
+            at: 1_000_000_001
+        ) {
+        case .success: XCTFail("participant enrolled another identity")
+        case .failure(.identityEnrollmentDenied): break
+        case let .failure(error): XCTFail("wrong self-enrollment error: \(error)")
+        }
+    }
+
+    func testParticipantCanEnrollOnlyTheirOwnIdentityThroughIPC() throws {
+        let suffix = UUID().uuidString.prefix(8)
+        let directory = URL(fileURLWithPath: "/private/tmp/soma-self-enrollment-ipc-\(suffix)", isDirectory: true)
+        let socketURL = directory.appendingPathComponent("identity.sock")
+        let store = SOMASessionCapabilityStore(lifetimeSeconds: 60)
+        let participantID = UUID()
+        let token = store.issue(personEntityID: participantID, authority: .participant)
+        let enrolled = LockedIdentity()
+        let server = EmbodimentShadowSocketServer(
+            socketURL: socketURL,
+            identityEnrollmentProvider: { request in
+                enrolled.set(request.personEntityID)
+                return .success(.init(personEntityID: request.personEntityID, referenceCount: 3))
+            },
+            sessionAuthorizationProvider: { supplied, scope in
+                store.authorize(token: supplied, scope: scope).mapError { $0 as Error }
+            }
+        )
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let ownEnrollment = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .identityEnrollment,
+                identityEnrollment: .init(personEntityID: participantID, confirmedByUser: true),
+                sessionAuthorization: token
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertTrue(ownEnrollment.ok)
+        XCTAssertEqual(ownEnrollment.identityEnrollment?.personEntityID, participantID)
+        XCTAssertEqual(enrolled.value, participantID)
+
+        let otherID = UUID()
+        let otherEnrollment = try EmbodimentShadowSocketClient.send(
+            .init(
+                kind: .identityEnrollment,
+                identityEnrollment: .init(personEntityID: otherID, confirmedByUser: true),
+                sessionAuthorization: token
+            ),
+            socketURL: socketURL
+        )
+        XCTAssertFalse(otherEnrollment.ok)
+        XCTAssertEqual(enrolled.value, participantID)
     }
 
     func testEveryCognitiveLayerCanIssueTheSameLeasedTrackingGoal() throws {
@@ -1413,7 +1480,11 @@ final class CognitiveEmbodimentTests: XCTestCase {
         XCTAssertEqual(zoomDecision.snapshot.activeRequestID, orientation.requestID)
         XCTAssertEqual(
             coordinator.apply(request: zoom, decision: zoomDecision, at: now + 1),
-            .opticalZoom(requestID: zoom.requestID, factor: 1.25)
+            .opticalZoom(
+                requestID: zoom.requestID,
+                factor: 1.25,
+                expiresAtNS: zoom.lease.expiresAtNS
+            )
         )
     }
 
@@ -2144,6 +2215,23 @@ private final class LockedValue: @unchecked Sendable {
     }
 
     func set(_ value: Bool) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
+    }
+}
+
+private final class LockedIdentity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: UUID?
+
+    var value: UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func set(_ value: UUID) {
         lock.lock()
         storedValue = value
         lock.unlock()

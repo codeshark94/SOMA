@@ -3,6 +3,55 @@ import Testing
 @testable import SOMACore
 
 @Suite struct L1LiveConversationToolAdviceTests {
+    @Test func semanticCoordinatorOwnsNewWorkVersusExistingStatusDivision() {
+        let policy = L1LiveWorkCoordinationPolicy.instruction
+        #expect(policy.contains("exactly one execution domain"))
+        #expect(policy.contains("new independent external work"))
+        #expect(policy.contains("bounded administrator host work"))
+        #expect(policy.contains("belongs to backing Codex"))
+        #expect(policy.contains("work that is already delegated, running, or completed"))
+        #expect(policy.contains("has not yet been performed is a new work request"))
+        #expect(policy.contains("The participant does not need to name Hermes"))
+    }
+
+    @Test func externalWorkDispatchRequiresCurrentAuthorizedSilentTurn() {
+        let turnID = UUID()
+        let advice = L1LiveToolAdvice(
+            cycleID: UUID(),
+            threadID: "thread-a",
+            turnID: turnID,
+            action: .recommendTool,
+            toolName: "delegate_hermes_task",
+            groundingQuote: "조사해 줘",
+            confidence: 0.85,
+            rationale: "external work"
+        )
+        #expect(L1LiveExternalWorkDispatchPolicy.permits(
+            advice: advice,
+            transcript: "오늘 시장 동향을 조사해 줘",
+            activeTranscript: "오늘  시장 동향을 조사해 줘",
+            sessionActive: true,
+            administratorAuthorized: true,
+            assistantOutputStarted: false
+        ))
+        #expect(!L1LiveExternalWorkDispatchPolicy.permits(
+            advice: advice,
+            transcript: "오늘 시장 동향을 조사해 줘",
+            activeTranscript: "오늘 시장 동향을 조사해 줘",
+            sessionActive: true,
+            administratorAuthorized: false,
+            assistantOutputStarted: false
+        ))
+        #expect(!L1LiveExternalWorkDispatchPolicy.permits(
+            advice: advice,
+            transcript: "오늘 시장 동향을 조사해 줘",
+            activeTranscript: "오늘 시장 동향을 조사해 줘",
+            sessionActive: true,
+            administratorAuthorized: true,
+            assistantOutputStarted: true
+        ))
+    }
+
     @Test func explicitStatusReportUsesImmediateReadOnlyOverviewRoute() throws {
         let request = L1LiveToolAdviceRequest(
             threadID: "thread-status",

@@ -101,9 +101,10 @@ final class HermesAgentTaskTests: XCTestCase {
     func testTaskRoutingSeparatesHostWorkFromRobotEmbodiment() {
         let enabled = L2TaskRoutingPolicy.instruction(hermesEnabled: true)
         XCTAssertTrue(enabled.contains("visible Mac UI"))
+        XCTAssertTrue(enabled.contains("executed directly by backing Codex"))
         XCTAssertTrue(enabled.contains("delegate_hermes_task exactly once"))
-        XCTAssertTrue(enabled.contains("keep listening and converse normally"))
-        XCTAssertTrue(enabled.contains("acknowledge aloud"))
+        XCTAssertTrue(enabled.contains("Keep listening and converse normally"))
+        XCTAssertTrue(enabled.contains("controller owns the immediate spoken acceptance"))
         XCTAssertTrue(enabled.contains("Do not read the task UUID aloud"))
         XCTAssertTrue(enabled.contains("Do not substitute screen pixels or get_robot_body_state"))
         XCTAssertTrue(enabled.contains("use get_activity_overview"))
@@ -156,33 +157,70 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertFalse(diagnostic?.succeeded ?? true)
     }
 
-    func testDelegationAcknowledgementIsLocalizedAndInjectedOnlyForSilentSuccess() {
+    func testAuthorizationFailureAlwaysHasOneLocalizedFallback() throws {
+        let diagnostic = try XCTUnwrap(MCPToolCompletionDiagnostic.parse([
+            "id": "tool-denied",
+            "type": "mcpToolCall",
+            "server": "soma_embodiment",
+            "tool": "control_host_computer",
+            "status": "completed",
+            "result": [
+                "structuredContent": [
+                    "ok": false,
+                    "error": "Only the local administrator may control host input",
+                ],
+            ],
+        ]))
+        XCTAssertTrue(diagnostic.isAuthorizationFailure)
+        XCTAssertEqual(
+            MCPToolAuthorizationFailureResponse.phrase(languageTag: "ko-KR"),
+            "현재 신원에는 이 작업 권한이 없습니다."
+        )
+        XCTAssertEqual(
+            MCPToolAuthorizationFailureResponse.phrase(languageTag: "en-US"),
+            "This identity is not authorized to perform that action."
+        )
+    }
+
+    func testDelegationAcknowledgementIsLocalizedAndOwnedByNewTaskTransition() {
         XCTAssertEqual(
             HermesDelegationAcknowledgement.phrase(languageTag: "ko-KR"),
             "컴퓨터 관리자에게 맡겼어요. 끝나면 알려드릴게요."
         )
-        XCTAssertTrue(
-            HermesDelegationAcknowledgement.controllerEvent(languageTag: "ko-KR")
-                .contains("SOMA_HERMES_DELEGATION_ACCEPTED language=ko-kr")
-        )
-        XCTAssertTrue(HermesDelegationAcknowledgementPolicy.shouldInject(
-            successfulDelegation: true,
-            assistantSpeechObserved: false,
+        XCTAssertTrue(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
+            operation: .submit,
+            deduplicated: false,
+            sessionActive: true,
             alreadyHandled: false
         ))
-        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldInject(
-            successfulDelegation: true,
-            assistantSpeechObserved: true,
+        XCTAssertTrue(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
+            operation: .continueTask,
+            deduplicated: false,
+            sessionActive: true,
             alreadyHandled: false
         ))
-        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldInject(
-            successfulDelegation: false,
-            assistantSpeechObserved: false,
+        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
+            operation: .submit,
+            deduplicated: true,
+            sessionActive: true,
             alreadyHandled: false
         ))
-        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldInject(
-            successfulDelegation: true,
-            assistantSpeechObserved: false,
+        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
+            operation: .submit,
+            deduplicated: false,
+            sessionActive: false,
+            alreadyHandled: false
+        ))
+        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
+            operation: .list,
+            deduplicated: false,
+            sessionActive: true,
+            alreadyHandled: false
+        ))
+        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
+            operation: .submit,
+            deduplicated: false,
+            sessionActive: true,
             alreadyHandled: true
         ))
     }
