@@ -13198,6 +13198,13 @@ private func run(_ options: Options) throws {
         },
         transcriptRetentionSeconds: somaEnvDouble("SOMA_MEMORY_SHORT_TERM_RETENTION_HOURS", default: 24) * 60 * 60
     )
+    let liveVoiceMemoryPrefetcher = SpeculativeMemoryPrefetcher { personEntityID, query in
+        await l1MemoryContext.recallMemoryProjections(
+            query: query,
+            entityID: personEntityID
+        )
+    }
+    let liveVoiceMemoryPipeline = SerialAsyncEventPipeline()
     memoryContextBox.provider = l1MemoryContext
     Task {
         await l1MemoryContext.recoverPendingConversationMemories()
@@ -13352,6 +13359,15 @@ private func run(_ options: Options) throws {
                         threadID: threadID,
                         personEntityID: personEntityID
                     )
+                    liveVoiceMemoryPipeline.enqueue {
+                        await liveVoiceMemoryPrefetcher.begin(
+                            threadID: threadID,
+                            personEntityID: personEntityID
+                        )
+                    }
+                    if let personEntityID {
+                        Task { await l1MemoryContext.warmSemanticIndex(for: personEntityID) }
+                    }
                 }
                 writer.write(RuntimeEvent(
                     event: "human.interaction",
@@ -13508,10 +13524,17 @@ private func run(_ options: Options) throws {
                     state: "input_transcription_failed",
                     message: reason
                 ))
-            case let .transcriptPartial(threadID, text):
-                _ = threadID
-                _ = text
-            case let .transcriptFinalized(threadID, role, text):
+            case let .transcriptPartial(threadID, turnGeneration, text):
+                if let threadID, let turnGeneration {
+                    liveVoiceMemoryPipeline.enqueue {
+                        await liveVoiceMemoryPrefetcher.ingestPartial(
+                            threadID: threadID,
+                            turnGeneration: turnGeneration,
+                            text: text
+                        )
+                    }
+                }
+            case let .transcriptFinalized(threadID, turnGeneration, role, text):
                 if role == .user {
                     // A finalized user transcript is the first reliable proof
                     // that the participant, rather than ambient audio, kept
@@ -13525,11 +13548,44 @@ private func run(_ options: Options) throws {
                     state: role == .user ? "user" : "assistant",
                     message: "characters=\(min(text.count, 65_535)); content=encrypted_archive_only"
                 ))
-                if let threadID {
+                if let threadID, let turnGeneration, role == .user {
+                    liveVoiceMemoryPipeline.enqueue {
+                        let personEntityID = await liveVoiceMemoryPrefetcher.personEntityID(
+                            threadID: threadID
+                        )
+                        l1MemoryContext.clearSpeculativeRecall(for: personEntityID)
+                        let recall = await liveVoiceMemoryPrefetcher.claim(
+                            threadID: threadID,
+                            turnGeneration: turnGeneration,
+                            finalText: text
+                        )
+                        if let recall {
+                            l1MemoryContext.publishSpeculativeRecall(
+                                recall.projections,
+                                for: recall.personEntityID
+                            )
+                            writer.write(RuntimeEvent(
+                                event: "source.health",
+                                monotonicNS: monotonicNanoseconds(),
+                                source: "live_memory_prefetch",
+                                state: "claimed",
+                                message: "memories=\(recall.projections.count); final_compatible=true; synthetic_turn=false"
+                            ))
+                        }
+                        l1ThoughtRelay.recordConversationTurn(
+                            threadID: threadID,
+                            role: role,
+                            text: text,
+                            recalledMemory: recall?.projections ?? [],
+                            at: eventNS
+                        )
+                    }
+                } else if let threadID {
                     l1ThoughtRelay.recordConversationTurn(
                         threadID: threadID,
                         role: role,
                         text: text,
+                        recalledMemory: [],
                         at: eventNS
                     )
                 }
@@ -13640,8 +13696,16 @@ private func run(_ options: Options) throws {
                 l1LiveConversationState.end()
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
+                if let threadID {
+                    liveVoiceMemoryPipeline.enqueue {
+                        await liveVoiceMemoryPrefetcher.end(threadID: threadID)
+                        l1MemoryContext.clearSpeculativeRecall(for: personEntityID)
+                    }
+                } else {
+                    l1MemoryContext.clearSpeculativeRecall(for: personEntityID)
+                }
                 Task {
-                    await l1MemoryContext.endConversation(
+                    _ = await l1MemoryContext.endConversation(
                         threadID: threadID,
                         personEntityID: personEntityID,
                         interrupted: false,
@@ -13679,6 +13743,14 @@ private func run(_ options: Options) throws {
                 l1LiveConversationState.end()
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
+                if let threadID {
+                    liveVoiceMemoryPipeline.enqueue {
+                        await liveVoiceMemoryPrefetcher.end(threadID: threadID)
+                        l1MemoryContext.clearSpeculativeRecall(for: personEntityID)
+                    }
+                } else {
+                    l1MemoryContext.clearSpeculativeRecall(for: personEntityID)
+                }
                 if reason == "service_shutdown" {
                     _ = l1MemoryContext.endConversationBeforeShutdown(
                         threadID: threadID,

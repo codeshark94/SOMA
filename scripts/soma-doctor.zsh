@@ -243,6 +243,8 @@ if [[ "$soma_mode" == "--runtime" ]]; then
   SOMA_ENABLE_L2_LIVE_VOICE=1
   SOMA_ENABLE_L05_VLM=0
   SOMA_L1_MODEL="$SOMA_DEFAULT_L1_MODEL"
+  SOMA_EMBEDDING_MODEL="$SOMA_DEFAULT_EMBEDDING_MODEL"
+  SOMA_EMBEDDING_HOST=http://127.0.0.1:11434
   OLLAMA_HOST=http://127.0.0.1:11434
   if [[ -f "$soma_env_file" ]]; then
     soma_env_mode=$(stat -f '%Lp' "$soma_env_file" 2>/dev/null || true)
@@ -298,6 +300,14 @@ if [[ "$soma_mode" == "--runtime" ]]; then
       soma_ok "Ollama model ${SOMA_L1_MODEL:-$SOMA_DEFAULT_L1_MODEL} at ${OLLAMA_HOST:-http://127.0.0.1:11434}"
     else
       soma_fail "Ollama server/model unavailable: ${SOMA_L1_MODEL:-$SOMA_DEFAULT_L1_MODEL}"
+    fi
+    soma_embedding_model=${SOMA_EMBEDDING_MODEL:-$SOMA_DEFAULT_EMBEDDING_MODEL}
+    soma_embedding_host=${SOMA_EMBEDDING_HOST:-http://127.0.0.1:11434}
+    soma_embedding_list=$(OLLAMA_HOST="$soma_embedding_host" "$soma_ollama" list 2>/dev/null || true)
+    if print -r -- "$soma_embedding_list" | awk 'NR > 1 {print $1}' | grep -Fxq "$soma_embedding_model"; then
+      soma_ok "local memory embedding model $soma_embedding_model at $soma_embedding_host"
+    else
+      soma_fail "local memory embedding server/model unavailable: $soma_embedding_model at $soma_embedding_host"
     fi
   else
     soma_fail 'Ollama is unavailable; install it from Brewfile and start its local server'

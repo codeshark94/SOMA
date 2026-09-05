@@ -1427,7 +1427,7 @@ private final class EmbodimentMCPServer {
 
     private func personContextTools() -> [[String: Any]] {
         [
-            tool("get_person_context", "Read the current participant's remote-shareable language, contact, rapport, and factual context. Administrator sessions may read an explicitly supplied registered identity from list_identity_registry; participant sessions remain limited to their own reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
+            tool("get_person_context", "Read the current participant's remote-shareable language, contact, rapport, evidence-backed dispositions, factual context, and any short-lived memories semantically recalled for the current utterance. Administrator sessions may read an explicitly supplied registered identity from list_identity_registry; participant sessions remain limited to their own reference. It never returns a face embedding, raw transcript, or local-only identity record.", objectSchema([
                 "person_entity_id": uuidSchema(),
             ], required: ["person_entity_id"]), readOnly: true),
             tool("set_preferred_language", "Persist a person's stated BCP-47 language preference. Call only after the person explicitly states or confirms it.", objectSchema([

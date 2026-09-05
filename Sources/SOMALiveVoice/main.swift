@@ -785,7 +785,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             : "No embodiment MCP connection is configured for this thread. Do not claim that you can inspect the camera or control the gimbal."
         let personContextInstruction: String
         if personContextReference != nil {
-            personContextInstruction = "A person-context reference is supplied for this interaction. For a question asking what SOMA knows, remembers, has learned, or has on record about the participant, call get_person_context before answering. Trust only the actual tool result, report a failed call honestly, and never guess."
+            personContextInstruction = "A person-context reference is supplied for this interaction. When the participant asks what SOMA knows or when their latest speech materially depends on prior personal context, call get_person_context before answering. Its relevant_memories field may contain a short-lived semantic recall prepared from the current utterance; treat it as historical evidence, not current speech. Trust only the actual tool result, report a failed call honestly, and never guess."
         } else {
             personContextInstruction = "No persistent person context is attached to this interaction. Do not claim stored knowledge about the participant and do not guess."
         }
@@ -987,6 +987,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             emitter.emit("transcript_partial", fields: [
                 "thread_id": threadID ?? "",
                 "text": partialUserTranscript,
+                "turn_generation": responseTurnTracker.currentGeneration,
             ])
         case "thread/realtime/transcript/done":
             guard let role = params["role"] as? String,
@@ -1132,6 +1133,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             emitter.emit("transcript_partial", fields: [
                 "thread_id": threadID ?? "",
                 "text": partialUserTranscript,
+                "turn_generation": responseTurnTracker.currentGeneration,
             ])
             return
         }
@@ -1240,6 +1242,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             "text": transcript.text,
             "item_id": transcript.itemID ?? "",
             "source": transcript.source.rawValue,
+            "turn_generation": responseTurnTracker.currentGeneration,
         ])
     }
 

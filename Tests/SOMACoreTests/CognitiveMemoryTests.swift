@@ -797,6 +797,84 @@ final class CognitiveMemoryTests: XCTestCase {
         XCTAssertFalse(known.mission.recommendedKeys.contains("preferred_language"))
     }
 
+    func testEvidenceBackedDispositionIsPersonScopedAndProjectedWithoutRawTurns() async throws {
+        let directory = temporaryDirectory("disposition")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        let now = Date(timeIntervalSince1970: 9_000)
+        let personID = UUID()
+        let evidenceID = UUID()
+        let store = try CognitiveMemoryStore(directoryURL: directory, encryptionKey: key)
+
+        _ = try await store.insert(
+            CognitiveMemoryDraft(
+                tier: .mediumTerm,
+                summary: "Prefers direct technical explanations",
+                payload: .personDisposition(PersonDispositionMemory(
+                    personEntityID: personID,
+                    scope: .stableTrait,
+                    statement: "Prefers direct technical explanations",
+                    evidenceMemoryIDs: [evidenceID]
+                )),
+                confidence: 0.86,
+                provenance: [MemoryProvenance(
+                    source: .consolidation,
+                    sourceID: "conversation:test",
+                    observedAt: now,
+                    evidenceIDs: ["conversation_turn:\(evidenceID.uuidString.lowercased())"]
+                )],
+                sensitivity: .personal,
+                disclosure: .remoteSummaryAllowed,
+                expiresAt: now.addingTimeInterval(30 * 24 * 60 * 60)
+            ),
+            at: now
+        )
+
+        let context = try await store.personContext(for: personID, at: now)
+        XCTAssertEqual(context.dispositions.count, 1)
+        XCTAssertEqual(context.dispositions.first?.scope, .stableTrait)
+        XCTAssertEqual(context.dispositions.first?.evidenceCount, 1)
+        XCTAssertTrue(context.relevantMemories.isEmpty)
+        try await store.close()
+    }
+
+    func testDispositionWithoutEvidenceIsRejected() async throws {
+        let directory = temporaryDirectory("disposition-validation")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try CognitiveMemoryStore(
+            directoryURL: directory,
+            encryptionKey: try CognitiveMemoryEncryptionKey(rawRepresentation: keyData)
+        )
+        let now = Date(timeIntervalSince1970: 9_100)
+
+        do {
+            _ = try await store.insert(
+                CognitiveMemoryDraft(
+                    tier: .mediumTerm,
+                    summary: "Unsupported inferred trait",
+                    payload: .personDisposition(PersonDispositionMemory(
+                        personEntityID: UUID(),
+                        scope: .stableTrait,
+                        statement: "Unsupported inferred trait",
+                        evidenceMemoryIDs: []
+                    )),
+                    confidence: 0.8,
+                    provenance: [sensorProvenance(at: now)],
+                    sensitivity: .personal,
+                    disclosure: .remoteSummaryAllowed,
+                    expiresAt: now.addingTimeInterval(60)
+                ),
+                at: now
+            )
+            XCTFail("evidence-free disposition was stored")
+        } catch let error as CognitiveMemoryError {
+            guard case .validationFailed = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+        try await store.close()
+    }
+
     private func temporaryDirectory(_ suffix: String) -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("soma-memory-\(suffix)-\(UUID().uuidString)", isDirectory: true)

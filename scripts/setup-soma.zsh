@@ -114,6 +114,7 @@ if (( soma_plan_only )); then
   print -r -- "  physical motion: $([[ $soma_enable_motion == 1 ]] && print enable || print preserve)"
   print -r -- "  Homebrew dependencies: $([[ $soma_skip_brew == 1 ]] && print already-present || print install)"
   print -r -- "  L1 model: $SOMA_DEFAULT_L1_MODEL"
+  print -r -- "  local memory embedding model: $SOMA_DEFAULT_EMBEDDING_MODEL"
   print -r -- "  signing identity: ensure $SOMA_CODESIGN_IDENTITY_NAME"
   if (( soma_full )); then
     print -r -- '  actions: guided preflight, bootstrap, local model provisioning, runtime configuration, L1 provisioning, tests, doctor, signed app installation, process verification'
@@ -178,7 +179,7 @@ if (( soma_with_l05 )); then
   soma_set_env_value SOMA_ENABLE_L05_VLM 1
 fi
 
-print -r -- '[5/9] Ensuring the L1 model is available'
+print -r -- '[5/9] Ensuring cognition models are available'
 soma_ollama=$(soma_find_ollama)
 [[ -n "$soma_ollama" && -x "$soma_ollama" ]] \
   || { print -u2 -r -- 'Ollama was not installed by bootstrap.'; exit 2; }
@@ -198,6 +199,12 @@ fi
 if ! "$soma_ollama" list | /usr/bin/awk 'NR > 1 {print $1}' \
     | /usr/bin/grep -Fxq "$SOMA_DEFAULT_L1_MODEL"; then
   "$soma_ollama" pull "$SOMA_DEFAULT_L1_MODEL"
+fi
+soma_embedding_host=http://127.0.0.1:11434
+if ! OLLAMA_HOST="$soma_embedding_host" "$soma_ollama" list \
+    | /usr/bin/awk 'NR > 1 {print $1}' \
+    | /usr/bin/grep -Fxq "$SOMA_DEFAULT_EMBEDDING_MODEL"; then
+  OLLAMA_HOST="$soma_embedding_host" "$soma_ollama" pull "$SOMA_DEFAULT_EMBEDDING_MODEL"
 fi
 
 print -r -- '[6/9] Running the verification suite'

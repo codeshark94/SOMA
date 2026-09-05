@@ -12,6 +12,7 @@ protocol L1ThoughtStreaming: AnyObject, Sendable {
         threadID: String,
         role: ConversationParticipantRole,
         text: String,
+        recalledMemory: [RemoteMemoryProjection],
         at monotonicNS: UInt64
     )
     func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt)
@@ -60,6 +61,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         /// `nil` means use the ordinary event-time current frame. An explicit
         /// empty array means the event has no valid pixels to attach.
         let visuals: [L1VisualResource]?
+        let memoryOverride: [RemoteMemoryProjection]?
         let completion: (@Sendable (WorkspaceTransition, Bool) -> Void)?
     }
 
@@ -362,6 +364,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         threadID: String,
         role: ConversationParticipantRole,
         text: String,
+        recalledMemory: [RemoteMemoryProjection],
         at monotonicNS: UInt64
     ) {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -382,7 +385,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                     curiosity: role == .user ? 0.08 : 0,
                     socialInterest: role == .user ? 0.12 : 0.04
                 )
-            ))
+            ), memoryOverride: recalledMemory.isEmpty ? nil : recalledMemory)
         }
     }
 
@@ -509,11 +512,17 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     private func enqueueEvidence(
         _ event: MentalEvidenceEvent,
         visuals: [L1VisualResource]? = nil,
+        memoryOverride: [RemoteMemoryProjection]? = nil,
         completion: (@Sendable (WorkspaceTransition, Bool) -> Void)? = nil
     ) {
         guard !event.id.isEmpty else { return }
         if evidenceQueue.contains(where: { $0.event.id == event.id }) { return }
-        evidenceQueue.append(.init(event: event, visuals: visuals, completion: completion))
+        evidenceQueue.append(.init(
+            event: event,
+            visuals: visuals,
+            memoryOverride: memoryOverride,
+            completion: completion
+        ))
         drainEvidenceQueue()
     }
 
@@ -535,7 +544,8 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                         for: event,
                         snapshot: transition.after,
                         wakeKind: forcedPeriodic ? .periodic : .event,
-                        suppliedVisuals: queued.visuals
+                        suppliedVisuals: queued.visuals,
+                        suppliedMemory: queued.memoryOverride
                     )
                 }
                 if transition.changed, queued.completion != nil {
@@ -572,6 +582,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
         snapshot: MentalWorkspaceSnapshot,
         wakeKind: L1ThoughtWakeKind,
         suppliedVisuals: [L1VisualResource]? = nil,
+        suppliedMemory: [RemoteMemoryProjection]? = nil,
         authorityRebaseAttempt: Int = 0
     ) {
         let entityID = event.subjectEntityID ?? snapshot.context.presentEntityIDs.first
@@ -592,7 +603,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
             evidence: [event],
             beliefSummary: event.summary,
             presentEntityIDs: snapshot.context.presentEntityIDs,
-            memory: memory?.projections ?? [],
+            memory: suppliedMemory ?? memory?.projections ?? [],
             informationNeeds: memory?.informationNeeds ?? [],
             rapport: memory?.rapport,
             preferredLanguageTag: memory.flatMap(effectiveLanguageTag),

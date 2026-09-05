@@ -12,9 +12,14 @@ public struct OllamaEmbeddingClient: Sendable {
         host: String? = nil,
         model: String = "embeddinggemma:300m"
     ) {
-        let raw = host ?? ProcessInfo.processInfo.environment["OLLAMA_HOST"] ?? "http://127.0.0.1:11434"
+        // Memory embeddings may contain private conversational context. Keep
+        // this transport explicitly local even when L1 generation uses a
+        // remote or LAN Ollama-compatible host.
+        let raw = host
+            ?? ProcessInfo.processInfo.environment["SOMA_EMBEDDING_HOST"]
+            ?? "http://127.0.0.1:11434"
         self.host = raw.replacingOccurrences(of: "/$", with: "", options: .regularExpression)
-        self.model = model
+        self.model = ProcessInfo.processInfo.environment["SOMA_EMBEDDING_MODEL"] ?? model
     }
 
     /// Embeds a single text. Returns `nil` on any transport or decode failure

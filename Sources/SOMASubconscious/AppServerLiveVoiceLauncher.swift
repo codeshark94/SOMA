@@ -31,8 +31,13 @@ enum AppServerLiveVoiceEvent: Sendable {
     case inputAccepted(characters: Int)
     case realtimeEventType(type: String)
     case inputTranscriptionFailed(reason: String)
-    case transcriptPartial(threadID: String?, text: String)
-    case transcriptFinalized(threadID: String?, role: ConversationParticipantRole, text: String)
+    case transcriptPartial(threadID: String?, turnGeneration: UInt64?, text: String)
+    case transcriptFinalized(
+        threadID: String?,
+        turnGeneration: UInt64?,
+        role: ConversationParticipantRole,
+        text: String
+    )
     case preparingResponse
     case responseStarted(latencyMilliseconds: Double)
     case assistantSpeechStarted
@@ -1035,6 +1040,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                       !text.isEmpty else { continue }
                 onEvent(.transcriptPartial(
                     threadID: event.threadID,
+                    turnGeneration: event.turnGeneration,
                     text: String(text.prefix(4_096))
                 ))
             case "transcript_finalized":
@@ -1042,6 +1048,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                       let role = ConversationParticipantRole(rawValue: rawRole),
                       let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !text.isEmpty else { continue }
+                var resolvedTurnGeneration = event.turnGeneration
                 if role == .assistant {
                     if proactiveOpeningAwaitingParticipant {
                         if proactiveOpeningDelivered {
@@ -1066,6 +1073,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         latestParticipantTurnGeneration,
                         turnGeneration
                     )
+                    resolvedTurnGeneration = turnGeneration
                     awaitingAssistantResponseGeneration = turnGeneration
                     latestUserTranscriptNS = now
                     recordUserActivity(at: now)
@@ -1073,6 +1081,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 }
                 onEvent(.transcriptFinalized(
                     threadID: event.threadID,
+                    turnGeneration: resolvedTurnGeneration,
                     role: role,
                     text: String(text.prefix(8_192))
                 ))

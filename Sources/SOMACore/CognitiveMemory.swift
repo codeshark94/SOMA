@@ -22,6 +22,7 @@ public enum MemoryKind: String, Codable, CaseIterable, Hashable, Sendable {
     case identity
     case relationship
     case personFact = "person_fact"
+    case personDisposition = "person_disposition"
     case space
     case episode
     case task
@@ -255,15 +256,86 @@ public struct PersonFactMemory: Codable, Equatable, Sendable {
     }
 }
 
-/// A bounded, remotely-shareable projection of a person's explicitly managed
-/// context. It intentionally contains no identity reference, face data, raw
-/// transcript, or local-only record.
+public enum PersonDispositionScope: String, Codable, CaseIterable, Hashable, Sendable {
+    case stableTrait = "stable_trait"
+    case entitySpecific = "entity_specific"
+}
+
+public enum PersonDispositionStatus: String, Codable, CaseIterable, Hashable, Sendable {
+    case active
+    case disputed
+    case retired
+}
+
+/// A social or affective claim that remains bound to the evidence that earned
+/// it. Stable traits describe the person generally; entity-specific attitudes
+/// require an explicit target and never bleed into unrelated relationships.
+public struct PersonDispositionMemory: Codable, Equatable, Sendable {
+    public let personEntityID: UUID
+    public let scope: PersonDispositionScope
+    public let targetEntityID: UUID?
+    public let statement: String
+    public let evidenceMemoryIDs: [UUID]
+    public let status: PersonDispositionStatus
+
+    public init(
+        personEntityID: UUID,
+        scope: PersonDispositionScope,
+        targetEntityID: UUID? = nil,
+        statement: String,
+        evidenceMemoryIDs: [UUID],
+        status: PersonDispositionStatus = .active
+    ) {
+        self.personEntityID = personEntityID
+        self.scope = scope
+        self.targetEntityID = targetEntityID
+        self.statement = statement
+        self.evidenceMemoryIDs = Array(Set(evidenceMemoryIDs)).sorted {
+            $0.uuidString < $1.uuidString
+        }
+        self.status = status
+    }
+}
+
+public struct PersonDispositionProjection: Codable, Equatable, Sendable {
+    public let scope: PersonDispositionScope
+    public let targetEntityID: UUID?
+    public let statement: String
+    public let confidence: Double
+    public let evidenceCount: Int
+    public let updatedAt: Date
+
+    public init(
+        scope: PersonDispositionScope,
+        targetEntityID: UUID?,
+        statement: String,
+        confidence: Double,
+        evidenceCount: Int,
+        updatedAt: Date
+    ) {
+        self.scope = scope
+        self.targetEntityID = targetEntityID
+        self.statement = statement
+        self.confidence = min(max(confidence, 0), 1)
+        self.evidenceCount = min(max(evidenceCount, 0), 128)
+        self.updatedAt = updatedAt
+    }
+}
+
+/// A bounded, remotely-shareable projection of a person's durable context.
+/// It intentionally contains no identity reference, face data, raw transcript,
+/// or local-only record. Inferred dispositions remain linked to explicit
+/// evidence records and are distinguishable from user-managed facts.
 public struct PersonContextSnapshot: Codable, Equatable, Sendable {
     public let personEntityID: UUID
     public let preferredLanguageTag: String?
     public let proactiveContactPreference: ProactiveContactPreference
     public let rapport: RapportProfile?
     public let facts: [String: String]
+    public let dispositions: [PersonDispositionProjection]
+    /// Short-lived, query-relevant projections prepared from the current
+    /// utterance. These are authorized summaries, not raw transcript text.
+    public let relevantMemories: [RemoteMemoryProjection]
     /// The current bounded memory-acquisition mission. An unsatisfied mission
     /// may be supplied in the participant's session context and is always
     /// confirmed by reading this snapshot again after a write.
@@ -275,6 +347,8 @@ public struct PersonContextSnapshot: Codable, Equatable, Sendable {
         proactiveContactPreference: ProactiveContactPreference,
         rapport: RapportProfile?,
         facts: [String: String],
+        dispositions: [PersonDispositionProjection] = [],
+        relevantMemories: [RemoteMemoryProjection] = [],
         mission: PersonContextMission? = nil
     ) {
         self.personEntityID = personEntityID
@@ -282,10 +356,57 @@ public struct PersonContextSnapshot: Codable, Equatable, Sendable {
         self.proactiveContactPreference = proactiveContactPreference
         self.rapport = rapport
         self.facts = facts
+        self.dispositions = Array(dispositions.prefix(32))
+        self.relevantMemories = Array(relevantMemories.prefix(16))
         self.mission = mission ?? .from(
             preferredLanguageTag: preferredLanguageTag,
             proactiveContactPreference: proactiveContactPreference,
             facts: facts
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case personEntityID
+        case preferredLanguageTag
+        case proactiveContactPreference
+        case rapport
+        case facts
+        case dispositions
+        case relevantMemories
+        case mission
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let personEntityID = try container.decode(UUID.self, forKey: .personEntityID)
+        let preferredLanguageTag = try container.decodeIfPresent(
+            String.self,
+            forKey: .preferredLanguageTag
+        )
+        let proactiveContactPreference = try container.decode(
+            ProactiveContactPreference.self,
+            forKey: .proactiveContactPreference
+        )
+        let rapport = try container.decodeIfPresent(RapportProfile.self, forKey: .rapport)
+        let facts = try container.decodeIfPresent(
+            [String: String].self,
+            forKey: .facts
+        ) ?? [:]
+        self.init(
+            personEntityID: personEntityID,
+            preferredLanguageTag: preferredLanguageTag,
+            proactiveContactPreference: proactiveContactPreference,
+            rapport: rapport,
+            facts: facts,
+            dispositions: try container.decodeIfPresent(
+                [PersonDispositionProjection].self,
+                forKey: .dispositions
+            ) ?? [],
+            relevantMemories: try container.decodeIfPresent(
+                [RemoteMemoryProjection].self,
+                forKey: .relevantMemories
+            ) ?? [],
+            mission: try container.decodeIfPresent(PersonContextMission.self, forKey: .mission)
         )
     }
 
@@ -573,6 +694,7 @@ public enum CognitiveMemoryPayload: Equatable, Sendable {
     case identity(IdentityMemory)
     case relationship(RelationshipMemory)
     case personFact(PersonFactMemory)
+    case personDisposition(PersonDispositionMemory)
     case space(SpaceMemory)
     case episode(EpisodeMemory)
     case task(TaskMemory)
@@ -587,6 +709,7 @@ public enum CognitiveMemoryPayload: Equatable, Sendable {
         case .identity: .identity
         case .relationship: .relationship
         case .personFact: .personFact
+        case .personDisposition: .personDisposition
         case .space: .space
         case .episode: .episode
         case .task: .task
@@ -608,6 +731,8 @@ public enum CognitiveMemoryPayload: Equatable, Sendable {
             [value.personEntityID]
         case let .personFact(value):
             [value.personEntityID]
+        case let .personDisposition(value):
+            Set([value.personEntityID] + [value.targetEntityID].compactMap { $0 } + value.evidenceMemoryIDs)
         case let .space(value):
             value.atlasID.map { [$0] } ?? []
         case let .episode(value):
@@ -639,6 +764,7 @@ extension CognitiveMemoryPayload: Codable {
         case .identity: self = .identity(try container.decode(IdentityMemory.self, forKey: .value))
         case .relationship: self = .relationship(try container.decode(RelationshipMemory.self, forKey: .value))
         case .personFact: self = .personFact(try container.decode(PersonFactMemory.self, forKey: .value))
+        case .personDisposition: self = .personDisposition(try container.decode(PersonDispositionMemory.self, forKey: .value))
         case .space: self = .space(try container.decode(SpaceMemory.self, forKey: .value))
         case .episode: self = .episode(try container.decode(EpisodeMemory.self, forKey: .value))
         case .task: self = .task(try container.decode(TaskMemory.self, forKey: .value))
@@ -657,6 +783,7 @@ extension CognitiveMemoryPayload: Codable {
         case let .identity(value): try container.encode(value, forKey: .value)
         case let .relationship(value): try container.encode(value, forKey: .value)
         case let .personFact(value): try container.encode(value, forKey: .value)
+        case let .personDisposition(value): try container.encode(value, forKey: .value)
         case let .space(value): try container.encode(value, forKey: .value)
         case let .episode(value): try container.encode(value, forKey: .value)
         case let .task(value): try container.encode(value, forKey: .value)
@@ -968,6 +1095,18 @@ public struct CognitiveMemoryValidator: Sendable {
         case let .personFact(value):
             validateRequired(value.key, name: "person fact key", failures: &failures)
             validateRequired(value.value, name: "person fact value", failures: &failures)
+        case let .personDisposition(value):
+            validateRequired(value.statement, name: "person disposition statement", failures: &failures)
+            validateCount(value.evidenceMemoryIDs.count, name: "person disposition evidence", failures: &failures)
+            if value.evidenceMemoryIDs.isEmpty {
+                failures.append("person disposition requires evidence memory IDs")
+            }
+            if value.scope == .stableTrait, value.targetEntityID != nil {
+                failures.append("stable disposition cannot have a target entity")
+            }
+            if value.scope == .entitySpecific, value.targetEntityID == nil {
+                failures.append("entity-specific disposition requires a target entity")
+            }
         case let .space(value):
             validateRequired(value.name, name: "space name", failures: &failures)
             validateStrings(value.landmarkIDs, name: "space landmark IDs", failures: &failures)
@@ -1597,6 +1736,7 @@ public actor CognitiveMemoryStore {
         var facts: [String: String] = [:]
         var explicitRapport: RapportProfile?
         var contactHistory: [L1SocialContactEvent] = []
+        var dispositions: [PersonDispositionProjection] = []
         for record in records {
             switch record.payload {
             case let .personFact(value) where value.personEntityID == personEntityID:
@@ -1606,6 +1746,16 @@ public actor CognitiveMemoryStore {
                    record.provenance.contains(where: { $0.source == .explicitUser }) {
                     explicitRapport = value.rapport
                 }
+            case let .personDisposition(value)
+                where value.personEntityID == personEntityID && value.status == .active:
+                dispositions.append(PersonDispositionProjection(
+                    scope: value.scope,
+                    targetEntityID: value.targetEntityID,
+                    statement: value.statement,
+                    confidence: record.confidence,
+                    evidenceCount: value.evidenceMemoryIDs.count,
+                    updatedAt: record.updatedAt
+                ))
             case let .situation(value) where value.participantEntityIDs.contains(personEntityID):
                 guard value.state.hasPrefix("social_contact:"),
                       let rawKind = value.state.split(separator: ":", maxSplits: 1).last,
@@ -1640,14 +1790,15 @@ public actor CognitiveMemoryStore {
             preferredLanguageTag: facts["preferred_language"],
             proactiveContactPreference: contactPreference,
             rapport: rapport,
-            facts: facts
+            facts: facts,
+            dispositions: Array(dispositions.prefix(32))
         )
     }
 
     /// Returns the bounded, remotely-shareable person contexts known to the
-    /// local memory store. This intentionally projects only explicit facts
-    /// and rapport; identity embeddings, transcripts, and local-only records
-    /// remain inaccessible through this API.
+    /// local memory store. This projects authorized facts, rapport, and
+    /// evidence-backed dispositions; identity embeddings, transcripts, and
+    /// local-only records remain inaccessible through this API.
     public func personContexts(at date: Date = Date()) throws -> [PersonContextSnapshot] {
         try ensureOpen()
         let personIDs = Set(current.values.compactMap { record -> UUID? in
@@ -1659,6 +1810,7 @@ public actor CognitiveMemoryStore {
             switch record.payload {
             case let .personFact(value): return value.personEntityID
             case let .relationship(value): return value.personEntityID
+            case let .personDisposition(value): return value.personEntityID
             default: return nil
             }
         })

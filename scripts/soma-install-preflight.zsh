@@ -141,17 +141,25 @@ fi
 
 soma_ollama=$(soma_find_ollama)
 if [[ -z "$soma_ollama" ]]; then
-  soma_info 'Ollama / L1' "will be installed; $SOMA_DEFAULT_L1_MODEL will be provisioned"
+  soma_info 'Ollama / cognition' "will install $SOMA_DEFAULT_L1_MODEL and local $SOMA_DEFAULT_EMBEDDING_MODEL"
 else
   soma_ollama_list=$("$soma_ollama" list 2>/dev/null || true)
   if [[ -z "$soma_ollama_list" ]]; then
-    soma_info 'Ollama / L1' "installed; setup will launch it and provision $SOMA_DEFAULT_L1_MODEL"
+    soma_info 'Ollama / cognition' "installed; setup will provision cognition models"
   elif print -r -- "$soma_ollama_list" \
       | /usr/bin/awk 'NR > 1 { print $1 }' \
       | /usr/bin/grep -Fxq "$SOMA_DEFAULT_L1_MODEL"; then
     soma_pass 'Ollama / L1' "$SOMA_DEFAULT_L1_MODEL is ready"
   else
     soma_info 'Ollama / L1' "responding; setup will provision $SOMA_DEFAULT_L1_MODEL"
+  fi
+  soma_local_ollama_list=$(OLLAMA_HOST=http://127.0.0.1:11434 "$soma_ollama" list 2>/dev/null || true)
+  if print -r -- "$soma_local_ollama_list" \
+      | /usr/bin/awk 'NR > 1 { print $1 }' \
+      | /usr/bin/grep -Fxq "$SOMA_DEFAULT_EMBEDDING_MODEL"; then
+    soma_pass 'Memory retrieval' "$SOMA_DEFAULT_EMBEDDING_MODEL is ready locally"
+  else
+    soma_info 'Memory retrieval' "setup will provision local $SOMA_DEFAULT_EMBEDDING_MODEL"
   fi
 fi
 

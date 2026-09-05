@@ -155,6 +155,24 @@ private final class SynchronousWriteResult: @unchecked Sendable {
     }
 }
 
+private actor SemanticMemoryHydrationGate {
+    private var inFlight: [UUID: Task<Void, Never>] = [:]
+
+    func perform(
+        for personEntityID: UUID,
+        operation: @escaping @Sendable () async -> Void
+    ) async {
+        if let existing = inFlight[personEntityID] {
+            await existing.value
+            return
+        }
+        let task = Task { await operation() }
+        inFlight[personEntityID] = task
+        await task.value
+        inFlight.removeValue(forKey: personEntityID)
+    }
+}
+
 /// Keeps the L1 cloud packet on the allowed side of the memory boundary.
 /// Raw conversation, biometric identity material, and local-only records stay
 /// in the encrypted journal; only marked summaries, rapport, and information
@@ -331,6 +349,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private struct ConversationMemoryConsolidation: Decodable {
         enum Kind: String, Decodable {
             case personFact = "person_fact"
+            case personDisposition = "person_disposition"
             case task
             case openQuestion = "open_question"
         }
@@ -338,6 +357,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         struct Memory: Decodable {
             let kind: Kind
             let key: String?
+            let scope: PersonDispositionScope?
             let summary: String
             let confidence: Double?
         }
@@ -365,6 +385,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private var preferredLanguageByPersonID: [UUID: String] = [:]
     private var personContextByPersonID: [UUID: PersonContextSnapshot] = [:]
     private var personMemorySummariesByPersonID: [UUID: [String]] = [:]
+    private var prefetchedMemoryByPersonID: [UUID: [RemoteMemoryProjection]] = [:]
     private var personInfoNeedsByPersonID: [UUID: [PersistedInformationNeed]] = [:]
     private let legacyNeedSweepLock = NSLock()
     private var legacyNeedSweepStarted = false
@@ -378,6 +399,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private let conversationWriteGroup = DispatchGroup()
     private let embeddingClient = OllamaEmbeddingClient()
     private let embeddingCache = EpisodicEmbeddingCache()
+    private let semanticMemoryCache = RevisionedMemoryEmbeddingCache()
+    private let semanticHydrationGate = SemanticMemoryHydrationGate()
 
     init(
         onHealth: @escaping @Sendable (String, String) -> Void,
@@ -395,7 +418,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     func context(
         for entityID: UUID,
         createPseudonymousEntity: Bool = false,
-        placeAffiliation: L1PlaceAffiliationContext? = nil
+        placeAffiliation: L1PlaceAffiliationContext? = nil,
+        relevanceQuery: String? = nil
     ) async -> L1MemoryContext {
         guard let store else {
             return L1MemoryContext(
@@ -454,7 +478,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     && $0.sensitivity != .biometric
                     && $0.sensitivity != .secret
             }
-            let projections = allowed.map {
+            let recentProjections = allowed.map {
                 RemoteMemoryProjection(
                     id: $0.id,
                     revision: $0.revision,
@@ -465,6 +489,15 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     updatedAt: $0.updatedAt
                 )
             }
+            let relevance = relevanceQuery?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let projections = relevance.isEmpty
+                ? recentProjections
+                : await semanticProjections(
+                    from: allowed,
+                    query: relevance,
+                    limit: 16,
+                    at: now
+                )
             var inadmissibleInferenceNeedIDs: [UUID] = []
             let allowedOpenQuestions = openQuestionRecords.filter {
                 $0.disclosure == .remoteSummaryAllowed
@@ -583,7 +616,9 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             await markInformationNeedsSurfaced(persistedNeeds, at: now)
             let recalled = await recallEpisodes(
                 entityID: entityID,
-                query: personContext.preferenceDirectives().joined(separator: " "),
+                query: relevance.isEmpty
+                    ? personContext.preferenceDirectives().joined(separator: " ")
+                    : relevance,
                 at: now
             )
             return L1MemoryContext(
@@ -758,6 +793,143 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         }
     }
 
+    /// Query-driven recall across every remotely shareable typed memory for a
+    /// person. The utterance and embeddings stay on the local embedding host;
+    /// only already-authorized summaries can leave this process as context.
+    func recallMemoryProjections(
+        query: String,
+        entityID: UUID,
+        limit: Int = 16,
+        at date: Date = Date()
+    ) async -> [RemoteMemoryProjection] {
+        guard let store else { return [] }
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return [] }
+        do {
+            await warmSemanticIndex(for: entityID, at: date)
+            guard !Task.isCancelled else { return [] }
+            let records = try await store.query(
+                .init(relatedTo: [entityID], limit: 500),
+                at: date
+            ).filter {
+                $0.kind != .conversationTurn
+                    && $0.disclosure == .remoteSummaryAllowed
+                    && $0.sensitivity != .biometric
+                    && $0.sensitivity != .secret
+            }
+            guard !Task.isCancelled else { return [] }
+            return await semanticProjections(
+                from: records,
+                query: normalized,
+                limit: limit,
+                at: date
+            )
+        } catch {
+            onHealth("semantic_memory_recall_failed", String(error.localizedDescription.prefix(192)))
+            return []
+        }
+    }
+
+    func warmSemanticIndex(for entityID: UUID, at date: Date = Date()) async {
+        await semanticHydrationGate.perform(for: entityID) { [weak self] in
+            await self?.hydrateSemanticIndex(for: entityID, at: date)
+        }
+    }
+
+    private func hydrateSemanticIndex(for entityID: UUID, at date: Date) async {
+        guard let store, !Task.isCancelled else { return }
+        do {
+            let records = try await store.query(
+                .init(relatedTo: [entityID], limit: 500),
+                at: date
+            ).filter {
+                $0.kind != .conversationTurn
+                    && $0.disclosure == .remoteSummaryAllowed
+                    && $0.sensitivity != .biometric
+                    && $0.sensitivity != .secret
+                    && semanticMemoryCache.embedding(for: $0.id, revision: $0.revision) == nil
+            }
+            guard !records.isEmpty else { return }
+            var indexed = 0
+            for chunkStart in stride(from: 0, to: records.count, by: 64) {
+                guard !Task.isCancelled else { return }
+                let chunk = Array(records[chunkStart ..< min(chunkStart + 64, records.count)])
+                guard let embeddings = await embeddingClient.embedBatch(
+                    chunk.map { String($0.summary.prefix(1_024)) }
+                ), embeddings.count == chunk.count,
+                   !Task.isCancelled else { return }
+                for (record, embedding) in zip(chunk, embeddings) {
+                    semanticMemoryCache.set(embedding, for: record.id, revision: record.revision)
+                    indexed += 1
+                }
+            }
+            onHealth("semantic_memory_index_ready", "person=\(entityID.uuidString.lowercased()); indexed=\(indexed)")
+        } catch {
+            onHealth("semantic_memory_index_failed", String(error.localizedDescription.prefix(192)))
+        }
+    }
+
+    private func semanticProjections(
+        from records: [CognitiveMemoryRecord],
+        query: String,
+        limit: Int,
+        at date: Date
+    ) async -> [RemoteMemoryProjection] {
+        let boundedRecords = Array(records.prefix(500))
+        guard !boundedRecords.isEmpty, !Task.isCancelled else { return [] }
+        let missing = boundedRecords.filter {
+            semanticMemoryCache.embedding(for: $0.id, revision: $0.revision) == nil
+        }
+        let inputs = [String(query.prefix(512))] + missing.map { String($0.summary.prefix(1_024)) }
+        guard let batch = await embeddingClient.embedBatch(inputs),
+              batch.count == inputs.count,
+              let queryEmbedding = batch.first,
+              !Task.isCancelled else {
+            onHealth(
+                "semantic_memory_embedding_unavailable",
+                "ranking=confidence_recency; records=\(boundedRecords.count)"
+            )
+            return boundedRecords
+                .sorted { lhs, rhs in
+                    if lhs.confidence != rhs.confidence { return lhs.confidence > rhs.confidence }
+                    return lhs.updatedAt > rhs.updatedAt
+                }
+                .prefix(min(max(limit, 1), 64))
+                .map(Self.remoteProjection)
+        }
+        for (record, embedding) in zip(missing, batch.dropFirst()) {
+            semanticMemoryCache.set(embedding, for: record.id, revision: record.revision)
+        }
+        let candidates = boundedRecords.compactMap { record -> SemanticMemoryCandidate? in
+            guard let embedding = semanticMemoryCache.embedding(
+                for: record.id,
+                revision: record.revision
+            ) else { return nil }
+            return SemanticMemoryCandidate(
+                projection: Self.remoteProjection(record),
+                embedding: embedding
+            )
+        }
+        return SemanticMemoryRanker.rank(
+            queryEmbedding: queryEmbedding,
+            candidates: candidates,
+            at: date,
+            limit: limit
+        ).map(\.projection)
+    }
+
+    private static func remoteProjection(_ record: CognitiveMemoryRecord) -> RemoteMemoryProjection {
+        RemoteMemoryProjection(
+            id: record.id,
+            revision: record.revision,
+            tier: record.tier,
+            kind: record.kind,
+            summary: record.summary,
+            confidence: record.confidence,
+            updatedAt: record.updatedAt
+        )
+    }
+
     /// Public episodic recall for the L1 `recall_episodes` tool.
     func recallEpisodes(
         query: String,
@@ -918,6 +1090,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                 consolidation.memories ?? [],
                 personEntityID: personEntityID,
                 threadID: threadID,
+                sourceTurnRecordIDs: turns.map(\.id),
                 at: date
             )
             let derivedIDs = [episode.id] + result.derivedMemoryIDs
@@ -938,7 +1111,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             warmContext(for: personEntityID)
             onHealth(
                 "conversation_memory_consolidated",
-                "turns=\(turns.count); episode_chars=\(boundedNarrative.count); facts=\(result.facts); tasks=\(result.tasks); questions=\(result.questions)"
+                "turns=\(turns.count); episode_chars=\(boundedNarrative.count); facts=\(result.facts); dispositions=\(result.dispositions); tasks=\(result.tasks); questions=\(result.questions)"
             )
             return true
         } catch {
@@ -950,6 +1123,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
     private struct PersistedConversationMemoryResult {
         var derivedMemoryIDs: [UUID] = []
         var facts = 0
+        var dispositions = 0
         var tasks = 0
         var questions = 0
     }
@@ -958,6 +1132,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         _ memories: [ConversationMemoryConsolidation.Memory],
         personEntityID: UUID,
         threadID: String,
+        sourceTurnRecordIDs: [UUID],
         at date: Date
     ) async throws -> PersistedConversationMemoryResult {
         guard let store else { return .init() }
@@ -980,6 +1155,52 @@ final class L1MemoryContextProvider: @unchecked Sendable {
                     at: date
                 )
                 result.facts += 1
+            case .personDisposition:
+                guard memory.scope == .stableTrait,
+                      !sourceTurnRecordIDs.isEmpty else { continue }
+                let existing = try await store.query(
+                    .init(kinds: [.personDisposition], relatedTo: [personEntityID], limit: 200),
+                    at: date
+                ).first { record in
+                    guard case let .personDisposition(value) = record.payload else { return false }
+                    return value.personEntityID == personEntityID
+                        && value.scope == .stableTrait
+                        && value.status == .active
+                        && value.statement.compare(
+                            summary,
+                            options: [.caseInsensitive, .diacriticInsensitive]
+                        ) == .orderedSame
+                }
+                if existing == nil {
+                    let record = try await store.insert(
+                        CognitiveMemoryDraft(
+                            tier: .mediumTerm,
+                            summary: summary,
+                            payload: .personDisposition(PersonDispositionMemory(
+                                personEntityID: personEntityID,
+                                scope: .stableTrait,
+                                statement: summary,
+                                evidenceMemoryIDs: sourceTurnRecordIDs
+                            )),
+                            confidence: confidence,
+                            provenance: [MemoryProvenance(
+                                source: .consolidation,
+                                sourceID: "l1_conversation_disposition:\(threadID)",
+                                observedAt: date,
+                                evidenceIDs: sourceTurnRecordIDs.map {
+                                    "conversation_turn:\($0.uuidString.lowercased())"
+                                },
+                                modelID: "gemma4:31b-cloud"
+                            )],
+                            sensitivity: .personal,
+                            disclosure: .remoteSummaryAllowed,
+                            expiresAt: date.addingTimeInterval(store.maximumMediumTermLifetime)
+                        ),
+                        at: date
+                    )
+                    result.derivedMemoryIDs.append(record.id)
+                    result.dispositions += 1
+                }
             case .task:
                 let record = try await store.insert(
                     CognitiveMemoryDraft(
@@ -1032,6 +1253,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
 
         For each memory, use exactly one kind:
         - person_fact: a stable fact stated by the user. key must be interests, work_context, ongoing_project, or personal_context.
+        - person_disposition: a stable communication or interaction tendency the user explicitly states about themself. scope must be stable_trait. Never infer it from tone, emotion, appearance, or one observed reaction.
         - task: an active task the user explicitly asked SOMA to remember or work on.
         - open_question: a meaningful unresolved question that a future conversation can naturally answer.
 
@@ -1040,7 +1262,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         Transcript:
         \(boundedTranscript)
         Return strict JSON only:
-        {"narrative":"...","salience":0.7,"memories":[{"kind":"person_fact","key":"interests","summary":"...","confidence":0.9}]}
+        {"narrative":"...","salience":0.7,"memories":[{"kind":"person_fact","key":"interests","scope":null,"summary":"...","confidence":0.9}]}
         """
         guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return nil }
         var request = URLRequest(url: url)
@@ -2077,6 +2299,25 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         return personMemorySummariesByPersonID[personEntityID] ?? []
     }
 
+    /// Publishes a bounded, already-authorized recall prepared from the active
+    /// utterance. It is ephemeral session context and never becomes a memory
+    /// write merely because retrieval found it.
+    func publishSpeculativeRecall(
+        _ projections: [RemoteMemoryProjection],
+        for personEntityID: UUID
+    ) {
+        preferredLanguageLock.lock()
+        prefetchedMemoryByPersonID[personEntityID] = Array(projections.prefix(16))
+        preferredLanguageLock.unlock()
+    }
+
+    func clearSpeculativeRecall(for personEntityID: UUID?) {
+        guard let personEntityID else { return }
+        preferredLanguageLock.lock()
+        prefetchedMemoryByPersonID.removeValue(forKey: personEntityID)
+        preferredLanguageLock.unlock()
+    }
+
     func warmContext(for personEntityID: UUID) {
         Task { _ = await context(for: personEntityID) }
     }
@@ -2302,7 +2543,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         guard let personEntityID = request.personEntityID else {
             throw L1MemoryContextRuntimeError.invalidPersonContextRequest
         }
-        let snapshot: PersonContextSnapshot
+        var snapshot: PersonContextSnapshot
         switch request.operation {
         case .get:
             snapshot = try await store.personContext(for: personEntityID)
@@ -2374,6 +2615,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
             // context mutation.
             throw L1MemoryContextRuntimeError.invalidPersonContextRequest
         }
+        snapshot = includingSpeculativeRecall(snapshot)
         cachePersonContext(snapshot)
         return snapshot
     }
@@ -2386,6 +2628,22 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         preferredLanguageLock.unlock()
         guard previous != snapshot.preferredLanguageTag else { return }
         onPreferredLanguageChanged(snapshot.personEntityID, snapshot.preferredLanguageTag)
+    }
+
+    private func includingSpeculativeRecall(_ snapshot: PersonContextSnapshot) -> PersonContextSnapshot {
+        preferredLanguageLock.lock()
+        let recalled = prefetchedMemoryByPersonID[snapshot.personEntityID] ?? []
+        preferredLanguageLock.unlock()
+        return PersonContextSnapshot(
+            personEntityID: snapshot.personEntityID,
+            preferredLanguageTag: snapshot.preferredLanguageTag,
+            proactiveContactPreference: snapshot.proactiveContactPreference,
+            rapport: snapshot.rapport,
+            facts: snapshot.facts,
+            dispositions: snapshot.dispositions,
+            relevantMemories: recalled,
+            mission: snapshot.mission
+        )
     }
 
     private func cachePersonMemorySummaries(_ summaries: [String], for personEntityID: UUID) {
@@ -2585,6 +2843,7 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
         threadID: String,
         role: ConversationParticipantRole,
         text: String,
+        recalledMemory: [RemoteMemoryProjection],
         at monotonicNS: UInt64
     ) {
         lock.lock()
@@ -2594,6 +2853,7 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
             threadID: threadID,
             role: role,
             text: text,
+            recalledMemory: recalledMemory,
             at: monotonicNS
         )
     }

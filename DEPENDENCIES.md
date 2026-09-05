@@ -58,8 +58,8 @@ camera model, and OBSBOT Center contention. Every blocking row includes its
 single next action; provisioning starts only after the report is ready.
 
 The setup command is safe to rerun. It invokes the locked bootstrap, starts
-Ollama and provisions
-the L1 model when absent, runs the tests and runtime doctor, installs the signed
+Ollama and provisions the L1 model plus the local memory-embedding model when
+absent, runs the tests and runtime doctor, installs the signed
 app, and verifies that the process remains active. `--full` also provisions
 the pinned L0.5 model and ArcFace identity model and enables motion. Use
 `--plan` for a read-only preview or select only `--with-l05`,
@@ -82,7 +82,12 @@ Start Ollama and provision the default L1 model:
 ```sh
 open -a Ollama
 ollama pull gemma4:31b-cloud
+ollama pull embeddinggemma:300m
 ```
+
+Memory embeddings default to the loopback Ollama server even when L1 uses a
+different compatible host. `SOMA_EMBEDDING_HOST` and `SOMA_EMBEDDING_MODEL`
+can select another explicitly trusted local endpoint and embedding model.
 
 The cloud model may require the operator to sign in to Ollama. Set
 `OLLAMA_API_KEY` only if hosted web search/fetch is desired; it is not stored in

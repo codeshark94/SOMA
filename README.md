@@ -257,11 +257,25 @@ than one useful duration:
 | **Long-term** | Explicitly confirmed preferences, rapport, familiar-place references, consolidated facts | Supports continuity across encounters without treating every observation as permanent truth |
 
 Exact conversation turns remain in the encrypted local short-term journal.
-Bounded excerpts may feed the asynchronous L1 situation stream, and session
-closure performs typed memory consolidation, but neither operation launches a
-second model call on the Live Voice response path. Identity and person-context
-changes require an explicit MCP action and confirmation. A model may propose a
-memory update; it does not get to invent one from tone or camera appearance.
+As a participant speaks, the evolving local transcript can start a speculative
+semantic lookup against that person's authorized memory summaries. A result is
+admitted only if the finalized utterance still agrees with the partial text
+that produced it; stale results are cancelled or discarded and never become a
+synthetic user turn. This lets L1 receive relevant memory with the completed
+conversation event and lets an on-demand L2 person-context read reuse the same
+bounded recall without placing another model call on the Live Voice response
+path.
+
+The semantic index is local, revision-aware, and bounded: correcting a memory
+invalidates its old vector, while confidence and age remain part of retrieval
+rather than allowing vector similarity to become the sole truth signal.
+Conversation closure still performs typed consolidation. Stable interaction
+tendencies are stored separately from scalar rapport and ordinary facts, must
+name their supporting conversation-memory records, and remain scoped either to
+the person generally or to one explicit related entity. Identity and explicit
+person-context changes require the appropriate MCP action and confirmation. A
+model may propose a memory update; it does not get to invent one from tone,
+camera appearance, or a single observed reaction.
 
 ## The embodiment interface
 
@@ -336,7 +350,7 @@ SOMA's Swift package has no remote SwiftPM dependencies. A full runtime uses:
 - Xcode command-line tools with a Swift 6 toolchain
 - Homebrew OpenCV 5 for the Swift/C++ vision bridge
 - CMake for the native open UVC/XU gimbal, tracking, audio, and LED bridge
-- Ollama with the configured L1 model
+- Ollama with the configured L1 model and local memory-embedding model
 - A compatible signed-in Codex installation when L2 Live Voice is enabled
 - Optional Hermes CLI for administrator-only asynchronous agent work
 
@@ -355,10 +369,10 @@ explicit `SOMA_CODEX_BINARY`, the executable `PATH`, common CLI locations, and
 installed application bundles that embed `Contents/Resources/codex`. This covers
 both Codex- and ChatGPT-named desktop installations.
 
-`--full` provisions the optional L0.5 semantic helper and ArcFace identity
-model, enables the supported gimbal profiles, creates a machine-local persistent
-code-signing identity when needed, verifies the complete runtime, installs the
-apps, and starts SOMA. The same flow is available by double-clicking
+`--full` provisions the local memory-embedding model, optional L0.5 semantic
+helper, and ArcFace identity model, enables the supported gimbal profiles,
+creates a machine-local persistent code-signing identity when needed, verifies
+the complete runtime, installs the apps, and starts SOMA. The same flow is available by double-clicking
 [`Install SOMA.command`](Install%20SOMA.command).
 Use `--with-l05`, `--with-face-identity`, and `--enable-motion` to select
 individual capabilities instead.
@@ -376,8 +390,8 @@ profiles. The installed bundle neither contains nor links a proprietary OBSBOT
 library.
 
 `soma-doctor` verifies tool versions, bundled-model hashes, the native helper
-build, Ollama/model availability, conditional Codex support, and optional
-MLX/ArcFace assets. The installed Control Center exposes the same runtime audit
+build, L1 and local memory-embedding availability, conditional Codex support,
+and optional MLX/ArcFace assets. The installed Control Center exposes the same runtime audit
 under **System → External dependencies**, with failures and warnings surfaced
 before the complete check list. See
 [`DEPENDENCIES.md`](DEPENDENCIES.md) for the full clean-Mac procedure and
