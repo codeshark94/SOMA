@@ -22,8 +22,8 @@ private enum GemmaConsciousnessRuntimeError: LocalizedError {
 }
 
 /// One shared, strictly single-flight transport for primary L1 cognition.
-/// A current participant turn runs before executive, event, and periodic work.
-/// Replaceable inputs coalesce while intention episodes remain distinct.
+/// Executive work runs before event and periodic reflection. Replaceable inputs
+/// coalesce while intention episodes remain distinct.
 final class GemmaConsciousnessRuntime: @unchecked Sendable {
     typealias ThoughtCompletion = @Sendable (
         L1ThoughtRequest,
@@ -35,17 +35,11 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         Result<L1ExecutiveDecision, Error>,
         UInt64
     ) -> Void
-    typealias LiveToolCompletion = @Sendable (
-        Result<L1LiveToolAdvice, Error>,
-        UInt64
-    ) -> Void
-
     private struct ChatRequest: Encodable {
         let model: String
         let messages: [Message]
         let stream = false
-        let format: String?
-        let tools: [Tool]?
+        let format = "json"
         let options: Options
 
         struct Message: Encodable {
@@ -61,29 +55,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
             enum CodingKeys: String, CodingKey {
                 case temperature
                 case numPredict = "num_predict"
-            }
-        }
-
-        struct Tool: Encodable {
-            let type = "function"
-            let function: Function
-
-            struct Function: Encodable {
-                let name: String
-                let description: String
-                let parameters: Parameters
-            }
-
-            struct Parameters: Encodable {
-                let type = "object"
-                let properties: [String: Property]
-                let required: [String]
-                let additionalProperties = false
-            }
-
-            struct Property: Encodable {
-                let type: String
-                let description: String
             }
         }
     }
@@ -106,7 +77,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
     private var activeRequestID: UUID?
     private var inFlight: L1ConsciousnessWorkItem?
     private var workQueue = L1ConsciousnessWorkQueue()
-    private var liveToolCompletions: [UUID: LiveToolCompletion] = [:]
     private var stopped = false
 
     init(
@@ -142,7 +112,7 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         session = URLSession(configuration: sessionConfiguration)
         onHealth(
             "consciousness_configured",
-            "model=\(configuration.model); queue=live_tool,executive,event,periodic; single_in_flight=true; live_tool_protocol=ollama_native_tool_calls"
+            "model=\(configuration.model); queue=executive,event,periodic; single_in_flight=true"
         )
     }
 
@@ -171,33 +141,10 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         }
     }
 
-    func submitLiveToolAdvice(
-        _ request: L1LiveToolAdviceRequest,
-        completion: @escaping LiveToolCompletion
-    ) {
-        queue.async { [weak self] in
-            guard let self, !stopped else {
-                completion(.failure(GemmaConsciousnessRuntimeError.invalidResponse("stopped")), DispatchTime.now().uptimeNanoseconds)
-                return
-            }
-            if let displaced = workQueue.enqueue(request),
-               let displacedCompletion = liveToolCompletions.removeValue(forKey: displaced.cycleID) {
-                displacedCompletion(
-                    .failure(GemmaConsciousnessRuntimeError.invalidResponse("superseded")),
-                    DispatchTime.now().uptimeNanoseconds
-                )
-            }
-            liveToolCompletions[request.cycleID] = completion
-            preemptForLiveToolIfNeeded()
-            startNextIfIdle()
-        }
-    }
-
     func stop() {
         queue.sync {
             stopped = true
             workQueue.removeAll()
-            liveToolCompletions.removeAll()
             activeRequestID = nil
             task?.cancel()
             task = nil
@@ -210,29 +157,7 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         guard !stopped, task == nil, inFlight == nil else { return }
         guard let work = workQueue.dequeue() else { return }
         inFlight = work
-        start(work, retryCount: work.isLiveTool ? 0 : 1)
-    }
-
-    /// Human-turn cognition must not queue behind replaceable reflection. The
-    /// interrupted semantic request is returned to its lane and will run from
-    /// the newest workspace state after the participant turn. A stale live
-    /// request is completed as superseded instead of being replayed.
-    private func preemptForLiveToolIfNeeded() {
-        guard let active = inFlight, task != nil else { return }
-        switch active {
-        case let .liveTool(request):
-            liveToolCompletions.removeValue(forKey: request.cycleID)?(
-                .failure(GemmaConsciousnessRuntimeError.invalidResponse("superseded")),
-                DispatchTime.now().uptimeNanoseconds
-            )
-        case .thought, .executive:
-            workQueue.requeuePreempted(active)
-        }
-        onHealth("model_preempted", "role=\(active.label); by=live_tool")
-        activeRequestID = nil
-        task?.cancel()
-        task = nil
-        inFlight = nil
+        start(work, retryCount: 1)
     }
 
     private func start(_ work: L1ConsciousnessWorkItem, retryCount: Int) {
@@ -240,15 +165,8 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         let packet: String
         let binding: String
         let images: [String]?
-        let tools: [ChatRequest.Tool]?
         do {
             switch work {
-            case let .liveTool(request):
-                systemPrompt = Self.liveToolPrompt
-                packet = try Self.packet(request)
-                binding = "cycle_id=\(request.cycleID.uuidString.lowercased()); thread_id=\(request.threadID); turn_id=\(request.turnID.uuidString.lowercased())"
-                images = nil
-                tools = Self.liveToolDefinitions(for: request)
             case let .thought(request):
                 systemPrompt = Self.thoughtPrompt
                 packet = try Self.packet(request)
@@ -260,13 +178,11 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
                     .joined(separator: ",")
                 binding = "expected_revision=\(request.workspace.revision); cycle_id=\(request.cycleID.uuidString.lowercased()); available_evidence_ids=[\(evidence)]; available_hypothesis_ids=[\(hypotheses)]; active_intention_ids=[\(intentions)]"
                 images = try Self.images(for: request.visuals)
-                tools = nil
             case let .executive(request):
                 systemPrompt = Self.executivePrompt
                 packet = try Self.packet(request)
                 binding = "expected_revision=\(request.workspaceRevision); cycle_id=\(request.cycleID.uuidString.lowercased()); intention_episode_id=\(request.intention.id.uuidString.lowercased())"
                 images = nil
-                tools = nil
             }
         } catch {
             completeFailure(work, error: GemmaConsciousnessRuntimeError.requestEncoding)
@@ -275,9 +191,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         let temperature: Double
         let maximumTokens: Int
         switch work {
-        case .liveTool:
-            temperature = 0
-            maximumTokens = 96
         case .thought:
             temperature = 0.35
             maximumTokens = 1_400
@@ -295,8 +208,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
                     images: images
                 ),
             ],
-            format: work.isLiveTool ? nil : "json",
-            tools: tools,
             options: .init(temperature: temperature, numPredict: maximumTokens)
         )
         guard let body = try? JSONEncoder().encode(payload) else {
@@ -305,12 +216,11 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        if work.isLiveTool { request.timeoutInterval = 4 }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
         onHealth(
             "model_started",
-            "role=\(work.label); live_tool_pending=\(workQueue.hasLiveToolAdvice ? 1 : 0); queue_executive=\(workQueue.executiveCount); event_pending=\(workQueue.hasEventThought ? 1 : 0); periodic_pending=\(workQueue.hasPeriodicThought ? 1 : 0)"
+            "role=\(work.label); queue_executive=\(workQueue.executiveCount); event_pending=\(workQueue.hasEventThought ? 1 : 0); periodic_pending=\(workQueue.hasPeriodicThought ? 1 : 0)"
         )
         let requestID = UUID()
         activeRequestID = requestID
@@ -332,19 +242,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
                     )
                     return
                 }
-                if case let .liveTool(request) = work {
-                    do {
-                        let advice = try L1LiveToolAdviceOllamaDecoder.decode(data, for: request)
-                        onHealth(
-                            "model_response",
-                            "role=\(work.label); native_tool=\(advice.toolName ?? "none")"
-                        )
-                        complete(work, result: .success(advice))
-                    } catch {
-                        handleFailure(work, error: error, retryCount: retryCount)
-                    }
-                    return
-                }
                 guard let response = try? JSONDecoder().decode(ChatResponse.self, from: data),
                       let content = response.message?.content ?? response.response,
                       let object = Self.jsonObjectData(from: content) else {
@@ -358,8 +255,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
                 onHealth("model_response", "role=\(work.label); json=\(String(decoding: object, as: UTF8.self).prefix(4_096))")
                 do {
                     switch work {
-                    case .liveTool:
-                        preconditionFailure("live tool work returns before JSON decoding")
                     case let .thought(request):
                         let update = try L1ThoughtResponseDecoder.decode(object, for: request)
                         complete(work, result: .success(update))
@@ -394,8 +289,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
 
     private func completeFailure(_ work: L1ConsciousnessWorkItem, error: Error) {
         switch work {
-        case .liveTool:
-            complete(work, result: Result<L1LiveToolAdvice, Error>.failure(error))
         case .thought:
             complete(work, result: Result<L1ThoughtUpdate, Error>.failure(error))
         case .executive:
@@ -406,14 +299,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
     private func complete<T>(_ work: L1ConsciousnessWorkItem, result: Result<T, Error>) {
         let completedNS = DispatchTime.now().uptimeNanoseconds
         switch work {
-        case let .liveTool(request):
-            let typed: Result<L1LiveToolAdvice, Error> = result.flatMap { value in
-                guard let value = value as? L1LiveToolAdvice else {
-                    return .failure(GemmaConsciousnessRuntimeError.invalidResponse("live_tool_type"))
-                }
-                return .success(value)
-            }
-            liveToolCompletions.removeValue(forKey: request.cycleID)?(typed, completedNS)
         case let .thought(request):
             let typed: Result<L1ThoughtUpdate, Error> = result.flatMap { value in
                 guard let value = value as? L1ThoughtUpdate else {
@@ -471,33 +356,6 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
         return encoded.isEmpty ? nil : encoded
     }
 
-    private static func liveToolDefinitions(
-        for request: L1LiveToolAdviceRequest
-    ) -> [ChatRequest.Tool] {
-        request.availableTools
-            .filter { !request.toolsAlreadyCalled.contains($0) }
-            .compactMap { name in
-                guard let description = L2CognitiveToolPolicy.advisoryDescription(for: name) else {
-                    return nil
-                }
-                return ChatRequest.Tool(function: .init(
-                    name: name,
-                    description: description,
-                    parameters: .init(
-                        properties: [
-                            "grounding_quote": .init(
-                                type: "string",
-                                description: "A short exact substring of latest_user_transcript proving why this function is needed."
-                            ),
-                        ],
-                        required: ["grounding_quote"]
-                    )
-                ))
-            }
-    }
-
-    private static let liveToolPrompt = L1LiveWorkCoordinationPolicy.instruction
-
     private static let thoughtPrompt = """
     You are SOMA L1a, the private thought-update process inside a persistent mental workspace. You do not choose social actions, speak, move the gimbal, or issue behavior directives. Assess only what changed, how existing hypotheses should be supported, contradicted, resolved, abandoned, or associated, and what deserves the foreground next. Evidence IDs and workspace revision are authoritative. Copy expected_revision exactly from authoritative_output_binding; it is the current revision, not a value to increment or predict. Never invent evidence, identity, gaze, speech, object details, or memory. Relationship uncertainty is canonical workspace state; do not recompute or overwrite it.
 
@@ -520,14 +378,8 @@ final class GemmaConsciousnessRuntime: @unchecked Sendable {
 }
 
 private extension L1ConsciousnessWorkItem {
-    var isLiveTool: Bool {
-        if case .liveTool = self { return true }
-        return false
-    }
-
     var label: String {
         switch self {
-        case .liveTool: "live_tool"
         case let .thought(request): "l1a_\(request.wakeKind.rawValue)"
         case .executive: "l1b_executive"
         }

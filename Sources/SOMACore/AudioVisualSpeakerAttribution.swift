@@ -159,10 +159,9 @@ public enum LiveVoiceSpeakerEpisodeState: String, Equatable, Sendable {
     case rejected
 }
 
-/// Temporal speech evidence required before a new participant episode can be
-/// promoted into a Live Voice session. A strong window may qualify speech
-/// immediately; the episode gate still requires matching visual contact and
-/// independent speaker evidence before it authorizes a session.
+/// Temporal speech evidence required before a detected voice may open a Live
+/// Voice session. A strong window may qualify speech immediately; identity and
+/// elevated authority still require matching gaze and speaker evidence.
 public struct LiveVoiceOpeningSpeechConfiguration: Equatable, Sendable {
     public let strongConfidence: Double
     public let supportingConfidence: Double
@@ -192,8 +191,9 @@ public struct LiveVoiceOpeningSpeechConfiguration: Equatable, Sendable {
     }
 
     /// Uses the neural detector's admission threshold as the single speech
-    /// confidence boundary. Face continuity, directed contact, and independent
-    /// mouth-motion evidence remain separate requirements at the episode gate.
+    /// confidence boundary. Face presence admits ordinary conversation;
+    /// contradictory speaker evidence remains authoritative for identity,
+    /// elevated authority, duplex barge-in, and optional strict-turn policy.
     public static func alignedWithDetectorThreshold(
         _ activationThreshold: Double
     ) -> Self {
@@ -292,15 +292,12 @@ public struct LiveVoiceSpeakerEpisodeObservation: Equatable, Sendable {
     public let directContactObserved: Bool
     public let speakerEvidenceObserved: Bool
     public let speechEvidence: LiveVoiceOpeningSpeechEvidence
-    public let maximumVoiceConfidence: Double
-    public let endedState: LiveVoiceSpeakerEpisodeState?
 }
 
 /// Joins onset-time visual contact with independent speaker evidence for one
-/// continuously tracked face. The visual result may be delivered later, but
-/// its capture must precede the acoustic onset; a face switch, contradiction,
-/// or expired episode prevents evidence from different people or moments from
-/// being combined.
+/// continuously tracked face. This stricter result binds a stored identity,
+/// elevated authority, and echo-safe barge-in; it does not delay an ordinary
+/// participant session once face presence and speech are already qualified.
 public struct LiveVoiceSpeakerEpisodeGate: Sendable {
     private let maximumResolutionNS: UInt64
     private let maximumEvidenceSkewNS: UInt64
@@ -316,7 +313,6 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
     private var lastSpeakerEvidenceNS: UInt64?
     private var confirmedAtNS: UInt64?
     private var hardSpeakerRejection = false
-    private var maximumVoiceConfidence = 0.0
     private var openingSpeechEvidence: LiveVoiceOpeningSpeechAccumulator
 
     public init(
@@ -352,7 +348,6 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         at monotonicNS: UInt64
     ) -> LiveVoiceSpeakerEpisodeObservation {
         guard active else {
-            let endedState = state == .idle ? nil : state
             let transitioned = state != .idle || episodeActive
             episodeActive = false
             state = .idle
@@ -365,12 +360,10 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
             lastSpeakerEvidenceNS = nil
             confirmedAtNS = nil
             hardSpeakerRejection = false
-            maximumVoiceConfidence = 0
             openingSpeechEvidence.reset()
-            return observation(didTransition: transitioned, endedState: endedState)
+            return observation(didTransition: transitioned)
         }
 
-        maximumVoiceConfidence = max(maximumVoiceConfidence, evidence.voiceConfidence)
         let voiceEvidenceNS = voiceWindowObservedNS.flatMap {
             $0 <= monotonicNS ? $0 : nil
         } ?? monotonicNS
@@ -604,19 +597,14 @@ public struct LiveVoiceSpeakerEpisodeGate: Sendable {
         onsetNS >= observedNS && onsetNS - observedNS <= maximumContactLeadNS
     }
 
-    private func observation(
-        didTransition: Bool,
-        endedState: LiveVoiceSpeakerEpisodeState? = nil
-    ) -> LiveVoiceSpeakerEpisodeObservation {
+    private func observation(didTransition: Bool) -> LiveVoiceSpeakerEpisodeObservation {
         .init(
             state: state,
             didTransition: didTransition,
             hardSpeakerRejection: hardSpeakerRejection,
             directContactObserved: directContactObserved,
             speakerEvidenceObserved: speakerEvidenceObserved,
-            speechEvidence: openingSpeechEvidence.snapshot,
-            maximumVoiceConfidence: maximumVoiceConfidence,
-            endedState: endedState
+            speechEvidence: openingSpeechEvidence.snapshot
         )
     }
 }

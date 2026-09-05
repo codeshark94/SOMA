@@ -58,7 +58,7 @@ final class SOMAControlSettingsTests: XCTestCase {
         )
         XCTAssertFalse(migrated.realtimeVoiceRequiresEyeContactForEveryTurn)
         XCTAssertEqual(migrated.realtimeVoiceMode, .natural)
-        XCTAssertEqual(migrated.realtimeVoiceSilenceTimeoutSeconds, 60)
+        XCTAssertEqual(migrated.realtimeVoiceSilenceTimeoutSeconds, 600)
         XCTAssertTrue(migrated.hermesAgentDelegationEnabled)
         XCTAssertNil(migrated.hermesAgentWorkspace)
         XCTAssertEqual(migrated.schemaVersion, SOMAControlSettings.currentSchemaVersion)

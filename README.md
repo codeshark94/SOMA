@@ -104,7 +104,7 @@ layers are connected, but they are not interchangeable.
 | --- | --- | --- | --- |
 | **L0 · subconscious** | Video/audio cadence | Captures sensor evidence, follows a verified face, keeps target continuity, estimates voice activity, maintains spatial coverage, and executes the final motor policy | The only path to physical motion, stabilization, limits, watchdogs, and immediate stops |
 | **L0.5 · local semantic helper** | Sparse asynchronous visual inference and temporal evidence integration | Produces provisional visual evidence deltas for L1 without blocking L0 | No independent motor, tool-selection, tool-execution, speech, identity, memory, or wake authority |
-| **L1a · persistent thought stream** | Event-driven plus an adaptive stochastic clock | Maintains hypotheses, curiosity, goal-linked thought episodes, self-correction, probabilistic foreground thought, and Live Voice tool selection through the primary L1 model | May form an abstract intention, request bounded visual evidence, or advise one current-turn tool; cannot execute a tool, speak, or move hardware |
+| **L1a · persistent thought stream** | Event-driven plus an adaptive stochastic clock | Maintains hypotheses, curiosity, goal-linked thought episodes, self-correction, and probabilistic foreground thought through the primary L1 model | May form an abstract intention or request bounded visual evidence for its own workspace; cannot classify Live Voice turns, execute a tool, speak, or move hardware |
 | **L1b · executive judgment** | Only when an L1a intention creates action pressure | Chooses one currently available social or attention action against a frozen workspace revision | Semantic attention, labels, tracking goals, exploration policy, view requests, and expressions through existing leased MCP/L0 goals |
 | **L2 · conversation and executive reasoning** | Human turn time | Conducts account-backed live conversation, high-order reasoning, goal-directed tool use, and explicit delegation of longer external work | The same semantic embodiment interface as L1 plus an administrator-only asynchronous Hermes task queue; never raw device velocity |
 
@@ -176,8 +176,10 @@ open a conversation with a concrete purpose.
 
 ### 4. Converse without losing the body
 
-An authorized direct human contact can open an L2 Live Voice session, while L1
-can also initiate a conversation when it has a concrete purpose. L2 receives
+Qualified speech near a currently tracked live face can open an ordinary L2
+Live Voice session without requiring eye contact. Matching gaze plus independent
+speaker evidence is required before SOMA binds a stored identity or administrator
+authority. L1 can also initiate a conversation when it has a concrete purpose. L2 receives
 the private conversational objective and relevant memory context, then responds
 to the person's actual words. During a conversation it can proactively use the
 narrowest permitted SOMA MCP tool when doing so materially reduces uncertainty
@@ -202,7 +204,8 @@ supported-key action per call. These are two high-level MCP tools rather than
 separate mouse and keyboard tool families. They require the current
 administrator capability and a fresh participant turn; screen pixels and typed
 text are not written to the cognitive trace. A single simple local command or
-bounded host inspection can run in the backing Codex turn. Work that must
+bounded host inspection can run in the backing Codex turn. One current factual
+or web/API lookup also stays on that default live path. Work that must
 continue across turns, supervise a process, modify a repository, or perform
 sustained research belongs to Hermes. This channel remains available when
 gimbal motion is disabled; physical camera authority is negotiated separately.
@@ -211,13 +214,16 @@ Hermes is the worker for external jobs that can proceed independently of the
 spoken exchange. When delegation is enabled, L2 keeps direct conversation,
 SOMA embodiment, and bounded current-turn host actions in the backing Codex
 session, while long-running or multi-step administrator work is delegated; the
-administrator does not need to name Hermes. L2 submits one bounded objective,
+administrator does not need to name Hermes. The delegation call must declare
+an eligible durable work class and concrete acceptance criteria, and must carry
+a model-authored explicit-request intent; a gateway cannot silently promote a
+plain lookup into external work. L2 submits one bounded objective,
 receives a durable task ID immediately, acknowledges the accepted handoff
 aloud, and continues the spoken conversation without waiting. The
-acknowledgement never reads the internal task ID. If the model finishes the
-successful tool turn silently, the Live Voice controller emits the same
-one-time acknowledgement in the person's preferred language; an acknowledgement
-already spoken by the model is not duplicated. The owner-only SOMA runtime
+acknowledgement never reads the internal task ID. The standard App Server Live
+Voice handoff owns that acknowledgement and final response; SOMA does not add a
+parallel L1 classifier, controller-generated speech, or client-side response
+timeout. The owner-only SOMA runtime
 starts a Hermes Agent session,
 stores the task state and result in an encrypted bounded checkpoint, and
 retrieves the real completion event. If the same L2 conversation is still open,
@@ -250,10 +256,12 @@ than one useful duration:
 | **Medium-term** | Recent episodes, open questions, current tasks, daily public-world brief | Gives L1 an evolving situation rather than a fresh start every cycle |
 | **Long-term** | Explicitly confirmed preferences, rapport, familiar-place references, consolidated facts | Supports continuity across encounters without treating every observation as permanent truth |
 
-Raw conversation turns remain in the encrypted local short-term journal before
-L1 consolidates an allowed, typed memory. Identity and person-context changes
-require explicit confirmation. A model may propose a memory update; it does
-not get to invent one from tone or camera appearance.
+Exact conversation turns remain in the encrypted local short-term journal.
+Bounded excerpts may feed the asynchronous L1 situation stream, and session
+closure performs typed memory consolidation, but neither operation launches a
+second model call on the Live Voice response path. Identity and person-context
+changes require an explicit MCP action and confirmation. A model may propose a
+memory update; it does not get to invent one from tone or camera appearance.
 
 ## The embodiment interface
 
@@ -305,8 +313,10 @@ by default.
 
 - Scalar runtime traces do not contain raw camera frames, PCM, biometric
   templates, or direct device-control payloads.
-- Face templates and raw conversation turns are encrypted local records; they
-  are not placed in L1 prompts or normal diagnostic traces.
+- Face templates and exact conversation turns are encrypted local records and
+  never enter normal diagnostic traces. Only the bounded L1 situation and
+  end-of-session consolidation projections described above may disclose
+  transcript content to the configured L1 route.
 - Visual capture for a reasoning turn is bounded and short-lived rather than a
   rolling remote camera feed.
 - Identity enrollment, persistent personal facts, and preference changes are
@@ -401,10 +411,12 @@ swift run soma-menu-bar
 ```
 
 The menu bar application is where a local operator configures voice, indicator
-semantics, attention policy, and explicit identity enrollment. A new Live Voice
-session requires current eye contact, voice activity, and affirmative
-audiovisual evidence that the tracked person is speaking. Once open, conversation remains gaze-independent
-by default; an optional setting can require current eye contact for every spoken
+semantics, attention policy, and explicit identity enrollment. A new ordinary
+Live Voice session requires a currently tracked live face and qualified voice
+activity; current eye contact is not required. Matching gaze and independent
+lip-motion or directional evidence is required only to bind stored identity and
+administrator authority. Once open, conversation remains gaze-independent by
+default; an optional setting can require current eye contact for every spoken
 turn. Quiet admitted speech is levelled with a bounded VAD-driven gain stage and
 the initiating utterance is replayed after transport startup so session latency
 does not discard the first words. Review the scripts and hardware flags before

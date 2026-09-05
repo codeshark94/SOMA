@@ -9,19 +9,6 @@ public struct MCPToolCompletionDiagnostic: Equatable, Sendable {
     public let protocolStatus: String
     public let effectiveStatus: String
     public let error: String
-    public let succeeded: Bool
-
-    public var isAuthorizationFailure: Bool {
-        guard !succeeded else { return false }
-        let normalized = error.lowercased()
-        return normalized.contains("not authorized")
-            || normalized.contains("permission")
-            || normalized.contains("denied")
-            || normalized.contains("only the local administrator")
-            || normalized.contains("current participant turn")
-            || normalized.contains("interaction capability")
-            || normalized.contains("session may")
-    }
 
     public static func parse(
         _ item: [String: Any],
@@ -37,35 +24,12 @@ public struct MCPToolCompletionDiagnostic: Equatable, Sendable {
         let protocolError = ((item["error"] as? [String: Any])?["message"] as? String) ?? ""
         let toolError = (structured?["error"] as? String) ?? ""
         let error = protocolError.isEmpty ? toolError : protocolError
-        let succeeded = status == "completed" && error.isEmpty && structuredOK != false
         return Self(
             itemID: item["id"] as? String,
             tool: String(tool.prefix(96)),
             protocolStatus: String(status.prefix(48)),
             effectiveStatus: structuredOK == false ? "failed" : String(status.prefix(48)),
-            error: String(error.prefix(512)),
-            succeeded: succeeded
+            error: String(error.prefix(512))
         )
-    }
-}
-
-/// Provides a deterministic last-resort acknowledgement when a backing turn
-/// contains only a denied tool call. Normal model speech still wins, so this
-/// cannot create a second response owner.
-public enum MCPToolAuthorizationFailureResponse {
-    public static func phrase(languageTag: String?) -> String {
-        let language = languageTag?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() ?? ""
-        if language.hasPrefix("ko") {
-            return "현재 신원에는 이 작업 권한이 없습니다."
-        }
-        if language.hasPrefix("zh") {
-            return "当前身份没有执行此操作的权限。"
-        }
-        if language.hasPrefix("ja") {
-            return "現在のIDにはこの操作を実行する権限がありません。"
-        }
-        return "This identity is not authorized to perform that action."
     }
 }

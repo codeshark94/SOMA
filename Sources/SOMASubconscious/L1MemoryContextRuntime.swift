@@ -1017,8 +1017,8 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         return result
     }
 
-    /// Asks L1 to turn a finished conversation into a privacy-preserving
-    /// episode plus only explicitly supported person-context additions.
+    /// Sends a bounded finished transcript to L1 and accepts only a neutral
+    /// episode plus explicitly supported person-context additions.
     private func summarizeEpisode(
         transcript: String,
         reason: String
@@ -1026,7 +1026,7 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         let boundedTranscript = String(transcript.prefix(6_000))
         guard !boundedTranscript.isEmpty else { return nil }
         let prompt = """
-        You are SOMA's memory consolidator. Turn this finished conversation into a short, neutral memory. The original transcript stays local: never quote it and never include sensitive identifiers.
+        You are SOMA's memory consolidator. Turn this finished conversation into a short, neutral memory. Never quote the transcript and never include sensitive identifiers in the output.
 
         Return one 1-3 sentence narrative of what happened and its importance (salience 0.0...1.0). Then emit only durable information explicitly stated by the user or jointly resolved in the conversation. Do not infer facts from tone, appearance, the room, or a single gesture. Do not emit a relationship score: contact history is stored separately.
 
@@ -2081,69 +2081,6 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         Task { _ = await context(for: personEntityID) }
     }
 
-    /// Persists durable, enforceable per-person preferences captured from a
-    /// live user turn. Runs on the L1 queue; extraction is a lightweight local
-    /// model call and only writes when the user stated a new/changed preference.
-    func captureUserPreferences(
-        threadID: String?,
-        role: ConversationParticipantRole,
-        rawText: String,
-        at date: Date = Date()
-    ) async {
-        guard role == .user else { return }
-        let normalizedThreadID = threadID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedThreadID.isEmpty, !text.isEmpty else { return }
-        guard let personEntityID = activePersonEntityID(forThread: normalizedThreadID), let store else { return }
-        let extracted = await Self.extractUserPreferences(from: text)
-        guard !extracted.isEmpty else { return }
-        do {
-            var changed = false
-            let current = try await store.personContext(for: personEntityID, at: date)
-            for (key, value) in extracted {
-                guard PersonContextSnapshot.preferenceKeys.contains(key) else { continue }
-                if current.facts[key]?.trimmingCharacters(in: .whitespacesAndNewlines) == value {
-                    continue
-                }
-                _ = try await store.setExplicitPersonFact(
-                    personEntityID: personEntityID,
-                    key: key,
-                    value: value,
-                    sourceID: "l2_live_voice:\(normalizedThreadID)",
-                    at: date
-                )
-                changed = true
-            }
-            if changed {
-                cachePersonContext(try await store.personContext(for: personEntityID, at: date))
-                onHealth("person_preference_captured", "entity=\(personEntityID.uuidString.lowercased()); keys=\(extracted.map(\.key).joined(separator: ","))")
-            }
-        } catch {
-            onHealth("person_preference_capture_failed", String(error.localizedDescription.prefix(192)))
-        }
-    }
-
-    private func activePersonEntityID(forThread threadID: String) -> UUID? {
-        conversationLock.lock()
-        defer { conversationLock.unlock() }
-        return activeConversations[threadID]?.personEntityID
-    }
-
-    /// Just-in-time episodic recall for an active conversation turn: recalls
-    /// episodes relevant to the user's latest message and returns their
-    /// narratives so the live-voice runtime can append them as context.
-    func recallEpisodesForTurn(
-        threadID: String?,
-        text: String,
-        at date: Date = Date()
-    ) async -> [String] {
-        let normalizedThreadID = threadID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !normalizedThreadID.isEmpty,
-              let personEntityID = activePersonEntityID(forThread: normalizedThreadID) else { return [] }
-        return await recallEpisodes(entityID: personEntityID, query: text, at: date)
-            .map { $0.context(at: date) }
-    }
-
     /// Reads the stored preference directives for a person as one instruction
     /// string (used by the L1 packet and the L2 conversation context).
     func personPreferenceDirectives(for personEntityID: UUID) -> String {
@@ -2152,53 +2089,6 @@ final class L1MemoryContextProvider: @unchecked Sendable {
         guard let snapshot = personContextByPersonID[personEntityID] else { return "" }
         let directives = snapshot.preferenceDirectives()
         return directives.isEmpty ? "" : directives.joined(separator: " ")
-    }
-
-    /// Asks the local model whether the user stated any durable preference or
-    /// request in this turn, and returns the extracted {key, value} pairs.
-    private static func extractUserPreferences(
-        from text: String
-    ) async -> [(key: String, value: String)] {
-        let allowed = PersonContextSnapshot.preferenceKeys.sorted().joined(separator: ", ")
-        let prompt = """
-        The user just said: "\(text)"
-        Did they state a durable preference, how to address them, or an ongoing request?
-        If yes, choose the matching key from this set: \(allowed).
-        Return strict JSON only: {"preferences":[{"key":"...","value":"..."}]} or {"preferences":[]}.
-        Keep each value short and concrete. If nothing durable was stated, return {"preferences":[]}.
-        """
-        guard let url = URL(string: "\(somaOllamaHost())/api/generate") else { return [] }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "model": ProcessInfo.processInfo.environment["SOMA_L1_MODEL"] ?? "gemma4:31b-cloud",
-            "prompt": prompt,
-            "stream": false,
-            "format": "json",
-            "options": ["temperature": 0.1, "num_predict": 160],
-        ])
-        request.timeoutInterval = 15
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            guard let outer = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let content = outer["response"] as? String,
-                  let contentData = content.data(using: .utf8),
-                  let parsed = try JSONSerialization.jsonObject(with: contentData) as? [String: Any],
-                  let rawPreferences = parsed["preferences"] as? [[String: Any]] else {
-                return []
-            }
-            return rawPreferences.compactMap { item -> (key: String, value: String)? in
-                guard let key = item["key"] as? String,
-                      let value = item["value"] as? String else { return nil }
-                let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-                let normalizedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !normalizedKey.isEmpty, !normalizedValue.isEmpty else { return nil }
-                return (normalizedKey, normalizedValue)
-            }
-        } catch {
-            return []
-        }
     }
 
     /// Seeds durable person facts for the local administrator from the control
@@ -2643,12 +2533,6 @@ final class L1DailyWorldMemoryRelay: @unchecked Sendable {
 /// Converts recognized-person observations into sparse L1 cycles. Identity
 /// evidence is a wake signal, not a command to speak. Repeated recognition is
 /// locally coalesced before Gemma is contacted, and a late response is ignored.
-private enum L1ThoughtStreamRelayError: LocalizedError {
-    case unavailable
-
-    var errorDescription: String? { "primary_l1_unavailable" }
-}
-
 final class L1ThoughtStreamRelay: @unchecked Sendable {
     private let lock = NSLock()
     private var stream: (any L1ThoughtStreaming)?
@@ -2712,17 +2596,6 @@ final class L1ThoughtStreamRelay: @unchecked Sendable {
             text: text,
             at: monotonicNS
         )
-    }
-
-    func submitLiveToolAdvice(
-        _ request: L1LiveToolAdviceRequest,
-        completion: @escaping @Sendable (Result<L1LiveToolAdvice, Error>) -> Void
-    ) {
-        guard let stream = currentStream() else {
-            completion(.failure(L1ThoughtStreamRelayError.unavailable))
-            return
-        }
-        stream.submitLiveToolAdvice(request, completion: completion)
     }
 
     private func currentStream() -> (any L1ThoughtStreaming)? {

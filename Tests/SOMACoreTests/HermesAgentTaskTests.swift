@@ -5,7 +5,7 @@ import XCTest
 
 final class HermesAgentTaskTests: XCTestCase {
     func testEveryAdvertisedMCPToolHasAnExplicitCognitivePolicy() {
-        XCTAssertTrue(L2CognitiveToolPolicy.instruction.contains("before emitting its first audible token"))
+        XCTAssertTrue(L2CognitiveToolPolicy.instruction.contains("standard single brief handoff acknowledgement"))
         XCTAssertTrue(L2CognitiveToolPolicy.instruction.contains("deliver one continuous grounded answer"))
         XCTAssertFalse(L2CognitiveToolPolicy.knownToolNames.isEmpty)
         for name in L2CognitiveToolPolicy.knownToolNames {
@@ -26,6 +26,8 @@ final class HermesAgentTaskTests: XCTestCase {
             title: "Research task",
             objective: "Inspect one bounded question",
             workingDirectory: "/tmp",
+            workClass: .sustainedResearch,
+            acceptanceCriteria: "A cited report exists.",
             status: .completed,
             hermesStoredSessionID: "session-1",
             result: "private worker result",
@@ -44,6 +46,32 @@ final class HermesAgentTaskTests: XCTestCase {
             (try FileManager.default.attributesOfItem(atPath: checkpoint.path)[.posixPermissions] as? NSNumber)?.intValue,
             0o600
         )
+    }
+
+    func testWorkerPromptPreservesCriteriaAfterMaximumLengthObjective() {
+        let task = HermesAgentTask(
+            goalEpisodeID: UUID(),
+            title: "Long task",
+            objective: String(repeating: "x", count: 24_000),
+            workingDirectory: "/tmp",
+            workClass: .artifactDelivery,
+            acceptanceCriteria: "The requested artifact exists and opens successfully."
+        )
+
+        XCTAssertEqual(task.objective.count, 24_000)
+        XCTAssertTrue(task.workerPrompt?.contains("Work class: artifact_delivery") == true)
+        XCTAssertTrue(task.workerPrompt?.hasSuffix("The requested artifact exists and opens successfully.") == true)
+    }
+
+    func testLegacyTaskWithoutDelegationContractCannotProduceWorkerPrompt() {
+        let task = HermesAgentTask(
+            goalEpisodeID: UUID(),
+            title: "Legacy task",
+            objective: "Continue old work",
+            workingDirectory: "/tmp"
+        )
+
+        XCTAssertNil(task.workerPrompt)
     }
 
     func testParticipantCannotUseExternalTaskAuthority() {
@@ -81,7 +109,7 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_robot_body_state"))
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "get_activity_overview"))
         XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "capture_view"))
-        XCTAssertFalse(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "delegate_hermes_task"))
+        XCTAssertTrue(L2CognitiveToolPolicy.requiresModelAuthoredIntent(for: "delegate_hermes_task"))
         XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "get_robot_body_state"))
         XCTAssertFalse(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "capture_view"))
         XCTAssertTrue(L2CognitiveToolPolicy.usesSemanticDeduplication(for: "set_person_fact"))
@@ -93,9 +121,7 @@ final class HermesAgentTaskTests: XCTestCase {
         let captureGateway = L2CognitiveToolPolicy.gatewayIntent(for: "capture_view")
         XCTAssertEqual(captureGateway?.authorizationBasis, .autonomousGoal)
         XCTAssertEqual(captureGateway?.expectedInformationGain, 0.9)
-        let delegationGateway = L2CognitiveToolPolicy.gatewayIntent(for: "delegate_hermes_task")
-        XCTAssertEqual(delegationGateway?.authorizationBasis, .explicitRequest)
-        XCTAssertEqual(delegationGateway?.expectedInformationGain, 1)
+        XCTAssertNil(L2CognitiveToolPolicy.gatewayIntent(for: "delegate_hermes_task"))
     }
 
     func testTaskRoutingSeparatesHostWorkFromRobotEmbodiment() {
@@ -104,16 +130,56 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertTrue(enabled.contains("executed directly by backing Codex"))
         XCTAssertTrue(enabled.contains("delegate_hermes_task exactly once"))
         XCTAssertTrue(enabled.contains("Keep listening and converse normally"))
-        XCTAssertTrue(enabled.contains("controller owns the immediate spoken acceptance"))
+        XCTAssertTrue(enabled.contains("standard Live Voice handoff owns"))
+        XCTAssertTrue(enabled.contains("One factual or web/API lookup"))
+        XCTAssertTrue(enabled.contains("Fresh data or network access alone never requires Hermes"))
         XCTAssertTrue(enabled.contains("Do not read the task UUID aloud"))
         XCTAssertTrue(enabled.contains("Do not substitute screen pixels or get_robot_body_state"))
         XCTAssertTrue(enabled.contains("use get_activity_overview"))
         XCTAssertTrue(L2TaskRoutingPolicy.embodimentStateToolDescription.contains("not the host Mac"))
-        XCTAssertTrue(L2TaskRoutingPolicy.hermesDelegationToolDescription.contains("while the voice conversation remains responsive"))
+        XCTAssertTrue(L2TaskRoutingPolicy.hermesDelegationToolDescription.contains("declared work_class"))
+        XCTAssertTrue(L2TaskRoutingPolicy.hermesDelegationToolDescription.contains("acceptance_criteria"))
 
         let disabled = L2TaskRoutingPolicy.instruction(hermesEnabled: false)
         XCTAssertTrue(disabled.contains("delegation is disabled"))
         XCTAssertFalse(disabled.contains("call delegate_hermes_task exactly once"))
+    }
+
+    func testHermesDelegationContractAdmitsOnlyDurableWorkClasses() {
+        XCTAssertEqual(
+            Set(HermesDelegatedWorkClass.allCases.map(\.rawValue)),
+            Set([
+                "artifact_delivery",
+                "repository_change",
+                "sustained_research",
+                "service_management",
+                "process_supervision",
+            ])
+        )
+        XCTAssertNil(L2TaskRoutingPolicy.hermesDelegationValidationError(
+            workClass: .sustainedResearch,
+            objective: "Compare the literature and deliver a cited report.",
+            acceptanceCriteria: "A reviewed report with primary-source citations exists.",
+            workingDirectory: nil
+        ))
+        XCTAssertEqual(
+            L2TaskRoutingPolicy.hermesDelegationValidationError(
+                workClass: .repositoryChange,
+                objective: "Implement and verify the requested change.",
+                acceptanceCriteria: "The focused test and full build pass.",
+                workingDirectory: nil
+            ),
+            "repository_change requires working_directory"
+        )
+        XCTAssertEqual(
+            L2TaskRoutingPolicy.hermesDelegationValidationError(
+                workClass: .artifactDelivery,
+                objective: "Create the requested artifact.",
+                acceptanceCriteria: "   ",
+                workingDirectory: nil
+            ),
+            "delegate_hermes_task acceptance_criteria is required"
+        )
     }
 
     func testActivityOverviewProjectionCannotDiscloseWorkerResult() throws {
@@ -154,75 +220,6 @@ final class HermesAgentTaskTests: XCTestCase {
         XCTAssertEqual(diagnostic?.protocolStatus, "completed")
         XCTAssertEqual(diagnostic?.effectiveStatus, "failed")
         XCTAssertEqual(diagnostic?.error, "invalid tool arguments: unexpected field")
-        XCTAssertFalse(diagnostic?.succeeded ?? true)
-    }
-
-    func testAuthorizationFailureAlwaysHasOneLocalizedFallback() throws {
-        let diagnostic = try XCTUnwrap(MCPToolCompletionDiagnostic.parse([
-            "id": "tool-denied",
-            "type": "mcpToolCall",
-            "server": "soma_embodiment",
-            "tool": "control_host_computer",
-            "status": "completed",
-            "result": [
-                "structuredContent": [
-                    "ok": false,
-                    "error": "Only the local administrator may control host input",
-                ],
-            ],
-        ]))
-        XCTAssertTrue(diagnostic.isAuthorizationFailure)
-        XCTAssertEqual(
-            MCPToolAuthorizationFailureResponse.phrase(languageTag: "ko-KR"),
-            "현재 신원에는 이 작업 권한이 없습니다."
-        )
-        XCTAssertEqual(
-            MCPToolAuthorizationFailureResponse.phrase(languageTag: "en-US"),
-            "This identity is not authorized to perform that action."
-        )
-    }
-
-    func testDelegationAcknowledgementIsLocalizedAndOwnedByNewTaskTransition() {
-        XCTAssertEqual(
-            HermesDelegationAcknowledgement.phrase(languageTag: "ko-KR"),
-            "컴퓨터 관리자에게 맡겼어요. 끝나면 알려드릴게요."
-        )
-        XCTAssertTrue(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
-            operation: .submit,
-            deduplicated: false,
-            sessionActive: true,
-            alreadyHandled: false
-        ))
-        XCTAssertTrue(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
-            operation: .continueTask,
-            deduplicated: false,
-            sessionActive: true,
-            alreadyHandled: false
-        ))
-        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
-            operation: .submit,
-            deduplicated: true,
-            sessionActive: true,
-            alreadyHandled: false
-        ))
-        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
-            operation: .submit,
-            deduplicated: false,
-            sessionActive: false,
-            alreadyHandled: false
-        ))
-        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
-            operation: .list,
-            deduplicated: false,
-            sessionActive: true,
-            alreadyHandled: false
-        ))
-        XCTAssertFalse(HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
-            operation: .submit,
-            deduplicated: false,
-            sessionActive: true,
-            alreadyHandled: true
-        ))
     }
 
     func testRootHermesSubmissionIsIdempotentAcrossObjectiveParaphrases() {

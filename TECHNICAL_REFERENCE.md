@@ -55,15 +55,20 @@ revision and deletion lifecycles, and a minimal remote-summary projection. It
 also has a local-only raw L2 conversation-turn type and archiver: exact finalized
 user and assistant transcript text stays encrypted in short-term memory until
 L1 links it to derived episode, person, relationship, task, or open-question
-records. Live transcript capture and runtime-key provisioning are not yet wired.
+records. Live transcript capture and runtime-key provisioning are wired through
+the owner process. Session closure runs the bounded L1 consolidation pass,
+persists its validated typed memories, and links the source turns; failures keep
+the turns pending so restart recovery can retry them.
 The C3 transition core is also present:
 it produces a versioned, normalized distribution over `stay_l0`, `wake_l1`,
 and `request_human_interaction`, records bounded evidence references and the
 policy reason, dispatches explicit contact directly to L2 with parallel L1
 context preparation, and prevents non-human events from opening interaction.
-`--l2-live-voice` is the primary L2 interaction route. A Core ML VAD onset must
-coincide with fresh directed eye contact, except for one response to a greeting
-pulse that SOMA initiated. `soma-live-voice` starts the installed Codex
+`--l2-live-voice` is the primary L2 interaction route. A Core ML VAD speech
+episode near a currently tracked live face may open an ordinary participant
+session without direct gaze. Matching gaze plus independent lip-motion or
+calibrated direction evidence is required before the session receives a stored
+identity or administrator authority. `soma-live-voice` starts the installed Codex
 app-server with its realtime feature, creates an ephemeral `realtime_voice`
 thread that is not materialized in the Codex desktop task list, and
 negotiates V3 audio over WebRTC using the existing ChatGPT account. The OBSBOT
@@ -86,8 +91,9 @@ pursuing the motive after an answer or graceful decline. L2 may mark explicit us
 corrections as memory proposals; L1 remains the default curator and the deterministic memory
 validator owns the final commit. The deployed `gemma4:31b-cloud` stream performs
 event-driven situational inference with policy-filtered memory retrieval.
-Transcript ingestion and consolidation are still pending. There is no second L1
-model, shadow route, or fallback cognition path.
+Finalized Live turns are ingested, and session closure performs typed
+conversation consolidation outside the response-critical Live path. There is
+no second L1 model, shadow route, or fallback cognition path.
 
 Face identity now has a real local inference boundary rather than treating a
 detector box as a person record. System Vision eye/nose landmarks align each
@@ -517,22 +523,15 @@ measured E2B at 1.47 s cold and 1.39 s warm median. The checkpoint occupies
 3.3 GiB and reported a 4.20 GB MLX peak. The person-free fixture stayed
 `ambient / none`; broader labelled human and object evaluation remains open.
 The worker accepts only the pinned E2B checkpoint and has no Ollama fallback.
-It is a visual-only helper. Current-turn Live Voice tool selection runs on the
-primary 31B route through Ollama native function definitions and decodes
-`message.tool_calls`. It has highest priority in the primary L1 single-flight
-queue and safely preempts/requeues background L1 inference, while L2 retains
-authority over side effects and open-ended tool arguments. Three bounded
-current-state reads (`get_activity_overview`, `get_robot_body_state`, and
-`list_hermes_tasks`) may be executed directly by the active Live Voice host
-after a validated, transcript-grounded L1 recommendation; the actual result is
-injected into that same turn before the grounded answer.
-
-The former E2B JSON-advice route could spend roughly 2–4 seconds failing to
-extract its expected JSON before L2 continued without advice. A direct native
-tool-call probe on the installed primary route selected `get_activity_overview`
-for `Status report.` in 0.58 seconds. The runtime now uses that native envelope,
-allows at most one function, validates its exact transcript grounding, and
-rejects any argument outside the advisory contract.
+It is a visual-only helper. Finalized conversation outcomes may enter L1's
+asynchronous memory stream, but L1 does not classify transcripts for live
+routing, select conversation tools, preempt its queue for a voice turn, or
+inject advice into that turn. GPT-Live answers ordinary conversation directly
+and uses the app-server's standard handoff to backing Codex only for exact
+current data, a tool, or substantial reasoning. Bounded factual, web/API,
+calculation, and read-only inspection work finishes in that current turn.
+Only durable artifacts, repository changes, sustained research, service
+management, and supervised process work may be delegated to Hermes.
 
 The selected `gemma4:31b-cloud` primary L1 situational model measured 0.79 s
 cold and 0.89 s warm median on the same fixture. Its active situation-stream

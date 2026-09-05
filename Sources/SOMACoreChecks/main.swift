@@ -47,99 +47,135 @@ require(
     "ambient object admitted a new live conversation"
 )
 var contactGate = ConversationContactGate()
+let ordinarySession = LiveVoiceSessionAdmission.evaluate(
+    trackedFaceVisible: true,
+    speechEvidenceQualified: true,
+    speakerAttributionHardRejected: false,
+    speakerEpisodeState: .pending
+)
 require(
-    contactGate.observeVoiceActivity(active: true, at: start, directContact: false) == nil,
-    "ambient speech authorized a new spoken turn"
+    ordinarySession.permitsParticipantSession,
+    "qualified speech near a tracked face did not admit an ordinary session"
+)
+require(
+    !ordinarySession.permitsRecognizedIdentity,
+    "unconfirmed speaker evidence bound a stored identity"
+)
+let confirmedIdentity = LiveVoiceSessionAdmission.evaluate(
+    trackedFaceVisible: true,
+    speechEvidenceQualified: true,
+    speakerAttributionHardRejected: false,
+    speakerEpisodeState: .confirmed
+)
+require(
+    confirmedIdentity.permitsRecognizedIdentity,
+    "confirmed speaker evidence did not admit a stored identity"
+)
+let contradictedOrdinarySession = LiveVoiceSessionAdmission.evaluate(
+    trackedFaceVisible: true,
+    speechEvidenceQualified: true,
+    speakerAttributionHardRejected: true,
+    speakerEpisodeState: .rejected
+)
+require(
+    contradictedOrdinarySession.permitsParticipantSession
+        && !contradictedOrdinarySession.permitsRecognizedIdentity
+        && !contradictedOrdinarySession.rejectsParticipantAudio,
+    "strict speaker contradiction leaked into ordinary conversation admission"
+)
+let contradictedStrictTurn = LiveVoiceSessionAdmission.evaluate(
+    trackedFaceVisible: true,
+    speechEvidenceQualified: true,
+    speakerAttributionHardRejected: true,
+    speakerEpisodeState: .rejected,
+    requiresVerifiedSpeakerForEveryTurn: true
+)
+require(
+    !contradictedStrictTurn.permitsParticipantSession
+        && contradictedStrictTurn.rejectsParticipantAudio,
+    "strict turn admitted hard-contradicted speaker audio"
+)
+require(
+    !LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+        trackedFaceVisible: true,
+        independentSpeakerEvidence: true,
+        speechEvidenceQualified: true,
+        directContactConfirmed: false,
+        speakerAttributionRejected: false
+    ),
+    "ordinary gaze policy weakened assistant-playback interruption verification"
+)
+require(
+    LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+        trackedFaceVisible: true,
+        independentSpeakerEvidence: true,
+        speechEvidenceQualified: true,
+        directContactConfirmed: true,
+        speakerAttributionRejected: false
+    ),
+    "fully confirmed participant could not interrupt assistant playback"
+)
+require(
+    contactGate.observeVoiceActivity(
+        active: true,
+        at: start,
+        newSessionAdmitted: false
+    ) == nil,
+    "unqualified speech authorized a new spoken turn"
 )
 require(
     contactGate.observeVoiceActivity(
         active: true,
         at: start + 100_000_000,
-        directContact: true
-    ) == nil,
-    "later eye contact upgraded an already-rejected ambient sound"
+        newSessionAdmitted: true
+    ) == .voiceActivity,
+    "later-qualified speech did not authorize the same spoken episode"
 )
 _ = contactGate.observeVoiceActivity(
     active: false,
     at: start + 200_000_000,
-    directContact: true
-)
-require(
-    contactGate.observeVoiceActivity(
-        active: true,
-        at: start + 300_000_000,
-        directContact: true
-    ) == .voiceActivity,
-    "direct contact did not authorize the first spoken turn"
-)
-_ = contactGate.observeVoiceActivity(
-    active: false,
-    at: start + 400_000_000,
-    directContact: true
-)
-require(
-    contactGate.observeVoiceActivity(
-        active: true,
-        at: start + 1_100_000_000,
-        directContact: false
-    ) == nil,
-    "speech without current direct contact authorized a new spoken turn"
-)
-var l0FaceFixationAdmission = L0FaceFixationAdmission(freshnessMilliseconds: 500)
-l0FaceFixationAdmission.observeVerifiedFixation(
-    sceneID: "face-a",
-    directContact: true,
-    at: start
-)
-require(
-    l0FaceFixationAdmission.permitsNewSession(at: start + 100_000_000),
-    "current verified L0 face fixation did not admit direct speech"
-)
-l0FaceFixationAdmission.clear()
-require(
-    !l0FaceFixationAdmission.permitsNewSession(at: start + 100_000_000),
-    "cleared L0 fixation still admitted historical gaze"
+    newSessionAdmitted: false
 )
 contactGate.markConversationOpened(at: start + 2_000_000_000)
 _ = contactGate.observeVoiceActivity(
     active: false,
     at: start + 2_100_000_000,
-    directContact: false
+    newSessionAdmitted: false
 )
 require(
     contactGate.observeVoiceActivity(
         active: true,
         at: start + 61_999_000_000,
-        directContact: false
+        newSessionAdmitted: false
     ) == .activeConversation,
     "opened conversation did not retain its active lease"
 )
 _ = contactGate.observeVoiceActivity(
     active: false,
     at: start + 61_999_500_000,
-    directContact: false
+    newSessionAdmitted: false
 )
 require(
     contactGate.observeVoiceActivity(
         active: true,
         at: start + 62_000_000_000,
-        directContact: true
+        newSessionAdmitted: true
     ) == .voiceActivity,
-    "direct contact did not remain admissible after the conversation lease closed"
+    "qualified speech did not remain admissible after the conversation lease closed"
 )
 var liveSessionInactivity = LiveVoiceSessionInactivityGate()
 let firstLiveDeadline = liveSessionInactivity.activate(at: start)
 require(
     !liveSessionInactivity.shouldClose(at: firstLiveDeadline - 1),
-    "Live voice session closed before one minute of user silence"
+    "Live voice session closed before ten minutes of user silence"
 )
 require(
     liveSessionInactivity.shouldClose(at: firstLiveDeadline),
-    "Live voice session did not close after one minute of user silence"
+    "Live voice session did not close after ten minutes of user silence"
 )
 let renewedLiveDeadline = liveSessionInactivity.recordUserActivity(at: firstLiveDeadline - 1)
 require(
-    renewedLiveDeadline == firstLiveDeadline + 59_999_999_999,
+    renewedLiveDeadline == firstLiveDeadline + 599_999_999_999,
     "user activity did not renew the Live voice silence deadline"
 )
 var indicatorInputs = SubconsciousIndicatorInputs(

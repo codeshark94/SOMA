@@ -59,61 +59,6 @@ public struct LiveVoiceLaunchGate: Equatable, Sendable {
     }
 }
 
-public enum LiveVoiceOpeningOrigin: Equatable, Sendable {
-    case participantContact
-    case proactive
-}
-
-/// Releases one captured opening utterance only after the remote realtime
-/// session and its WebRTC audio track are both active. This keeps prerecorded
-/// PCM on the same transport as the rest of the participant's live speech.
-public struct LiveVoiceOpeningAudioPlayoutGate: Equatable, Sendable {
-    public private(set) var sessionActive = false
-    public private(set) var inputTrackReady = false
-    public private(set) var playoutAuthorized = false
-
-    public init() {}
-
-    public mutating func observeSessionActive() {
-        sessionActive = true
-    }
-
-    public mutating func observeInputTrackReady() {
-        inputTrackReady = true
-    }
-
-    public mutating func authorizePlayoutIfReady(hasBufferedAudio: Bool) -> Bool {
-        guard hasBufferedAudio,
-              sessionActive,
-              inputTrackReady,
-              !playoutAuthorized else { return false }
-        playoutAuthorized = true
-        return true
-    }
-
-    public mutating func reset() {
-        sessionActive = false
-        inputTrackReady = false
-        playoutAuthorized = false
-    }
-}
-
-public enum LiveVoiceOpeningAudioPolicy {
-    /// Server-side turn detection needs an explicit acoustic offset after a
-    /// buffered utterance. A finite silent tail on the WebRTC input track
-    /// provides that boundary without converting or resynthesizing speech.
-    public static let trailingSilenceMilliseconds = 480
-
-    public static func trailingSilenceSampleCount(sampleRate: Int) -> Int? {
-        guard (8_000...96_000).contains(sampleRate) else { return nil }
-        let product = sampleRate.multipliedReportingOverflow(
-            by: trailingSilenceMilliseconds
-        )
-        guard !product.overflow else { return nil }
-        return product.partialValue / 1_000
-    }
-}
-
 /// Classifies server-side realtime events that prove participant audio reached
 /// the conversation backend. Transcript text may arrive later on the canonical
 /// App Server notification stream, so admission must not depend on the data
@@ -236,247 +181,107 @@ public enum LiveVoiceWireTranscriptParser {
     }
 }
 
-/// Realtime snapshots their available tools and startup instructions when the
-/// session begins. The bounded capability barrier prevents the first spoken
-/// turn from racing ahead with an "initializing" view of embodiment.
-public enum LiveVoiceEmbodimentStartupPolicy {
-    public static let verificationTimeoutMilliseconds: UInt64 = 5_000
-
-    /// Local microphone/WebRTC offer preparation is safe to overlap with the
-    /// capability snapshot because it does not create a remote Realtime
-    /// session or consume a model turn.
+/// Prepares the local WebRTC audio graph as soon as its WebView exists. This
+/// work needs neither an account-backed session nor a Codex thread, so keeping
+/// it off the participant's first-turn critical path is both safe and cheaper.
+/// App Server remains the authority for starting the remote Realtime session.
+public enum LiveVoiceRealtimeStartupPolicy {
     public static func permitsTransportPreparation(
         webViewReady: Bool,
-        threadReady: Bool,
         transportAlreadyStarted: Bool
     ) -> Bool {
-        webViewReady && threadReady && !transportAlreadyStarted
+        webViewReady && !transportAlreadyStarted
     }
 
-    /// The remote session still waits for the bounded capability snapshot so
-    /// its initial tool and instruction view cannot race MCP initialization.
     public static func permitsRealtimeStart(
         offerReady: Bool,
-        capabilityVerificationFinished: Bool,
         realtimeAlreadyStarted: Bool
     ) -> Bool {
         offerReady
-            && capabilityVerificationFinished
             && !realtimeAlreadyStarted
     }
-}
 
-public enum LiveVoiceHandoffResponseDisposition: Equatable, Sendable {
-    case appendFinalSpeech
-    case appendRecoverySpeech(LiveVoiceTurnRecoveryKind)
-    case retainExistingRealtimeResponse
-    case externalDelegationOwnsResponse
-}
-
-public enum LiveVoiceBackingTurnStatus: String, Equatable, Sendable {
-    case completed
-    case interrupted
-    case failed
-    case inProgress = "inProgress"
-
-    public init(protocolValue: String?) {
-        self = protocolValue.flatMap(Self.init(rawValue:)) ?? .failed
+    /// The prepared local input track is intentionally independent of the
+    /// remote thread. It queues the opening utterance until WebRTC connects.
+    public static func permitsAudioEnqueue(webViewReady: Bool) -> Bool {
+        webViewReady
     }
 }
 
-public enum LiveVoiceTurnRecoveryKind: Equatable, Sendable {
-    case failed
-    case interrupted
-    case emptyResult
-    case timedOut
+public enum LiveVoiceResponseCompletion: Equatable, Sendable {
+    case current(generation: UInt64)
+    case stale(generation: UInt64, currentGeneration: UInt64)
+    case uncorrelated
 }
 
-/// A deterministic voice-safe terminal response for infrastructure paths that
-/// cannot produce their own agent message. This is deliberately separate from
-/// model wording so a failed turn can never become silence.
-public enum LiveVoiceTurnRecoveryResponse {
-    public static func phrase(
-        kind: LiveVoiceTurnRecoveryKind,
-        languageTag: String?
-    ) -> String {
-        let language = languageTag?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() ?? ""
-        return switch (languagePrefix(language), kind) {
-        case ("ko", .failed):
-            "요청을 처리하는 중 오류가 발생했습니다."
-        case ("ko", .interrupted):
-            "요청 처리가 중단됐습니다."
-        case ("ko", .emptyResult):
-            "요청은 들었지만 처리 결과를 만들지 못했습니다."
-        case ("ko", .timedOut):
-            "요청 처리가 지연되어 중단했습니다."
-        case ("zh", .failed):
-            "处理请求时发生了错误。"
-        case ("zh", .interrupted):
-            "请求处理已中断。"
-        case ("zh", .emptyResult):
-            "我收到了请求，但未能生成处理结果。"
-        case ("zh", .timedOut):
-            "请求处理超时，已停止。"
-        case ("ja", .failed):
-            "リクエストの処理中にエラーが発生しました。"
-        case ("ja", .interrupted):
-            "リクエストの処理が中断されました。"
-        case ("ja", .emptyResult):
-            "リクエストは受け取りましたが、処理結果を生成できませんでした。"
-        case ("ja", .timedOut):
-            "リクエストの処理がタイムアウトしたため停止しました。"
-        case (_, .failed):
-            "I encountered an error while processing that request."
-        case (_, .interrupted):
-            "That request was interrupted before it finished."
-        case (_, .emptyResult):
-            "I received the request but could not produce a result."
-        case (_, .timedOut):
-            "That request took too long, so I stopped it."
-        }
-    }
+/// Correlates terminal response events with the participant turn that created
+/// them. Realtime may deliver a cancelled or completed response after a newer
+/// barge-in has already opened another turn; that stale terminal event must not
+/// revoke the newer turn's action authority.
+public struct LiveVoiceResponseTurnTracker: Equatable, Sendable {
+    public private(set) var currentGeneration: UInt64 = 0
+    public private(set) var participantTurnOpen = false
+    private var responseGenerations: [String: UInt64] = [:]
+    private var responseOrder: [String] = []
 
-    private static func languagePrefix(_ value: String) -> String {
-        if value.hasPrefix("ko") { return "ko" }
-        if value.hasPrefix("zh") { return "zh" }
-        if value.hasPrefix("ja") { return "ja" }
-        return "en"
-    }
-}
+    public init() {}
 
-/// Gives every participant turn an audible response owner. A grounded result
-/// remains deliverable after a realtime preamble when tools performed work;
-/// task delegation acknowledgements retain their dedicated controller path.
-public enum LiveVoiceHandoffResponsePolicy {
-    public static func disposition(
-        hasAgentMessage: Bool,
-        realtimeResponseSpoken: Bool,
-        successfulExternalDelegation: Bool,
-        containsAuthoritativeBackingWork: Bool,
-        turnStatus: LiveVoiceBackingTurnStatus
-    ) -> LiveVoiceHandoffResponseDisposition {
-        if successfulExternalDelegation {
-            return .externalDelegationOwnsResponse
-        }
-        if hasAgentMessage {
-            // A realtime utterance made before a tool-backed result is only a
-            // presentation preamble. The grounded Codex result must still be
-            // delivered. With no backing work, retain the already-spoken
-            // realtime answer so two equivalent answers are not voiced.
-            if realtimeResponseSpoken && !containsAuthoritativeBackingWork {
-                return .retainExistingRealtimeResponse
-            }
-            return .appendFinalSpeech
-        }
-        if realtimeResponseSpoken {
-            return .retainExistingRealtimeResponse
-        }
-        return switch turnStatus {
-        case .failed, .inProgress:
-            .appendRecoverySpeech(.failed)
-        case .interrupted:
-            .appendRecoverySpeech(.interrupted)
-        case .completed:
-            .appendRecoverySpeech(.emptyResult)
-        }
-    }
-}
-
-/// Keeps the initial participant-contact authorization provisional until the
-/// realtime transport confirms usable participant input. Proactive openings
-/// have their own L1 authorization and are deliberately outside this rule.
-public struct LiveVoiceInitialTurnValidation: Equatable, Sendable {
-    public let transcriptTimeoutMilliseconds: UInt64
-    public private(set) var origin: LiveVoiceOpeningOrigin?
-    public private(set) var participantInputConfirmed = false
-    public private(set) var transcriptDeadlineNS: UInt64?
-    public private(set) var initialAudioSubmitted = false
-    public private(set) var initialAudioTransportConfirmed = false
-    public private(set) var serverSpeechDetected = false
-
-    public init(transcriptTimeoutMilliseconds: UInt64 = 3_500) {
-        precondition(transcriptTimeoutMilliseconds > 0)
-        self.transcriptTimeoutMilliseconds = transcriptTimeoutMilliseconds
-    }
-
-    public mutating func begin(origin: LiveVoiceOpeningOrigin) {
-        self.origin = origin
-        participantInputConfirmed = false
-        transcriptDeadlineNS = nil
-        initialAudioSubmitted = false
-        initialAudioTransportConfirmed = false
-        serverSpeechDetected = false
+    @discardableResult
+    public mutating func beginParticipantTurn() -> UInt64 {
+        currentGeneration &+= 1
+        if currentGeneration == 0 { currentGeneration = 1 }
+        participantTurnOpen = true
+        return currentGeneration
     }
 
     @discardableResult
-    public mutating func observeTransportActive(at monotonicNS: UInt64) -> UInt64? {
-        guard origin == .participantContact,
-              !participantInputConfirmed else {
-            transcriptDeadlineNS = nil
-            return nil
+    public mutating func ensureParticipantTurn() -> UInt64 {
+        participantTurnOpen ? currentGeneration : beginParticipantTurn()
+    }
+
+    @discardableResult
+    public mutating func observeResponseStarted(responseID: String?) -> UInt64? {
+        guard let responseID = Self.normalizedResponseID(responseID) else { return nil }
+        if let existing = responseGenerations[responseID] { return existing }
+        responseGenerations[responseID] = currentGeneration
+        responseOrder.append(responseID)
+        if responseOrder.count > 64 {
+            let expired = Array(responseOrder.prefix(responseOrder.count - 64))
+            responseOrder.removeFirst(expired.count)
+            for responseID in expired { responseGenerations.removeValue(forKey: responseID) }
         }
-        let delta = transcriptTimeoutMilliseconds.multipliedReportingOverflow(by: 1_000_000)
-        let deadline = monotonicNS.addingReportingOverflow(delta.partialValue)
-        transcriptDeadlineNS = delta.overflow || deadline.overflow
-            ? UInt64.max
-            : deadline.partialValue
-        return transcriptDeadlineNS
+        return currentGeneration
     }
 
-    public mutating func confirmParticipantInput() {
-        guard origin == .participantContact else { return }
-        participantInputConfirmed = true
-        transcriptDeadlineNS = nil
+    public func generation(forResponseID responseID: String?) -> UInt64? {
+        guard let responseID = Self.normalizedResponseID(responseID) else { return nil }
+        return responseGenerations[responseID]
     }
 
-    /// Confirms that the remote realtime transport, rather than only the
-    /// local AudioWorklet, detected participant speech. Local PCM progress is
-    /// a transport health signal and cannot establish a conversational turn.
-    public mutating func observeServerSpeechDetected() {
-        guard origin == .participantContact else { return }
-        serverSpeechDetected = true
-        confirmParticipantInput()
-    }
-
-    /// Tracks local transport health without treating it as evidence that the
-    /// realtime service heard or understood a participant.
-    public mutating func observeInitialAudioSubmitted() {
-        guard origin == .participantContact else { return }
-        initialAudioSubmitted = true
-    }
-
-    public mutating func observeInitialAudioTransportProgress() {
-        guard origin == .participantContact else { return }
-        initialAudioTransportConfirmed = true
-    }
-
-    public var isUnconfirmedParticipantOpening: Bool {
-        origin == .participantContact && !participantInputConfirmed
-    }
-
-    public var shouldCloseWhenContactIsRevoked: Bool {
-        isUnconfirmedParticipantOpening
-    }
-
-    public var permitsAssistantResponse: Bool {
-        !isUnconfirmedParticipantOpening
-    }
-
-    public func shouldCloseForMissingTranscript(at monotonicNS: UInt64) -> Bool {
-        guard isUnconfirmedParticipantOpening,
-              let transcriptDeadlineNS else { return false }
-        return monotonicNS >= transcriptDeadlineNS
+    public mutating func completeResponse(responseID: String?) -> LiveVoiceResponseCompletion {
+        guard let responseID = Self.normalizedResponseID(responseID),
+              let generation = responseGenerations.removeValue(forKey: responseID) else {
+            return .uncorrelated
+        }
+        responseOrder.removeAll { $0 == responseID }
+        guard generation == currentGeneration else {
+            return .stale(generation: generation, currentGeneration: currentGeneration)
+        }
+        participantTurnOpen = false
+        return .current(generation: generation)
     }
 
     public mutating func reset() {
-        origin = nil
-        participantInputConfirmed = false
-        transcriptDeadlineNS = nil
-        initialAudioSubmitted = false
-        initialAudioTransportConfirmed = false
-        serverSpeechDetected = false
+        currentGeneration = 0
+        participantTurnOpen = false
+        responseGenerations.removeAll(keepingCapacity: true)
+        responseOrder.removeAll(keepingCapacity: true)
+    }
+
+    private static func normalizedResponseID(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : String(normalized.prefix(256))
     }
 }
 
@@ -488,7 +293,7 @@ public struct LiveVoiceSessionInactivityGate: Equatable, Sendable {
     public private(set) var deadlineNS: UInt64?
     public private(set) var assistantActivityInProgress = false
 
-    public init(timeoutMilliseconds: UInt64 = 60_000) {
+    public init(timeoutMilliseconds: UInt64 = 600_000) {
         precondition(timeoutMilliseconds > 0)
         self.timeoutMilliseconds = timeoutMilliseconds
     }
@@ -579,23 +384,22 @@ public struct LiveVoicePlaybackCaptureGate: Sendable {
 }
 
 /// Resolves the participant evidence required to interrupt rendered assistant
-/// audio. Direct gaze is an optional policy constraint; independent speaker
-/// evidence remains necessary because ordinary VAD cannot distinguish a
-/// participant from acoustic playback leaking into the camera microphone.
+/// audio. Unlike ordinary conversation admission, playback interruption always
+/// requires confirmed direct contact plus independent speaker evidence because
+/// ordinary VAD cannot distinguish a participant from loudspeaker leakage.
 public enum LiveVoiceDuplexSpeakerPolicy {
     public static func verifiesParticipant(
         trackedFaceVisible: Bool,
         independentSpeakerEvidence: Bool,
         speechEvidenceQualified: Bool,
         directContactConfirmed: Bool,
-        speakerAttributionRejected: Bool,
-        requiresDirectGaze: Bool
+        speakerAttributionRejected: Bool
     ) -> Bool {
         !speakerAttributionRejected
             && trackedFaceVisible
             && independentSpeakerEvidence
             && speechEvidenceQualified
-            && (!requiresDirectGaze || directContactConfirmed)
+            && directContactConfirmed
     }
 }
 

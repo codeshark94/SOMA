@@ -1504,7 +1504,6 @@ private final class ConversationContactRuntime: @unchecked Sendable {
     private let lock = NSLock()
     private var gate: ConversationContactGate
     private var directedContactHistory = DirectedContactHistory()
-    private var l0FixationAdmission = L0FaceFixationAdmission()
 
     init() {
         gate = ConversationContactGate()
@@ -1531,51 +1530,17 @@ private final class ConversationContactRuntime: @unchecked Sendable {
         return directedContactHistory.snapshot(at: monotonicNS)
     }
 
-    /// The motor controller invokes this only after it has accepted a current
-    /// verified face lock and cancelled exploration. The return value is a
-    /// transition for bounded runtime diagnostics; it deliberately contains no
-    /// identity or image data.
-    func observeL0FaceFixation(
-        sceneID: String?,
-        directContact: Bool,
-        at monotonicNS: UInt64
-    ) -> L0FaceFixationAdmission.State? {
-        lock.lock()
-        defer { lock.unlock() }
-        let previous = l0FixationAdmission.state(at: monotonicNS)
-        if let sceneID {
-            l0FixationAdmission.observeVerifiedFixation(
-                sceneID: sceneID,
-                directContact: directContact,
-                at: monotonicNS
-            )
-        } else {
-            l0FixationAdmission.clear()
-        }
-        let current = l0FixationAdmission.state(at: monotonicNS)
-        return current == previous ? nil : current
-    }
-
     func observeVoiceActivity(
         active: Bool,
         at monotonicNS: UInt64,
-        confidence: Double,
-        audioVisualDirectContact: Bool = false
+        newSessionAdmitted: Bool
     ) -> ConversationOpeningAuthorization? {
         lock.lock()
         defer { lock.unlock() }
-        // Directed-contact history remains L1 social context. It cannot
-        // authorize a new conversation on its own: either the current L0
-        // fixation or the bounded same-face audiovisual episode must verify
-        // direct contact. An already open conversation keeps its own
-        // inactivity lease.
-        let directContact = l0FixationAdmission.permitsNewSession(at: monotonicNS)
-            || audioVisualDirectContact
         return gate.observeVoiceActivity(
             active: active,
             at: monotonicNS,
-            directContact: directContact,
-            voiceConfidence: confidence
+            newSessionAdmitted: newSessionAdmitted
         )
     }
 
@@ -2016,11 +1981,11 @@ private func l1PanelHealthEvent(state: String, message: String) -> (state: Strin
         return (state, message)
     case "discarded", "decision_rejected", "opening_suppressed":
         return (state, "reason=policy_or_context_guard")
-    case "memory_ready", "memory_consolidated", "conversation_memory_consolidated", "conversation_memory_recovery_finished", "memory_proposal_stored", "daily_world_memory_stored", "person_fact_stored", "person_preference_captured":
+    case "memory_ready", "memory_consolidated", "conversation_memory_consolidated", "conversation_memory_recovery_finished", "memory_proposal_stored", "daily_world_memory_stored", "person_fact_stored":
         return ("memory_updated", "status=stored")
     case "conversation_memory_recovery_started", "episode_consolidation_deferred":
         return ("memory_deferred", "status=awaiting_consolidation")
-    case "conversation_memory_recovery_failed", "memory_unavailable", "memory_consolidation_failed", "memory_proposal_store_failed", "daily_world_memory_store_failed", "person_fact_store_failed", "person_preference_capture_failed":
+    case "conversation_memory_recovery_failed", "memory_unavailable", "memory_consolidation_failed", "memory_proposal_store_failed", "daily_world_memory_store_failed", "person_fact_store_failed":
         return ("memory_deferred", "status=storage_unavailable")
     default:
         return nil
@@ -3765,9 +3730,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private let spatialAtlas: SphericalSceneAtlasStore
     private let faceLockDiagnosticRecorder: FaceLockDiagnosticRecorder?
     private let embodimentViewCaptureStore: EmbodimentViewCaptureStore?
-    /// Publishes only an L0-accepted fixation. Raw scene candidates stay
-    /// inside perception and cannot independently open a Live Voice session.
-    private let onL0FaceFixation: (String?, Bool, UInt64) -> Void
     private let externalCalibration: ExternalGimbalCalibration?
     private let shutdownLock = NSLock()
     private let controlRecoveryLock = NSLock()
@@ -4004,8 +3966,8 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
     private var indicatorCalibrationStateID: Int?
     private var indicatorReassertionGeneration = 0
     /// A completed Vision gaze result remains current through a normal
-    /// asynchronous landmark gap. This affects only presentation; speech still
-    /// requires a separately fresh direct-contact observation.
+    /// asynchronous landmark gap. This affects presentation plus the stricter
+    /// identity/authority binding path, not ordinary conversation admission.
     private var eyeContactIndicatorLease = EyeContactIndicatorLease(holdMilliseconds: 3_000)
     private let indicatorReassertionIntervalMilliseconds = 1_000
 
@@ -4067,7 +4029,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         spatialAtlas: SphericalSceneAtlasStore,
         faceLockDiagnosticRecorder: FaceLockDiagnosticRecorder?,
         embodimentViewCaptureStore: EmbodimentViewCaptureStore?,
-        onL0FaceFixation: @escaping (String?, Bool, UInt64) -> Void,
         writer: JSONLWriter
     ) throws {
         self.writer = writer
@@ -4083,7 +4044,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         self.spatialAtlas = spatialAtlas
         self.faceLockDiagnosticRecorder = faceLockDiagnosticRecorder
         self.embodimentViewCaptureStore = embodimentViewCaptureStore
-        self.onL0FaceFixation = onL0FaceFixation
         self.externalCalibration = externalCalibration
         var entropy = SystemRandomNumberGenerator()
         explorationRandomState = UInt64.random(in: UInt64.min...UInt64.max, using: &entropy)
@@ -4761,7 +4721,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         let shouldStop: Bool = queue.sync {
             if case .stopped = state { return false }
             let stopNS = monotonicNanoseconds()
-            onL0FaceFixation(nil, false, stopNS)
             if calibrationOutputURL != nil {
                 switch calibrationStage {
                 case .completed, .failed:
@@ -5383,7 +5342,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         socialRetentionDeadlineNS = nil
         guard hadFaceLock else { return }
         faceLock.invalidate()
-        onL0FaceFixation(nil, false, monotonicNS)
         if !wasVerified {
             faceFixationCooldownUntilNS = monotonicNS + faceFixationReleaseCooldownNS
         }
@@ -6461,20 +6419,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
                 attemptedSpatialFaceReacquisitionIDs.removeAll()
                 explorationFailureCount = max(0, explorationFailureCount - 1)
                 cancelScan()
-                // A direct gaze observation becomes eligible to open Live
-                // Voice only after this accepted L0 face lock has cancelled
-                // the active coverage route. This preserves the first spoken
-                // utterance while rejecting gaze history left behind by a
-                // scan that is still moving elsewhere.
-                if faceLock.permitsMotor(at: monotonicNS) {
-                    onL0FaceFixation(
-                        observedFace.id,
-                        lockedGazeEvidence == .direct,
-                        monotonicNS
-                    )
-                } else {
-                    onL0FaceFixation(nil, false, monotonicNS)
-                }
                 if preemptedExploration, externalCommandID != nil {
                     cancelExternalStop()
                     sendExternalStop(state: "face_observation_preempted_exploration", at: monotonicNS)
@@ -6555,7 +6499,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
 
     private func releaseWrongFixation(reason: String, at monotonicNS: UInt64, priority: ScanPriority = .l0) {
         faceLock.invalidate()
-        onL0FaceFixation(nil, false, monotonicNS)
         lastMotorTarget = nil
         // Make the release sticky: block re-acquiring the same (possibly
         // false-positive) face lock for the cooldown window so the coverage
@@ -8393,7 +8336,6 @@ private final class AttentionGimbalBridge: @unchecked Sendable {
         }
         scanPriority = priority
         scanRunning = true
-        onL0FaceFixation(nil, false, now)
         scanGeneration += 1
         explorationWaypoint = nil
         explorationWaypointStartedNS = nil
@@ -12864,9 +12806,6 @@ private func run(_ options: Options) throws {
             ))
         }
     }
-    let liveCameraFrameRelay = options.l2LiveVoice && controlSettings.realtimeVoiceEnabled
-        ? LiveCameraFrameRelay()
-        : nil
     // The L1 and L2 paths share this arbiter whether or not the external MCP
     // socket is exposed. Transport availability must not change L1's semantic
     // view of the scene or its lease contract with L0.
@@ -13176,27 +13115,6 @@ private func run(_ options: Options) throws {
             spatialAtlas: spatialAtlas,
             faceLockDiagnosticRecorder: faceLockDiagnosticRecorder,
             embodimentViewCaptureStore: embodimentViewCaptureStore,
-            onL0FaceFixation: { sceneID, directContact, observedNS in
-                guard let state = conversationContact.observeL0FaceFixation(
-                    sceneID: sceneID,
-                    directContact: directContact,
-                    at: observedNS
-                ) else {
-                    return
-                }
-                // Direct/averted updates are frame-rate perception state;
-                // emitting each landmark fluctuation would drown out the
-                // interaction timeline. Only an anchor clear is a durable
-                // control transition worth retaining in the runtime trace.
-                guard state == .absent else { return }
-                writer.write(RuntimeEvent(
-                    event: "human.interaction",
-                    monotonicNS: observedNS,
-                    source: "conversation_contact",
-                    state: "l0_face_fixation_absent",
-                    message: "voice_opening_anchor=cleared"
-                ))
-            },
             writer: writer
         )
         attentionGimbalBridge?.recognizedIdentityProvider = {
@@ -13368,82 +13286,11 @@ private func run(_ options: Options) throws {
         }
     )
     defer { hermesAgentCoordinator.stop() }
-    let l1LiveToolSupervisor = L1LiveConversationToolSupervisor(
-        infer: { request, completion in
-            l1ThoughtRelay.submitLiveToolAdvice(request, completion: completion)
-        },
-        onHealth: { state, message in
-            writer.write(RuntimeEvent(
-                event: "source.health",
-                monotonicNS: monotonicNanoseconds(),
-                source: "l1_live_tool",
-                state: state,
-                message: message
-            ))
-        },
-        onAdvice: { advice, transcript in
-            if liveVoiceBox.launcher?.authorizesL1ExternalWork(
-                advice,
-                forUserTranscript: transcript
-            ) == true {
-                let result = hermesAgentCoordinator.handle(.init(
-                    operation: .submit,
-                    goalEpisodeID: advice.turnID,
-                    title: String(transcript.prefix(160)),
-                    objective: transcript
-                ))
-                if case let .success(value) = result,
-                   let task = value.task {
-                    _ = liveVoiceBox.launcher?.acknowledgeHermesTaskAccepted(
-                        taskID: task.id,
-                        operation: .submit,
-                        deduplicated: value.deduplicated
-                    )
-                    writer.write(RuntimeEvent(
-                        event: "l1.live_tool",
-                        monotonicNS: monotonicNanoseconds(),
-                        source: "l1_live_tool",
-                        state: "executed",
-                        message: "turn=\(advice.turnID.uuidString.lowercased()); tool=delegate_hermes_task; task_id=\(task.id.uuidString.lowercased()); owner=l1_controller; deduplicated=\(value.deduplicated)"
-                    ))
-                    return
-                }
-                let reason: String
-                if case let .failure(error) = result {
-                    reason = error.localizedDescription
-                } else {
-                    reason = "hermes_task_missing_after_submit"
-                }
-                writer.write(RuntimeEvent(
-                    event: "l1.live_tool",
-                    monotonicNS: monotonicNanoseconds(),
-                    source: "l1_live_tool",
-                    state: "execution_failed",
-                    message: "turn=\(advice.turnID.uuidString.lowercased()); tool=delegate_hermes_task; reason=\(String(reason.prefix(192)))"
-                ))
-            }
-            let injected = liveVoiceBox.launcher?.injectL1ToolAdvice(
-                advice,
-                forUserTranscript: transcript
-            ) ?? false
-            writer.write(RuntimeEvent(
-                event: "l1.live_tool",
-                monotonicNS: monotonicNanoseconds(),
-                source: "l1_live_tool",
-                state: injected ? "injection_requested" : "held",
-                message: "turn=\(advice.turnID.uuidString.lowercased()); tool=\(advice.toolName ?? "none"); reason=\(injected ? "current_turn" : "stale_or_output_started")"
-            ))
-        }
-    )
-    defer { l1LiveToolSupervisor.stop() }
     if options.l2LiveVoice, controlSettings.realtimeVoiceEnabled {
         let launcher = AppServerLiveVoiceLauncher(
             voice: controlSettings.realtimeVoice,
             voiceMode: controlSettings.realtimeVoiceMode,
             audioOutputDeviceUID: controlSettings.audioOutputDeviceUID,
-            currentCameraImageDataURI: {
-                liveCameraFrameRelay?.currentImageDataURI(at: monotonicNanoseconds())
-            },
             embodimentSocketURL: options.embodimentShadowSocketURL,
             requireVerifiedSpeakerForEveryTurn: controlSettings
                 .realtimeVoiceRequiresEyeContactForEveryTurn,
@@ -13476,7 +13323,6 @@ private func run(_ options: Options) throws {
                 ))
             case let .launchRequested(authorization, _):
                 l1LiveConversationState.begin()
-                liveCameraFrameRelay?.setEnabled(true)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(
                     authorization == ConversationOpeningAuthorization.voiceActivity.rawValue
                         ? .hearingUser
@@ -13491,7 +13337,6 @@ private func run(_ options: Options) throws {
                 ))
             case let .active(threadID, personEntityID):
                 l1LiveConversationState.begin()
-                if let threadID { l1LiveToolSupervisor.begin(threadID: threadID) }
                 conversationContact.markConversationOpened(at: eventNS)
                 if let personEntityID {
                     Task {
@@ -13522,43 +13367,6 @@ private func run(_ options: Options) throws {
                     source: "l2_live_voice",
                     state: "input_streaming",
                     message: "audio_worklet_to_webrtc"
-                ))
-            case let .inputBootstrapSubmitted(
-                itemID,
-                durationMilliseconds,
-                trailingSilenceMilliseconds,
-                peakDBFS,
-                maximumGainDB
-            ):
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "opening_audio_submitted",
-                    message: String(
-                        format: "item_id=%@; route=ordered_webrtc_input_track; duration_ms=%.1f; trailing_silence_ms=%.1f; input_peak_dbfs=%.1f; max_gain_db=%.1f",
-                        itemID.uuidString.lowercased(),
-                        durationMilliseconds,
-                        trailingSilenceMilliseconds,
-                        peakDBFS,
-                        maximumGainDB
-                    )
-                ))
-            case let .inputBootstrapQueued(itemID):
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "opening_audio_queued",
-                    message: "item_id=\(itemID.uuidString.lowercased()); audio_worklet_accepted=true"
-                ))
-            case let .inputBootstrapPlayed(itemID):
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "opening_audio_played",
-                    message: "item_id=\(itemID.uuidString.lowercased()); webrtc_track_drained=true"
                 ))
             case let .outputPlaybackReady(mode, route, effectProfile):
                 writer.write(RuntimeEvent(
@@ -13640,30 +13448,6 @@ private func run(_ options: Options) throws {
                     state: "proactive_opening_extra_output_suppressed",
                     message: "session_terminated_before_participant_turn"
                 ))
-            case let .hermesDelegationAcknowledgementRequested(taskID):
-                writer.write(RuntimeEvent(
-                    event: "hermes.task",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "acceptance_speech_requested",
-                    message: "task_id=\(taskID.uuidString.lowercased()); owner=controller"
-                ))
-            case let .hermesDelegationAcknowledgementSpoken(taskID):
-                writer.write(RuntimeEvent(
-                    event: "hermes.task",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "acceptance_spoken",
-                    message: "task_id=\(taskID.uuidString.lowercased()); exactly_once=true"
-                ))
-            case let .hermesDelegationAcknowledgementRejected(taskID, reason):
-                writer.write(RuntimeEvent(
-                    event: "hermes.task",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "acceptance_speech_rejected",
-                    message: "task_id=\(taskID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
-                ))
             case let .hermesReportOfferStarted(taskID):
                 let resolution = hermesAgentCoordinator.handle(.init(
                     operation: .markReportOffered,
@@ -13691,120 +13475,13 @@ private func run(_ options: Options) throws {
                     state: "hearing_user",
                     message: "participant_audio_received=true; transcript_pending=true"
                 ))
-            case .visualContextAttached:
-                writer.write(RuntimeEvent(
-                    event: "human.interaction",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "visual_context_attached",
-                    message: "source=current_camera_frame; retention=live_turn_only"
-                ))
-            case let .visualContextRejected(reason):
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "visual_context_rejected",
-                    message: String(reason.prefix(192))
-                ))
-            case let .visualTurnBarrier(state, episodeID, reason):
-                writer.write(RuntimeEvent(
-                    event: "l2.visual_turn",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: state,
-                    message: "episode_id=\(episodeID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
-                ))
-            case .embodimentMCPReady:
-                l1LiveToolSupervisor.setMCPAvailable(true)
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "embodiment_mcp_ready",
-                    message: "capability_preflight=get_robot_body_state; capture_view_and_identity_tools_available"
-                ))
-            case .personContextReady:
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "person_context_ready",
-                    message: "capability_preflight=get_person_context; local_memory_binding=verified"
-                ))
-            case let .personContextUnavailable(reason):
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "person_context_unavailable",
-                    message: String(reason.prefix(192))
-                ))
-            case let .embodimentMCPUnavailable(reason):
-                l1LiveToolSupervisor.setMCPAvailable(false)
-                writer.write(RuntimeEvent(
-                    event: "source.health",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "embodiment_mcp_unavailable",
-                    message: String(reason.prefix(192))
-                ))
             case let .embodimentMCPCall(tool, status, error):
-                l1LiveToolSupervisor.observeToolCall(tool: tool, status: status)
                 writer.write(RuntimeEvent(
                     event: "l2.mcp",
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: status,
                     message: "tool=\(tool); error=\(error ?? "none")"
-                ))
-            case let .l1ToolAdviceAttached(tool):
-                writer.write(RuntimeEvent(
-                    event: "l1.live_tool",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "attached",
-                    message: "tool=\(tool)"
-                ))
-            case let .l1ToolAdviceRejected(tool, reason):
-                writer.write(RuntimeEvent(
-                    event: "l1.live_tool",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "rejected",
-                    message: "tool=\(tool); reason=\(reason)"
-                ))
-            case let .backingTurnStarted(turnID, sequence):
-                writer.write(RuntimeEvent(
-                    event: "l2.turn",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "backing_started",
-                    message: "sequence=\(sequence); turn_id=\(turnID)"
-                ))
-            case let .backingTurnCompleted(turnID, sequence, status, error):
-                writer.write(RuntimeEvent(
-                    event: "l2.turn",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "backing_\(status)",
-                    message: "sequence=\(sequence); turn_id=\(turnID); error=\(error ?? "none")"
-                ))
-            case let .managedResponse(state, sequence, kind, reason):
-                writer.write(RuntimeEvent(
-                    event: "l2.turn",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: state,
-                    message: "sequence=\(sequence); kind=\(kind); reason=\(reason ?? "none")"
-                ))
-            case let .responseDeadlineExpired(sequence):
-                writer.write(RuntimeEvent(
-                    event: "l2.turn",
-                    monotonicNS: eventNS,
-                    source: "l2_live_voice",
-                    state: "response_deadline_expired",
-                    message: "sequence=\(sequence); recovery=spoken"
                 ))
             case let .inputAccepted(characters):
                 attentionGimbalBridge?.ingestLiveVoiceTurnAccepted()
@@ -13846,7 +13523,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: eventNS,
                     source: "l2_live_voice",
                     state: role == .user ? "user" : "assistant",
-                    message: String(text.prefix(300))
+                    message: "characters=\(min(text.count, 65_535)); content=encrypted_archive_only"
                 ))
                 if let threadID {
                     l1ThoughtRelay.recordConversationTurn(
@@ -13855,17 +13532,6 @@ private func run(_ options: Options) throws {
                         text: text,
                         at: eventNS
                     )
-                    if role == .user {
-                        l1LiveToolSupervisor.observeUserTurn(
-                            threadID: threadID,
-                            transcript: text
-                        )
-                    } else {
-                        l1LiveToolSupervisor.observeAssistantTurn(
-                            threadID: threadID,
-                            transcript: text
-                        )
-                    }
                 }
                 if let threadID {
                     l1MemoryContext.archiveConversationTurn(
@@ -13887,14 +13553,6 @@ private func run(_ options: Options) throws {
                                 state: "detected",
                                 message: "language=\(detected)"
                             ))
-                        }
-                        Task {
-                            await l1MemoryContext.captureUserPreferences(
-                                threadID: threadID,
-                                role: role,
-                                rawText: text,
-                                at: Date()
-                            )
                         }
                     }
                 }
@@ -13979,9 +13637,7 @@ private func run(_ options: Options) throws {
                 conversationContact.recordConversationActivity(at: eventNS)
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.ready)
             case let .ended(threadID, personEntityID, reason):
-                l1LiveToolSupervisor.end(threadID: threadID)
                 l1LiveConversationState.end()
-                liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
                 Task {
@@ -14020,9 +13676,7 @@ private func run(_ options: Options) throws {
                     message: "task_id=\(taskID?.uuidString.lowercased() ?? "unknown"); reason=\(reason)"
                 ))
             case let .failed(threadID, personEntityID, reason):
-                l1LiveToolSupervisor.end(threadID: threadID)
                 l1LiveConversationState.end()
-                liveCameraFrameRelay?.setEnabled(false)
                 conversationContact.closeConversation()
                 attentionGimbalBridge?.ingestLiveVoicePresentation(.inactive)
                 if reason == "service_shutdown" {
@@ -14058,7 +13712,7 @@ private func run(_ options: Options) throws {
             monotonicNS: monotonicNanoseconds(),
             source: "l2_live_voice",
             state: "configured",
-            message: "transport=codex_app_server_webrtc_audio; opening_input=ordered_webrtc_track_with_explicit_vad_offset; app_server=persistent_local_broker; local_helper=prewarming_without_realtime; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); contact_gate=joint_live_face_gaze_and_voice_evidence; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_direct_gaze_plus_calibrated_or_sustained_voice; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=post_effect_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_playout; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); visual_turn=current_frame_barrier_then_single_response; mcp_capture_view=current_frame_or_reframe; mcp_status_checked=parallel_capability_snapshot_joined_before_realtime; text_context=startup_context_plus_explicit_user_coupled_tools"
+            message: "transport=codex_app_server_webrtc_audio; input=single_ordered_webrtc_track; preconnect_buffering=local_audio_worklet; app_server=persistent_local_broker; local_helper=prewarming_without_realtime; idle_realtime=false; idle_model_turn=false; auth=chatgpt_account; voice=\(controlSettings.realtimeVoice.rawValue); voice_mode=\(controlSettings.realtimeVoiceMode.rawValue); contact_gate=tracked_live_face_plus_qualified_voice; speaker_attribution=face_gaze_lip_motion_plus_calibrated_doa; new_session_requires=interaction_liveness_plus_calibrated_voice; recognized_identity_requires=matched_gaze_and_speaker_evidence; active_session_eye_contact=\(controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn ? "required_per_turn" : "optional"); duplex_capture=post_effect_pcm_reference_plus_echo_safe_verified_barge_in; input_leveling=vad_bounded_agc_plus_timestamped_episode_playout; user_silence_timeout_seconds=\(controlSettings.realtimeVoiceSilenceTimeoutSeconds); hermes_task_routing=\(controlSettings.hermesAgentDelegationEnabled ? "enabled" : "disabled"); tool_handoff=app_server_managed; mcp_capture_view=on_demand; mcp_startup_probe=none; text_context=startup_context_plus_explicit_user_coupled_tools"
         ))
     } else {
         liveVoiceLauncher = nil
@@ -14785,13 +14439,6 @@ private func run(_ options: Options) throws {
                 let result = hermesAgentCoordinator.handle(request)
                 if case let .success(value) = result {
                     let task = value.task ?? value.tasks.first
-                    if let task {
-                        _ = liveVoiceBox.launcher?.acknowledgeHermesTaskAccepted(
-                            taskID: task.id,
-                            operation: request.operation,
-                            deduplicated: value.deduplicated
-                        )
-                    }
                     writer.write(RuntimeEvent(
                         event: "hermes.task",
                         monotonicNS: monotonicNanoseconds(),
@@ -14881,7 +14528,6 @@ private func run(_ options: Options) throws {
             )
         },
         onCameraFrame: { pixelBuffer, captureNS in
-            liveCameraFrameRelay?.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
             l1CurrentFrameRelay.record(pixelBuffer: pixelBuffer, capturedAtNS: captureNS)
         },
         onDiagnosticFrame: { pixelBuffer, candidates, captureNS in
@@ -15000,7 +14646,9 @@ private func run(_ options: Options) throws {
                 observedNS: update.observedNS,
                 at: monotonicNanoseconds()
             )
-            if observation.didTransition, observation.state == .rejected {
+            if observation.didTransition,
+               observation.hardSpeakerRejection,
+               controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn {
                 liveVoiceLauncher?.revokeProvisionalParticipantOpening(
                     reason: "visual_contact_revoked_before_opening_confirmation"
                 )
@@ -15068,9 +14716,9 @@ private func run(_ options: Options) throws {
         speechInteraction = nil
     }
     defer { speechInteraction?.stop() }
-    // A live voice opening is additionally gated by fresh directed visual
-    // contact. This lets the microphone onset be calibrated to the actual
-    // Tiny 3 front end without turning ambient room noise into a session.
+    // A live voice opening joins qualified microphone speech with a currently
+    // tracked live face. Stricter directed-contact and speaker evidence binds
+    // identity/authority without delaying an ordinary participant session.
     let voiceEvidenceTelemetry = VoiceEvidenceTelemetry()
     let voiceWorker = try AudioVADWorker(
         activationThreshold: voiceVADThreshold,
@@ -15140,37 +14788,39 @@ private func run(_ options: Options) throws {
                 episodeOnsetNS: isVoiceOnset ? resolvedVoiceOnsetNS : nil,
                 at: completedNS
             )
-            if speakerEpisode.didTransition, speakerEpisode.state == .rejected {
+            let sessionAdmission = LiveVoiceSessionAdmission.evaluate(
+                trackedFaceVisible: visualAdmission,
+                speechEvidenceQualified: speakerEpisode.speechEvidence.qualified,
+                speakerAttributionHardRejected: speakerEpisode.hardSpeakerRejection,
+                speakerEpisodeState: speakerEpisode.state,
+                requiresVerifiedSpeakerForEveryTurn: controlSettings
+                    .realtimeVoiceRequiresEyeContactForEveryTurn
+            )
+            if speakerEpisode.didTransition, sessionAdmission.rejectsParticipantAudio {
                 liveVoiceLauncher?.revokeProvisionalParticipantOpening(
                     reason: "speaker_attribution_revoked_before_participant_input"
                 )
             }
-            let confirmedTrackedSpeaker = speakerEpisode.state == .confirmed
-            // Visual contact and the independent lip/DOA cue may arrive on
-            // different detector cadences. The episode gate binds both to the
-            // same continuously tracked face before contact is authorized.
-            let contactAuthorization: ConversationOpeningAuthorization?
-            if !evidence.active {
-                contactAuthorization = conversationContact.observeVoiceActivity(
-                    active: false,
-                    at: completedNS,
-                    confidence: evidence.probability
-                )
-            } else if confirmedTrackedSpeaker {
-                contactAuthorization = conversationContact.observeVoiceActivity(
-                    active: true,
-                    at: completedNS,
-                    confidence: speakerEpisode.maximumVoiceConfidence,
-                    audioVisualDirectContact: speakerEpisode.directContactObserved
-                )
-            } else {
-                contactAuthorization = nil
-            }
+            let confirmedTrackedSpeaker = sessionAdmission.permitsRecognizedIdentity
+            // Ordinary conversation starts from a tracked live face plus
+            // qualified speech. The stricter gaze/lip/DOA episode is retained
+            // solely for known-identity binding, elevated authority, and
+            // echo-safe barge-in verification.
+            let contactAuthorization = conversationContact.observeVoiceActivity(
+                active: evidence.active,
+                at: completedNS,
+                newSessionAdmitted: sessionAdmission.permitsParticipantSession
+            )
             let openingAuthorization = contactAuthorization
             if evidence.changed, options.l2LiveVoice {
                 attentionGimbalBridge?.ingestLiveVoiceUserActivity(active: evidence.active)
             }
-            let recognizedParticipant = visualAdmission
+            // Speech-bound sessions require confirmed attribution before a
+            // stored identity is attached. During silence, recognized visual
+            // presence may still authorize the existing administrator-only
+            // pending-result offer flow; no participant utterance is claimed.
+            let recognizedParticipant = (confirmedTrackedSpeaker || !evidence.active)
+                && visualAdmission
                 ? identityPresence.currentParticipant()
                 : nil
             let interactionParticipant = recognizedParticipant ?? InteractionParticipant(
@@ -15237,7 +14887,7 @@ private func run(_ options: Options) throws {
                     monotonicNS: completedNS,
                     source: "l2_live_voice",
                     state: "opening_suppressed",
-                    message: "new_conversation_evidence_unconfirmed; tracked_face=\(visualAdmission); direct_gaze=\(speakerSnapshot.evidence.directGaze); speaker_class=\(speakerSnapshot.assessment.classification.rawValue); speaker_episode=\(speakerEpisode.state.rawValue); speech_qualified=\(speakerEpisode.speechEvidence.qualified); strong_windows=\(speakerEpisode.speechEvidence.strongWindowCount); supporting_windows=\(speakerEpisode.speechEvidence.supportingWindowCount)"
+                    message: "new_conversation_evidence_unconfirmed; tracked_face=\(visualAdmission); hard_speaker_rejection=\(speakerEpisode.hardSpeakerRejection); direct_gaze=\(speakerSnapshot.evidence.directGaze); speaker_class=\(speakerSnapshot.assessment.classification.rawValue); speaker_episode=\(speakerEpisode.state.rawValue); speech_qualified=\(speakerEpisode.speechEvidence.qualified); strong_windows=\(speakerEpisode.speechEvidence.strongWindowCount); supporting_windows=\(speakerEpisode.speechEvidence.supportingWindowCount)"
                 ))
             }
             if let openingAuthorization,
@@ -15293,8 +14943,6 @@ private func run(_ options: Options) throws {
                 || openingAuthorization != nil
                 || strictConfirmedWindow
             if shouldTraceSpeakerTransition || evidence.active {
-                let strictTurnAdmission = !controlSettings
-                    .realtimeVoiceRequiresEyeContactForEveryTurn || confirmedTrackedSpeaker
                 let duplexSpeakerVerified = LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
                     trackedFaceVisible: visualAdmission,
                     independentSpeakerEvidence: speakerEpisode.speakerEvidenceObserved,
@@ -15302,26 +14950,16 @@ private func run(_ options: Options) throws {
                     directContactConfirmed: confirmedTrackedSpeaker,
                     speakerAttributionRejected: speakerEpisode.hardSpeakerRejection
                         || (controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn
-                            && speakerEpisode.state == .rejected),
-                    requiresDirectGaze: controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn
+                            && speakerEpisode.state == .rejected)
                 )
                 liveVoiceLauncher?.observeVoiceActivity(
                     evidence.active,
-                    admitted: strictTurnAdmission && (
-                        controlSettings.realtimeVoiceRequiresEyeContactForEveryTurn
-                            ? confirmedTrackedSpeaker
-                            : speakerSnapshot.assessment.admitsAudio
-                    ),
+                    admitted: sessionAdmission.permitsParticipantSession,
                     duplexSpeakerVerified: duplexSpeakerVerified,
                     duplexSpeakerEvidenceNS: speakerSnapshot.speakerEvidenceObservedNS,
-                    discardBufferedEpisode: !evidence.active && (
-                        speakerEpisode.endedState == .pending
-                            || speakerEpisode.endedState == .rejected
-                    ) || (
-                        evidence.active
-                            && speakerEpisode.didTransition
-                            && speakerEpisode.state == .rejected
-                    ),
+                    discardBufferedEpisode: evidence.active
+                        && speakerEpisode.didTransition
+                        && sessionAdmission.rejectsParticipantAudio,
                     onsetCaptureNS: isVoiceOnset ? resolvedVoiceOnsetNS : nil,
                     assessedThroughCaptureNS: evidence.windowEndNS,
                     preserveDetectorHistoryFromCaptureNS: evidence.discontinuityReset

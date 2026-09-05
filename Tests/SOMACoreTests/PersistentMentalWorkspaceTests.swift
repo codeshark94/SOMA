@@ -3,6 +3,23 @@ import XCTest
 @testable import SOMACore
 
 final class PersistentMentalWorkspaceTests: XCTestCase {
+    func testEvidenceTraceProjectionNeverIncludesPrivateSummary() {
+        let privateTranscript = "이 문장은 암호화된 대화 기록에만 있어야 한다"
+        let event = MentalEvidenceEvent(
+            id: "conversation-turn:test:user:1",
+            kind: .conversationOutcome,
+            summary: "The participant said: \(privateTranscript)",
+            confidence: 1,
+            novelty: 0.8
+        )
+
+        let message = MentalEvidenceTraceProjection.message(for: event)
+        XCTAssertFalse(message.contains(privateTranscript))
+        XCTAssertFalse(message.contains(event.summary))
+        XCTAssertTrue(message.contains("kind=conversation_outcome"))
+        XCTAssertTrue(message.contains("content=private"))
+    }
+
     func testRepeatedEvidenceIsIdempotentAndDoesNotAdvanceRevision() async {
         let workspace = PersistentMentalWorkspace()
         let event = MentalEvidenceEvent(

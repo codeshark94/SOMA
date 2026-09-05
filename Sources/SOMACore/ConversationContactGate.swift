@@ -7,30 +7,12 @@ public enum ConversationOpeningAuthorization: String, Equatable, Sendable {
 
 public struct ConversationContactConfiguration: Equatable, Sendable {
     public let conversationInactivityMilliseconds: UInt64
-    public let immediateOpeningVoiceConfidence: Double
-    public let supportingOpeningVoiceConfidence: Double
-    public let requiredSupportingVoiceWindows: Int
-    public let maximumSupportingVoiceGapMilliseconds: UInt64
 
     public init(
-        conversationInactivityMilliseconds: UInt64 = 60_000,
-        immediateOpeningVoiceConfidence: Double = 0.50,
-        supportingOpeningVoiceConfidence: Double = 0.35,
-        requiredSupportingVoiceWindows: Int = 2,
-        maximumSupportingVoiceGapMilliseconds: UInt64 = 400
+        conversationInactivityMilliseconds: UInt64 = 60_000
     ) {
         precondition(conversationInactivityMilliseconds > 0)
-        precondition((0...1).contains(immediateOpeningVoiceConfidence))
-        precondition((0...1).contains(supportingOpeningVoiceConfidence))
-        precondition(supportingOpeningVoiceConfidence <= immediateOpeningVoiceConfidence)
-        precondition(requiredSupportingVoiceWindows >= 2)
-        precondition(maximumSupportingVoiceGapMilliseconds > 0)
-        precondition(maximumSupportingVoiceGapMilliseconds <= UInt64.max / 1_000_000)
         self.conversationInactivityMilliseconds = conversationInactivityMilliseconds
-        self.immediateOpeningVoiceConfidence = immediateOpeningVoiceConfidence
-        self.supportingOpeningVoiceConfidence = supportingOpeningVoiceConfidence
-        self.requiredSupportingVoiceWindows = requiredSupportingVoiceWindows
-        self.maximumSupportingVoiceGapMilliseconds = maximumSupportingVoiceGapMilliseconds
     }
 }
 
@@ -91,59 +73,37 @@ public struct SustainedVoiceEvidenceAccumulator: Sendable {
     }
 }
 
-/// Owns the temporal boundary between a validated direct-contact event and an
-/// interaction. A user-initiated conversation always requires fresh direct
-/// contact; an already-open conversation carries its own inactivity lease.
+/// Owns the temporal boundary between an admitted participant speech episode
+/// and an interaction. Multimodal speech qualification happens once upstream;
+/// this gate only deduplicates openings and maintains the inactivity lease.
 public struct ConversationContactGate: Sendable {
     public let configuration: ConversationContactConfiguration
     private var conversationExpiresAtNS: UInt64?
     private var speechEpisodeActive = false
-    private var openingVoiceEvidence: SustainedVoiceEvidenceAccumulator
 
     public init(configuration: ConversationContactConfiguration = .init()) {
         self.configuration = configuration
-        openingVoiceEvidence = SustainedVoiceEvidenceAccumulator(
-            immediateConfidence: configuration.immediateOpeningVoiceConfidence,
-            supportingConfidence: configuration.supportingOpeningVoiceConfidence,
-            requiredSupportingWindows: configuration.requiredSupportingVoiceWindows,
-            maximumSupportingGapMilliseconds: configuration.maximumSupportingVoiceGapMilliseconds
-        )
     }
 
-    /// Evaluates a voice-activity episode from its first admitted sample. An
-    /// upstream audiovisual gate may hold raw VAD samples while it aligns
-    /// contact and speaker evidence; once admitted, this gate emits at most one
-    /// opening authorization for the episode.
+    /// Emits at most one opening authorization for each speech episode. A
+    /// denied sample does not consume the episode because speech qualification
+    /// can become available on a later detector window.
     public mutating func observeVoiceActivity(
         active: Bool,
         at monotonicNS: UInt64,
-        directContact: Bool,
-        voiceConfidence: Double = 1
+        newSessionAdmitted: Bool
     ) -> ConversationOpeningAuthorization? {
         expire(at: monotonicNS)
         guard active else {
             speechEpisodeActive = false
-            openingVoiceEvidence.reset()
             return nil
         }
         guard !speechEpisodeActive else { return nil }
         if let conversationExpiresAtNS, monotonicNS < conversationExpiresAtNS {
             speechEpisodeActive = true
-            openingVoiceEvidence.reset()
             return .activeConversation
         }
-        // A caller that admits an episode without verified contact consumes
-        // that episode. Multimodal alignment must therefore happen upstream,
-        // before the first admitted sample reaches this interaction boundary.
-        guard directContact else {
-            speechEpisodeActive = true
-            openingVoiceEvidence.reset()
-            return nil
-        }
-        guard openingVoiceEvidence.observe(
-            confidence: voiceConfidence,
-            at: monotonicNS
-        ) else { return nil }
+        guard newSessionAdmitted else { return nil }
         speechEpisodeActive = true
         return .voiceActivity
     }
@@ -182,71 +142,9 @@ public struct ConversationContactGate: Sendable {
     }
 }
 
-/// The visual half of a user-initiated Live Voice opening. A face detector can
-/// report direct gaze while L0 is already moving away on a coverage route; that
-/// observation is useful social evidence, but it is not yet an interaction
-/// anchor. This gate accepts a new conversation only while L0 has an actively
-/// verified face fixation for the current frame sequence.
-public struct L0FaceFixationAdmission: Sendable {
-    public enum State: String, Equatable, Sendable {
-        case absent
-        case averted
-        case direct
-    }
-
-    private struct Anchor: Sendable {
-        let sceneID: String
-        let directContact: Bool
-        let observedNS: UInt64
-    }
-
-    private let freshnessNS: UInt64
-    private var anchor: Anchor?
-
-    public init(freshnessMilliseconds: UInt64 = 500) {
-        precondition(freshnessMilliseconds > 0)
-        freshnessNS = freshnessMilliseconds * 1_000_000
-    }
-
-    /// Records L0's accepted, independently verified face fixation. This is
-    /// intentionally fed after the motor controller has cancelled exploration,
-    /// rather than directly from raw detector candidates.
-    public mutating func observeVerifiedFixation(
-        sceneID: String,
-        directContact: Bool,
-        at monotonicNS: UInt64
-    ) {
-        anchor = Anchor(
-            sceneID: sceneID,
-            directContact: directContact,
-            observedNS: monotonicNS
-        )
-    }
-
-    public mutating func clear() {
-        anchor = nil
-    }
-
-    public mutating func state(at monotonicNS: UInt64) -> State {
-        guard let anchor,
-              monotonicNS >= anchor.observedNS,
-              monotonicNS - anchor.observedNS <= freshnessNS else {
-            if let anchor, monotonicNS >= anchor.observedNS {
-                self.anchor = nil
-            }
-            return .absent
-        }
-        return anchor.directContact ? .direct : .averted
-    }
-
-    public mutating func permitsNewSession(at monotonicNS: UInt64) -> Bool {
-        state(at: monotonicNS) == .direct
-    }
-}
-
-/// Coarse visual admission for a detected voice. The current verified face is
-/// still insufficient by itself: audiovisual attribution separately requires
-/// direct gaze and speaker evidence from the same tracked-face episode.
+/// Coarse visual admission for a detected voice. A currently tracked live face
+/// anchors ordinary participant speech; identity and elevated authority remain
+/// behind the stricter same-speaker evidence gate below.
 public enum LiveConversationVisualAdmission {
     public static func permitsNewSession(for belief: BeliefSnapshot) -> Bool {
         guard belief.targetStatus == .tracked,
@@ -257,9 +155,40 @@ public enum LiveConversationVisualAdmission {
     }
 }
 
+/// Separates low-latency conversation admission from privileged identity
+/// binding. Qualified speech addressed near a tracked live face may open an
+/// ordinary participant session without eye contact. A stored identity may be
+/// attached only after the stricter speaker episode has been confirmed.
+public struct LiveVoiceSessionAdmission: Equatable, Sendable {
+    public let permitsParticipantSession: Bool
+    public let permitsRecognizedIdentity: Bool
+    public let rejectsParticipantAudio: Bool
+
+    public static func evaluate(
+        trackedFaceVisible: Bool,
+        speechEvidenceQualified: Bool,
+        speakerAttributionHardRejected: Bool,
+        speakerEpisodeState: LiveVoiceSpeakerEpisodeState,
+        requiresVerifiedSpeakerForEveryTurn: Bool = false
+    ) -> Self {
+        let ordinaryParticipant = trackedFaceVisible && speechEvidenceQualified
+        let verifiedSpeaker = ordinaryParticipant
+            && !speakerAttributionHardRejected
+            && speakerEpisodeState == .confirmed
+        return .init(
+            permitsParticipantSession: requiresVerifiedSpeakerForEveryTurn
+                ? verifiedSpeaker
+                : ordinaryParticipant,
+            permitsRecognizedIdentity: verifiedSpeaker,
+            rejectsParticipantAudio: requiresVerifiedSpeakerForEveryTurn
+                && speakerAttributionHardRejected
+        )
+    }
+}
+
 /// Keeps the LED invitation stable across brief landmark-gaze dropouts without
-/// changing the much shorter eye-contact requirement for opening a voice turn.
-/// The owner clears this lease when visual contact is conclusively lost.
+/// changing the stricter evidence used for identity binding or an optional
+/// per-turn gaze policy. The owner clears this lease when contact is lost.
 public struct EyeContactIndicatorLease: Sendable {
     private let holdNS: UInt64
     private let aversionConfirmationNS: UInt64

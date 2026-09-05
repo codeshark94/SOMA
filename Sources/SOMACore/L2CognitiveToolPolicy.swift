@@ -25,6 +25,18 @@ public enum CognitiveActionEffect: String, Codable, CaseIterable, Sendable {
     case hostComputer = "host_computer"
 }
 
+/// The durable execution domains that justify leaving the latency-sensitive
+/// Live Voice turn. Current facts, web/API lookups, calculations, and bounded
+/// inspections are intentionally absent: backing Codex completes those inside
+/// the standard App Server handoff.
+public enum HermesDelegatedWorkClass: String, Codable, CaseIterable, Sendable {
+    case artifactDelivery = "artifact_delivery"
+    case repositoryChange = "repository_change"
+    case sustainedResearch = "sustained_research"
+    case serviceManagement = "service_management"
+    case processSupervision = "process_supervision"
+}
+
 public enum CognitiveActionStatus: String, Codable, CaseIterable, Sendable {
     case succeeded
     case failed
@@ -149,10 +161,9 @@ public struct CognitiveActionQuery: Codable, Equatable, Hashable, Sendable {
 /// Enforcement remains in the capability store and L0 arbiter; this contract
 /// tells every L2 transport when initiative is cognitively appropriate.
 public enum L2CognitiveToolPolicy {
-    /// Canonical names exposed by the SOMA embodiment MCP. Conversation-side
-    /// supervisors use this set to constrain model recommendations, and the
-    /// MCP server uses the same set for request admission so the two surfaces
-    /// cannot silently drift apart.
+    /// Canonical names exposed by the SOMA embodiment MCP. The Live prompt and
+    /// MCP server share this set so tool guidance and request admission cannot
+    /// silently drift apart.
     public static let knownToolNames: Set<String> = [
         "end_conversation",
         "get_robot_body_state",
@@ -205,11 +216,11 @@ public enum L2CognitiveToolPolicy {
     ]
 
     public static let instruction = """
-    Cognitive tool initiative: privately maintain one current conversational goal. Before each response, decide whether a permitted SOMA MCP action would materially reduce an uncertainty that blocks a useful answer, ground a deictic or embodied reference, advance that goal, preserve an explicitly stated durable fact, or verify completion. When it would, call the narrowest suitable tool proactively and silently; do not wait for the participant to name the tool or issue a command, do not speak a provisional wait message, and use the returned result before responding. Complete every tool call needed for the current answer before emitting its first audible token; never speak a preamble such as “checking” or “reporting now” and then leave a sentence unfinished while a tool runs. After the tool result arrives, deliver one continuous grounded answer. When no tool materially helps, answer directly without a ceremonial call. If a tool call is denied or fails, acknowledge that outcome once in the participant's language instead of ending the turn silently; never claim the action succeeded.
+    Cognitive tool initiative: privately maintain one current conversational goal. Before each response, decide whether a permitted SOMA MCP action would materially reduce an uncertainty that blocks a useful answer, ground a deictic or embodied reference, advance that goal, preserve an explicitly stated durable fact, or verify completion. When it would, call the narrowest suitable tool proactively; do not wait for the participant to name the tool, and use the returned result before composing the final answer. The realtime presentation layer may emit the standard single brief handoff acknowledgement; backing Codex must not add a second preamble or a speculative answer while a tool runs. After the tool result arrives, deliver one continuous grounded answer. When no tool materially helps, answer directly without a ceremonial call. If a tool call is denied or fails, acknowledge that outcome once in the participant's language instead of ending the turn silently; never claim the action succeeded.
 
     Autonomous read-only robot perception, memory lookup, and current-state inspection are epistemic actions. Reversible camera orientation, tracking, or reframing may also be initiated when it is necessary for the active conversational goal and remains subject to L0 authority. The host Mac screen is a separate private sensor: observe_host_screen requires a current administrator request and must never be substituted for capture_view. Bounded foreground UI interaction may use control_host_computer after that same explicit request, one immediate input per call; inspect the current screen first and again after any state-changing step whose result is uncertain. Durable memory writes require an explicit fact or preference supplied or confirmed by the participant. Identity enrollment requires explicit consent. Ending the conversation and external file, shell, network, service, or system changes still require the participant's explicit request and applicable authority. When the administrator explicitly delegates external work, use delegate_hermes_task once and return its task ID immediately instead of pretending to perform the work in the voice turn. Use get_hermes_task or list_hermes_tasks to retrieve actual progress and results. Continue or cancel the external worker only on an explicit request. A controller-supplied pending_hermes_report_task_id authorizes only a yes/no report offer: after a clear answer, call resolve_hermes_report_offer exactly once with that ID and the participant's decision. Never disclose or fetch the result before acceptance.
 
-    Every non-read-only SOMA MCP call except delegate_hermes_task must include cognitive_intent with one stable goal_episode_id reused across calls serving the same conversational objective, a concise private purpose, expected_information_gain from 0 to 1, only supplied evidence_ids, and authorization_basis. The trusted gateway supplies this envelope for read-only epistemic tools, capture_view, and delegate_hermes_task; do not add cognitive_intent to those arguments. Call capture_view with no arguments for the immediate current camera frame, or add target_reference or bearing only when reframing is needed. For delegate_hermes_task, supply the external objective and an optional concise title; the trusted gateway binds the request to the current authorized participant turn and creates an idempotent goal episode. Use autonomous_goal only for reversible goal-bound orientation, tracking, reframing, and expression. Use explicit_statement for a fact or preference the participant just supplied, explicit_consent for identity enrollment, and explicit_request for conversation termination or device configuration the participant explicitly requested. Generate a new goal_episode_id when the conversational objective materially changes. Never expose these fields to the participant. Do not repeat a mutating call when the same goal and semantic request already produced an equivalent result; treat tool failure as evidence and never claim an unverified result.
+    Every non-read-only SOMA MCP call must include cognitive_intent with one stable goal_episode_id reused across calls serving the same conversational objective, a concise private purpose, expected_information_gain from 0 to 1, only supplied evidence_ids, and authorization_basis. The trusted gateway supplies this envelope only for read-only epistemic tools and capture_view; do not add cognitive_intent to those arguments. Call capture_view with no arguments for the immediate current camera frame, or add target_reference or bearing only when reframing is needed. For delegate_hermes_task, use explicit_request and supply one eligible durable work_class plus concrete acceptance_criteria. Use autonomous_goal only for reversible goal-bound orientation, tracking, reframing, and expression. Use explicit_statement for a fact or preference the participant just supplied, explicit_consent for identity enrollment, and explicit_request for conversation termination, device configuration, or eligible external work the participant explicitly requested. Generate a new goal_episode_id when the conversational objective materially changes. Never expose these fields to the participant. Do not repeat a mutating call when the same goal and semantic request already produced an equivalent result; treat tool failure as evidence and never claim an unverified result.
     """
 
     public static func autonomy(for toolName: String) -> L2ToolAutonomy? {
@@ -274,70 +285,6 @@ public enum L2CognitiveToolPolicy {
         }
     }
 
-    /// Compact semantic descriptions for the primary L1 model's native
-    /// Ollama tool-selection pass. These describe when a function is useful;
-    /// L2 remains responsible for authoring its real MCP arguments.
-    public static func advisoryDescription(for toolName: String) -> String? {
-        guard knownToolNames.contains(toolName) else { return nil }
-        return switch toolName {
-        case "get_activity_overview":
-            L2TaskRoutingPolicy.activityOverviewToolDescription
-        case "get_robot_body_state":
-            L2TaskRoutingPolicy.embodimentStateToolDescription
-        case "observe_host_screen":
-            "Inspect the host Mac display only when the administrator explicitly asks what is visible on that screen."
-        case "control_host_computer":
-            "Perform one administrator-requested visible Mac UI action after observing the host screen."
-        case "capture_view":
-            "Acquire fresh OBSBOT camera evidence when the answer depends on what SOMA currently sees."
-        case "list_present_people":
-            "Read the currently observed people and their recognized identity bindings."
-        case "list_identity_registry":
-            "Read the registered identity roster when the administrator asks who SOMA knows."
-        case "get_person_context":
-            "Read stored context, preferences, rapport, and facts for a person relevant to the current turn."
-        case "recall_episodes":
-            "Search remembered interaction episodes when the participant asks about prior events or conversations."
-        case "list_information_needs":
-            "Read unresolved person-information motives when the conversation needs that memory context."
-        case "get_spatial_map":
-            "Read SOMA's spherical room map, remembered bearings, and reachable coverage."
-        case "list_scene_entities":
-            "Read the currently maintained camera-space entity map and semantic labels."
-        case "get_view_capture":
-            "Retrieve a previously requested short-lived camera capture by request ID."
-        case "delegate_hermes_task":
-            L2TaskRoutingPolicy.hermesDelegationToolDescription
-        case "get_hermes_task", "list_hermes_tasks":
-            "Read actual progress or completed results from delegated Hermes work."
-        case "continue_hermes_task":
-            "Continue an existing Hermes task only after an explicit administrator request."
-        case "cancel_hermes_task":
-            "Cancel an existing Hermes task only after an explicit administrator request."
-        case "resolve_hermes_report_offer":
-            "Record the participant's explicit accept or dismiss decision for a pending Hermes result report."
-        case "end_conversation":
-            "End the current voice conversation only when the participant explicitly asks to stop or be quiet."
-        case "set_preferred_language", "clear_preferred_language", "set_contact_preference",
-             "set_person_rapport", "set_person_fact", "remove_person_fact",
-             "record_information_need_answer":
-            "Update durable person memory only from an explicit fact, preference, correction, or answer in the current turn."
-        case "enroll_present_identity":
-            "Enroll a currently present person's identity only after explicit consent."
-        case "register_semantic_target", "remove_semantic_target", "set_attention_policy",
-             "track_target", "orient_to", "set_exploration_policy", "set_camera_optical_zoom",
-             "express_gimbal", "release_embodiment":
-            "Use SOMA's reversible embodiment controls when they materially advance the current conversational goal."
-        case "set_audio_capture_mode", "set_audio_input_gain", "set_camera_white_balance",
-             "set_camera_exposure_lock", "set_camera_focus", "set_camera_absolute_exposure",
-             "set_camera_face_priority", "set_camera_anti_flicker", "set_camera_image_tuning",
-             "set_native_human_tracking_policy", "set_camera_field_of_view":
-            "Change this device setting only after an explicit participant request."
-        default:
-            "Select the SOMA MCP function named \(toolName) only when it is necessary for the latest participant turn."
-        }
-    }
-
     public static func permits(
         _ basis: L2CognitiveAuthorizationBasis,
         for toolName: String
@@ -365,7 +312,6 @@ public enum L2CognitiveToolPolicy {
     public static func requiresModelAuthoredIntent(for toolName: String) -> Bool {
         autonomy(for: toolName) != .epistemic
             && toolName != "capture_view"
-            && toolName != "delegate_hermes_task"
     }
 
     public static func gatewayIntent(
@@ -381,13 +327,6 @@ public enum L2CognitiveToolPolicy {
         case .goalBoundEmbodiment where toolName == "capture_view":
             purpose = "Acquire current camera evidence through capture_view."
             informationGain = 0.9
-        case .explicitRequest where toolName == "delegate_hermes_task":
-            return L2CognitiveToolIntent(
-                goalEpisodeID: goalEpisodeID,
-                purpose: "Delegate the administrator's current explicit external-work request.",
-                expectedInformationGain: 1,
-                authorizationBasis: .explicitRequest
-            )
         default:
             return nil
         }
@@ -425,20 +364,39 @@ public enum L2CognitiveToolPolicy {
 public enum L2TaskRoutingPolicy {
     public static let embodimentStateToolDescription = "Read only SOMA's robot-body state: L0 lease, camera/gimbal attention target, and attention policy for this interaction. This is not the host Mac's OS, CPU, memory, filesystem, process, network, or service state."
 
-    public static let hermesDelegationToolDescription = "Delegate an administrator's explicit external job to the local Hermes Agent when it is long-running, asynchronous, multi-step, or requires sustained research, coding, repository changes, services, or process supervision while the voice conversation remains responsive. A single bounded command or inspection that should finish within the current turn belongs to backing Codex instead. Returns immediately with a durable task ID; acceptance is not completion. Use observe_host_screen/control_host_computer only for an immediate visible UI interaction, and never use this for SOMA camera/gimbal state."
+    public static let hermesDelegationToolDescription = "Delegate an administrator's explicit durable external job to the local Hermes Agent only when it fits one declared work_class: artifact_delivery, repository_change, sustained_research, service_management, or process_supervision. Supply concrete acceptance_criteria that a worker can verify. A direct answer, one factual or web/API lookup, one simple calculation, one bounded command, or one read-only inspection that should finish within the current turn is not eligible and belongs to backing Codex instead. Returns immediately with a durable task ID; acceptance is not completion. Use observe_host_screen/control_host_computer only for an immediate visible UI interaction, and never use this for SOMA camera/gimbal state."
 
-    public static let activityOverviewToolDescription = "Administrator-only: read a compact current overview of SOMA's robot-body state and delegated Hermes task activity. Use this for an ambiguous request such as 'what are you doing?' or 'status report'. It omits worker result contents. Use get_robot_body_state for a specifically physical camera/gimbal question, list_hermes_tasks for delegated-work details, and delegate_hermes_task for host-Mac inspection."
+    public static let activityOverviewToolDescription = "Administrator-only: read a compact current overview of SOMA's robot-body state and delegated Hermes task activity. Use this for an ambiguous request such as 'what are you doing?' or 'status report'. It omits worker result contents. Use get_robot_body_state for a specifically physical camera/gimbal question and list_hermes_tasks for delegated-work details. A bounded current-turn host inspection stays with backing Codex; only an eligible durable job uses delegate_hermes_task."
+
+    public static func hermesDelegationValidationError(
+        workClass: HermesDelegatedWorkClass,
+        objective: String,
+        acceptanceCriteria: String,
+        workingDirectory: String?
+    ) -> String? {
+        guard !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "delegate_hermes_task objective is required"
+        }
+        guard !acceptanceCriteria.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "delegate_hermes_task acceptance_criteria is required"
+        }
+        if workClass == .repositoryChange,
+           workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            return "repository_change requires working_directory"
+        }
+        return nil
+    }
 
     public static func instruction(hermesEnabled: Bool) -> String {
         guard hermesEnabled else {
             return "External task routing: Hermes delegation is disabled for this session. Never claim that external work was queued or completed. An administrator's single bounded local command or inspection may still be completed by backing Codex within the current turn under the configured sandbox; participants remain non-mutating."
         }
         return """
-        External task routing: before responding to an administrator's explicit request, classify the requested outcome into exactly one execution domain. A direct answer stays in conversation. SOMA perception, memory, camera, gimbal, and attention use the narrow SOMA tools. A bounded foreground visible Mac UI interaction uses observe_host_screen and control_host_computer. One simple local command or read-only host inspection that is expected to finish within the current turn may be executed directly by backing Codex under its configured sandbox. Work that is long-running, asynchronous, multi-step, requires sustained research or coding, edits a repository, manages services, or needs process supervision belongs to the Hermes external-worker domain. The administrator does not need to say the word Hermes.
+        External task routing: before responding to an administrator's explicit request, classify the requested outcome into exactly one execution domain. A direct answer stays in conversation. SOMA perception, memory, camera, gimbal, and attention use the narrow SOMA tools. A bounded foreground visible Mac UI interaction uses observe_host_screen and control_host_computer. One factual or web/API lookup, simple calculation, local command, or read-only host inspection that is expected to finish within the current turn may be executed directly by backing Codex under its configured sandbox. Work that creates a durable work product, is long-running, asynchronous, multi-step, requires sustained research or coding, edits a repository, manages services, or needs process supervision belongs to the Hermes external-worker domain. Fresh data or network access alone never requires Hermes. The administrator does not need to say the word Hermes.
 
         Route status requests by their subject. For SOMA's physical camera, gimbal, attention, or tracking state, use get_robot_body_state. For delegated work progress or results, use list_hermes_tasks. For an ambiguous administrator request such as 'what are you doing?' or 'status report', use get_activity_overview. Use observe_host_screen only when the administrator explicitly asks about the visible display. A bounded host CPU, memory, process, file, or network check may run in backing Codex; create a Hermes job only when that work crosses the current-turn boundary. Do not substitute screen pixels or get_robot_body_state for host-computer status.
 
-        For an eligible external job, call delegate_hermes_task exactly once. The controller owns the immediate spoken acceptance at the durable task boundary, so do not repeat or paraphrase an acknowledgement after the tool returns. Keep listening and converse normally while the worker runs. Do not read the task UUID aloud, block, poll, or send a provisional wait message. Completion is delivered separately and must be reported only from the actual task result. Reuse the same goal_episode_id so one request cannot create duplicate workers.
+        For an eligible external job, call delegate_hermes_task exactly once and return its accepted state promptly. The standard Live Voice handoff owns any single brief acknowledgement and App Server delivery; do not manufacture a second controller acknowledgement or a speculative result. Keep listening and converse normally while the worker runs. Do not read the task UUID aloud, block, or poll. Completion is delivered separately and must be reported only from the actual task result. Reuse the same goal_episode_id so one request cannot create duplicate workers.
         """
     }
 }

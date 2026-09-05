@@ -582,7 +582,7 @@ public struct SOMAAdministratorIdentity: Codable, Equatable, Sendable {
 /// None of the fields contain face embeddings or other raw biometric material.
 public struct SOMAControlSettings: Codable, Equatable, Sendable {
     public static let currentSchemaVersion = 15
-    public static let defaultRealtimeVoiceSilenceTimeoutSeconds = 60
+    public static let defaultRealtimeVoiceSilenceTimeoutSeconds = 600
     public static let realtimeVoiceSilenceTimeoutRange = 15...600
 
     public var schemaVersion: Int

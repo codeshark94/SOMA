@@ -7,12 +7,7 @@ private struct Command: Decodable {
     enum Kind: String, Decodable {
         case start
         case appendAudio = "append_audio"
-        case appendOpeningAudio = "append_opening_audio"
-        case appendImage = "append_image"
         case appendText = "append_text"
-        case acceptExternalWork = "accept_external_work"
-        case appendInstruction = "append_instruction"
-        case beginVisualTurn = "begin_visual_turn"
         case stop
     }
 
@@ -26,16 +21,13 @@ private struct Command: Decodable {
     let sessionCapability: String?
     let embodimentSocketPath: String?
     let appServerURL: String?
-    let cameraContextAutoInjected: Bool?
     let codexSandbox: String?
     let codexAdminOnly: Bool?
     let hermesAgentDelegationEnabled: Bool?
     let data: String?
     let sampleRate: Int?
     let samplesPerChannel: Int?
-    let itemID: String?
     let taskID: String?
-    let tool: String?
 }
 
 private enum FinalizedTranscriptOrigin: Equatable {
@@ -135,7 +127,6 @@ private final class AppServerConnection: @unchecked Sendable {
     func request(
         method: String,
         params: [String: Any],
-        timeoutMilliseconds: Int? = nil,
         completion: @escaping ResponseHandler
     ) {
         let sendableParams = JSONDictionary(value: params)
@@ -148,19 +139,6 @@ private final class AppServerConnection: @unchecked Sendable {
                 "method": method,
                 "params": sendableParams.value,
             ])
-            if let timeoutMilliseconds, timeoutMilliseconds > 0 {
-                self.queue.asyncAfter(
-                    deadline: .now() + .milliseconds(timeoutMilliseconds)
-                ) {
-                    guard let handler = self.handlers.removeValue(forKey: requestID) else { return }
-                    handler(JSONDictionary(value: [
-                        "error": [
-                            "code": "request_timed_out",
-                            "message": "\(method) timed out",
-                        ],
-                    ]))
-                }
-            }
         }
     }
 
@@ -188,11 +166,6 @@ private final class AppServerConnection: @unchecked Sendable {
             return String(message.prefix(256))
         }
         return "request_failed"
-    }
-
-    static func responseTimedOut(_ response: [String: Any]) -> Bool {
-        guard let error = response["error"] as? [String: Any] else { return false }
-        return error["code"] as? String == "request_timed_out"
     }
 
     private static func validSessionCapability(_ value: String?) -> String? {
@@ -336,13 +309,6 @@ private struct AssistantPCMChunk {
 
 }
 
-private enum VisualTurnTransportPolicy {
-    static let captureTimeoutMilliseconds = 5_000
-    static let evidenceInjectionTimeoutMilliseconds = 3_000
-    static let cancellationTimeoutMilliseconds = 3_000
-    static let replacementPresentationTimeoutMilliseconds = 12_000
-}
-
 @MainActor
 private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate {
     private let emitter: JSONLineEmitter
@@ -367,7 +333,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var sessionCapability: String?
     private var embodimentSocketURL: URL?
     private var appServerURL: String?
-    private var cameraContextAutoInjected = false
     private var codexSandbox = "danger-full-access"
     private var codexAdminOnly = false
     private var hermesAgentDelegationEnabled = false
@@ -376,13 +341,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var stopping = false
     private var startRequestAccepted = false
     private var appServerStarted = false
-    private var embodimentMCPAvailable = false
-    private var embodimentMCPVerificationFinished = false
-    private var embodimentBodyCheckFinished = false
-    private var embodimentBodyCheckAvailable = false
-    private var embodimentBodyCheckFailureReason: String?
-    private var personContextCheckFinished = false
-    private var personContextAvailable = false
     private var webRTCStarted = false
     private var pendingOfferSDP: String?
     private var realtimeStartRequested = false
@@ -393,37 +351,19 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private var partialUserTranscript = ""
     private var assistantOutputActive = false
     private var assistantOutputEndWorkItem: DispatchWorkItem?
-    private var embodimentMCPVerificationTimeoutWorkItem: DispatchWorkItem?
     private var pendingTransportClosureReason: String?
-    private var assistantSpeechObservedSequences: Set<UInt64> = []
     private var reportedEmbodimentMCPItemIDs: Set<String> = []
     private var cognitiveTurnOpen = false
     private var naturalTurnTakingConfirmed = false
-    private var currentRealtimeResponseID: String?
-    private var visualResponseBarrier: LiveVoiceVisualResponseBarrier?
-    private var visualEvidenceInjectionInFlightEpisodeID: UUID?
-    private var deferredVisualEvidenceEpisodeID: UUID?
-    private var visualCancellationTimeoutWorkItem: DispatchWorkItem?
-    private var visualReplacementTimeoutWorkItem: DispatchWorkItem?
-    private var participantTurnSequence: UInt64 = 0
+    private var responseTurnTracker = LiveVoiceResponseTurnTracker()
+    private var latestAssistantResponseGeneration: UInt64?
+    private var assistantOutputGeneration: UInt64?
     private var participantAudioEpoch: UInt64 = 0
-    private var latestParticipantTranscript = ""
     private var lastWireParticipantTranscript: (text: String, turnID: String?, epoch: UInt64)?
-    private var currentBackingTurnID: String?
-    private var backingTurnSequenceByID: [String: UInt64] = [:]
-    private var pendingBackingTurnHydrationIDs: Set<String> = []
-    private var handledBackingTurnIDs: Set<String> = []
-    private var handledBackingTurnOrder: [String] = []
-    private var managedResponseInFlightSequences: Set<UInt64> = []
-    private var managedResponseDeliveredSequences: Set<UInt64> = []
-    private var responseDeadlineWorkItem: DispatchWorkItem?
-    private var responseDeadlineSequence: UInt64?
-    private var externalWorkResponseOwnerSequence: UInt64?
     private var observedRealtimeEventTypes: Set<String> = []
     private var finalizedTranscriptItemIDs: Set<String> = []
     private var finalizedTranscriptItemOrder: [String] = []
     private var lastFallbackTranscript: (role: String, text: String, atNS: UInt64)?
-    private let preflightGoalEpisodeID = UUID()
     private let conversationControlClassifier = LiveVoiceConversationControlClassifier()
 
     init(
@@ -518,9 +458,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 // WebKit. Start them while the hidden audio frontend loads;
                 // the WebRTC offer is joined once both sides are ready.
                 break
-            case .appendAudio, .appendOpeningAudio, .appendImage, .appendText, .acceptExternalWork,
-                 .appendInstruction,
-                 .beginVisualTurn, .stop:
+            case .appendAudio, .appendText, .stop:
                 pendingCommands.append(command)
                 return
             }
@@ -551,7 +489,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 : nil
             appServerURL = command.appServerURL?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            cameraContextAutoInjected = command.cameraContextAutoInjected ?? false
             if let sandbox = command.codexSandbox,
                ["read-only", "workspace-write", "danger-full-access"].contains(sandbox) {
                 codexSandbox = sandbox
@@ -559,16 +496,15 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             codexAdminOnly = command.codexAdminOnly ?? false
             hermesAgentDelegationEnabled = command.hermesAgentDelegationEnabled ?? false
             audioPlayoutSource = nil
+            responseTurnTracker.reset()
+            latestAssistantResponseGeneration = nil
+            assistantOutputGeneration = nil
+            participantAudioEpoch = 0
             startAppServer()
-        case .appendImage:
-            guard let threadID,
-                  let dataURI = command.data,
-                  dataURI.utf8.count <= 4 * 1_048_576,
-                  Self.validCameraImageDataURI(dataURI) else { return }
-            injectCameraImage(dataURI, into: threadID)
         case .appendAudio:
-            guard threadID != nil,
-                  let data = command.data,
+            guard LiveVoiceRealtimeStartupPolicy.permitsAudioEnqueue(
+                webViewReady: webViewReady
+            ), let data = command.data,
                   data.count <= 262_144,
                   let sampleRate = command.sampleRate,
                   (8_000...96_000).contains(sampleRate),
@@ -580,44 +516,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "appendPCM16(\(literal), \(sampleRate), \(samplesPerChannel))"
             ) { [weak self] _, error in
                 if let error { self?.fail(LiveVoiceError.webRTC(error.localizedDescription)) }
-            }
-        case .appendOpeningAudio:
-            guard threadID != nil,
-                  let data = command.data,
-                  data.utf8.count <= 4 * 1_048_576,
-                  let sampleRate = command.sampleRate,
-                  (8_000...96_000).contains(sampleRate),
-                  let samplesPerChannel = command.samplesPerChannel,
-                  (1...1_500_000).contains(samplesPerChannel),
-                  let itemID = command.itemID,
-                  UUID(uuidString: itemID) != nil,
-                  let decoded = Data(base64Encoded: data),
-                  decoded.count == samplesPerChannel * MemoryLayout<Int16>.size else {
-                emitter.emit("opening_audio_rejected", fields: [
-                    "reason": "invalid_opening_audio_payload",
-                ])
-                return
-            }
-            guard let encoded = try? JSONEncoder().encode(data),
-                  let literal = String(data: encoded, encoding: .utf8),
-                  let encodedItemID = try? JSONEncoder().encode(itemID),
-                  let itemLiteral = String(data: encodedItemID, encoding: .utf8) else { return }
-            webView.evaluateJavaScript(
-                "appendPCM16(\(literal), \(sampleRate), \(samplesPerChannel), \(itemLiteral))"
-            ) { [weak self] result, error in
-                guard let self, !self.stopping else { return }
-                guard error == nil, (result as? Bool) == true else {
-                    self.emitter.emit("opening_audio_rejected", fields: [
-                        "item_id": itemID,
-                        "reason": error?.localizedDescription ?? "webrtc_input_track_unavailable",
-                    ])
-                    return
-                }
-                self.emitter.emit("opening_audio_queued", fields: [
-                    "item_id": itemID,
-                    "sample_rate": sampleRate,
-                    "samples_per_channel": samplesPerChannel,
-                ])
             }
         case .appendText:
             guard let threadID,
@@ -648,82 +546,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                     self.pendingHermesReportTaskID = taskID
                 }
             }
-        case .acceptExternalWork:
-            guard let text = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty,
-                  text.utf8.count <= 8_192,
-                  let taskID = command.taskID,
-                  UUID(uuidString: taskID) != nil else { return }
-            externalWorkResponseOwnerSequence = participantTurnSequence
-            interruptBackingTurnIfOwnedByExternalWork()
-            appendManagedHandoffSpeech(
-                text,
-                sequence: participantTurnSequence,
-                kind: "external_work_ack",
-                taskID: taskID,
-                successEvent: "hermes_delegation_ack_spoken",
-                failureEvent: "hermes_delegation_ack_rejected"
-            )
-        case .appendInstruction:
-            guard let threadID,
-                  let text = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty,
-                  text.utf8.count <= 8_192,
-                  let turnID = command.taskID,
-                  UUID(uuidString: turnID) != nil,
-                  let tool = command.tool,
-                  L2CognitiveToolPolicy.knownToolNames.contains(tool) else { return }
-            let item: [String: Any] = [
-                "type": "message",
-                "role": "developer",
-                "content": [["type": "input_text", "text": text]],
-            ]
-            connection.request(
-                method: "thread/inject_items",
-                params: ["threadId": threadID, "items": [item]]
-            ) { [weak self] response in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    if response.value["error"] == nil {
-                        self.emitter.emit("l1_tool_advice_attached", fields: [
-                            "turn_id": turnID,
-                            "tool": tool,
-                        ])
-                    } else {
-                        self.emitter.emit("l1_tool_advice_rejected", fields: [
-                            "turn_id": turnID,
-                            "tool": tool,
-                            "reason": AppServerConnection.responseMessage(response.value),
-                        ])
-                    }
-                }
-            }
-        case .beginVisualTurn:
-            guard let transcript = command.data?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !transcript.isEmpty,
-                  let rawEpisodeID = command.taskID,
-                  let episodeID = UUID(uuidString: rawEpisodeID) else { return }
-            let normalizedTranscript = transcript
-                .split(whereSeparator: \.isWhitespace)
-                .joined(separator: " ")
-            guard normalizedTranscript == latestParticipantTranscript else {
-                emitter.emit("visual_turn_barrier", fields: [
-                    "state": "stale_advice_rejected",
-                    "task_id": rawEpisodeID,
-                    "reason": "participant_turn_advanced",
-                ])
-                return
-            }
-            beginCurrentVisualTurn(
-                episodeID: episodeID,
-                participantTurnSequence: participantTurnSequence,
-                transcript: normalizedTranscript,
-                source: "l1_capture_advice"
-            )
-            emitter.emit("l1_tool_advice_attached", fields: [
-                "turn_id": rawEpisodeID,
-                "tool": "capture_view",
-            ])
         case .stop:
             stop(reason: "control_stop")
         }
@@ -732,9 +554,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webViewReady = true
         guard !stopping else { return }
-        if threadID != nil {
-            startWebRTCIfNeeded()
-        }
+        startWebRTCIfNeeded()
         let commands = pendingCommands
         pendingCommands.removeAll()
         for command in commands { receive(command) }
@@ -765,15 +585,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             ])
         case "audio_input_progress":
             emitter.emit("audio_input_progress")
-        case "opening_audio_drained":
-            emitter.emit("opening_audio_drained", fields: [
-                "item_id": body["itemID"] as? String ?? "",
-            ])
-        case "opening_audio_rejected":
-            emitter.emit("opening_audio_rejected", fields: [
-                "item_id": body["itemID"] as? String ?? "",
-                "reason": body["reason"] as? String ?? "opening_audio_rejected",
-            ])
         case "output_playback_ready":
             emitter.emit("output_playback_ready", fields: [
                 "mode": body["mode"] as? String ?? "unknown",
@@ -781,19 +592,21 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "effect_profile": body["effectProfile"] as? String ?? "none",
             ])
         case "output_speech_started":
-            if observeVisualPresentationStarted(responseID: nil) { return }
-            observeAssistantOutputStarted()
+            observeAssistantOutputStarted(
+                generation: latestAssistantResponseGeneration ?? responseTurnTracker.currentGeneration
+            )
         case "output_speech_ended":
-            observeAssistantOutputEnded()
+            observeAssistantOutputEnded(generation: assistantOutputGeneration)
         case "output_reference":
             guard let encoded = body["data"] as? String,
                   let sampleRate = body["sampleRate"] as? Int,
                   let channels = body["numChannels"] as? Int,
                   let samplesPerChannel = body["samplesPerChannel"] as? Int,
                   let decoded = Data(base64Encoded: encoded) else { return }
-            if observeVisualPresentationStarted(responseID: nil) { return }
             if body["startsOutput"] as? Bool == true {
-                observeAssistantOutputStarted()
+                observeAssistantOutputStarted(
+                    generation: latestAssistantResponseGeneration ?? responseTurnTracker.currentGeneration
+                )
             }
             noteAssistantAudioActivity()
             let chunk = AssistantPCMChunk(
@@ -810,7 +623,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 forwardAssistantReference(chunk)
             }
             if body["endsOutput"] as? Bool == true {
-                observeAssistantOutputEnded()
+                observeAssistantOutputEnded(generation: assistantOutputGeneration)
             }
         case "realtime_event":
             handleRealtimeDataChannel(body["payload"] as? String ?? "")
@@ -902,212 +715,18 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 }
                 self.threadID = threadID
                 self.emitter.emit("thread_ready", fields: ["thread_id": threadID])
-                // Preparing the local offer does not open Realtime. Overlap it
-                // with the bounded MCP snapshot, then join both at
-                // startRealtimeIfReady().
+                // App Server owns MCP readiness. Start the native Realtime
+                // session immediately with the already-prepared local offer.
                 self.startWebRTCIfNeeded()
-                self.armEmbodimentMCPVerificationTimeout()
-                self.verifyEmbodimentMCP(for: threadID)
+                self.startRealtimeIfReady()
             }
         }
-    }
-
-    private func armEmbodimentMCPVerificationTimeout() {
-        embodimentMCPVerificationTimeoutWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self,
-                  !self.embodimentMCPVerificationFinished,
-                  !self.stopping else { return }
-            self.finishEmbodimentMCPVerification(
-                available: false,
-                reason: "capability_preflight_timeout"
-            )
-        }
-        embodimentMCPVerificationTimeoutWorkItem = work
-        let milliseconds = LiveVoiceEmbodimentStartupPolicy.verificationTimeoutMilliseconds
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .milliseconds(Int(milliseconds)),
-            execute: work
-        )
-    }
-
-    private func verifyEmbodimentMCP(for threadID: String) {
-        connection.request(
-            method: "mcpServerStatus/list",
-            params: ["threadId": threadID, "detail": "toolsAndAuthOnly"]
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self,
-                      !self.stopping,
-                      !self.embodimentMCPVerificationFinished else { return }
-                let statuses = (response.value["result"] as? [String: Any])?["data"] as? [[String: Any]] ?? []
-                let server = statuses.first { $0["name"] as? String == "soma_embodiment" }
-                let tools = server?["tools"] as? [String: Any]
-                let personToolsAvailable = self.personContextReference == nil || (
-                    tools?["get_person_context"] != nil && tools?["list_information_needs"] != nil
-                )
-                let hermesToolsAvailable = !self.hermesAgentDelegationEnabled
-                    || tools?["delegate_hermes_task"] != nil
-                self.embodimentMCPAvailable = response.value["error"] == nil
-                    && tools?["capture_view"] != nil
-                    && tools?["get_view_capture"] != nil
-                    && tools?["end_conversation"] != nil
-                    && personToolsAvailable
-                    && hermesToolsAvailable
-                guard self.embodimentMCPAvailable else {
-                    self.finishEmbodimentMCPVerification(
-                        available: false,
-                        reason: response.value["error"] == nil
-                            ? "required_mcp_tools_missing"
-                            : AppServerConnection.responseMessage(response.value)
-                    )
-                    return
-                }
-                self.embodimentBodyCheckFinished = false
-                self.embodimentBodyCheckAvailable = false
-                self.embodimentBodyCheckFailureReason = nil
-                self.personContextCheckFinished = self.personContextReference == nil
-                self.personContextAvailable = false
-                self.verifyEmbodimentCapability(for: threadID)
-                if let personEntityID = self.personContextReference {
-                    self.verifyPersonContextCapability(
-                        for: threadID,
-                        personEntityID: personEntityID
-                    )
-                }
-            }
-        }
-    }
-
-    private func verifyEmbodimentCapability(for threadID: String) {
-        connection.request(
-            method: "mcpServer/tool/call",
-            params: [
-                "threadId": threadID,
-                "server": "soma_embodiment",
-                "tool": "get_robot_body_state",
-                "arguments": [
-                    "cognitive_intent": preflightIntent(
-                        purpose: "Verify the current session's bounded embodiment capability."
-                    ),
-                ],
-            ]
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self,
-                      !self.stopping,
-                      !self.embodimentMCPVerificationFinished else { return }
-                let result = response.value["result"] as? [String: Any]
-                let toolFailed = (result?["isError"] as? Bool) == true
-                self.embodimentBodyCheckAvailable = response.value["error"] == nil && !toolFailed
-                self.embodimentBodyCheckFinished = true
-                if self.embodimentBodyCheckAvailable {
-                    self.embodimentBodyCheckFailureReason = nil
-                } else {
-                    let reason: String
-                    if response.value["error"] != nil {
-                        reason = AppServerConnection.responseMessage(response.value)
-                    } else if let content = result?["content"] as? [[String: Any]],
-                              let text = content.compactMap({ $0["text"] as? String }).first,
-                              !text.isEmpty {
-                        reason = text
-                    } else {
-                        reason = "capability_preflight_failed"
-                    }
-                    self.embodimentBodyCheckFailureReason = reason
-                }
-                self.finishParallelEmbodimentVerificationIfReady()
-            }
-        }
-    }
-
-    private func verifyPersonContextCapability(for threadID: String, personEntityID: UUID) {
-        connection.request(
-            method: "mcpServer/tool/call",
-            params: [
-                "threadId": threadID,
-                "server": "soma_embodiment",
-                "tool": "get_person_context",
-                "arguments": [
-                    "person_entity_id": personEntityID.uuidString.lowercased(),
-                    "cognitive_intent": preflightIntent(
-                        purpose: "Verify the current session's bounded person-context capability."
-                    ),
-                ],
-            ]
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self,
-                      !self.stopping,
-                      !self.embodimentMCPVerificationFinished else { return }
-                let result = response.value["result"] as? [String: Any]
-                let toolFailed = (result?["isError"] as? Bool) == true
-                self.personContextAvailable = response.value["error"] == nil && !toolFailed
-                self.personContextCheckFinished = true
-                if self.personContextAvailable {
-                    self.emitter.emit("person_context_ready")
-                } else {
-                    let reason: String
-                    if response.value["error"] != nil {
-                        reason = AppServerConnection.responseMessage(response.value)
-                    } else if let content = result?["content"] as? [[String: Any]],
-                              let text = content.compactMap({ $0["text"] as? String }).first,
-                              !text.isEmpty {
-                        reason = text
-                    } else {
-                        reason = "person_context_preflight_failed"
-                    }
-                    self.emitter.emit("person_context_unavailable", fields: [
-                        "reason": String(reason.prefix(192)),
-                    ])
-                }
-                self.finishParallelEmbodimentVerificationIfReady()
-            }
-        }
-    }
-
-    private func finishParallelEmbodimentVerificationIfReady() {
-        guard !stopping,
-              embodimentBodyCheckFinished,
-              personContextCheckFinished,
-              !embodimentMCPVerificationFinished else { return }
-        finishEmbodimentMCPVerification(
-            available: embodimentBodyCheckAvailable,
-            reason: embodimentBodyCheckFailureReason
-        )
-    }
-
-    private func finishEmbodimentMCPVerification(available: Bool, reason: String? = nil) {
-        guard !stopping, !embodimentMCPVerificationFinished else { return }
-        embodimentMCPVerificationTimeoutWorkItem?.cancel()
-        embodimentMCPVerificationTimeoutWorkItem = nil
-        embodimentMCPAvailable = available
-        embodimentMCPVerificationFinished = true
-        if available {
-            emitter.emit("embodiment_mcp_ready")
-        } else {
-            emitter.emit("embodiment_mcp_unavailable", fields: [
-                "reason": String((reason ?? "capability_preflight_failed").prefix(192)),
-            ])
-        }
-        startRealtimeIfReady()
-    }
-
-    private func preflightIntent(purpose: String) -> [String: Any] {
-        [
-            "goal_episode_id": preflightGoalEpisodeID.uuidString.lowercased(),
-            "purpose": purpose,
-            "expected_information_gain": 0,
-            "evidence_ids": [],
-            "authorization_basis": L2CognitiveAuthorizationBasis.autonomousGoal.rawValue,
-        ]
     }
 
     private func startWebRTCIfNeeded() {
         guard !stopping,
-              LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
+              LiveVoiceRealtimeStartupPolicy.permitsTransportPreparation(
             webViewReady: webViewReady,
-            threadReady: threadID != nil,
             transportAlreadyStarted: webRTCStarted
         ) else { return }
         webRTCStarted = true
@@ -1146,9 +765,8 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private func startRealtimeIfReady() {
         guard !stopping,
               threadID != nil,
-              LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+              LiveVoiceRealtimeStartupPolicy.permitsRealtimeStart(
             offerReady: pendingOfferSDP != nil,
-            capabilityVerificationFinished: embodimentMCPVerificationFinished,
             realtimeAlreadyStarted: realtimeStartRequested
         ), let offerSDP = pendingOfferSDP else { return }
         pendingOfferSDP = nil
@@ -1156,455 +774,22 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         startRealtime(offerSDP: offerSDP)
     }
 
-    private func injectCameraImage(_ dataURI: String, into threadID: String) {
-        let item: [String: Any] = [
-            "type": "message",
-            "role": "developer",
-            "content": [
-                [
-                    "type": "input_text",
-                    "text": "Current SOMA camera frame — passive sensor context, NOT a request to describe it. It is what the robot currently sees, for understanding the user's situation. Always respond to the user's actual spoken message. Never narrate or describe this image unless the user explicitly asks what you see.",
-                ],
-                [
-                    "type": "input_image",
-                    "image_url": dataURI,
-                    "detail": "low",
-                ],
-            ],
-        ]
-        connection.request(
-            method: "thread/inject_items",
-            params: ["threadId": threadID, "items": [item]]
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard response.value["error"] == nil else {
-                    self.emitter.emit("visual_context_rejected", fields: [
-                        "reason": AppServerConnection.responseMessage(response.value),
-                    ])
-                    return
-                }
-                self.emitter.emit("visual_context_attached")
-            }
-        }
-    }
-
-    private func beginCurrentVisualTurn(
-        episodeID: UUID,
-        participantTurnSequence: UInt64,
-        transcript: String,
-        source: String
-    ) {
-        guard let threadID, embodimentMCPAvailable else {
-            emitter.emit("visual_turn_barrier", fields: [
-                "state": "unavailable",
-                "task_id": episodeID.uuidString.lowercased(),
-                "reason": "embodiment_mcp_unavailable",
-            ])
-            return
-        }
-        let boundedTranscript = String(transcript.prefix(4_096))
-        if let current = visualResponseBarrier,
-           current.participantTurnSequence == participantTurnSequence {
-            emitter.emit("visual_turn_barrier", fields: [
-                "state": "already_armed",
-                "task_id": current.episodeID.uuidString.lowercased(),
-                "reason": source,
-            ])
-            return
-        }
-        if visualResponseBarrier?.presentationReleased == true {
-            completeCurrentVisualResponse()
-        }
-        if let current = visualResponseBarrier {
-            emitter.emit("visual_turn_barrier", fields: [
-                "state": "superseded",
-                "task_id": current.episodeID.uuidString.lowercased(),
-                "reason": "newer_participant_turn",
-            ])
-        }
-        visualCancellationTimeoutWorkItem?.cancel()
-        visualCancellationTimeoutWorkItem = nil
-        visualReplacementTimeoutWorkItem?.cancel()
-        visualReplacementTimeoutWorkItem = nil
-        let barrier = LiveVoiceVisualResponseBarrier(
-            episodeID: episodeID,
-            participantTurnSequence: participantTurnSequence,
-            transcript: boundedTranscript,
-            provisionalResponseID: currentRealtimeResponseID
-        )
-        visualResponseBarrier = barrier
-        emitter.emit("visual_turn_barrier", fields: [
-            "state": "armed",
-            "task_id": episodeID.uuidString.lowercased(),
-            "reason": source,
-        ])
-        applyVisualBarrierActions(barrier.initialActions, episodeID: episodeID, threadID: threadID)
-        scheduleVisualCancellationTimeout(episodeID: episodeID)
-    }
-
-    private func observeVisualResponseStarted(responseID: String?) -> Bool {
-        guard var barrier = visualResponseBarrier else { return false }
-        let actions = barrier.observeResponseStarted(responseID: responseID)
-        visualResponseBarrier = barrier
-        if let threadID {
-            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
-        }
-        return barrier.suppressesAssistantPresentation
-    }
-
-    private func observeVisualPresentationStarted(responseID: String?) -> Bool {
-        guard var barrier = visualResponseBarrier else { return false }
-        let actions = barrier.observePresentationStarted(responseID: responseID)
-        visualResponseBarrier = barrier
-        if let threadID {
-            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
-        }
-        if barrier.presentationReleased {
-            visualReplacementTimeoutWorkItem?.cancel()
-            visualReplacementTimeoutWorkItem = nil
-        }
-        return barrier.suppressesAssistantPresentation
-    }
-
-    private func observeVisualResponseEnded(responseID: String?) {
-        guard var barrier = visualResponseBarrier else { return }
-        let actions = barrier.observeResponseEnded(responseID: responseID)
-        visualResponseBarrier = barrier
-        if barrier.provisionalResponseSettled {
-            visualCancellationTimeoutWorkItem?.cancel()
-            visualCancellationTimeoutWorkItem = nil
-        }
-        if let threadID {
-            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
-        }
-    }
-
-    private func observeVisualCancellationSettled(episodeID: UUID) {
-        guard var barrier = visualResponseBarrier else { return }
-        guard barrier.episodeID == episodeID else { return }
-        let actions = barrier.observeProvisionalResponseSettled(cancellationAcknowledged: true)
-        visualResponseBarrier = barrier
-        visualCancellationTimeoutWorkItem?.cancel()
-        visualCancellationTimeoutWorkItem = nil
-        if let threadID {
-            applyVisualBarrierActions(actions, episodeID: barrier.episodeID, threadID: threadID)
-        }
-    }
-
-    private func completeCurrentVisualResponse() {
-        guard let barrier = visualResponseBarrier,
-              barrier.phase == .presentingReplacementResponse else { return }
-        cancelVisualTurnTimeouts()
-        visualResponseBarrier = nil
-        setVisualOutputGate(closed: false)
-        emitter.emit("visual_turn_barrier", fields: [
-            "state": "completed",
-            "task_id": barrier.episodeID.uuidString.lowercased(),
-            "reason": "single_grounded_response",
-        ])
-    }
-
-    private func cancelVisualTurnTimeouts() {
-        visualCancellationTimeoutWorkItem?.cancel()
-        visualCancellationTimeoutWorkItem = nil
-        visualReplacementTimeoutWorkItem?.cancel()
-        visualReplacementTimeoutWorkItem = nil
-    }
-
-    private func scheduleVisualCancellationTimeout(episodeID: UUID) {
-        visualCancellationTimeoutWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self,
-                  self.visualResponseBarrier?.episodeID == episodeID,
-                  self.visualResponseBarrier?.provisionalResponseSettled == false else { return }
-            self.fail(LiveVoiceError.webRTC("visual_response_cancellation_timed_out"))
-        }
-        visualCancellationTimeoutWorkItem = workItem
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .milliseconds(VisualTurnTransportPolicy.cancellationTimeoutMilliseconds),
-            execute: workItem
-        )
-    }
-
-    private func scheduleVisualReplacementTimeout(episodeID: UUID) {
-        visualReplacementTimeoutWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self,
-                  self.visualResponseBarrier?.episodeID == episodeID,
-                  self.visualResponseBarrier?.presentationReleased == false else { return }
-            self.fail(LiveVoiceError.webRTC("visual_replacement_response_timed_out"))
-        }
-        visualReplacementTimeoutWorkItem = workItem
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .milliseconds(
-                VisualTurnTransportPolicy.replacementPresentationTimeoutMilliseconds
-            ),
-            execute: workItem
-        )
-    }
-
-    private func applyVisualBarrierActions(
-        _ actions: [LiveVoiceVisualResponseBarrier.Action],
-        episodeID: UUID,
-        threadID: String
-    ) {
-        for action in actions {
-            switch action {
-            case .closeOutput:
-                setVisualOutputGate(closed: true, resetPresentation: true)
-            case .acquireEvidence:
-                if visualEvidenceInjectionInFlightEpisodeID != nil {
-                    deferredVisualEvidenceEpisodeID = episodeID
-                    emitter.emit("visual_turn_barrier", fields: [
-                        "state": "evidence_deferred",
-                        "task_id": episodeID.uuidString.lowercased(),
-                        "reason": "prior_injection_in_flight",
-                    ])
-                } else {
-                    acquireCurrentVisualEvidence(episodeID: episodeID, threadID: threadID)
-                }
-            case .cancelResponse:
-                sendRealtimeControlEvent(
-                    type: "response.cancel",
-                    episodeID: episodeID,
-                    failureIsFatal: true
-                )
-                sendRealtimeControlEvent(
-                    type: "output_audio_buffer.clear",
-                    episodeID: episodeID
-                )
-                emitter.emit("visual_turn_barrier", fields: [
-                    "state": "response_cancel_requested",
-                    "task_id": episodeID.uuidString.lowercased(),
-                    "reason": "awaiting_current_frame",
-                ])
-            case .requestResponse:
-                setVisualOutputGate(closed: true, resetPresentation: true)
-                currentRealtimeResponseID = nil
-                sendRealtimeControlEvent(
-                    type: "response.create",
-                    episodeID: episodeID,
-                    failureIsFatal: true
-                )
-                emitter.emit("visual_turn_barrier", fields: [
-                    "state": "response_requested",
-                    "task_id": episodeID.uuidString.lowercased(),
-                    "reason": "evidence_committed",
-                ])
-                scheduleVisualReplacementTimeout(episodeID: episodeID)
-            case .openOutput:
-                setVisualOutputGate(closed: false)
-                emitter.emit("visual_turn_barrier", fields: [
-                    "state": "presentation_released",
-                    "task_id": episodeID.uuidString.lowercased(),
-                    "reason": "replacement_response_started",
-                ])
-            }
-        }
-    }
-
-    private func sendRealtimeControlEvent(
-        type: String,
-        episodeID: UUID,
-        failureIsFatal: Bool = false
-    ) {
-        let event: [String: Any] = [
-            "type": type,
-            "event_id": "soma_\(episodeID.uuidString.lowercased())_\(type.replacingOccurrences(of: ".", with: "_"))",
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: event),
-              let literal = String(data: data, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("sendRealtimeControl(\(literal))") { [weak self] result, error in
-            guard error == nil, (result as? Bool) == true else {
-                guard let self else { return }
-                let reason = error?.localizedDescription ?? "data_channel_unavailable"
-                self.emitter.emit("visual_turn_barrier", fields: [
-                    "state": "control_rejected",
-                    "task_id": episodeID.uuidString.lowercased(),
-                    "reason": reason,
-                ])
-                if failureIsFatal {
-                    self.fail(LiveVoiceError.webRTC("visual_response_request_failed: \(reason)"))
-                }
-                return
-            }
-        }
-    }
-
-    private func setVisualOutputGate(closed: Bool, resetPresentation: Bool = false) {
-        if closed { selectedAudioOutput?.flush() }
-        webView.evaluateJavaScript(
-            "setVisualOutputGate(\(closed ? "true" : "false"), \(resetPresentation ? "true" : "false"))"
-        )
-    }
-
-    private func acquireCurrentVisualEvidence(episodeID: UUID, threadID: String) {
-        connection.request(
-            method: "mcpServer/tool/call",
-            params: [
-                "threadId": threadID,
-                "server": "soma_embodiment",
-                "tool": "capture_view",
-                "arguments": [:],
-            ],
-            timeoutMilliseconds: VisualTurnTransportPolicy.captureTimeoutMilliseconds
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self,
-                      self.visualResponseBarrier?.episodeID == episodeID else { return }
-                let result = response.value["result"] as? [String: Any]
-                let failed = response.value["error"] != nil || (result?["isError"] as? Bool) == true
-                let content = result?["content"] as? [[String: Any]] ?? []
-                let text = content
-                    .compactMap { $0["text"] as? String }
-                    .joined(separator: "\n")
-                let imageDataURI = content.lazy.compactMap { item -> String? in
-                    guard item["type"] as? String == "image",
-                          let data = item["data"] as? String,
-                          !data.isEmpty else { return nil }
-                    let mimeType = (item["mimeType"] as? String)
-                        ?? (item["mime_type"] as? String)
-                        ?? "image/jpeg"
-                    return "data:\(mimeType);base64,\(data)"
-                }.first
-                let captureSucceeded = !failed && imageDataURI != nil
-                self.emitter.emit("embodiment_mcp_call", fields: [
-                    "tool": "capture_view",
-                    "status": captureSucceeded ? "completed" : "failed",
-                    "error": captureSucceeded
-                        ? ""
-                        : AppServerConnection.responseMessage(response.value),
-                    "item_id": episodeID.uuidString.lowercased(),
-                ])
-                self.injectCurrentVisualEvidence(
-                    episodeID: episodeID,
-                    threadID: threadID,
-                    imageDataURI: imageDataURI,
-                    captureText: text,
-                    captureSucceeded: captureSucceeded
-                )
-            }
-        }
-    }
-
-    private func injectCurrentVisualEvidence(
-        episodeID: UUID,
-        threadID: String,
-        imageDataURI: String?,
-        captureText: String,
-        captureSucceeded: Bool
-    ) {
-        guard let barrier = visualResponseBarrier,
-              barrier.episodeID == episodeID else { return }
-        var content: [[String: Any]] = [[
-            "type": "input_text",
-            "text": captureSucceeded
-                ? "SOMA_CURRENT_VISUAL_EVIDENCE \(episodeID.uuidString.lowercased())\nThis camera evidence was captured after the latest participant utterance and belongs only to that turn. Answer that utterance once using this evidence. Do not issue another capture_view call for the same turn.\n\(String(captureText.prefix(4_096)))"
-                : "SOMA_CURRENT_VISUAL_EVIDENCE_FAILURE \(episodeID.uuidString.lowercased())\nThe required fresh camera capture failed. Answer the latest participant utterance once and state the concrete sensor failure briefly; do not guess visual facts.",
-        ]]
-        if let imageDataURI {
-            content.append([
-                "type": "input_image",
-                "image_url": imageDataURI,
-                "detail": "low",
-            ])
-        }
-        let item: [String: Any] = [
-            "type": "message",
-            "role": "developer",
-            "content": content,
-        ]
-        guard visualEvidenceInjectionInFlightEpisodeID == nil else {
-            deferredVisualEvidenceEpisodeID = episodeID
-            return
-        }
-        visualEvidenceInjectionInFlightEpisodeID = episodeID
-        connection.request(
-            method: "thread/inject_items",
-            params: ["threadId": threadID, "items": [item]],
-            timeoutMilliseconds: VisualTurnTransportPolicy.evidenceInjectionTimeoutMilliseconds
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard var current = self.visualResponseBarrier,
-                      current.episodeID == episodeID else {
-                    self.emitter.emit("visual_turn_barrier", fields: [
-                        "state": "superseded_evidence_settled",
-                        "task_id": episodeID.uuidString.lowercased(),
-                        "reason": response.value["error"] == nil
-                            ? "newer_turn_waited_for_injection"
-                            : AppServerConnection.responseMessage(response.value),
-                    ])
-                    if AppServerConnection.responseTimedOut(response.value) {
-                        self.fail(LiveVoiceError.appServerResponse(
-                            "superseded_visual_evidence_injection_timed_out"
-                        ))
-                        return
-                    }
-                    self.finishVisualEvidenceInjection(episodeID: episodeID)
-                    return
-                }
-                guard response.value["error"] == nil else {
-                    self.emitter.emit("visual_turn_barrier", fields: [
-                        "state": "evidence_rejected",
-                        "task_id": episodeID.uuidString.lowercased(),
-                        "reason": AppServerConnection.responseMessage(response.value),
-                    ])
-                    self.finishVisualEvidenceInjection(episodeID: episodeID)
-                    self.fail(LiveVoiceError.appServerResponse(
-                        "visual_evidence_injection_failed: \(AppServerConnection.responseMessage(response.value))"
-                    ))
-                    return
-                }
-                let actions = current.observeEvidenceCommitted()
-                self.visualResponseBarrier = current
-                self.emitter.emit("visual_turn_barrier", fields: [
-                    "state": captureSucceeded ? "evidence_committed" : "failure_committed",
-                    "task_id": episodeID.uuidString.lowercased(),
-                    "reason": captureSucceeded ? "fresh_frame" : "capture_failed",
-                ])
-                self.finishVisualEvidenceInjection(episodeID: episodeID)
-                self.applyVisualBarrierActions(actions, episodeID: episodeID, threadID: threadID)
-            }
-        }
-    }
-
-    private func finishVisualEvidenceInjection(episodeID: UUID) {
-        guard visualEvidenceInjectionInFlightEpisodeID == episodeID else { return }
-        visualEvidenceInjectionInFlightEpisodeID = nil
-        guard let deferredEpisodeID = deferredVisualEvidenceEpisodeID,
-              let barrier = visualResponseBarrier,
-              barrier.episodeID == deferredEpisodeID,
-              let threadID else {
-            deferredVisualEvidenceEpisodeID = nil
-            return
-        }
-        deferredVisualEvidenceEpisodeID = nil
-        acquireCurrentVisualEvidence(episodeID: deferredEpisodeID, threadID: threadID)
-    }
-
     private func startRealtime(offerSDP: String) {
         guard let threadID else {
             fail(LiveVoiceError.webRTC("thread_not_ready"))
             return
         }
-        let embodimentInstruction = embodimentMCPAvailable
-            ? (cameraContextAutoInjected
-                ? "The soma_embodiment MCP server is available. One passive SOMA camera frame may be attached after the realtime service confirms the opening participant speech. For that first utterance only, treat the attached frame as current evidence and do not duplicate it with capture_view. It becomes stale as soon as the participant, scene, or gimbal moves. On later turns, when current visual information matters, including when the user asks what SOMA can see or who is present, call capture_view with no arguments before answering. Its authorized result includes the fresh local identity roster for recognized people present at capture time; use only those roster entries for names and never infer identity from image appearance. Supply target_reference or bearing only for a genuinely reframed, zoomed, or different-direction view. Never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. The opening image may ground a semantic embodiment action when tracking, orienting, or reframing would advance the participant's request; choose the narrowest suitable MCP action and never move merely because an image is available. Treat images as passive sensor context, never as a prompt to narrate them unless the user explicitly asks. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token. When you are speaking with the local administrator, list_present_people compares recently observed faces with the registered identity roster; list_identity_registry and the existing person-context tools can read and update all non-biometric identity memory. A newly recurring anonymous person may be promoted only through enroll_present_identity after explicit consent, then given explicitly stated facts through set_person_fact."
-                : "The soma_embodiment MCP server is available. Call capture_view when visual information is genuinely needed. For an immediate no-motion view, call capture_view with no arguments. Supply target_reference or bearing only for a reframed view, and never add cognitive_intent to capture_view. Make a necessary capture tool call silently and wait for its returned image before speaking; never send a provisional wait message. Treat a returned image as passive context — never as a prompt to describe it unless the user explicitly asks what you see. The current interaction is already bound to the MCP server; never ask for, mention, or try to supply an internal access token.")
-            : (embodimentMCPVerificationFinished
-                ? "The soma_embodiment MCP server is unavailable in this session. Do not claim that you can inspect the camera or control the gimbal; say the local perception connection is unavailable."
-                : "The soma_embodiment MCP server is still initializing. Do not claim that camera or gimbal tools are unavailable or available before an actual MCP tool call establishes the result.")
+        let embodimentConfigured = embodimentSocketURL != nil
+        let embodimentInstruction = embodimentConfigured
+            ? "The soma_embodiment MCP server is configured for this thread. Call capture_view only when current visual information is genuinely needed, including when the participant asks what SOMA can see or who is present. Call it with no arguments for an immediate no-motion view; supply target_reference or bearing only for a genuinely reframed view. Never add cognitive_intent to capture_view. Make a necessary capture silently and wait for its returned image before speaking. Treat the tool result, including its authorized current identity roster, as the authority; never infer identity from appearance or claim success after a failed call. The interaction is already bound to the MCP server, so never ask for or expose an access token."
+            : "No embodiment MCP connection is configured for this thread. Do not claim that you can inspect the camera or control the gimbal."
         let personContextInstruction: String
-        if personContextReference != nil, personContextAvailable {
-            personContextInstruction = "A verified person-context MCP binding is active for person_context_reference. For any question asking what SOMA knows, remembers, has learned, or has on record about the current participant, call get_person_context with that reference before answering. Treat its returned facts, rapport, and preferences as the authority; distinguish what is stored from what is not stored, and never guess."
-        } else if personContextReference != nil {
-            personContextInstruction = "The supplied person-context reference could not be verified for this session. Do not claim stored knowledge about the participant and do not guess."
+        if personContextReference != nil {
+            personContextInstruction = "A person-context reference is supplied for this interaction. For a question asking what SOMA knows, remembers, has learned, or has on record about the participant, call get_person_context before answering. Trust only the actual tool result, report a failed call honestly, and never guess."
         } else {
             personContextInstruction = "No persistent person context is attached to this interaction. Do not claim stored knowledge about the participant and do not guess."
         }
-        let identityManagementInstruction = embodimentMCPAvailable
+        let identityManagementInstruction = embodimentConfigured
             ? "For the current participant's explicit request to register their own face, call enroll_present_identity with the supplied person_context_reference and confirmed_by_user=true; self-enrollment does not require administrator authority or list_present_people. An administrator registering another currently present person must first call list_present_people and select only the one anonymous entry unambiguously identified in the current scene. Never enroll a historical, absent, ambiguous, or merely detected face. After successful enrollment, persist only identity facts explicitly supplied by that person or the administrator, such as a name or stated relationship, with the person-context tools. Do not claim registration or memory is complete until every required tool result succeeds."
             : ""
         let stopConversationInstruction = """
@@ -1614,7 +799,20 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         let conversationOriginInstruction = LiveVoiceConversationFrame.originInstruction(
             isProactiveSession: isProactiveSession
         )
-        let baseInstruction = "You are SOMA's L2 conversational reasoning layer. Respond naturally by voice. Treat supplied L0 and L1 context as background evidence, never as user speech or a prompt that requires an answer. Every normal response must answer the participant's most recent actual spoken message; never narrate scene context, a camera image, a memory, or a private mission unless the participant asks about it. Use the realtime model directly only for brief social exchange and simple answers. Hand a turn to backing Codex when it requires multi-step reasoning, diagnosis, planning, exact state or memory grounding, any tool, or external work; realtime remains the low-latency speech interface, not the execution agent. One participant turn has exactly one audible response owner. If you hand the turn to backing Codex, emit no provisional answer, acknowledgement, wait message, or parallel conclusion; the client will speak the final Codex result once. If you answer directly, do not also hand off the same objective. A developer item beginning SOMA_L1_TOOL_ADVISORY is trusted, current-turn L1 control context rather than participant speech: hand the current turn to backing Codex with its named tool requirement, emit no audio, never recite it, and ignore it after that participant turn. A text envelope beginning SOMA_HERMES_DELEGATION_ACCEPTED is trusted local controller input, not participant speech. Speak exactly its enclosed acknowledgement once, without calling a tool, adding a preface, or reading a task identifier, then listen. A text envelope beginning SOMA_HERMES_TASK_RESULT is also trusted local controller input, not participant speech. It contains the actual result of external work the administrator previously delegated. Report its outcome concisely in the participant's language, mention failure or incompleteness honestly, and never treat the envelope as a new request. Once a live conversation is active, the participant has already invited exchange: scene-derived interruption cost only governs unsolicited openings from silence, never whether to offer a relevant follow-up during this conversation. Keep the exchange reciprocal and organic. active_tasks is only a cached hint. The authoritative curiosity queue is list_information_needs: before introducing a curiosity-driven question, or when asked what you want to learn, call it with person_context_reference. It returns durable L1 motives ordered by expected information gain. Select at most one only when it naturally fits the participant's words, timing, rapport, and the evolving conversation; never turn it into a checklist or a generic service question. After the participant explicitly answers that exact motive, immediately call record_information_need_answer with its motive_id and a concise confirmed fact. That single call persists the answer and clears the motive. Never invent a motive, infer an answer from an image or silence, or claim a motive is complete without the successful tool result. \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) If context contains person_context_reference, use get_person_context whenever its relationship facts or communication preference would inform a social follow-up; never delay a direct answer merely to obtain it. Its mission has required_keys, missing_required_keys, recommended_keys, and is_satisfied. Treat this as private relationship orientation, never as a questionnaire or script. If missing_required_keys is empty, never ask the same required information again. Persist an explicitly stated name or preferred form of address as preferred_name; persist explicit language with set_preferred_language; persist an explicit request such as stop talking, be quiet, or do not initiate contact as proactive_contact=avoid. If the person later explicitly asks SOMA to resume initiating contact, set proactive_contact=allowed. After every person-context write, immediately call get_person_context again and do not claim it was remembered unless the returned mission/facts confirm it. These writes are required before acknowledging the statement and must never be inferred from tone alone. Use the supplied person_context_reference for person-context MCP calls; never speak, reveal, or accept an internal access token. When interaction_authority is participant, do not delegate external tasks, modify files or services, change system settings, or take actions outside the SOMA embodiment MCP. When interaction_authority is administrator, external work still requires an explicit request. Keep replies concise unless the user asks for depth."
+        let baseInstruction = """
+        You are SOMA's conversational reasoning layer. Respond naturally by voice and answer the participant's latest actual speech. Treat supplied L0 and L1 context as background evidence, never as user speech. Do not narrate camera, memory, or private context unless asked.
+
+        Preserve the standard Live Voice fast path. Answer greetings, ordinary conversation, follow-ups, common knowledge, and simple reasoning directly in realtime. Hand off to backing Codex only when the answer genuinely requires a tool, exact current external or local state, or substantial reasoning. A handoff may use the standard single brief acknowledgement while Codex works; never guess the result or produce a parallel conclusion. The App Server owns acknowledgement and final-result delivery.
+
+        Explicit requests for durable, multi-step research, coding, repository changes, service management, or process supervision belong to Hermes through backing Codex. A text envelope beginning SOMA_HERMES_TASK_RESULT contains the actual result of previously delegated work; report it concisely in the participant's language and state any failure or incompleteness honestly.
+
+        Once a live conversation is active, keep it reciprocal and organic. Before introducing a curiosity-driven question, use list_information_needs and select at most one that naturally fits. After the participant explicitly answers it, persist that confirmed answer with record_information_need_answer. Never invent a motive or infer an answer from an image or silence.
+
+        \(embodimentInstruction) \(identityManagementInstruction) \(personContextInstruction) Use person context only when it materially informs the response, and never delay an ordinary direct answer to fetch it. Never expose internal references or access tokens. When interaction_authority is participant, a bounded read-only public fact, weather, web, or API lookup may still run through backing Codex in the current turn; do not access private local host state, delegate external tasks, modify files or services, change system settings, or perform any other external side effect. Administrator authority still requires an explicit request for external work. Keep replies concise unless the participant asks for depth.
+        """
+        let presentationInstruction = """
+        You are SOMA's low-latency Live Voice interface. Answer casual conversation, follow-ups, common knowledge, and simple reasoning directly and immediately. Delegate only when exact current data, a tool, or substantial reasoning is actually required. When delegating, use the normal Live Voice handoff: say at most one brief natural acknowledgement, do not speculate, and then present the returned result once. Never turn a casual statement into a memory write or another tool action unless the participant explicitly asks.
+        """
         let modePolicyInstruction = voiceMode.liveVoicePolicyInstruction
         let instruction = [
             baseInstruction,
@@ -1641,18 +839,14 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             "version": "v3",
             "voice": voice,
             "flushTranscriptTailOnSessionEnd": true,
-            "delegationAckFiller": false,
-            "clientManagedHandoffs": true,
         ]
-        // The realtime presentation model consumes `prompt` directly, while
-        // the backing reasoning session consumes startup instructions and
-        // role-bearing history. Supplying the canonical tool and presentation
-        // policies to both prevents audible preambles before tool calls and
-        // keeps early audio in the selected voice mode.
+        // Keep the realtime prompt small. Detailed tool and task policies stay
+        // with backing Codex, while the presentation model retains the native
+        // low-latency Live Voice handoff behavior.
         params["prompt"] = [
-            L2CognitiveToolPolicy.instruction,
+            presentationInstruction,
+            voiceMode == .natural ? languageInstruction() : nil,
             modePolicyInstruction,
-            initialContext.isEmpty ? nil : initialContext,
         ]
             .compactMap { $0 }
             .joined(separator: "\n\n")
@@ -1761,10 +955,13 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         case "thread/realtime/error":
             fail(LiveVoiceError.webRTC(params["message"] as? String ?? "realtime_error"))
         case "thread/realtime/outputAudio/delta":
-            if observeVisualPresentationStarted(responseID: Self.realtimeResponseID(in: params)) {
-                return
-            }
-            observeAssistantOutputStarted()
+            let responseID = Self.realtimeResponseID(in: params)
+            let generation = responseTurnTracker.generation(forResponseID: responseID)
+                ?? responseTurnTracker.observeResponseStarted(responseID: responseID)
+                ?? latestAssistantResponseGeneration
+                ?? responseTurnTracker.currentGeneration
+            latestAssistantResponseGeneration = generation
+            observeAssistantOutputStarted(generation: generation)
             noteAssistantAudioActivity()
             if voiceMode.requiresProcessedPlayback,
                let chunk = Self.appServerAudioChunk(from: params),
@@ -1806,403 +1003,18 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             stop(reason: params["reason"] as? String ?? "realtime_closed")
         case "item/completed":
             if let item = params["item"] as? [String: Any] {
-                _ = inspectEmbodimentMCPItem(item, emitDiagnostic: true)
+                inspectEmbodimentMCPItem(item)
             }
-        case "turn/started":
-            guard let turn = params["turn"] as? [String: Any],
-                  let turnID = turn["id"] as? String,
-                  !turnID.isEmpty else { return }
-            currentBackingTurnID = turnID
-            backingTurnSequenceByID[turnID] = participantTurnSequence
-            emitter.emit("backing_turn_started", fields: [
-                "turn_id": String(turnID.prefix(128)),
-                "turn_sequence": participantTurnSequence,
-            ])
-            interruptBackingTurnIfOwnedByExternalWork()
-        case "turn/completed":
-            handleCompletedTurn(params)
         default:
             break
         }
     }
 
-    private func handleCompletedTurn(_ params: [String: Any]) {
-        guard let turn = params["turn"] as? [String: Any],
-              let turnID = turn["id"] as? String,
-              !turnID.isEmpty else { return }
-        if currentBackingTurnID == turnID {
-            currentBackingTurnID = nil
-        }
-        let sequence = backingTurnSequenceByID.removeValue(forKey: turnID)
-            ?? participantTurnSequence
-        guard !handledBackingTurnIDs.contains(turnID),
-              !pendingBackingTurnHydrationIDs.contains(turnID) else { return }
-        let status = LiveVoiceBackingTurnStatus(protocolValue: turn["status"] as? String)
-        let errorMessage = (turn["error"] as? [String: Any])?["message"] as? String
-        let items = turn["items"] as? [[String: Any]] ?? []
-        let itemsView = turn["itemsView"] as? String
-        if itemsView != "full" && (itemsView != nil || items.isEmpty) {
-            hydrateCompletedTurn(
-                turnID: turnID,
-                sequence: sequence,
-                status: status,
-                errorMessage: errorMessage,
-                fallbackItems: items
-            )
-            return
-        }
-        processCompletedTurn(
-            turnID: turnID,
-            sequence: sequence,
-            status: status,
-            errorMessage: errorMessage,
-            items: items
-        )
-    }
-
-    private func hydrateCompletedTurn(
-        turnID: String,
-        sequence: UInt64,
-        status: LiveVoiceBackingTurnStatus,
-        errorMessage: String?,
-        fallbackItems: [[String: Any]]
-    ) {
-        guard let threadID else {
-            processCompletedTurn(
-                turnID: turnID,
-                sequence: sequence,
-                status: status,
-                errorMessage: errorMessage,
-                items: fallbackItems
-            )
-            return
-        }
-        pendingBackingTurnHydrationIDs.insert(turnID)
-        let fallback = JSONDictionary(value: ["items": fallbackItems])
-        connection.request(
-            method: "thread/items/list",
-            params: [
-                "threadId": threadID,
-                "turnId": turnID,
-                "limit": 200,
-                "sortDirection": "asc",
-            ],
-            timeoutMilliseconds: 2_000
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.pendingBackingTurnHydrationIDs.remove(turnID)
-                let result = response.value["result"] as? [String: Any]
-                let entries = result?["data"] as? [[String: Any]] ?? []
-                let hydratedItems = entries.compactMap { $0["item"] as? [String: Any] }
-                self.emitter.emit("backing_turn_hydrated", fields: [
-                    "turn_id": String(turnID.prefix(128)),
-                    "turn_sequence": sequence,
-                    "item_count": hydratedItems.count,
-                    "fallback_used": hydratedItems.isEmpty,
-                ])
-                let fallbackItems = fallback.value["items"] as? [[String: Any]] ?? []
-                self.processCompletedTurn(
-                    turnID: turnID,
-                    sequence: sequence,
-                    status: status,
-                    errorMessage: errorMessage,
-                    items: hydratedItems.isEmpty ? fallbackItems : hydratedItems
-                )
-            }
-        }
-    }
-
-    private func processCompletedTurn(
-        turnID: String,
-        sequence: UInt64,
-        status: LiveVoiceBackingTurnStatus,
-        errorMessage: String?,
-        items: [[String: Any]]
-    ) {
-        guard handledBackingTurnIDs.insert(turnID).inserted else { return }
-        handledBackingTurnOrder.append(turnID)
-        if handledBackingTurnOrder.count > 256 {
-            for expired in handledBackingTurnOrder.prefix(64) {
-                handledBackingTurnIDs.remove(expired)
-            }
-            handledBackingTurnOrder.removeFirst(64)
-        }
-        guard sequence == participantTurnSequence else {
-            emitter.emit("backing_turn_response_held", fields: [
-                "turn_id": String(turnID.prefix(128)),
-                "turn_sequence": sequence,
-                "current_sequence": participantTurnSequence,
-                "reason": "participant_turn_advanced",
-            ])
-            return
-        }
-        let assistantSpeechObserved = assistantSpeechObservedSequences.contains(sequence)
-        var successfulHermesDelegation = false
-        var authorizationFailure: MCPToolCompletionDiagnostic?
-        for item in items where item["type"] as? String == "mcpToolCall" {
-            if let diagnostic = MCPToolCompletionDiagnostic.parse(item),
-               diagnostic.isAuthorizationFailure {
-                authorizationFailure = diagnostic
-            }
-            successfulHermesDelegation = inspectEmbodimentMCPItem(
-                item,
-                emitDiagnostic: true
-            ) || successfulHermesDelegation
-        }
-        let agentMessages = items.filter { $0["type"] as? String == "agentMessage" }
-        let agentMessage = agentMessages.reversed().first { item in
-            item["phase"] as? String == "final_answer"
-        }?["text"] as? String ?? agentMessages.last?["text"] as? String
-        let normalizedAgentMessage = agentMessage?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let managedResponse = normalizedAgentMessage?.isEmpty == false
-            ? normalizedAgentMessage
-            : authorizationFailure.map { _ in
-                MCPToolAuthorizationFailureResponse.phrase(languageTag: preferredLanguageTag)
-            }
-        let workItemTypes: Set<String> = [
-            "mcpToolCall", "commandExecution", "fileChange", "dynamicToolCall",
-            "functionCallOutput", "collabAgentToolCall",
-        ]
-        let containsAuthoritativeBackingWork = items.contains {
-            guard let type = $0["type"] as? String else { return false }
-            return workItemTypes.contains(type)
-        }
-        let itemFailed = items.contains { item in
-            guard let itemStatus = item["status"] as? String else { return false }
-            return itemStatus == "failed" || itemStatus == "declined"
-        }
-        let effectiveStatus: LiveVoiceBackingTurnStatus =
-            status == .completed && itemFailed ? .failed : status
-        switch LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: managedResponse?.isEmpty == false,
-            realtimeResponseSpoken: assistantSpeechObserved,
-            successfulExternalDelegation: successfulHermesDelegation,
-            containsAuthoritativeBackingWork: containsAuthoritativeBackingWork,
-            turnStatus: effectiveStatus
-        ) {
-        case .appendFinalSpeech:
-            if let managedResponse {
-                appendManagedHandoffSpeech(
-                    managedResponse,
-                    sequence: sequence,
-                    kind: authorizationFailure == nil ? "backing_final" : "authorization_denial"
-                )
-                if authorizationFailure != nil, normalizedAgentMessage?.isEmpty != false {
-                    emitter.emit("managed_authorization_denial_spoken", fields: [
-                        "tool": authorizationFailure?.tool ?? "unknown",
-                    ])
-                }
-            }
-        case .retainExistingRealtimeResponse:
-            cancelResponseDeadline(for: sequence)
-            emitter.emit("managed_handoff_response_held", fields: [
-                "reason": "realtime_response_already_spoken",
-                "turn_sequence": sequence,
-            ])
-        case .externalDelegationOwnsResponse:
-            cancelResponseDeadline(for: sequence)
-        case let .appendRecoverySpeech(kind):
-            let recovery = authorizationFailure.map { _ in
-                MCPToolAuthorizationFailureResponse.phrase(languageTag: preferredLanguageTag)
-            } ?? LiveVoiceTurnRecoveryResponse.phrase(
-                kind: kind,
-                languageTag: preferredLanguageTag
-            )
-            appendManagedHandoffSpeech(
-                recovery,
-                sequence: sequence,
-                kind: "recovery_\(String(describing: kind))"
-            )
-        }
-        emitter.emit("backing_turn_completed", fields: [
-            "turn_id": String(turnID.prefix(128)),
-            "turn_sequence": sequence,
-            "status": effectiveStatus.rawValue,
-            "item_count": items.count,
-            "authoritative_work": containsAuthoritativeBackingWork,
-            "error": String((errorMessage ?? "").prefix(256)),
-        ])
-    }
-
-    private func interruptBackingTurnIfOwnedByExternalWork() {
-        guard externalWorkResponseOwnerSequence == participantTurnSequence,
-              let threadID,
-              let turnID = currentBackingTurnID else { return }
-        currentBackingTurnID = nil
-        connection.request(
-            method: "turn/interrupt",
-            params: ["threadId": threadID, "turnId": turnID]
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if response.value["error"] == nil {
-                    self.emitter.emit("backing_turn_interrupted", fields: [
-                        "turn_id": String(turnID.prefix(128)),
-                        "response_owner": "l1_external_work",
-                    ])
-                } else {
-                    self.emitter.emit("backing_turn_interrupt_rejected", fields: [
-                        "turn_id": String(turnID.prefix(128)),
-                        "reason": AppServerConnection.responseMessage(response.value),
-                    ])
-                }
-            }
-        }
-    }
-
-    private func appendManagedHandoffSpeech(
-        _ text: String,
-        sequence: UInt64,
-        kind: String,
-        attempt: Int = 0,
-        taskID: String? = nil,
-        successEvent: String = "managed_handoff_response_spoken",
-        failureEvent: String = "managed_handoff_response_rejected"
-    ) {
-        guard !text.isEmpty,
-              sequence == participantTurnSequence,
-              !managedResponseDeliveredSequences.contains(sequence) else { return }
-        guard let threadID else {
-            emitter.emit(failureEvent, fields: [
-                "reason": "live_voice_thread_unavailable",
-                "turn_sequence": sequence,
-                "kind": kind,
-            ])
-            fail(LiveVoiceError.appServerResponse("live_voice_thread_unavailable"))
-            return
-        }
-        if attempt == 0 {
-            guard managedResponseInFlightSequences.insert(sequence).inserted else { return }
-        }
-        connection.request(
-            method: "thread/realtime/appendSpeech",
-            params: [
-                "threadId": threadID,
-                "text": String(text.prefix(8_192)),
-            ],
-            timeoutMilliseconds: 2_000
-        ) { [weak self] response in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                let taskFields: [String: Any] = taskID.map { ["task_id": $0] } ?? [:]
-                guard sequence == self.participantTurnSequence else {
-                    self.managedResponseInFlightSequences.remove(sequence)
-                    self.emitter.emit("managed_handoff_response_held", fields: [
-                        "turn_sequence": sequence,
-                        "kind": kind,
-                        "reason": "participant_turn_advanced",
-                    ])
-                    return
-                }
-                if response.value["error"] == nil {
-                    self.managedResponseInFlightSequences.remove(sequence)
-                    self.managedResponseDeliveredSequences.insert(sequence)
-                    self.cancelResponseDeadline(for: sequence)
-                    self.emitter.emit(successEvent, fields: taskFields.merging([
-                        "turn_sequence": sequence,
-                        "kind": kind,
-                        "attempt": attempt + 1,
-                    ]) { _, new in new })
-                } else if attempt == 0, sequence == self.participantTurnSequence {
-                    self.emitter.emit("managed_handoff_response_retrying", fields: [
-                        "turn_sequence": sequence,
-                        "kind": kind,
-                        "reason": AppServerConnection.responseMessage(response.value),
-                    ])
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                        self?.appendManagedHandoffSpeech(
-                            text,
-                            sequence: sequence,
-                            kind: kind,
-                            attempt: 1,
-                            taskID: taskID,
-                            successEvent: successEvent,
-                            failureEvent: failureEvent
-                        )
-                    }
-                } else {
-                    self.managedResponseInFlightSequences.remove(sequence)
-                    self.emitter.emit(failureEvent, fields: taskFields.merging([
-                        "reason": AppServerConnection.responseMessage(response.value),
-                        "turn_sequence": sequence,
-                        "kind": kind,
-                    ]) { _, new in new })
-                    self.fail(LiveVoiceError.appServerResponse(
-                        AppServerConnection.responseMessage(response.value)
-                    ))
-                }
-            }
-        }
-    }
-
-    private func armResponseDeadline(for sequence: UInt64) {
-        responseDeadlineWorkItem?.cancel()
-        responseDeadlineSequence = sequence
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self,
-                  !self.stopping,
-                  self.responseDeadlineSequence == sequence,
-                  self.participantTurnSequence == sequence,
-                  !self.assistantSpeechObservedSequences.contains(sequence),
-                  !self.managedResponseDeliveredSequences.contains(sequence),
-                  !self.managedResponseInFlightSequences.contains(sequence),
-                  self.externalWorkResponseOwnerSequence != sequence else { return }
-            self.responseDeadlineWorkItem = nil
-            self.responseDeadlineSequence = nil
-            self.emitter.emit("response_deadline_expired", fields: [
-                "turn_sequence": sequence,
-                "deadline_ms": 20_000,
-            ])
-            let recovery = LiveVoiceTurnRecoveryResponse.phrase(
-                kind: .timedOut,
-                languageTag: self.preferredLanguageTag
-            )
-            if let threadID = self.threadID,
-               let turnID = self.currentBackingTurnID,
-               self.backingTurnSequenceByID[turnID] == sequence {
-                self.currentBackingTurnID = nil
-                self.connection.request(
-                    method: "turn/interrupt",
-                    params: ["threadId": threadID, "turnId": turnID],
-                    timeoutMilliseconds: 1_500
-                ) { [weak self] _ in
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        self?.appendManagedHandoffSpeech(
-                            recovery,
-                            sequence: sequence,
-                            kind: "recovery_timedOut"
-                        )
-                    }
-                }
-            } else {
-                self.appendManagedHandoffSpeech(
-                    recovery,
-                    sequence: sequence,
-                    kind: "recovery_timedOut"
-                )
-            }
-        }
-        responseDeadlineWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: workItem)
-    }
-
-    private func cancelResponseDeadline(for sequence: UInt64) {
-        guard responseDeadlineSequence == sequence else { return }
-        responseDeadlineWorkItem?.cancel()
-        responseDeadlineWorkItem = nil
-        responseDeadlineSequence = nil
-    }
-
     /// App Server emits tool completion before the enclosing turn completes.
     /// Logging the item immediately preserves the actual MCP failure instead
     /// of relying on the assistant's later natural-language interpretation.
-    private func inspectEmbodimentMCPItem(
-        _ item: [String: Any],
-        emitDiagnostic: Bool
-    ) -> Bool {
-        guard let diagnostic = MCPToolCompletionDiagnostic.parse(item) else { return false }
+    private func inspectEmbodimentMCPItem(_ item: [String: Any]) {
+        guard let diagnostic = MCPToolCompletionDiagnostic.parse(item) else { return }
         let itemID = diagnostic.itemID
         let shouldEmit: Bool
         if let itemID, !itemID.isEmpty {
@@ -2214,7 +1026,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         } else {
             shouldEmit = true
         }
-        if emitDiagnostic, shouldEmit {
+        if shouldEmit {
             emitter.emit("embodiment_mcp_call", fields: [
                 "tool": diagnostic.tool,
                 "status": diagnostic.effectiveStatus,
@@ -2223,7 +1035,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 "item_id": String((itemID ?? "").prefix(128)),
             ])
         }
-        return diagnostic.tool == "delegate_hermes_task" && diagnostic.succeeded
     }
 
     private func handleRealtimeDataChannel(_ payload: String) {
@@ -2254,34 +1065,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         if type == "error" {
             let error = object["error"] as? [String: Any]
             let eventID = (object["event_id"] as? String) ?? "unknown"
-            if eventID.hasPrefix("soma_"), eventID.hasSuffix("_response_cancel") {
-                if let episodeID = Self.visualEpisodeID(
-                    from: eventID,
-                    suffix: "_response_cancel"
-                ) {
-                    observeVisualCancellationSettled(episodeID: episodeID)
-                }
-                emitter.emit("visual_turn_barrier", fields: [
-                    "state": "cancel_not_required",
-                    "task_id": visualResponseBarrier?.episodeID.uuidString.lowercased() ?? "unknown",
-                    "reason": String(((error?["code"] as? String) ?? "no_active_response").prefix(128)),
-                ])
-                return
-            }
-            if eventID.hasPrefix("soma_"), eventID.hasSuffix("_output_audio_buffer_clear") {
-                emitter.emit("visual_turn_barrier", fields: [
-                    "state": "audio_clear_not_required",
-                    "task_id": visualResponseBarrier?.episodeID.uuidString.lowercased() ?? "unknown",
-                    "reason": String(((error?["code"] as? String) ?? "no_audio_to_clear").prefix(128)),
-                ])
-                return
-            }
-            if eventID.hasPrefix("soma_"), eventID.hasSuffix("_response_create") {
-                fail(LiveVoiceError.webRTC(
-                    "visual_response_create_failed: \((error?["message"] as? String) ?? "unknown")"
-                ))
-                return
-            }
             emitter.emit("realtime_protocol_error", fields: [
                 "event_id": String(eventID.prefix(128)),
                 "code": String(((error?["code"] as? String) ?? "unknown").prefix(128)),
@@ -2290,8 +1073,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             return
         }
         if type.contains("speech_started") {
-            participantAudioEpoch &+= 1
-            observeInputSpeechStarted()
+            observeInputSpeechStarted(forceNewTurn: true)
             return
         }
         if LiveVoiceRealtimeEventSemantics.confirmsParticipantInput(type: type) {
@@ -2304,15 +1086,31 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         if type.contains("response.cancelled") || type.contains("response.canceled") {
             selectedAudioOutput?.flush()
             let responseID = Self.realtimeResponseID(in: object)
-            observeVisualResponseEnded(responseID: responseID)
-            emitter.emit("response_interrupted")
+            let completion = responseTurnTracker.completeResponse(responseID: responseID)
+            var fields: [String: Any] = ["response_id": responseID ?? ""]
+            switch completion {
+            case let .current(generation):
+                setCognitiveTurn(active: false)
+                fields["turn_generation"] = generation
+                fields["correlation"] = "current"
+            case let .stale(generation, currentGeneration):
+                fields["turn_generation"] = generation
+                fields["current_turn_generation"] = currentGeneration
+                fields["correlation"] = "stale"
+            case .uncorrelated:
+                fields["correlation"] = "uncorrelated"
+            }
+            emitter.emit("response_interrupted", fields: fields)
             return
         }
         if type == "output_audio_buffer.started" || type.contains("response.output_audio.delta") {
-            if observeVisualPresentationStarted(responseID: Self.realtimeResponseID(in: object)) {
-                return
-            }
-            observeAssistantOutputStarted()
+            let responseID = Self.realtimeResponseID(in: object)
+            let generation = responseTurnTracker.generation(forResponseID: responseID)
+                ?? responseTurnTracker.observeResponseStarted(responseID: responseID)
+                ?? latestAssistantResponseGeneration
+                ?? responseTurnTracker.currentGeneration
+            latestAssistantResponseGeneration = generation
+            observeAssistantOutputStarted(generation: generation)
             return
         }
         if type == "output_audio_buffer.stopped" {
@@ -2381,43 +1179,55 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
         if type == "turn.created" || type.contains("response.created") {
             let responseID = Self.realtimeResponseID(in: object)
-            currentRealtimeResponseID = responseID
-            if observeVisualResponseStarted(responseID: responseID) { return }
-            emitter.emit("response_preparing")
+            let generation = responseTurnTracker.observeResponseStarted(responseID: responseID)
+                ?? responseTurnTracker.currentGeneration
+            latestAssistantResponseGeneration = generation
+            var fields: [String: Any] = ["response_id": responseID ?? ""]
+            fields["turn_generation"] = generation
+            emitter.emit("response_preparing", fields: fields)
             return
         }
         if type == "turn.completed" || type == "turn.finished" || type == "turn.done" ||
             type.contains("response.completed") || type.contains("response.done") {
             let responseID = Self.realtimeResponseID(in: object)
-            if currentRealtimeResponseID == responseID { currentRealtimeResponseID = nil }
-            if let barrier = visualResponseBarrier,
-               barrier.ownsReplacementResponse(responseID) {
-                if barrier.presentationReleased {
-                    completeCurrentVisualResponse()
-                } else {
-                    fail(LiveVoiceError.webRTC(
-                        "visual_replacement_ended_without_audio_presentation"
-                    ))
-                    return
-                }
-            } else {
-                observeVisualResponseEnded(responseID: responseID)
+            let completion = responseTurnTracker.completeResponse(responseID: responseID)
+            var fields: [String: Any] = ["response_id": responseID ?? ""]
+            var completedCurrentResponse = false
+            switch completion {
+            case let .current(generation):
+                completedCurrentResponse = true
+                setCognitiveTurn(active: false)
+                scheduleAssistantOutputEnd(after: 0.35)
+                fields["turn_generation"] = generation
+                fields["correlation"] = "current"
+            case let .stale(generation, currentGeneration):
+                fields["turn_generation"] = generation
+                fields["current_turn_generation"] = currentGeneration
+                fields["correlation"] = "stale"
+            case .uncorrelated:
+                fields["correlation"] = "uncorrelated"
             }
-            setCognitiveTurn(active: false)
-            scheduleAssistantOutputEnd(after: 0.35)
-            emitter.emit("response_completed")
-            if let taskID = pendingHermesReportTaskID {
+            emitter.emit("response_completed", fields: fields)
+            if completedCurrentResponse, let taskID = pendingHermesReportTaskID {
                 pendingHermesReportTaskID = nil
                 emitter.emit("hermes_task_result_accepted", fields: ["task_id": taskID])
             }
         }
     }
 
-    private func observeInputSpeechStarted() {
+    private func observeInputSpeechStarted(forceNewTurn: Bool = false) {
+        if forceNewTurn, !inputSpeechInProgress {
+            participantAudioEpoch = responseTurnTracker.beginParticipantTurn()
+            latestAssistantResponseGeneration = nil
+        } else if !responseTurnTracker.participantTurnOpen {
+            participantAudioEpoch = responseTurnTracker.ensureParticipantTurn()
+        }
         guard !inputSpeechInProgress else { return }
         setCognitiveTurn(active: true)
         inputSpeechInProgress = true
-        emitter.emit("input_speech_started")
+        emitter.emit("input_speech_started", fields: [
+            "turn_generation": responseTurnTracker.currentGeneration,
+        ])
     }
 
     private func observeWireParticipantTranscriptDelta(_ transcript: LiveVoiceWireTranscript) {
@@ -2511,51 +1321,14 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             lastFallbackTranscript = (role, normalizedText, nowNS)
         }
 
-        if role == "assistant",
-           let barrier = visualResponseBarrier,
-           barrier.suppressesAssistantPresentation {
-            emitter.emit("visual_turn_barrier", fields: [
-                "state": "provisional_transcript_suppressed",
-                "task_id": barrier.episodeID.uuidString.lowercased(),
-                "reason": "fresh_evidence_not_committed",
-            ])
-            return
-        }
-
         if role == "user" {
-            participantTurnSequence &+= 1
-            if participantTurnSequence > 64 {
-                let minimumRetainedSequence = participantTurnSequence - 64
-                assistantSpeechObservedSequences = assistantSpeechObservedSequences.filter {
-                    $0 >= minimumRetainedSequence
-                }
-                managedResponseInFlightSequences = managedResponseInFlightSequences.filter {
-                    $0 >= minimumRetainedSequence
-                }
-                managedResponseDeliveredSequences = managedResponseDeliveredSequences.filter {
-                    $0 >= minimumRetainedSequence
-                }
-                backingTurnSequenceByID = backingTurnSequenceByID.filter {
-                    $0.value >= minimumRetainedSequence
-                }
-            }
-            responseDeadlineWorkItem?.cancel()
-            responseDeadlineWorkItem = nil
-            responseDeadlineSequence = nil
-            if let externalWorkResponseOwnerSequence,
-               externalWorkResponseOwnerSequence != participantTurnSequence {
-                self.externalWorkResponseOwnerSequence = nil
-            }
-            if let currentBackingTurnID,
-               backingTurnSequenceByID[currentBackingTurnID] == 0 {
-                backingTurnSequenceByID[currentBackingTurnID] = participantTurnSequence
-            }
-            latestParticipantTranscript = normalizedText
+            participantAudioEpoch = responseTurnTracker.ensureParticipantTurn()
             if conversationControlClassifier.classify(normalizedText) == .endConversation {
                 emitter.emit("transcript_finalized", fields: [
                     "thread_id": threadID ?? "",
                     "role": role,
                     "text": String(normalizedText.prefix(8_192)),
+                    "turn_generation": responseTurnTracker.currentGeneration,
                 ])
                 emitter.emit("conversation_control_applied", fields: [
                     "control": "end_conversation",
@@ -2564,31 +1337,19 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 stop(reason: "participant_requested_end")
                 return
             }
-            if L1LiveEpistemicReflexRouter.requiresCurrentCameraEvidence(
-                transcript: normalizedText
-            ) {
-                beginCurrentVisualTurn(
-                    episodeID: UUID(),
-                    participantTurnSequence: participantTurnSequence,
-                    transcript: normalizedText,
-                    source: "deterministic_current_view_intent"
-                )
-            } else if let barrier = visualResponseBarrier {
-                if barrier.presentationReleased {
-                    completeCurrentVisualResponse()
-                } else {
-                    fail(LiveVoiceError.webRTC("visual_turn_interrupted_by_new_participant_turn"))
-                    return
-                }
-            }
-            armResponseDeadline(for: participantTurnSequence)
         }
 
-        emitter.emit("transcript_finalized", fields: [
+        var transcriptFields: [String: Any] = [
             "thread_id": threadID ?? "",
             "role": role,
             "text": String(normalizedText.prefix(8_192)),
-        ])
+        ]
+        if role == "user" {
+            transcriptFields["turn_generation"] = responseTurnTracker.currentGeneration
+        } else if let latestAssistantResponseGeneration {
+            transcriptFields["turn_generation"] = latestAssistantResponseGeneration
+        }
+        emitter.emit("transcript_finalized", fields: transcriptFields)
         if role == "user" {
             inputSpeechInProgress = false
             partialUserTranscript = ""
@@ -2597,24 +1358,33 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
     }
 
-    private func observeAssistantOutputStarted() {
-        assistantSpeechObservedSequences.insert(participantTurnSequence)
-        cancelResponseDeadline(for: participantTurnSequence)
+    private func observeAssistantOutputStarted(generation: UInt64?) {
         assistantOutputEndWorkItem?.cancel()
         assistantOutputEndWorkItem = nil
         guard !assistantOutputActive else { return }
         assistantOutputActive = true
+        assistantOutputGeneration = generation
         selectedAudioOutput?.beginSpeech()
-        emitter.emit("output_speech_started")
+        var fields: [String: Any] = [:]
+        if let generation { fields["turn_generation"] = generation }
+        emitter.emit("output_speech_started", fields: fields)
     }
 
-    private func observeAssistantOutputEnded() {
+    private func observeAssistantOutputEnded(generation: UInt64? = nil) {
         assistantOutputEndWorkItem?.cancel()
         assistantOutputEndWorkItem = nil
+        if let generation, let activeGeneration = assistantOutputGeneration,
+           generation != activeGeneration {
+            return
+        }
         guard assistantOutputActive else { return }
         assistantOutputActive = false
+        let completedGeneration = assistantOutputGeneration
+        assistantOutputGeneration = nil
         selectedAudioOutput?.finishSpeech()
-        emitter.emit("output_speech_ended")
+        var fields: [String: Any] = [:]
+        if let completedGeneration { fields["turn_generation"] = completedGeneration }
+        emitter.emit("output_speech_ended", fields: fields)
         if let reason = pendingTransportClosureReason {
             pendingTransportClosureReason = nil
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
@@ -2632,10 +1402,11 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     private func scheduleAssistantOutputEnd(after delay: TimeInterval) {
         guard assistantOutputActive else { return }
         assistantOutputEndWorkItem?.cancel()
+        let generation = assistantOutputGeneration
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.stopping else { return }
             self.assistantOutputEndWorkItem = nil
-            self.observeAssistantOutputEnded()
+            self.observeAssistantOutputEnded(generation: generation)
         }
         assistantOutputEndWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -2787,8 +1558,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     }
 
     private static func realtimeResponseID(in event: [String: Any]) -> String? {
-        let directKeys = ["response_id", "responseId", "turn_id", "turnId"]
-        for key in directKeys {
+        for key in ["response_id", "responseId", "turn_id", "turnId"] {
             if let value = event[key] as? String,
                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return String(value.prefix(256))
@@ -2802,14 +1572,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
             }
         }
         return nil
-    }
-
-    private static func visualEpisodeID(from eventID: String, suffix: String) -> UUID? {
-        guard eventID.hasPrefix("soma_"), eventID.hasSuffix(suffix) else { return nil }
-        let start = eventID.index(eventID.startIndex, offsetBy: "soma_".count)
-        let end = eventID.index(eventID.endIndex, offsetBy: -suffix.count)
-        guard start < end else { return nil }
-        return UUID(uuidString: String(eventID[start..<end]))
     }
 
     private func activateIfReady() {
@@ -2896,17 +1658,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         pendingTransportClosureReason = nil
         assistantOutputEndWorkItem?.cancel()
         assistantOutputEndWorkItem = nil
-        embodimentMCPVerificationTimeoutWorkItem?.cancel()
-        embodimentMCPVerificationTimeoutWorkItem = nil
-        responseDeadlineWorkItem?.cancel()
-        responseDeadlineWorkItem = nil
-        responseDeadlineSequence = nil
-        cancelVisualTurnTimeouts()
         partialUserTranscript = ""
-        currentRealtimeResponseID = nil
-        visualResponseBarrier = nil
-        deferredVisualEvidenceEpisodeID = nil
-        setVisualOutputGate(closed: false, resetPresentation: true)
+        responseTurnTracker.reset()
+        latestAssistantResponseGeneration = nil
+        assistantOutputGeneration = nil
         observeAssistantOutputEnded()
         setCognitiveTurn(active: false)
         if let threadID {
@@ -2923,12 +1678,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         SOMACodexLocator.locate()?.executableURL
     }
 
-    private static func validCameraImageDataURI(_ value: String) -> Bool {
-        guard value.hasPrefix("data:image/jpeg;base64,") else { return false }
-        let encoded = value.dropFirst("data:image/jpeg;base64,".count)
-        return !encoded.isEmpty && encoded.count <= 4 * 1_048_576
-    }
-
     private static let webRTCHTML = """
     <!doctype html><html><body><script>
     let peer = null;
@@ -2940,7 +1689,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
     let outputContext = null;
     let outputWorklet = null;
     let outputGate = null;
-    let visualOutputGateClosed = false;
     let outputSpeaking = false;
     let outputAboveCount = 0;
     let outputBelowCount = 0;
@@ -2964,36 +1712,33 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
               this.offset = 0;
               this.queued = 0;
               this.deliveredSinceReport = 0;
+              this.transportConnected = false;
               this.port.onmessage = event => {
+                if (event.data?.type === 'resume') {
+                  this.transportConnected = true;
+                  return;
+                }
                 if (event.data?.type !== 'append') return;
                 let samples = event.data.samples;
                 if (!(samples instanceof Float32Array) || samples.length === 0) return;
                 const maximum = Math.floor(sampleRate * 12);
                 while (this.queued + samples.length > maximum && this.buffers.length > 0) {
                   const removed = this.buffers.shift();
-                  this.queued -= removed.samples.length - this.offset;
-                  if (removed.itemID) {
-                    this.port.postMessage({type: 'rejected', itemID: removed.itemID, reason: 'input_queue_overflow'});
-                  }
+                  this.queued -= removed.length - this.offset;
                   this.offset = 0;
                 }
-                if (samples.length > maximum) {
-                  if (event.data.itemID) {
-                    this.port.postMessage({type: 'rejected', itemID: event.data.itemID, reason: 'input_too_long'});
-                  }
-                  return;
-                }
-                this.buffers.push({samples, itemID: event.data.itemID || ''});
+                if (samples.length > maximum) return;
+                this.buffers.push(samples);
                 this.queued += samples.length;
               };
             }
             process(inputs, outputs) {
               const output = outputs[0][0];
               output.fill(0);
+              if (!this.transportConnected) return true;
               let written = 0;
               while (written < output.length && this.buffers.length > 0) {
-                const entry = this.buffers[0];
-                const buffer = entry.samples;
+                const buffer = this.buffers[0];
                 const count = Math.min(output.length - written, buffer.length - this.offset);
                 output.set(buffer.subarray(this.offset, this.offset + count), written);
                 written += count;
@@ -3002,9 +1747,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
                 if (this.offset >= buffer.length) {
                   this.buffers.shift();
                   this.offset = 0;
-                  if (entry.itemID) {
-                    this.port.postMessage({type: 'drained', itemID: entry.itemID});
-                  }
                 }
               }
               this.deliveredSinceReport += written;
@@ -3029,15 +1771,6 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         inputWorklet.connect(inputDestination);
         inputWorklet.port.onmessage = event => {
           if (event.data?.type === 'progress') send('audio_input_progress');
-          if (event.data?.type === 'drained') {
-            send('opening_audio_drained', {itemID: event.data.itemID});
-          }
-          if (event.data?.type === 'rejected') {
-            send('opening_audio_rejected', {
-              itemID: event.data.itemID,
-              reason: event.data.reason || 'audio_worklet_rejected',
-            });
-          }
         };
         peer = new RTCPeerConnection();
         channel = peer.createDataChannel('oai-events');
@@ -3257,7 +1990,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
           });
           outputSource.connect(outputWorklet);
           outputGate = outputContext.createGain();
-          outputGate.gain.value = visualOutputGateClosed ? 0 : 1;
+          outputGate.gain.value = 1;
           outputWorklet.connect(outputGate);
           if (nativePlayback) {
             const silentOutput = outputContext.createGain();
@@ -3316,7 +2049,10 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
           }
         };
         peer.onconnectionstatechange = () => {
-          if (peer.connectionState === 'connected') send('connected');
+          if (peer.connectionState === 'connected') {
+            inputWorklet?.port.postMessage({type: 'resume'});
+            send('connected');
+          }
           if (peer.connectionState === 'failed') send('error', {message: 'peer_connection_failed'});
           if (peer.connectionState === 'closed') send('closed');
         };
@@ -3337,7 +2073,7 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         send('error', {message: String(error)});
       }
     }
-    function appendPCM16(base64, sampleRate, sampleCount, itemID = '') {
+    function appendPCM16(base64, sampleRate, sampleCount) {
       if (!inputContext || !inputWorklet || sampleCount <= 0) return false;
       const binary = atob(base64);
       if (binary.length !== sampleCount * 2) throw new Error('pcm16_size_mismatch');
@@ -3363,30 +2099,9 @@ private final class LiveVoiceRuntime: NSObject, WKNavigationDelegate, WKScriptMe
         }
       }
       inputWorklet.port.postMessage(
-        {type: 'append', samples: destination, itemID},
+        {type: 'append', samples: destination},
         [destination.buffer]
       );
-      return true;
-    }
-    function sendRealtimeControl(payload) {
-      if (!channel || channel.readyState !== 'open' || !payload || typeof payload.type !== 'string') {
-        return false;
-      }
-      channel.send(JSON.stringify(payload));
-      return true;
-    }
-    function setVisualOutputGate(closed, resetPresentation = false) {
-      visualOutputGateClosed = closed === true;
-      if (resetPresentation && outputWorklet) {
-        outputWorklet.port.postMessage({type: 'reset_presentation'});
-        outputSpeaking = false;
-        outputAboveCount = 0;
-        outputBelowCount = 0;
-      }
-      if (outputGate && outputContext) {
-        outputGate.gain.cancelScheduledValues(outputContext.currentTime);
-        outputGate.gain.setValueAtTime(visualOutputGateClosed ? 0 : 1, outputContext.currentTime);
-      }
       return true;
     }
     function stopWebRTC() {
@@ -3452,16 +2167,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     sessionCapability: nil,
                     embodimentSocketPath: nil,
                     appServerURL: nil,
-                    cameraContextAutoInjected: nil,
                     codexSandbox: nil,
                     codexAdminOnly: nil,
                     hermesAgentDelegationEnabled: nil,
                     data: nil,
                     sampleRate: nil,
                     samplesPerChannel: nil,
-                    itemID: nil,
-                    taskID: nil,
-                    tool: nil
+                    taskID: nil
                 ))
             }
         }

@@ -7,15 +7,6 @@ enum AppServerLiveVoiceEvent: Sendable {
     case launchRequested(authorization: String, personEntityID: UUID?)
     case active(threadID: String?, personEntityID: UUID?)
     case inputTransportStarted
-    case inputBootstrapSubmitted(
-        itemID: UUID,
-        durationMilliseconds: Double,
-        trailingSilenceMilliseconds: Double,
-        peakDBFS: Double,
-        maximumGainDB: Double
-    )
-    case inputBootstrapQueued(itemID: UUID)
-    case inputBootstrapPlayed(itemID: UUID)
     case outputPlaybackReady(mode: String, route: String, effectProfile: String)
     case audioPlayoutSourceSelected(source: String)
     case audioPlayoutStatus(
@@ -34,25 +25,9 @@ enum AppServerLiveVoiceEvent: Sendable {
     case proactiveOpeningExtraOutputSuppressed
     case hermesReportOfferStarted(taskID: UUID)
     case hearingUser
-    case visualContextAttached
-    case visualContextRejected(reason: String)
-    case visualTurnBarrier(state: String, episodeID: UUID?, reason: String)
-    case embodimentMCPReady
-    case embodimentMCPUnavailable(reason: String)
-    case hermesDelegationAcknowledgementRequested(taskID: UUID)
-    case hermesDelegationAcknowledgementSpoken(taskID: UUID)
-    case hermesDelegationAcknowledgementRejected(taskID: UUID?, reason: String)
     case hermesTaskResultAccepted(taskID: UUID)
     case hermesTaskResultRejected(taskID: UUID?, reason: String)
-    case personContextReady
-    case personContextUnavailable(reason: String)
     case embodimentMCPCall(tool: String, status: String, error: String?)
-    case l1ToolAdviceAttached(tool: String)
-    case l1ToolAdviceRejected(tool: String, reason: String)
-    case backingTurnStarted(turnID: String, sequence: UInt64)
-    case backingTurnCompleted(turnID: String, sequence: UInt64, status: String, error: String?)
-    case managedResponse(state: String, sequence: UInt64, kind: String, reason: String?)
-    case responseDeadlineExpired(sequence: UInt64)
     case inputAccepted(characters: Int)
     case realtimeEventType(type: String)
     case inputTranscriptionFailed(reason: String)
@@ -87,7 +62,6 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let data: String?
     let sampleRate: Int?
     let samplesPerChannel: Int?
-    let itemID: String?
     let numChannels: Int?
     let resetReference: Bool?
     let mode: String?
@@ -100,9 +74,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
     let queuedDurationMilliseconds: Double?
     let underruns: Int?
     let type: String?
-    let turnID: String?
-    let turnSequence: UInt64?
-    let kind: String?
+    let turnGeneration: UInt64?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -118,7 +90,6 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case data
         case sampleRate = "sample_rate"
         case samplesPerChannel = "samples_per_channel"
-        case itemID = "item_id"
         case numChannels = "num_channels"
         case resetReference = "reset_reference"
         case mode
@@ -131,9 +102,7 @@ private struct LiveVoiceHelperEvent: Decodable, Sendable {
         case queuedDurationMilliseconds = "queued_ms"
         case underruns
         case type
-        case turnID = "turn_id"
-        case turnSequence = "turn_sequence"
-        case kind
+        case turnGeneration = "turn_generation"
     }
 }
 
@@ -141,9 +110,6 @@ private struct BufferedLiveAudio: Sendable {
     let data: String
     let sampleRate: Int
     let samplesPerChannel: Int
-    let durationNS: UInt64
-    let inputPeakDBFS: Double
-    let appliedGainDB: Double
 }
 
 private struct CapturedLiveAudio: Sendable {
@@ -171,7 +137,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     private let voice: SOMARealtimeVoice
     private let voiceMode: SOMARealtimeVoiceMode
     private let audioOutputDeviceUID: String?
-    private let currentCameraImageDataURI: (@Sendable () -> String?)?
     private let embodimentSocketURL: URL?
     private let persistentAppServer: PersistentAppServerBroker?
     private let persistentSessionAuthorizer: (@Sendable (
@@ -179,14 +144,12 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         SOMASessionCapabilityScope,
         UInt64
     ) -> Result<Void, SOMASessionCapabilityError>)?
-    private let cameraContextAutoInjection: Bool
     private let requireVerifiedSpeakerForEveryTurn: Bool
     private let hermesAgentDelegationEnabled: Bool
     private let onEvent: @Sendable (AppServerLiveVoiceEvent) -> Void
     private var gate = LiveVoiceLaunchGate()
     private var inactivityGate = LiveVoiceSessionInactivityGate()
     private var inactivityTimer: DispatchWorkItem?
-    private var initialTranscriptTimer: DispatchWorkItem?
     private var process: Process?
     private var input: FileHandle?
     private var outputBuffer = Data()
@@ -199,11 +162,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         maximumEpisodeDurationNS: 12_000_000_000
     )
     private var speakerEpisodeInProgress = false
-    private var initiatingTurn: [BufferedLiveAudio] = []
-    private var pendingOpeningAudio: [BufferedLiveAudio] = []
     private var pendingLiveAudio: [BufferedLiveAudio] = []
-    private var openingAudioPlayoutGate = LiveVoiceOpeningAudioPlayoutGate()
-    private var pendingOpeningAudioItemID: UUID?
     private var liveInputTrackReady = false
     private var capturingInitiatingTurn = false
     private var inputLeveler = LiveVoiceInputLeveler()
@@ -228,33 +187,27 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
     /// This stays only with the corresponding helper process. It prevents an
     /// older local MCP child from ending a newer participant's conversation.
     private var activeSessionCapability: String?
-    private var activePreferredLanguageTag: String?
-    private var activeInteractionAuthority: SOMAInteractionAuthority?
-    private var openingVisualContextAttached = false
-    private var awaitingAssistantResponse = false
+    private var latestParticipantTurnGeneration: UInt64 = 0
+    private var awaitingAssistantResponseGeneration: UInt64?
     private var latestUserTranscriptNS: UInt64?
-    private var latestUserTranscript = ""
-    private var assistantOutputStartedForTurn = false
-    private var assistantResponseInProgress = false
-    private var assistantPlaybackActive = false
-    private var initialTurnValidation: LiveVoiceInitialTurnValidation
+    private var assistantResponseGeneration: UInt64?
+    private var assistantPlaybackGeneration: UInt64?
+    private var participantContactOpening = false
+    private var openingParticipantInputObserved = false
     private var proactiveOpeningAwaitingParticipant = false
     private var proactiveOpeningDelivered = false
     private var pendingHermesReportOfferTaskID: UUID?
     private var hermesResultAwaitingConfirmation = Set<UUID>()
-    private var acknowledgedHermesTaskIDs = Set<UUID>()
 
     init(
         projectDirectory: String? = nil,
         voice: SOMARealtimeVoice = .maple,
         voiceMode: SOMARealtimeVoiceMode = .natural,
         audioOutputDeviceUID: String? = nil,
-        currentCameraImageDataURI: (@Sendable () -> String?)? = nil,
         embodimentSocketURL: URL? = nil,
         requireVerifiedSpeakerForEveryTurn: Bool = false,
         hermesAgentDelegationEnabled: Bool = true,
-        inactivityTimeoutMilliseconds: UInt64 = 60_000,
-        initialParticipantTranscriptTimeoutMilliseconds: UInt64 = 3_500,
+        inactivityTimeoutMilliseconds: UInt64 = 600_000,
         persistentAppServer: PersistentAppServerBroker? = nil,
         persistentSessionAuthorizer: (@Sendable (
             String,
@@ -269,19 +222,14 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         self.voice = voice
         self.voiceMode = voiceMode
         self.audioOutputDeviceUID = SOMAControlSettings.normalizedDeviceUID(audioOutputDeviceUID)
-        self.currentCameraImageDataURI = currentCameraImageDataURI
         self.embodimentSocketURL = embodimentSocketURL
         self.requireVerifiedSpeakerForEveryTurn = requireVerifiedSpeakerForEveryTurn
         self.hermesAgentDelegationEnabled = hermesAgentDelegationEnabled
         inactivityGate = LiveVoiceSessionInactivityGate(
             timeoutMilliseconds: inactivityTimeoutMilliseconds
         )
-        initialTurnValidation = LiveVoiceInitialTurnValidation(
-            transcriptTimeoutMilliseconds: initialParticipantTranscriptTimeoutMilliseconds
-        )
         self.persistentAppServer = persistentAppServer
         self.persistentSessionAuthorizer = persistentSessionAuthorizer
-        cameraContextAutoInjection = somaEnvBool("SOMA_L2_AUTO_INJECT_CAMERA", default: true)
         self.onEvent = onEvent
     }
 
@@ -408,15 +356,16 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
-    /// Cancels only a participant-contact opening whose visual authorization
-    /// was disproved before any usable participant input reached the realtime
-    /// session. Once input is confirmed, gaze is no longer a session-lifetime
-    /// requirement. L1-authorized proactive openings are unaffected.
+    /// Cancels only a participant-contact opening whose same-episode speaker
+    /// attribution was conclusively contradicted before usable input reached
+    /// Realtime. Missing gaze is not a revocation. L1-authorized proactive
+    /// openings are unaffected.
     func revokeProvisionalParticipantOpening(reason: String) {
         queue.async { [weak self] in
             guard let self,
                   !stopped,
-                  initialTurnValidation.shouldCloseWhenContactIsRevoked,
+                  participantContactOpening,
+                  !openingParticipantInputObserved,
                   active || gate.phase == .starting else {
                 return
             }
@@ -446,10 +395,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
-    /// Preserves the single utterance that caused this session to open.  The
-    /// live transport can take longer to establish than an ordinary sentence,
-    /// so replaying an undifferentiated rolling buffer would either lose its
-    /// beginning or submit ambient silence as the first turn.
+    /// Releases the speech episode that caused the session to open into the
+    /// same ordered input track used by every later turn. The local Worklet
+    /// holds these samples until WebRTC connects, so the first turn needs no
+    /// separate bootstrap item or replay path.
     func observeVoiceActivity(
         _ active: Bool,
         admitted: Bool = true,
@@ -560,7 +509,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 }
                 duplexEpisodeInProgress = false
                 duplexEpisodeAdmitted = false
-                initiatingTurn.removeAll(keepingCapacity: true)
                 capturingInitiatingTurn = false
                 activeTurnAudioAdmitted = false
             }
@@ -599,16 +547,18 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             if active, admitted {
                 if requireVerifiedSpeakerForEveryTurn {
                     guard let assessedThroughCaptureNS else { return }
-                    initiatingTurn += speakerEpisodeAudio
+                    let buffered = speakerEpisodeAudio
                         .take(
                             throughCaptureNS: assessedThroughCaptureNS,
                             splitting: Self.splitCapturedAudio
                         )
                         .map(makeBufferedAudio)
+                    for chunk in buffered { send(chunk) }
                 } else {
                     guard !capturingInitiatingTurn else { return }
                     capturingInitiatingTurn = true
-                    initiatingTurn = speakerEpisodeAudio.take().map(makeBufferedAudio)
+                    let buffered = speakerEpisodeAudio.take().map(makeBufferedAudio)
+                    for chunk in buffered { send(chunk) }
                 }
             } else {
                 capturingInitiatingTurn = false
@@ -680,7 +630,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ), !requireVerifiedSpeakerForEveryTurn {
             send(makeBufferedAudio(captured))
         } else if capturingInitiatingTurn {
-            initiatingTurn.append(makeBufferedAudio(captured))
+            send(makeBufferedAudio(captured))
         } else {
             speakerEpisodeAudio.ingest(
                 captured,
@@ -695,10 +645,7 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         return BufferedLiveAudio(
             data: Self.pcm16Data(conditioned.samples).base64EncodedString(),
             sampleRate: captured.sampleRate,
-            samplesPerChannel: captured.samples.count,
-            durationNS: captured.durationNS,
-            inputPeakDBFS: conditioned.inputPeakDBFS,
-            appliedGainDB: conditioned.appliedGainDB
+            samplesPerChannel: captured.samples.count
         )
     }
 
@@ -715,32 +662,26 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 
     private func resetSessionEphemera(keepingAudioCapacity: Bool) {
         activeTurnAudioAdmitted = false
-        awaitingAssistantResponse = false
+        latestParticipantTurnGeneration = 0
+        awaitingAssistantResponseGeneration = nil
         latestUserTranscriptNS = nil
-        assistantResponseInProgress = false
-        assistantPlaybackActive = false
-        initialTurnValidation.reset()
+        assistantResponseGeneration = nil
+        assistantPlaybackGeneration = nil
+        participantContactOpening = false
+        openingParticipantInputObserved = false
         speakerEpisodeAudio.end(keepingCapacity: keepingAudioCapacity)
         speakerEpisodeInProgress = false
-        initiatingTurn.removeAll(keepingCapacity: keepingAudioCapacity)
-        pendingOpeningAudio.removeAll(keepingCapacity: keepingAudioCapacity)
         pendingLiveAudio.removeAll(keepingCapacity: keepingAudioCapacity)
-        openingAudioPlayoutGate.reset()
-        pendingOpeningAudioItemID = nil
         liveInputTrackReady = false
         capturingInitiatingTurn = false
         inputLeveler.reset()
         resetDuplexCaptureState()
         inactivityTimer?.cancel()
         inactivityTimer = nil
-        initialTranscriptTimer?.cancel()
-        initialTranscriptTimer = nil
         inactivityGate.close()
         proactiveOpeningAwaitingParticipant = false
         proactiveOpeningDelivered = false
         pendingHermesReportOfferTaskID = nil
-        activePreferredLanguageTag = nil
-        activeInteractionAuthority = nil
     }
 
     private static func splitCapturedAudio(
@@ -828,105 +769,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         }
     }
 
-    /// A task acceptance is a controller fact. Speak it at the exact durable
-    /// task boundary instead of waiting for the requesting model turn to end.
-    func acknowledgeHermesTaskAccepted(
-        taskID: UUID,
-        operation: HermesAgentTaskOperation,
-        deduplicated: Bool
-    ) -> Bool {
-        queue.sync {
-            let alreadyHandled = acknowledgedHermesTaskIDs.contains(taskID)
-            guard HermesDelegationAcknowledgementPolicy.shouldSpeakAcceptance(
-                operation: operation,
-                deduplicated: deduplicated,
-                sessionActive: active,
-                alreadyHandled: alreadyHandled
-            ) else { return false }
-            if acknowledgedHermesTaskIDs.count >= 128 {
-                acknowledgedHermesTaskIDs.removeAll(keepingCapacity: true)
-            }
-            acknowledgedHermesTaskIDs.insert(taskID)
-            let sent = send([
-                "type": "accept_external_work",
-                "taskID": taskID.uuidString.lowercased(),
-                "data": HermesDelegationAcknowledgement.phrase(
-                    languageTag: activePreferredLanguageTag
-                ),
-            ])
-            if sent {
-                onEvent(.hermesDelegationAcknowledgementRequested(taskID: taskID))
-            } else {
-                acknowledgedHermesTaskIDs.remove(taskID)
-                onEvent(.hermesDelegationAcknowledgementRejected(
-                    taskID: taskID,
-                    reason: "live_voice_control_transport_unavailable"
-                ))
-            }
-            return sent
-        }
-    }
-
-    /// Validates the current participant turn before L1 dispatches external
-    /// work directly. This is the same administrator/session boundary used by
-    /// the MCP path; L1 receives no general-purpose local execution authority.
-    func authorizesL1ExternalWork(
-        _ advice: L1LiveToolAdvice,
-        forUserTranscript transcript: String
-    ) -> Bool {
-        queue.sync {
-            hermesAgentDelegationEnabled && L1LiveExternalWorkDispatchPolicy.permits(
-                advice: advice,
-                transcript: transcript,
-                activeTranscript: latestUserTranscript,
-                sessionActive: active && activeThreadID == advice.threadID && awaitingAssistantResponse,
-                administratorAuthorized: activeInteractionAuthority == .administrator,
-                assistantOutputStarted: assistantOutputStartedForTurn
-            )
-        }
-    }
-
-    /// Adds a private, turn-bound L1 recommendation to the active realtime
-    /// thread. It is admitted only while the exact user transcript is still
-    /// awaiting its first spoken output; a late advisory is discarded instead
-    /// of leaking into the next conversational turn.
-    func injectL1ToolAdvice(
-        _ advice: L1LiveToolAdvice,
-        forUserTranscript transcript: String
-    ) -> Bool {
-        queue.sync {
-            guard active,
-                  activeThreadID == advice.threadID,
-                  awaitingAssistantResponse,
-                  latestUserTranscript == transcript,
-                  advice.action == .recommendTool,
-                  let tool = advice.toolName,
-                  L2CognitiveToolPolicy.knownToolNames.contains(tool) else {
-                return false
-            }
-            if tool == "capture_view" {
-                return send([
-                    "type": "begin_visual_turn",
-                    "taskID": advice.turnID.uuidString.lowercased(),
-                    "data": String(transcript.prefix(4_096)),
-                    "tool": tool,
-                ])
-            }
-            let quote = advice.groundingQuote ?? ""
-            guard !assistantOutputStartedForTurn else { return false }
-            let instruction = """
-            SOMA_L1_TOOL_ADVISORY
-            This is private current-turn control context, not participant speech and not text to recite. L1 independently determined that the latest participant turn requires the SOMA MCP tool `\(tool)` before a grounded answer. The grounding phrase was: "\(quote)". Hand this exact participant turn to backing Codex and require it to call `\(tool)` silently before composing the sole final response. The realtime presentation model must emit no acknowledgement or parallel answer. Do not substitute a verbal promise, inferred result, or another tool. If the call fails or is unavailable, the sole final response must report that concrete failure briefly. This advisory expires with the current participant turn.
-            """
-            return send([
-                "type": "append_instruction",
-                "taskID": advice.turnID.uuidString.lowercased(),
-                "data": String(instruction.prefix(4_096)),
-                "tool": tool,
-            ])
-        }
-    }
-
     private func sendHermesTaskResult(_ task: HermesAgentTask) -> Bool {
         guard active,
               task.status == .completed,
@@ -983,26 +825,17 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         at monotonicNS: UInt64
     ) {
         inputTransportReported = false
-        pendingOpeningAudio.removeAll(keepingCapacity: true)
         pendingLiveAudio.removeAll(keepingCapacity: true)
-        openingAudioPlayoutGate.reset()
-        pendingOpeningAudioItemID = nil
-        liveInputTrackReady = false
-        openingVisualContextAttached = false
-        awaitingAssistantResponse = false
+        latestParticipantTurnGeneration = 0
+        awaitingAssistantResponseGeneration = nil
         latestUserTranscriptNS = nil
-        latestUserTranscript = ""
-        assistantOutputStartedForTurn = false
-        assistantResponseInProgress = false
-        assistantPlaybackActive = false
+        assistantResponseGeneration = nil
+        assistantPlaybackGeneration = nil
         inputLeveler.reset()
         resetDuplexCaptureState()
         activeTurnAudioAdmitted = false
-        initialTranscriptTimer?.cancel()
-        initialTranscriptTimer = nil
-        initialTurnValidation.begin(
-            origin: proactiveOpeningText?.isEmpty == false ? .proactive : .participantContact
-        )
+        participantContactOpening = proactiveOpeningText?.isEmpty != false
+        openingParticipantInputObserved = false
         proactiveOpeningAwaitingParticipant = proactiveOpeningText?.isEmpty == false
         proactiveOpeningDelivered = false
         let persistentEndpoint: URL?
@@ -1040,8 +873,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         let effectivePreferredLanguageTag = voiceMode.forcesEnglish
             ? "en"
             : (preferredLanguageTag ?? "")
-        activePreferredLanguageTag = effectivePreferredLanguageTag
-        activeInteractionAuthority = interactionAuthority
         let effectiveLanguageStartInstruction = voiceMode.forcesEnglish
             ? ""
             : (languageStartInstruction ?? "")
@@ -1056,7 +887,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             "proactiveOpeningText": proactiveOpeningText ?? "",
             "interactionAuthority": interactionAuthority?.rawValue ?? "",
             "personContextReference": personContextReference?.uuidString.lowercased() ?? "",
-            "cameraContextAutoInjected": cameraContextAutoInjection,
             "codexSandbox": somaEnvString("SOMA_L2_CODEX_SANDBOX", default: "danger-full-access"),
             "codexAdminOnly": somaEnvBool("SOMA_L2_CODEX_ADMIN_ONLY", default: false),
             "hermesAgentDelegationEnabled": hermesAgentDelegationEnabled,
@@ -1101,43 +931,22 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 }
                 activeThreadID = event.threadID
                 gate.observeActive()
-                openingAudioPlayoutGate.observeSessionActive()
                 let activeNS = DispatchTime.now().uptimeNanoseconds
                 armInactivityTimeout(at: activeNS)
-                pendingOpeningAudio.append(contentsOf: initiatingTurn)
                 if !requireVerifiedSpeakerForEveryTurn || !speakerEpisodeInProgress {
                     speakerEpisodeAudio.end()
                 }
-                initiatingTurn.removeAll(keepingCapacity: true)
                 capturingInitiatingTurn = false
-                submitPendingOpeningAudioIfReady()
                 onEvent(.active(threadID: event.threadID, personEntityID: activePersonEntityID))
             case "audio_input_ready":
                 liveInputTrackReady = true
-                openingAudioPlayoutGate.observeInputTrackReady()
                 let buffered = pendingLiveAudio
                 pendingLiveAudio.removeAll(keepingCapacity: true)
                 for chunk in buffered { _ = sendBufferedAudio(chunk) }
-                submitPendingOpeningAudioIfReady()
             case "audio_input_progress":
                 guard !inputTransportReported else { continue }
                 inputTransportReported = true
                 onEvent(.inputTransportStarted)
-            case "opening_audio_queued":
-                guard let rawItemID = event.itemID,
-                      let itemID = UUID(uuidString: rawItemID),
-                      itemID == pendingOpeningAudioItemID else { continue }
-                onEvent(.inputBootstrapQueued(itemID: itemID))
-            case "opening_audio_drained":
-                guard let rawItemID = event.itemID,
-                      let itemID = UUID(uuidString: rawItemID),
-                      itemID == pendingOpeningAudioItemID else { continue }
-                pendingOpeningAudioItemID = nil
-                initialTurnValidation.observeInitialAudioTransportProgress()
-                armInitialTranscriptTimeout(at: DispatchTime.now().uptimeNanoseconds)
-                onEvent(.inputBootstrapPlayed(itemID: itemID))
-            case "opening_audio_rejected":
-                failCurrent(reason: event.reason ?? "opening_audio_rejected")
             case "output_playback_ready":
                 onEvent(.outputPlaybackReady(
                     mode: String((event.mode ?? "unknown").prefix(64)),
@@ -1161,10 +970,16 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             case "natural_turn_taking_confirmed":
                 onEvent(.naturalTurnTakingConfirmed)
             case "response_interrupted":
-                finishAssistantGeneration(at: DispatchTime.now().uptimeNanoseconds)
+                finishAssistantGeneration(
+                    generation: event.turnGeneration,
+                    at: DispatchTime.now().uptimeNanoseconds
+                )
                 onEvent(.responseInterrupted)
             case "interrupted_audio_cleared":
-                finishAssistantPlayback(at: DispatchTime.now().uptimeNanoseconds)
+                finishAssistantPlayback(
+                    generation: event.turnGeneration,
+                    at: DispatchTime.now().uptimeNanoseconds
+                )
                 onEvent(.interruptedAudioCleared)
             case "proactive_opening_triggered":
                 onEvent(.proactiveOpeningTriggered)
@@ -1174,36 +989,19 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 // the durable record, but an overlapping answer must not be
                 // mistaken for unsolicited extra model speech.
                 proactiveOpeningAwaitingParticipant = false
-                confirmInitialParticipantInput()
+                if let turnGeneration = event.turnGeneration {
+                    latestParticipantTurnGeneration = max(
+                        latestParticipantTurnGeneration,
+                        turnGeneration
+                    )
+                }
+                observeOpeningParticipantInput()
                 onEvent(.hearingUser)
             case "realtime_event_type":
                 onEvent(.realtimeEventType(type: String((event.type ?? "unknown").prefix(128))))
             case "input_transcription_failed":
                 onEvent(.inputTranscriptionFailed(
                     reason: String((event.reason ?? "realtime_input_transcription_failed").prefix(192))
-                ))
-            case "visual_context_attached":
-                onEvent(.visualContextAttached)
-            case "visual_context_rejected":
-                onEvent(.visualContextRejected(reason: String((event.reason ?? "unknown").prefix(192))))
-            case "visual_turn_barrier":
-                onEvent(.visualTurnBarrier(
-                    state: String((event.state ?? "unknown").prefix(64)),
-                    episodeID: event.taskID.flatMap(UUID.init(uuidString:)),
-                    reason: String((event.reason ?? "unknown").prefix(192))
-                ))
-            case "embodiment_mcp_ready":
-                onEvent(.embodimentMCPReady)
-            case "embodiment_mcp_unavailable":
-                onEvent(.embodimentMCPUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
-            case "hermes_delegation_ack_spoken":
-                if let rawID = event.taskID, let taskID = UUID(uuidString: rawID) {
-                    onEvent(.hermesDelegationAcknowledgementSpoken(taskID: taskID))
-                }
-            case "hermes_delegation_ack_rejected":
-                onEvent(.hermesDelegationAcknowledgementRejected(
-                    taskID: event.taskID.flatMap(UUID.init(uuidString:)),
-                    reason: String((event.reason ?? "unknown").prefix(192))
                 ))
             case "hermes_task_result_accepted":
                 if let rawID = event.taskID, let taskID = UUID(uuidString: rawID) {
@@ -1218,10 +1016,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     taskID: event.taskID.flatMap(UUID.init(uuidString:)),
                     reason: String((event.reason ?? "unknown").prefix(192))
                 ))
-            case "person_context_ready":
-                onEvent(.personContextReady)
-            case "person_context_unavailable":
-                onEvent(.personContextUnavailable(reason: String((event.reason ?? "unknown").prefix(192))))
             case "embodiment_mcp_call":
                 let tool = String((event.tool ?? "unknown").prefix(96))
                 let status = String((event.status ?? "unknown").prefix(48))
@@ -1231,38 +1025,9 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     status: status,
                     error: error?.isEmpty == false ? String(error!.prefix(192)) : nil
                 ))
-            case "l1_tool_advice_attached":
-                onEvent(.l1ToolAdviceAttached(tool: String((event.tool ?? "unknown").prefix(96))))
-            case "l1_tool_advice_rejected":
-                onEvent(.l1ToolAdviceRejected(
-                    tool: String((event.tool ?? "unknown").prefix(96)),
-                    reason: String((event.reason ?? "unknown").prefix(192))
-                ))
-            case "backing_turn_started":
-                onEvent(.backingTurnStarted(
-                    turnID: String((event.turnID ?? "unknown").prefix(128)),
-                    sequence: event.turnSequence ?? 0
-                ))
-            case "backing_turn_completed":
-                onEvent(.backingTurnCompleted(
-                    turnID: String((event.turnID ?? "unknown").prefix(128)),
-                    sequence: event.turnSequence ?? 0,
-                    status: String((event.status ?? "unknown").prefix(48)),
-                    error: event.error.map { String($0.prefix(192)) }
-                ))
-            case "managed_handoff_response_spoken", "managed_handoff_response_rejected",
-                 "managed_handoff_response_retrying", "managed_handoff_response_held":
-                onEvent(.managedResponse(
-                    state: event.event,
-                    sequence: event.turnSequence ?? 0,
-                    kind: String((event.kind ?? "unknown").prefix(64)),
-                    reason: event.reason.map { String($0.prefix(192)) }
-                ))
-            case "response_deadline_expired":
-                onEvent(.responseDeadlineExpired(sequence: event.turnSequence ?? 0))
             case "input_transcript_ready":
                 if (event.characters ?? 0) > 0 {
-                    confirmInitialParticipantInput()
+                    observeOpeningParticipantInput()
                 }
                 onEvent(.inputAccepted(characters: max(0, event.characters ?? 0)))
             case "transcript_partial":
@@ -1287,13 +1052,22 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                         proactiveOpeningDelivered = true
                     }
                 } else {
-                    confirmInitialParticipantInput()
+                    observeOpeningParticipantInput()
                     proactiveOpeningAwaitingParticipant = false
                     let now = DispatchTime.now().uptimeNanoseconds
-                    awaitingAssistantResponse = true
+                    let turnGeneration: UInt64
+                    if let supplied = event.turnGeneration {
+                        turnGeneration = supplied
+                    } else {
+                        let next = latestParticipantTurnGeneration &+ 1
+                        turnGeneration = next == 0 ? 1 : next
+                    }
+                    latestParticipantTurnGeneration = max(
+                        latestParticipantTurnGeneration,
+                        turnGeneration
+                    )
+                    awaitingAssistantResponseGeneration = turnGeneration
                     latestUserTranscriptNS = now
-                    latestUserTranscript = String(text.prefix(4_096))
-                    assistantOutputStartedForTurn = false
                     recordUserActivity(at: now)
                     onEvent(.inputAccepted(characters: text.count))
                 }
@@ -1303,28 +1077,28 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                     text: String(text.prefix(8_192))
                 ))
             case "response_preparing":
-                if !initialTurnValidation.permitsAssistantResponse {
-                    _ = closeSession(reason: "participant_input_unconfirmed_before_response")
-                    continue
-                }
-                beginAssistantGeneration()
+                // Realtime can create its response before publishing a separate
+                // transcript event. Response creation itself proves that the
+                // participant input was accepted; never terminate a valid native
+                // Live turn because those asynchronous events arrived in the
+                // opposite order.
+                observeOpeningParticipantInput()
+                guard beginAssistantGeneration(generation: event.turnGeneration) else { continue }
                 onEvent(.preparingResponse)
             case "output_speech_started":
-                if !initialTurnValidation.permitsAssistantResponse {
-                    _ = closeSession(reason: "participant_input_unconfirmed_before_output")
-                    continue
-                }
+                observeOpeningParticipantInput()
                 echoReferenceMatcher.reset()
                 lastEchoRelationship = nil
                 outputReferenceReported = false
-                assistantOutputStartedForTurn = true
                 let outputStartedNS = DispatchTime.now().uptimeNanoseconds
-                beginAssistantPlayback()
+                let turnGeneration = resolvedResponseGeneration(event.turnGeneration)
+                guard beginAssistantPlayback(generation: turnGeneration) else { continue }
                 duplexCaptureGate.beginAssistantOutput(at: outputStartedNS)
                 bargeInEpisodeBoundary.beginAssistantOutput(at: outputStartedNS)
                 onEvent(.microphoneCaptureSuppressed)
                 onEvent(.assistantSpeechStarted)
-                if let latestUserTranscriptNS {
+                if awaitingAssistantResponseGeneration == turnGeneration,
+                   let latestUserTranscriptNS {
                     let now = DispatchTime.now().uptimeNanoseconds
                     onEvent(.responseStarted(
                         latencyMilliseconds: elapsedMilliseconds(
@@ -1332,14 +1106,18 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                             to: now
                         )
                     ))
+                    awaitingAssistantResponseGeneration = nil
                     self.latestUserTranscriptNS = nil
                 }
                 onEvent(.responding)
             case "output_speech_ended":
                 let outputEndedNS = DispatchTime.now().uptimeNanoseconds
+                guard finishAssistantPlayback(
+                    generation: event.turnGeneration ?? assistantPlaybackGeneration,
+                    at: outputEndedNS
+                ) else { continue }
                 duplexCaptureGate.endAssistantOutput(at: outputEndedNS)
                 bargeInEpisodeBoundary.endAssistantOutput()
-                finishAssistantPlayback(at: outputEndedNS)
                 onEvent(.assistantSpeechEnded)
             case "assistant_output_reference":
                 guard let data = event.data,
@@ -1372,8 +1150,11 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
                 // Generation can complete before the remote playback buffer
                 // drains, so microphone capture resumes only when playback
                 // reports output_speech_ended.
-                finishAssistantResponseIfNeeded(at: DispatchTime.now().uptimeNanoseconds)
-                onEvent(.responseCompleted)
+                let completedCurrentTurn = finishAssistantResponseIfNeeded(
+                    generation: event.turnGeneration,
+                    at: DispatchTime.now().uptimeNanoseconds
+                )
+                if completedCurrentTurn { onEvent(.responseCompleted) }
             case "ended":
                 guard active || gate.phase == .starting else { continue }
                 let threadID = event.threadID ?? activeThreadID
@@ -1431,38 +1212,10 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         ))
     }
 
-    private func confirmInitialParticipantInput() {
-        let shouldAttachOpeningVisualContext = initialTurnValidation.isUnconfirmedParticipantOpening
-        initialTurnValidation.confirmParticipantInput()
-        initialTranscriptTimer?.cancel()
-        initialTranscriptTimer = nil
-        if shouldAttachOpeningVisualContext {
-            enqueueOpeningCameraImageIfEnabled()
-        }
-    }
-
-    private func armInitialTranscriptTimeout(at monotonicNS: UInt64) {
-        initialTranscriptTimer?.cancel()
-        initialTranscriptTimer = nil
-        guard let deadline = initialTurnValidation.observeTransportActive(at: monotonicNS) else {
-            return
-        }
-        let remainingNS = deadline > monotonicNS ? deadline - monotonicNS : 0
-        let work = DispatchWorkItem { [weak self] in
-            self?.closeForMissingInitialTranscript(at: DispatchTime.now().uptimeNanoseconds)
-        }
-        initialTranscriptTimer = work
-        queue.asyncAfter(
-            deadline: .now() + .nanoseconds(Int(min(remainingNS, UInt64(Int.max)))),
-            execute: work
-        )
-    }
-
-    private func closeForMissingInitialTranscript(at monotonicNS: UInt64) {
-        guard initialTurnValidation.shouldCloseForMissingTranscript(at: monotonicNS) else {
-            return
-        }
-        _ = closeSession(reason: "initial_participant_transcript_timeout")
+    private func observeOpeningParticipantInput() {
+        guard participantContactOpening,
+              !openingParticipantInputObserved else { return }
+        openingParticipantInputObserved = true
     }
 
     private func recordUserActivity(at monotonicNS: UInt64) {
@@ -1470,32 +1223,56 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
         armInactivityTimeout(at: monotonicNS)
     }
 
-    private func beginAssistantGeneration() {
-        assistantResponseInProgress = true
-        suspendUserSilenceTimeoutForAssistant()
+    private func resolvedResponseGeneration(_ supplied: UInt64?) -> UInt64 {
+        supplied
+            ?? awaitingAssistantResponseGeneration
+            ?? assistantResponseGeneration
+            ?? latestParticipantTurnGeneration
     }
 
-    private func beginAssistantPlayback() {
-        assistantPlaybackActive = true
+    @discardableResult
+    private func beginAssistantGeneration(generation supplied: UInt64?) -> Bool {
+        let generation = resolvedResponseGeneration(supplied)
+        guard generation >= latestParticipantTurnGeneration else { return false }
+        assistantResponseGeneration = generation
         suspendUserSilenceTimeoutForAssistant()
+        return true
     }
 
-    private func finishAssistantGeneration(at monotonicNS: UInt64) {
-        assistantResponseInProgress = false
+    @discardableResult
+    private func beginAssistantPlayback(generation: UInt64) -> Bool {
+        guard generation >= latestParticipantTurnGeneration else { return false }
+        assistantPlaybackGeneration = generation
+        suspendUserSilenceTimeoutForAssistant()
+        return true
+    }
+
+    private func finishAssistantGeneration(generation: UInt64?, at monotonicNS: UInt64) {
+        guard let generation, assistantResponseGeneration == generation else { return }
+        assistantResponseGeneration = nil
         resumeUserSilenceTimeoutIfAssistantIdle(at: monotonicNS)
     }
 
-    private func finishAssistantPlayback(at monotonicNS: UInt64) {
-        assistantPlaybackActive = false
+    @discardableResult
+    private func finishAssistantPlayback(generation: UInt64?, at monotonicNS: UInt64) -> Bool {
+        guard let generation, assistantPlaybackGeneration == generation else { return false }
+        assistantPlaybackGeneration = nil
         resumeUserSilenceTimeoutIfAssistantIdle(at: monotonicNS)
+        return true
     }
 
-    private func finishAssistantResponseIfNeeded(at monotonicNS: UInt64) {
-        if awaitingAssistantResponse {
-            awaitingAssistantResponse = false
+    @discardableResult
+    private func finishAssistantResponseIfNeeded(
+        generation: UInt64?,
+        at monotonicNS: UInt64
+    ) -> Bool {
+        guard let generation else { return false }
+        if awaitingAssistantResponseGeneration == generation {
+            awaitingAssistantResponseGeneration = nil
             latestUserTranscriptNS = nil
         }
-        finishAssistantGeneration(at: monotonicNS)
+        finishAssistantGeneration(generation: generation, at: monotonicNS)
+        return generation == latestParticipantTurnGeneration
     }
 
     private func suspendUserSilenceTimeoutForAssistant() {
@@ -1506,8 +1283,8 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
 
     private func resumeUserSilenceTimeoutIfAssistantIdle(at monotonicNS: UInt64) {
         guard active,
-              !assistantResponseInProgress,
-              !assistantPlaybackActive,
+              assistantResponseGeneration == nil,
+              assistantPlaybackGeneration == nil,
               inactivityGate.endAssistantActivity(at: monotonicNS) != nil else { return }
         armInactivityTimeout(at: monotonicNS)
     }
@@ -1583,87 +1360,6 @@ final class AppServerLiveVoiceLauncher: @unchecked Sendable {
             "data": chunk.data,
             "sampleRate": chunk.sampleRate,
             "samplesPerChannel": chunk.samplesPerChannel,
-        ])
-    }
-
-    private func submitPendingOpeningAudioIfReady() {
-        guard openingAudioPlayoutGate.authorizePlayoutIfReady(
-            hasBufferedAudio: !pendingOpeningAudio.isEmpty
-        ) else { return }
-        let buffered = pendingOpeningAudio
-        pendingOpeningAudio.removeAll(keepingCapacity: true)
-        guard let sampleRate = buffered.first?.sampleRate,
-              buffered.allSatisfy({ $0.sampleRate == sampleRate }),
-              let trailingSilenceSamples = LiveVoiceOpeningAudioPolicy
-                .trailingSilenceSampleCount(sampleRate: sampleRate) else {
-            failCurrent(reason: "opening_audio_format_mismatch")
-            return
-        }
-        var pcm = Data()
-        pcm.reserveCapacity(
-            buffered.reduce(0) { $0 + ($1.samplesPerChannel * MemoryLayout<Int16>.size) }
-                + trailingSilenceSamples * MemoryLayout<Int16>.size
-        )
-        for chunk in buffered {
-            guard let decoded = Data(base64Encoded: chunk.data),
-                  decoded.count == chunk.samplesPerChannel * MemoryLayout<Int16>.size else {
-                failCurrent(reason: "opening_audio_decode_failed")
-                return
-            }
-            pcm.append(decoded)
-        }
-        pcm.append(Data(count: trailingSilenceSamples * MemoryLayout<Int16>.size))
-        let totalSamples = pcm.count / MemoryLayout<Int16>.size
-        guard totalSamples > trailingSilenceSamples,
-              totalSamples <= 1_500_000 else {
-            failCurrent(reason: "opening_audio_duration_out_of_range")
-            return
-        }
-        let durationMilliseconds = Double(buffered.reduce(0) { $0 &+ $1.durationNS }) / 1_000_000
-        let peakDBFS = buffered.map(\.inputPeakDBFS).max() ?? -.infinity
-        let maximumGainDB = buffered.map(\.appliedGainDB).max() ?? 0
-        let itemID = UUID()
-        pendingOpeningAudioItemID = itemID
-        guard send([
-            "type": "append_opening_audio",
-            "data": pcm.base64EncodedString(),
-            "sampleRate": sampleRate,
-            "samplesPerChannel": totalSamples,
-            "itemID": itemID.uuidString.lowercased(),
-        ]) else {
-            pendingOpeningAudioItemID = nil
-            failCurrent(reason: "opening_audio_transport_failed")
-            return
-        }
-        initialTurnValidation.observeInitialAudioSubmitted()
-        onEvent(.inputBootstrapSubmitted(
-            itemID: itemID,
-            durationMilliseconds: durationMilliseconds,
-            trailingSilenceMilliseconds: Double(
-                LiveVoiceOpeningAudioPolicy.trailingSilenceMilliseconds
-            ),
-            peakDBFS: peakDBFS,
-            maximumGainDB: maximumGainDB
-        ))
-    }
-
-    /// One opening frame grounds a user-initiated conversation without making
-    /// every speech onset a permanent item in the realtime thread.
-    private func enqueueOpeningCameraImageIfEnabled() {
-        guard cameraContextAutoInjection else { return }
-        enqueueOpeningCameraImage()
-    }
-
-    private func enqueueOpeningCameraImage() {
-        guard active,
-              !openingVisualContextAttached,
-              let currentCameraImageDataURI,
-              let dataURI = currentCameraImageDataURI(),
-              dataURI.utf8.count <= 4 * 1_048_576 else { return }
-        openingVisualContextAttached = true
-        send([
-            "type": "append_image",
-            "data": dataURI,
         ])
     }
 
@@ -1895,19 +1591,9 @@ func testAppServerLiveVoiceLauncher() -> String {
         case .localHelperPrepared, .localHelperUnavailable,
              .launchRequested, .inputTransportStarted, .outputPlaybackReady,
              .audioPlayoutSourceSelected, .audioPlayoutStatus,
-             .inputBootstrapSubmitted, .inputBootstrapQueued, .inputBootstrapPlayed,
              .responseInterrupted, .interruptedAudioCleared, .proactiveOpeningTriggered,
              .proactiveOpeningExtraOutputSuppressed, .hermesReportOfferStarted, .hearingUser,
-             .visualContextAttached, .visualContextRejected, .visualTurnBarrier,
-             .embodimentMCPReady, .embodimentMCPUnavailable, .personContextReady,
-             .hermesDelegationAcknowledgementRequested,
-             .hermesDelegationAcknowledgementSpoken,
-             .hermesDelegationAcknowledgementRejected,
-             .hermesTaskResultAccepted, .hermesTaskResultRejected,
-             .personContextUnavailable, .embodimentMCPCall,
-             .l1ToolAdviceAttached, .l1ToolAdviceRejected,
-             .backingTurnStarted, .backingTurnCompleted,
-             .managedResponse, .responseDeadlineExpired,
+             .hermesTaskResultAccepted, .hermesTaskResultRejected, .embodimentMCPCall,
              .inputAccepted, .realtimeEventType, .inputTranscriptionFailed,
              .transcriptPartial, .transcriptFinalized, .preparingResponse, .responseStarted,
              .assistantSpeechStarted, .assistantSpeechEnded,

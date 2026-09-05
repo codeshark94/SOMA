@@ -114,127 +114,81 @@ struct LiveVoiceConversationControlTests {
     }
 
     @Test
-    func localTransportPreparationOverlapsCapabilitySnapshot() {
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
+    func localTransportPreparationDoesNotWaitForRemoteThread() {
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsTransportPreparation(
             webViewReady: true,
-            threadReady: true,
             transportAlreadyStarted: false
         ))
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
-            webViewReady: true,
-            threadReady: false,
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsTransportPreparation(
+            webViewReady: false,
             transportAlreadyStarted: false
         ) == false)
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsTransportPreparation(
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsTransportPreparation(
             webViewReady: true,
-            threadReady: true,
             transportAlreadyStarted: true
         ) == false)
     }
 
     @Test
-    func remoteRealtimeWaitsForOfferAndBoundedCapabilitySnapshot() {
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+    func remoteRealtimeStartsAsSoonAsOfferIsReady() {
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsRealtimeStart(
             offerReady: true,
-            capabilityVerificationFinished: false,
-            realtimeAlreadyStarted: false
-        ) == false)
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
-            offerReady: true,
-            capabilityVerificationFinished: true,
             realtimeAlreadyStarted: false
         ))
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsRealtimeStart(
             offerReady: false,
-            capabilityVerificationFinished: true,
             realtimeAlreadyStarted: false
         ) == false)
-        #expect(LiveVoiceEmbodimentStartupPolicy.permitsRealtimeStart(
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsRealtimeStart(
             offerReady: true,
-            capabilityVerificationFinished: true,
             realtimeAlreadyStarted: true
         ) == false)
     }
 
     @Test
-    func openingAudioWaitsForRemoteSessionAndInputTrackThenPlaysOnce() {
-        var gate = LiveVoiceOpeningAudioPlayoutGate()
-        let beforeActive = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
-        #expect(beforeActive == false)
-        gate.observeSessionActive()
-        let beforeInput = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
-        #expect(beforeInput == false)
-        gate.observeInputTrackReady()
-        let empty = gate.authorizePlayoutIfReady(hasBufferedAudio: false)
-        #expect(empty == false)
-        let submitted = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
-        #expect(submitted)
-        let duplicate = gate.authorizePlayoutIfReady(hasBufferedAudio: true)
-        #expect(duplicate == false)
+    func openingAudioCanQueueBeforeRemoteThreadExists() {
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsAudioEnqueue(webViewReady: true))
+        #expect(LiveVoiceRealtimeStartupPolicy.permitsAudioEnqueue(webViewReady: false) == false)
     }
 
     @Test
-    func openingAudioAddsAStableServerVADOffsetBoundary() {
-        #expect(LiveVoiceOpeningAudioPolicy.trailingSilenceSampleCount(sampleRate: 48_000) == 23_040)
-        #expect(LiveVoiceOpeningAudioPolicy.trailingSilenceSampleCount(sampleRate: 24_000) == 11_520)
-        #expect(LiveVoiceOpeningAudioPolicy.trailingSilenceSampleCount(sampleRate: 7_999) == nil)
+    func staleResponseCompletionCannotCloseNewerBargeInTurn() {
+        var tracker = LiveVoiceResponseTurnTracker()
+        let first = tracker.beginParticipantTurn()
+        #expect(first == 1)
+        #expect(tracker.observeResponseStarted(responseID: "response-a") == first)
+
+        let second = tracker.beginParticipantTurn()
+        #expect(second == 2)
+        #expect(tracker.observeResponseStarted(responseID: "response-b") == second)
+
+        #expect(tracker.completeResponse(responseID: "response-a") == .stale(
+            generation: first,
+            currentGeneration: second
+        ))
+        #expect(tracker.participantTurnOpen)
+        #expect(tracker.completeResponse(responseID: "response-b") == .current(
+            generation: second
+        ))
+        #expect(tracker.participantTurnOpen == false)
     }
 
     @Test
-    func oneParticipantTurnHasOneAudibleResponseOwner() {
-        #expect(LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: true,
-            realtimeResponseSpoken: false,
-            successfulExternalDelegation: false,
-            containsAuthoritativeBackingWork: false,
-            turnStatus: .completed
-        ) == .appendFinalSpeech)
-        #expect(LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: true,
-            realtimeResponseSpoken: true,
-            successfulExternalDelegation: false,
-            containsAuthoritativeBackingWork: false,
-            turnStatus: .completed
-        ) == .retainExistingRealtimeResponse)
-        #expect(LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: true,
-            realtimeResponseSpoken: false,
-            successfulExternalDelegation: true,
-            containsAuthoritativeBackingWork: true,
-            turnStatus: .completed
-        ) == .externalDelegationOwnsResponse)
-        #expect(LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: false,
-            realtimeResponseSpoken: false,
-            successfulExternalDelegation: false,
-            containsAuthoritativeBackingWork: false,
-            turnStatus: .completed
-        ) == .appendRecoverySpeech(.emptyResult))
-        #expect(LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: true,
-            realtimeResponseSpoken: true,
-            successfulExternalDelegation: false,
-            containsAuthoritativeBackingWork: true,
-            turnStatus: .completed
-        ) == .appendFinalSpeech)
-        #expect(LiveVoiceHandoffResponsePolicy.disposition(
-            hasAgentMessage: false,
-            realtimeResponseSpoken: false,
-            successfulExternalDelegation: false,
-            containsAuthoritativeBackingWork: true,
-            turnStatus: .failed
-        ) == .appendRecoverySpeech(.failed))
+    func duplicateResponseStartRetainsOriginalTurnBinding() {
+        var tracker = LiveVoiceResponseTurnTracker()
+        let first = tracker.beginParticipantTurn()
+        #expect(tracker.observeResponseStarted(responseID: "response-a") == first)
+        _ = tracker.beginParticipantTurn()
+        #expect(tracker.observeResponseStarted(responseID: "response-a") == first)
     }
 
     @Test
-    func failedBackingTurnsHaveLocalizedAudibleRecovery() {
-        #expect(LiveVoiceTurnRecoveryResponse.phrase(
-            kind: .failed,
-            languageTag: "ko-KR"
-        ) == "요청을 처리하는 중 오류가 발생했습니다.")
-        #expect(LiveVoiceTurnRecoveryResponse.phrase(
-            kind: .timedOut,
-            languageTag: "en-US"
-        ) == "That request took too long, so I stopped it.")
+    func uncorrelatedCompletionCannotCloseCurrentTurn() {
+        var tracker = LiveVoiceResponseTurnTracker()
+        _ = tracker.beginParticipantTurn()
+        #expect(tracker.completeResponse(responseID: nil) == .uncorrelated)
+        #expect(tracker.completeResponse(responseID: "unknown") == .uncorrelated)
+        #expect(tracker.participantTurnOpen)
     }
+
 }

@@ -303,6 +303,8 @@ private struct DelegateHermesTaskArguments: Codable {
     let title: String?
     let objective: String
     let workingDirectory: String?
+    let workClass: HermesDelegatedWorkClass
+    let acceptanceCriteria: String
 
     var resolvedTitle: String {
         if let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -315,6 +317,17 @@ private struct DelegateHermesTaskArguments: Codable {
             .map(String.init)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "External task"
         return String((firstLine.isEmpty ? "External task" : firstLine).prefix(160))
+    }
+
+    func validate() throws {
+        if let error = L2TaskRoutingPolicy.hermesDelegationValidationError(
+            workClass: workClass,
+            objective: objective,
+            acceptanceCriteria: acceptanceCriteria,
+            workingDirectory: workingDirectory
+        ) {
+            throw ServerFailure.invalidArguments(error)
+        }
     }
 }
 
@@ -460,12 +473,9 @@ private final class EmbodimentMCPServer {
                 }
             } else {
                 arguments.removeValue(forKey: "cognitive_intent")
-                let gatewayGoalEpisodeID = name == "delegate_hermes_task"
-                    ? deterministicGatewayGoalEpisodeID(toolName: name, arguments: arguments)
-                    : gatewayReadGoalEpisodeID
                 guard let gatewayIntent = L2CognitiveToolPolicy.gatewayIntent(
                     for: name,
-                    goalEpisodeID: gatewayGoalEpisodeID
+                    goalEpisodeID: gatewayReadGoalEpisodeID
                 ) else {
                     write(result: toolFailure("tool has no gateway authorization policy: \(name)"), id: id)
                     return
@@ -693,6 +703,7 @@ private final class EmbodimentMCPServer {
             )
         case "delegate_hermes_task":
             let value: DelegateHermesTaskArguments = try decode(toolArguments)
+            try value.validate()
             return try EmbodimentShadowSocketClient.send(
                 .init(
                     kind: .hermesAgentTask,
@@ -701,7 +712,9 @@ private final class EmbodimentMCPServer {
                         goalEpisodeID: cognitiveIntent.goalEpisodeID,
                         title: value.resolvedTitle,
                         objective: value.objective,
-                        workingDirectory: value.workingDirectory
+                        workingDirectory: value.workingDirectory,
+                        workClass: value.workClass,
+                        acceptanceCriteria: value.acceptanceCriteria
                     ),
                     sessionAuthorization: sessionAuthorization
                 ),
@@ -1172,31 +1185,6 @@ private final class EmbodimentMCPServer {
         return Self.sha256(data)
     }
 
-    /// Gateway-authored policy envelopes are deterministic within one live
-    /// session. Retrying the same semantic request therefore reaches the
-    /// durable Hermes deduplication boundary instead of creating a second job.
-    private func deterministicGatewayGoalEpisodeID(
-        toolName: String,
-        arguments: [String: Any]
-    ) -> UUID {
-        let seed: [String: Any] = [
-            "session": sessionAuthorization ?? "unbound",
-            "tool": toolName,
-            "arguments": Self.semanticArguments(arguments),
-        ]
-        let data = (try? JSONSerialization.data(withJSONObject: seed, options: [.sortedKeys]))
-            ?? Data("unencodable".utf8)
-        var bytes = Array(SHA256.hash(data: data).prefix(16))
-        bytes[6] = (bytes[6] & 0x0F) | 0x50
-        bytes[8] = (bytes[8] & 0x3F) | 0x80
-        return UUID(uuid: (
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[8], bytes[9], bytes[10], bytes[11],
-            bytes[12], bytes[13], bytes[14], bytes[15]
-        ))
-    }
-
     private static func semanticArguments(_ value: Any) -> Any {
         if let dictionary = value as? [String: Any] {
             return dictionary.reduce(into: [String: Any]()) { result, entry in
@@ -1412,7 +1400,7 @@ private final class EmbodimentMCPServer {
             ),
             tool(
                 "control_host_computer",
-                "Administrator-only: perform exactly one immediate pointer, scroll, text, or supported-key action on the Mac after an explicit request. Observe the current screen first when coordinates matter. Use Hermes instead for shell, files, repositories, research, services, or multi-step background work.",
+                "Administrator-only: perform exactly one immediate pointer, scroll, text, or supported-key action on the Mac after an explicit request. Observe the current screen first when coordinates matter. Bounded current-turn shell, file, and read-only host work stays with backing Codex; eligible durable repository, research, service, or supervised-process work uses Hermes.",
                 objectSchema([
                     "action": hostComputerActionSchema(),
                 ], required: ["action"])
@@ -1501,7 +1489,12 @@ private final class EmbodimentMCPServer {
                 "title": stringSchema(maxLength: 160),
                 "objective": stringSchema(maxLength: 24_000),
                 "working_directory": stringSchema(maxLength: 1_024),
-            ], required: ["objective"])),
+                "work_class": [
+                    "type": "string",
+                    "enum": HermesDelegatedWorkClass.allCases.map(\.rawValue),
+                ],
+                "acceptance_criteria": stringSchema(maxLength: 4_000),
+            ], required: ["objective", "work_class", "acceptance_criteria"])),
             tool("continue_hermes_task", "Continue a completed, failed, or input-blocked Hermes task in its preserved worker session after an explicit administrator request.", objectSchema([
                 "task_id": uuidSchema(),
                 "objective": stringSchema(maxLength: 24_000),

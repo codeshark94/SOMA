@@ -14,10 +14,6 @@ protocol L1ThoughtStreaming: AnyObject, Sendable {
         text: String,
         at monotonicNS: UInt64
     )
-    func submitLiveToolAdvice(
-        _ request: L1LiveToolAdviceRequest,
-        completion: @escaping @Sendable (Result<L1LiveToolAdvice, Error>) -> Void
-    )
     func wakeFromAuxiliary(_ interrupt: L1AuxiliarySemanticInterrupt)
     func stop()
 }
@@ -280,13 +276,6 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
                 driveSignal: MentalDriveSignal(socialInterest: -0.25, interruptionPressure: -1)
             ))
         }
-    }
-
-    func submitLiveToolAdvice(
-        _ request: L1LiveToolAdviceRequest,
-        completion: @escaping @Sendable (Result<L1LiveToolAdvice, Error>) -> Void
-    ) {
-        reasoner.submitLiveToolAdvice(request) { result, _ in completion(result) }
     }
 
     func invalidateMemoryContext(for entityID: UUID) {
@@ -1221,7 +1210,7 @@ final class PersistentConsciousnessStream: L1ThoughtStreaming, @unchecked Sendab
     private func record(_ transition: WorkspaceTransition, event: MentalEvidenceEvent) {
         onHealth(
             "evidence",
-            "id=\(event.id); kind=\(event.kind.rawValue); confidence=\(String(format: "%.2f", event.confidence)); novelty=\(String(format: "%.2f", event.novelty)); summary=\(event.summary)"
+            MentalEvidenceTraceProjection.message(for: event)
         )
         let changed = transition.delta.changedFields.isEmpty
             ? "none" : transition.delta.changedFields.joined(separator: ",")

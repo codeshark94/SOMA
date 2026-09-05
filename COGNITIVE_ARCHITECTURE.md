@@ -12,7 +12,7 @@ not imply that a language model is part of the real-time control loop.
 | Layer | Primary implementation | Responsibility | Authority |
 | --- | --- | --- | --- |
 | L0 subconscious | Local Core ML, temporal fusion, and deterministic control | Continuous perception, target continuity, VAD, spatial coverage, immediate motor control, and interaction-readiness evidence | Sole executor of hard real-time device commands and physical vetoes; supplies autonomous behaviour when no cognitive lease is active |
-| L1a persistent thought stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Evidence-grounded hypothesis maintenance, memory association, curiosity, self-correction, intentions, foreground-thought competition, and current-turn tool selection | May request bounded visual context and form an abstract intention or one validated tool advisory; cannot execute a tool, speak, or control the gimbal |
+| L1a persistent thought stream | Primary `gemma4:31b-cloud` plus optional local E2B visual helper | Evidence-grounded hypothesis maintenance, memory association, curiosity, self-correction, intentions, and foreground-thought competition | May request bounded visual context and form an abstract intention for its own workspace; cannot classify Live Voice turns, execute a tool, speak, or control the gimbal |
 | L1b executive judgment | A separate call to the same `gemma4:31b-cloud` route | Decides whether one current intention should become one currently permitted social or attention action | Broad leased control over labels, target priors, tracking, orientation, exploration policy, image acquisition, and expression; never sends device velocity directly |
 | L2 human interaction and executive reasoning | Codex account session with app-server GPT-Live WebRTC; explicit local fallback | Conversation, high-order reasoning, tool use, and delegation of user-requested external work | Opens directly from authorized L0 contact evidence, or from an L1-approved proactive opening; neither route waits on the other. It receives scoped text context, may pull image context through Codex/MCP, uses leased embodiment goals when observation or expression is needed, and may delegate explicit administrator work to the durable Hermes worker queue |
 
@@ -21,18 +21,15 @@ human or task context is active. E2B is a local semantic helper within that same
 stream, not an independent L0.5 consciousness or motor owner. L1 may invoke it
 when remote image disclosure is disallowed or a provisional local sketch is
 useful. E2B results remain provisional until the primary L1 cycle accepts or
-revises them. E2B is visual-only. During Live Voice, the primary 31B route uses
-Ollama's native function schema and `message.tool_calls` to recommend at most one
-currently available MCP tool for the active participant turn. The recommendation
-is validated and L2 retains execution authority.
+revises them. E2B is visual-only. During Live Voice, L1 remains outside the
+participant response path: it neither classifies finalized speech nor selects
+an L2 tool.
 
 The running `gemma4:31b-cloud` adapter uses Ollama's local `/api/chat`
 transport to reach the selected cloud route. One priority queue permits exactly
-one in-flight request: a current Live Voice tool-selection turn precedes L1b
-executive work, meaningful event-based L1a work, and periodic L1a reflection.
-Arrival of a current participant turn safely preempts and requeues background
-L1a/L1b inference; the newest Live Voice turn replaces an older live request.
-Event and periodic snapshots coalesce rather than forming a backlog. Raw
+one in-flight request across L1b executive work, meaningful event-based L1a
+work, and periodic L1a reflection. Event and periodic snapshots coalesce rather
+than forming a backlog. Raw
 biometric templates, unrestricted memory rows, and continuous camera media
 remain local by default.
 
@@ -53,7 +50,7 @@ flowchart LR
     Workspace --> L1A["L1a thought update"]
     L1A --> Competition["Probabilistic foreground competition"]
     Competition -->|"intention pressure"| L1B["L1b executive judgment"]
-    L0 -->|"authorized eye contact + speech"| Speech["Codex app-server GPT-Live WebRTC"]
+    L0 -->|"tracked live face + qualified speech"| Speech["Codex app-server GPT-Live WebRTC"]
     L1B -->|"purposeful spoken opening"| Speech
     Speech -->|"live conversation"| Codex["L2 Codex interaction and executive reasoning"]
     Codex -->|"live spoken response"| Speech
@@ -245,7 +242,7 @@ canonical database.
 
 | Horizon | Typical contents | Storage and lifecycle |
 | --- | --- | --- |
-| Short-term | Current scene graph, active tracks, exact recent L2 transcript turns, current goal, transient hypotheses, unresolved cues | Encrypted bounded recovery journal; raw transcript turns stay local until L1 consolidation and then expire by retention policy |
+| Short-term | Current scene graph, active tracks, exact recent L2 transcript turns, current goal, transient hypotheses, unresolved cues | Encrypted bounded recovery journal; exact turns remain local at rest, while bounded excerpts are disclosed only to asynchronous L1 situation and consolidation calls, then expire by retention policy |
 | Medium-term | Session episodes, recent visits, interaction episodes, task checkpoints, unresolved questions, rapport observations | Local episode store; retained by policy and periodically consolidated |
 | Long-term | Consented identities, familiar-space models, stable person facts and preferences, relationship history, completed task history, durable semantic knowledge | Local durable store with provenance, confidence, revision history, export, correction, and deletion |
 
@@ -323,9 +320,11 @@ before the model responds.
    encrypted short-term journal, linked only to opaque local participant
    references. It records explicit name, preferred-language, and proactive
    contact instructions through the owner-only person-context MCP before it
-   acknowledges them; raw transcript text never enters the trace or a remote
-   L1 packet.
-3. L1 is the default curator: it reads raw turns with situation context,
+   acknowledges them. Transcript text never enters the scalar trace or the
+   response-critical Live routing path; a bounded final-turn excerpt may enter
+   the asynchronous L1 situation stream.
+3. L1 is the default curator: after a session closes, it receives a bounded
+   transcript projection with situation context,
    resolves them against existing memory, and proposes typed episode, person,
    relationship, task, and open-question mutations.
 4. A deterministic validator checks schema, provenance, consent, sensitivity,
@@ -433,8 +432,9 @@ Vision landmarks provide a transient, non-identifying estimate from bilateral
 eyes and pupils, frontal yaw, and social-fovea alignment. The estimate is fresh
 for 450 ms. A greeting expression grants one response attempt for eight seconds.
 Only a confirmed app-server realtime session or a successful fallback handoff opens
-the conversation; 60 seconds without confirmed user activity closes the Live
-session. This separates ambient speech near a detected face from
+the conversation. The account-backed Live session remains warm for up to ten
+minutes without confirmed user activity so ordinary follow-ups do not repeatedly
+pay connection setup latency. This separates ambient speech near a detected face from
 speech addressed to SOMA without turning face detection into identity.
 
 `soma-event-eval` fits temperature on one partition and reports held-out
@@ -745,23 +745,31 @@ Voice process. The administrator's L2 session calls the local
 
 At session start L2 receives one execution-domain contract that distinguishes
 direct conversation, SOMA perception/embodiment, and external worker jobs.
-Host operating-system state, shell/process work, files, repositories, coding,
-services, APIs, and research belong to the external domain when the
-administrator explicitly requests the outcome. `get_robot_body_state` is
+Direct answers and bounded current-turn lookups, including one factual or
+web/API query, remain in the Codex conversation path. Durable artifacts,
+repository changes, sustained research, service management, and supervised
+process work belong to the external domain when the administrator explicitly
+requests the outcome. The submission schema admits only those durable work
+classes, requires concrete acceptance criteria, and requires a model-authored
+explicit-request intent instead of a gateway-generated authorization claim.
+`get_robot_body_state` is
 reserved for the robot body's L0 lease, attention target, and policy; it cannot
 stand in for host-computer inspection. An ambiguous administrator request for
 SOMA's current activity uses `get_activity_overview`, which combines robot-body
 state with result-free delegated-task summaries; detailed task results remain
 behind the explicit report workflow. A successful submission ends the tool
 turn immediately, leaves Live Voice listening, and never polls the worker from
-the spoken response path. L2 then gives one short spoken acceptance without
-reading the durable task ID. `turn/completed` is the protocol boundary: when it
-contains a completed `delegate_hermes_task` call but no assistant audio was
-observed for that turn, the controller injects one localized
-`SOMA_HERMES_DELEGATION_ACCEPTED` event. Individual `item/completed` events are
-also normalized immediately so a tool-level `ok: false` is not mistaken for a
-protocol-level completed call. Turn identity makes the acknowledgement fallback
-idempotent, while any acknowledgement already spoken suppresses it.
+the spoken response path. The standard App Server handoff owns its single brief
+acceptance and final-result delivery; SOMA does not inject, hydrate, retry, or
+time out a second client-managed response. Individual `item/completed` events
+are still normalized immediately so a tool-level `ok: false` is not mistaken
+for a protocol-level completed call.
+
+The persistent L1 mental workspace remains separate from this request path. It
+does not classify participant transcripts, preempt its cognition queue, inject
+tool advice into an active turn, or submit Hermes jobs. Current camera evidence
+and other bounded tool reads use the same normal Realtime-to-backing-Codex
+handoff as current web, API, or host-state lookups.
 
 Submission, continuation, cancellation, and every task read require an active
 administrator capability. Side-effecting operations additionally require a
@@ -828,7 +836,11 @@ ContextPacket
 ```
 
 The primary route is `--l2-live-voice`, using the installed app-server's
-`maple` voice. L0 evaluates local social evidence, and a human may
+`maple` voice. L0 opens an ordinary participant session from qualified speech
+near a currently tracked live face; it does not make direct gaze a startup
+latency gate. Stored identity and administrator authority are attached only
+when the same speech episode also has matched gaze and independent lip-motion
+or calibrated directional evidence. L0 evaluates local social evidence, and a human may
 also answer one recent SOMA social pulse. A dedicated helper starts the installed
 Codex app-server with `realtime_conversation`, creates an ephemeral
 `realtime_voice` thread that is not materialized in the Codex desktop task
@@ -845,9 +857,17 @@ visual speaker evidence can admit a barge-in. Ambiguous or matching playback
 stays quarantined; direct gaze remains an optional additional per-turn policy,
 not a universal interruption requirement. Neither reference nor microphone
 audio is persisted. Each finalized Live transcript turn is written into the
-encrypted short-term local journal; no raw transcript enters the scalar trace
-or remote L1 packet. L1 consolidation of those local turns into durable typed
-memories remains a separate pending pass.
+encrypted short-term local journal; no transcript enters the scalar trace or
+the Live response decision path. A bounded excerpt may be sent to the
+asynchronous L1 situation stream, and session closure sends a bounded transcript
+to L1 consolidation. There is no separate preference-extraction model call on
+finalization. Durable preference changes use the explicit person-context MCP
+path. Successful end-of-session consolidation writes a typed episode and
+supported facts, tasks, or open questions, then marks the contributing local
+turns as consolidated; failures leave them pending for recovery.
+Participant turns and assistant responses also carry a monotonic turn
+generation. A completion or cancellation from an interrupted older response
+cannot close the authority or playback bookkeeping of a newer barge-in turn.
 The installed realtime start path currently selects the `maple` voice and does
 not send a model override; the Codex app-server therefore owns the realtime
 model choice. `maple` is a voice, not a reasoning-model identifier.
@@ -867,8 +887,9 @@ as an image block and 60-second resource link to a Codex tool turn. The grounded
 result can be appended back to Live as text. Direct realtime image injection
 remains unclaimed.
 Closing an interaction releases embodiment leases, persists its observed social
-outcome, and finalizes the interaction state. Its raw local turns are ready for
-the same `gemma4:31b-cloud` consolidation stream when that pass is enabled.
+outcome, and finalizes the interaction state. Its bounded transcript is sent to
+the configured L1 consolidation stream; successful typed output is linked back
+to the encrypted turns, while failures remain recoverable and pending.
 Structured output will remain a proposal: L1 reconciles it with current memory
 and the deterministic validator owns the commit.
 
@@ -888,13 +909,13 @@ Official implementation references:
 | --- | --- | --- |
 | C0 L0 embodied baseline | Implemented; physical behaviour tuning continues | Bounded local perception/control traces, owner arbitration, and existing core checks |
 | C1 E2B L1 semantic helper | Worker implemented; opt-in visual evidence only | Direct-MLX bounded worker is advisory, consumes substantial unified memory, and has no independent layer, tool-selection authority, or motor lease |
-| C2 Memory contracts and store | Core, encrypted runtime store, L1 read projection, and finalized Live-turn ingestion implemented; consolidation remains pending | Versioned schemas, exact encrypted local L2 turns, L1 consolidation links, provenance/consent validator, encrypted short/medium/long store, correction, deletion, policy-filtered remote projection, and replay checks |
+| C2 Memory contracts and store | Core, encrypted runtime store, L1 read projection, finalized Live-turn ingestion, and end-of-session typed consolidation implemented | Versioned schemas, exact encrypted local L2 turns, recoverable L1 consolidation links, provenance/consent validator, encrypted short/medium/long store, correction, deletion, policy-filtered remote projection, and replay checks |
 | C3 Event-importance router | Core implemented; deployment labels and shadow integration pending | Versioned route probabilities, direct L2 interaction dispatch plus parallel L1 context, interaction/safety policy masks, 32-row bootstrap contract, calibration and false/missed-wake report; real labelled corpus still required |
 | C4 31B L1 conscious stream | Persistent workspace, separate L1a/L1b calls, adaptive stochastic reflection, selective restore, and installed cutover implemented; long soak and physical scenario matrix remain | Idempotent semantic evidence reduction, hypothesis lifecycle and confidence decay, canonical relationship uncertainty, seeded foreground competition, executive-first single-flight queue, revision-bound decisions, intention-episode idempotence, encrypted bounded checkpoint, and stale transient-state reset |
 | C5 Local embodiment MCP | Shadow transport implemented and deployed | MCP lifecycle plus thirteen schema-described tools; stdio to owner-only Unix socket; live L0 scene/atlas/state reply and scalar audit trace; no actuator writes |
 | C6 Leased embodiment actions | Implemented and physically validated | Target ownership, registration-before-tracking, priority preemption, independently scheduled expiry, owner release, explicit-scene permanence, probabilistic descriptor ambiguity, orient/grounded-track/policy-explore/active-view/social-expression execution, transient image return, labelled target reacquisition, and native stop/watchdog pass |
 | C7 Panoramic spatial memory | Learned fixed-base place memory and active mapping implemented; robustness evaluation pending | Capture-aligned spherical projection, bounded image registration, best-observation pixels, versioned Feature Print revisits, bounded cross-session persistence, information-gain reachable view planning, MCP map projection, static/dynamic separation and familiar-space evaluation |
-| C8 L0-to-L2 interaction bridge | Account-authenticated app-server GPT-Live WebRTC handshake implemented; physical conversation validation pending | Locally validated direct-contact opening, bot-pulse exception, V3 WebRTC session, one-second PCM pre-roll, purpose/context injection, duplicate-launch suppression, scalar audit, and an explicit local CLI/ASR/TTS fallback |
+| C8 L0-to-L2 interaction bridge | Account-authenticated app-server GPT-Live WebRTC handshake implemented; physical conversation validation pending | Tracked-live-face plus qualified-speech participant opening, separately verified identity/authority binding, bot-pulse exception, V3 WebRTC session, one-second PCM pre-roll, purpose/context injection, duplicate-launch suppression, scalar audit, and an explicit local CLI/ASR/TTS fallback |
 | C9 LED signalling | Firmware ABI and native L0 state wiring implemented; MCP tool and visual hue characterization pending | `rgb_palette=true`, `arbitrary_rgb=false`, allowlisted state set/clear, green contact-ready and blue human-presence palette states, brightness/enabled access, shutdown restore, semantic priority trace, and physical device acknowledgements |
 | C10 End-to-end social evaluation | Planned | Labelled explicit-contact, curiosity, dialogue, task, opt-out, memory-correction, and embodiment scenarios |
 

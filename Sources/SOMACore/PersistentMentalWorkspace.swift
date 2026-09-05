@@ -397,6 +397,15 @@ public struct MentalEvidenceEvent: Codable, Equatable, Sendable {
     }
 }
 
+/// A scalar diagnostic projection. Evidence summaries may contain transcript,
+/// memory, or visual semantics intended for cognition and must never be copied
+/// into the plaintext runtime trace.
+public enum MentalEvidenceTraceProjection {
+    public static func message(for event: MentalEvidenceEvent) -> String {
+        "id=\(event.id); kind=\(event.kind.rawValue); confidence=\(String(format: "%.2f", event.confidence)); novelty=\(String(format: "%.2f", event.novelty)); content=private"
+    }
+}
+
 public enum MentalHypothesisMutationOperation: String, Codable, CaseIterable, Hashable, Sendable {
     case propose
     case support

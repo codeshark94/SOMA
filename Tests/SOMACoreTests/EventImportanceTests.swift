@@ -386,75 +386,152 @@ final class EventImportanceTests: XCTestCase {
         )
     }
 
-    func testDirectContactIsRequiredToStartUserConversation() {
-        let start: UInt64 = 1_000_000_000
-        var gate = ConversationContactGate(configuration: .init(
-            conversationInactivityMilliseconds: 60_000
-        ))
-        XCTAssertEqual(
-            gate.observeVoiceActivity(active: true, at: start, directContact: false),
-            nil
+    func testQualifiedSpeechNearTrackedFaceOpensWithoutDirectGaze() {
+        var speakerGate = LiveVoiceSpeakerEpisodeGate(
+            openingSpeechConfiguration: .alignedWithDetectorThreshold(0.35)
         )
-        _ = gate.observeVoiceActivity(active: false, at: start + 1, directContact: false)
-        XCTAssertEqual(
-            gate.observeVoiceActivity(active: true, at: start + 2, directContact: true),
-            .voiceActivity
+        let speakerEpisode = speakerGate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: .init(
+                faceVisible: true,
+                directGaze: false,
+                mouthMotion: nil,
+                mouthSampleCount: 0,
+                directionMatchesFace: nil,
+                voiceConfidence: 0.80
+            ),
+            assessment: .init(classification: .ambiguous, probability: 0.45),
+            episodeOnsetNS: 1_000_000_000,
+            at: 1_000_000_000
         )
+        let admission = LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: true,
+            speechEvidenceQualified: speakerEpisode.speechEvidence.qualified,
+            speakerAttributionHardRejected: speakerEpisode.hardSpeakerRejection,
+            speakerEpisodeState: speakerEpisode.state
+        )
+
+        XCTAssertEqual(speakerEpisode.state, .pending)
+        XCTAssertTrue(admission.permitsParticipantSession)
+        XCTAssertFalse(admission.permitsRecognizedIdentity)
     }
 
-    func testNewConversationRequiresCurrentL0FixationRatherThanGazeHistory() {
-        let start: UInt64 = 1_000_000_000
-        var fixation = L0FaceFixationAdmission(freshnessMilliseconds: 500)
-        var conversation = ConversationContactGate()
-
-        // A detector can retain a direct-gaze history while L0 has already
-        // resumed coverage. Clearing the L0 fixation must make that history
-        // ineligible for a fresh voice session.
-        fixation.observeVerifiedFixation(
-            sceneID: "face-a",
-            directContact: true,
-            at: start
-        )
-        XCTAssertTrue(fixation.permitsNewSession(at: start + 100_000_000))
-        fixation.clear()
-        XCTAssertFalse(fixation.permitsNewSession(at: start + 120_000_000))
-        XCTAssertNil(
-            conversation.observeVoiceActivity(
-                active: true,
-                at: start + 120_000_000,
-                directContact: fixation.permitsNewSession(at: start + 120_000_000)
-            )
-        )
+    func testParticipantSessionRejectsMissingFaceAndUnqualifiedSpeech() {
+        XCTAssertFalse(LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: false,
+            speechEvidenceQualified: true,
+            speakerAttributionHardRejected: false,
+            speakerEpisodeState: .pending
+        ).permitsParticipantSession)
+        XCTAssertFalse(LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: true,
+            speechEvidenceQualified: false,
+            speakerAttributionHardRejected: false,
+            speakerEpisodeState: .pending
+        ).permitsParticipantSession)
     }
 
-    func testAmbientVoiceEpisodeCannotBeUpgradedByLaterEyeContact() {
+    func testOrdinaryConversationSurvivesStrictSpeakerContradictionWithoutBindingIdentity() {
+        let admission = LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: true,
+            speechEvidenceQualified: true,
+            speakerAttributionHardRejected: true,
+            speakerEpisodeState: .rejected
+        )
+
+        XCTAssertTrue(admission.permitsParticipantSession)
+        XCTAssertFalse(admission.permitsRecognizedIdentity)
+        XCTAssertFalse(admission.rejectsParticipantAudio)
+    }
+
+    func testStrictTurnPolicyRejectsContradictedSpeakerAudio() {
+        let admission = LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: true,
+            speechEvidenceQualified: true,
+            speakerAttributionHardRejected: true,
+            speakerEpisodeState: .rejected,
+            requiresVerifiedSpeakerForEveryTurn: true
+        )
+
+        XCTAssertFalse(admission.permitsParticipantSession)
+        XCTAssertFalse(admission.permitsRecognizedIdentity)
+        XCTAssertTrue(admission.rejectsParticipantAudio)
+    }
+
+    func testMissingGazeTimeoutDoesNotRevokeOrdinaryParticipantSession() {
+        var speakerGate = LiveVoiceSpeakerEpisodeGate(
+            maximumResolutionMilliseconds: 300,
+            openingSpeechConfiguration: .alignedWithDetectorThreshold(0.35)
+        )
+        let evidence = AudioVisualSpeakerEvidence(
+            faceVisible: true,
+            directGaze: false,
+            mouthMotion: nil,
+            mouthSampleCount: 0,
+            directionMatchesFace: nil,
+            voiceConfidence: 0.8
+        )
+        _ = speakerGate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: evidence,
+            assessment: .init(classification: .ambiguous, probability: 0.45),
+            episodeOnsetNS: 1_000_000_000,
+            at: 1_000_000_000
+        )
+        let timedOut = speakerGate.observe(
+            active: true,
+            trackedFaceID: "face-a",
+            evidence: evidence,
+            assessment: .init(classification: .ambiguous, probability: 0.45),
+            at: 1_300_000_000
+        )
+        let admission = LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: true,
+            speechEvidenceQualified: timedOut.speechEvidence.qualified,
+            speakerAttributionHardRejected: timedOut.hardSpeakerRejection,
+            speakerEpisodeState: timedOut.state
+        )
+
+        XCTAssertEqual(timedOut.state, .rejected)
+        XCTAssertFalse(timedOut.hardSpeakerRejection)
+        XCTAssertTrue(admission.permitsParticipantSession)
+        XCTAssertFalse(admission.permitsRecognizedIdentity)
+    }
+
+    func testOnlyConfirmedSpeakerCanBindRecognizedIdentity() {
+        let pending = LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: true,
+            speechEvidenceQualified: true,
+            speakerAttributionHardRejected: false,
+            speakerEpisodeState: .pending
+        )
+        let confirmed = LiveVoiceSessionAdmission.evaluate(
+            trackedFaceVisible: true,
+            speechEvidenceQualified: true,
+            speakerAttributionHardRejected: false,
+            speakerEpisodeState: .confirmed
+        )
+
+        XCTAssertFalse(pending.permitsRecognizedIdentity)
+        XCTAssertTrue(confirmed.permitsRecognizedIdentity)
+    }
+
+    func testDeniedSampleCanBeAdmittedLaterInSameSpeechEpisode() {
         let start: UInt64 = 1_000_000_000
         var gate = ConversationContactGate()
 
-        XCTAssertNil(
-            gate.observeVoiceActivity(active: true, at: start, directContact: false)
-        )
-        XCTAssertNil(
-            gate.observeVoiceActivity(
-                active: true,
-                at: start + 300_000_000,
-                directContact: true
-            )
-        )
-
-        _ = gate.observeVoiceActivity(
-            active: false,
-            at: start + 600_000_000,
-            directContact: true
-        )
-        XCTAssertEqual(
-            gate.observeVoiceActivity(
-                active: true,
-                at: start + 900_000_000,
-                directContact: true
-            ),
-            .voiceActivity
-        )
+        XCTAssertNil(gate.observeVoiceActivity(
+            active: true,
+            at: start,
+            newSessionAdmitted: false
+        ))
+        XCTAssertEqual(gate.observeVoiceActivity(
+            active: true,
+            at: start + 100_000_000,
+            newSessionAdmitted: true
+        ), .voiceActivity)
     }
 
     func testOneSpeechEpisodeEmitsAtMostOneAuthorization() {
@@ -462,130 +539,16 @@ final class EventImportanceTests: XCTestCase {
         var gate = ConversationContactGate()
 
         XCTAssertEqual(
-            gate.observeVoiceActivity(active: true, at: start, directContact: true),
+            gate.observeVoiceActivity(active: true, at: start, newSessionAdmitted: true),
             .voiceActivity
         )
         XCTAssertNil(
             gate.observeVoiceActivity(
                 active: true,
                 at: start + 260_000_000,
-                directContact: true
+                newSessionAdmitted: true
             )
         )
-    }
-
-    func testWeakSingleVADWindowCannotOpenNewConversation() {
-        let start: UInt64 = 1_000_000_000
-        var gate = ConversationContactGate()
-
-        XCTAssertNil(gate.observeVoiceActivity(
-            active: true,
-            at: start,
-            directContact: true,
-            voiceConfidence: 0.374
-        ))
-        XCTAssertNil(gate.observeVoiceActivity(
-            active: true,
-            at: start + 260_000_000,
-            directContact: true,
-            voiceConfidence: 0.08
-        ))
-        XCTAssertNil(gate.observeVoiceActivity(
-            active: false,
-            at: start + 520_000_000,
-            directContact: true,
-            voiceConfidence: 0
-        ))
-    }
-
-    func testSustainedModerateVoiceEvidenceOpensWithContinuousDirectContact() {
-        let start: UInt64 = 1_000_000_000
-        var gate = ConversationContactGate()
-
-        XCTAssertNil(gate.observeVoiceActivity(
-            active: true,
-            at: start,
-            directContact: true,
-            voiceConfidence: 0.42
-        ))
-        XCTAssertEqual(gate.observeVoiceActivity(
-            active: true,
-            at: start + 260_000_000,
-            directContact: true,
-            voiceConfidence: 0.44
-        ), .voiceActivity)
-    }
-
-    func testStrongVoiceEvidenceOpensImmediatelyButCannotSubstituteForGaze() {
-        let start: UInt64 = 1_000_000_000
-        var admitted = ConversationContactGate()
-        XCTAssertEqual(admitted.observeVoiceActivity(
-            active: true,
-            at: start,
-            directContact: true,
-            voiceConfidence: 0.85
-        ), .voiceActivity)
-
-        var rejected = ConversationContactGate()
-        XCTAssertNil(rejected.observeVoiceActivity(
-            active: true,
-            at: start,
-            directContact: false,
-            voiceConfidence: 0.85
-        ))
-        XCTAssertNil(rejected.observeVoiceActivity(
-            active: true,
-            at: start + 260_000_000,
-            directContact: true,
-            voiceConfidence: 0.90
-        ))
-    }
-
-    func testAvertedGazeBreaksPendingModerateVoiceAdmission() {
-        let start: UInt64 = 1_000_000_000
-        var gate = ConversationContactGate()
-
-        XCTAssertNil(gate.observeVoiceActivity(
-            active: true,
-            at: start,
-            directContact: true,
-            voiceConfidence: 0.42
-        ))
-        XCTAssertNil(gate.observeVoiceActivity(
-            active: true,
-            at: start + 260_000_000,
-            directContact: false,
-            voiceConfidence: 0.44
-        ))
-        XCTAssertNil(gate.observeVoiceActivity(
-            active: true,
-            at: start + 520_000_000,
-            directContact: true,
-            voiceConfidence: 0.90
-        ))
-    }
-
-    func testCurrentVerifiedFaceFixationRequiresDirectGazeAndExpires() {
-        let start: UInt64 = 2_000_000_000
-        var fixation = L0FaceFixationAdmission(freshnessMilliseconds: 500)
-
-        fixation.observeVerifiedFixation(
-            sceneID: "face-a",
-            directContact: false,
-            at: start
-        )
-        XCTAssertEqual(fixation.state(at: start), .averted)
-        XCTAssertFalse(fixation.permitsNewSession(at: start))
-
-        fixation.observeVerifiedFixation(
-            sceneID: "face-a",
-            directContact: true,
-            at: start + 100_000_000
-        )
-        XCTAssertEqual(fixation.state(at: start + 100_000_000), .direct)
-        XCTAssertTrue(fixation.permitsNewSession(at: start + 599_000_000))
-        XCTAssertEqual(fixation.state(at: start + 601_000_000), .absent)
-        XCTAssertFalse(fixation.permitsNewSession(at: start + 601_000_000))
     }
 
     func testNewLiveConversationRequiresCurrentVerifiedHumanTarget() {
@@ -628,20 +591,20 @@ final class EventImportanceTests: XCTestCase {
             gate.observeVoiceActivity(
                 active: true,
                 at: start + 59_999_000_000,
-                directContact: false
+                newSessionAdmitted: false
             ),
             .activeConversation
         )
         _ = gate.observeVoiceActivity(
             active: false,
             at: start + 59_999_500_000,
-            directContact: false
+            newSessionAdmitted: false
         )
         XCTAssertEqual(
             gate.observeVoiceActivity(
                 active: true,
                 at: start + 60_000_000_000,
-                directContact: true
+                newSessionAdmitted: true
             ),
             .voiceActivity
         )
@@ -660,13 +623,13 @@ final class EventImportanceTests: XCTestCase {
             gate.observeVoiceActivity(
                 active: true,
                 at: start + 60_000_000_000,
-                directContact: false
+                newSessionAdmitted: false
             )
         )
         _ = gate.observeVoiceActivity(
             active: false,
             at: start + 60_000_000_001,
-            directContact: false
+            newSessionAdmitted: false
         )
 
         gate.markConversationOpened(at: start)
@@ -675,25 +638,25 @@ final class EventImportanceTests: XCTestCase {
             gate.observeVoiceActivity(
                 active: true,
                 at: start + 118_000_000_000,
-                directContact: false
+                newSessionAdmitted: false
             ),
             .activeConversation
         )
         _ = gate.observeVoiceActivity(
             active: false,
             at: start + 118_500_000_000,
-            directContact: false
+            newSessionAdmitted: false
         )
         XCTAssertNil(
             gate.observeVoiceActivity(
                 active: true,
                 at: start + 119_000_000_000,
-                directContact: false
+                newSessionAdmitted: false
             )
         )
     }
 
-    func testLiveVoiceSessionClosesAfterOneMinuteWithoutUserActivity() {
+    func testLiveVoiceSessionKeepsWarmForTenMinutesWithoutUserActivity() {
         let start: UInt64 = 1_000_000_000
         var gate = LiveVoiceSessionInactivityGate()
         let initialDeadline = gate.activate(at: start)
@@ -701,7 +664,7 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertTrue(gate.shouldClose(at: initialDeadline))
 
         let renewedDeadline = gate.recordUserActivity(at: initialDeadline - 1)
-        XCTAssertEqual(renewedDeadline, initialDeadline + 59_999_999_999)
+        XCTAssertEqual(renewedDeadline, initialDeadline + 599_999_999_999)
         XCTAssertFalse(gate.shouldClose(at: renewedDeadline! - 1))
         XCTAssertTrue(gate.shouldClose(at: renewedDeadline!))
     }
@@ -726,7 +689,7 @@ final class EventImportanceTests: XCTestCase {
 
         let playbackEnded = originalDeadline + 45_000_000_000
         let renewedDeadline = gate.endAssistantActivity(at: playbackEnded)
-        XCTAssertEqual(renewedDeadline, playbackEnded + 60_000_000_000)
+        XCTAssertEqual(renewedDeadline, playbackEnded + 600_000_000_000)
         XCTAssertFalse(gate.shouldClose(at: renewedDeadline! - 1))
         XCTAssertTrue(gate.shouldClose(at: renewedDeadline!))
     }
@@ -908,7 +871,6 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertTrue(confirmed.didTransition)
         XCTAssertTrue(confirmed.directContactObserved)
         XCTAssertTrue(confirmed.speakerEvidenceObserved)
-        XCTAssertEqual(confirmed.maximumVoiceConfidence, 0.8, accuracy: 0.0001)
     }
 
     func testOpeningSpeechEvidenceRejectsObservedFalseActivationConfidenceBand() {
@@ -1875,39 +1837,71 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(gate.quarantinesMicrophone(at: 2_800_000_000))
     }
 
-    func testDuplexSpeakerVerificationMakesDirectGazeOptionalByPolicy() {
-        XCTAssertTrue(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
-            trackedFaceVisible: true,
-            independentSpeakerEvidence: true,
-            speechEvidenceQualified: true,
-            directContactConfirmed: false,
-            speakerAttributionRejected: false,
-            requiresDirectGaze: false
-        ))
+    func testPlaybackInterruptionAlwaysRequiresConfirmedDirectContact() {
         XCTAssertFalse(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
             trackedFaceVisible: true,
             independentSpeakerEvidence: true,
             speechEvidenceQualified: true,
             directContactConfirmed: false,
-            speakerAttributionRejected: false,
-            requiresDirectGaze: true
+            speakerAttributionRejected: false
+        ))
+        XCTAssertTrue(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+            trackedFaceVisible: true,
+            independentSpeakerEvidence: true,
+            speechEvidenceQualified: true,
+            directContactConfirmed: true,
+            speakerAttributionRejected: false
         ))
         XCTAssertFalse(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
             trackedFaceVisible: true,
             independentSpeakerEvidence: false,
             speechEvidenceQualified: true,
             directContactConfirmed: true,
-            speakerAttributionRejected: false,
-            requiresDirectGaze: false
+            speakerAttributionRejected: false
         ))
         XCTAssertFalse(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
             trackedFaceVisible: true,
             independentSpeakerEvidence: true,
             speechEvidenceQualified: true,
             directContactConfirmed: true,
-            speakerAttributionRejected: true,
-            requiresDirectGaze: false
+            speakerAttributionRejected: true
         ))
+    }
+
+    func testGazeOptionalConversationCannotReleasePlaybackFromMouthCueAlone() {
+        let speakerVerified = LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+            trackedFaceVisible: true,
+            independentSpeakerEvidence: true,
+            speechEvidenceQualified: true,
+            directContactConfirmed: false,
+            speakerAttributionRejected: false
+        )
+        var acousticGate = LiveVoiceAcousticBargeInGate(
+            requiredIndependentMilliseconds: 500
+        )
+        _ = acousticGate.observe(
+            speechActive: true,
+            speakerVerified: speakerVerified,
+            relationship: .acousticallyIndependent,
+            at: 1_000_000_000
+        )
+        let acousticAdmission = acousticGate.observe(
+            speechActive: true,
+            speakerVerified: speakerVerified,
+            relationship: .acousticallyIndependent,
+            at: 1_500_000_000
+        )
+        var captureGate = LiveVoiceDuplexCaptureGate()
+        captureGate.beginAssistantOutput(at: 900_000_000)
+        captureGate.observeParticipantSpeech(
+            active: true,
+            verified: acousticAdmission.admitted,
+            at: 1_500_000_000
+        )
+
+        XCTAssertFalse(speakerVerified)
+        XCTAssertFalse(acousticAdmission.admitted)
+        XCTAssertTrue(captureGate.quarantinesMicrophone(at: 1_500_000_000))
     }
 
     func testPlaybackReferenceIdentifiesDelayedGainChangedEcho() {
@@ -1923,7 +1917,7 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(assessment.permitsBargeIn)
     }
 
-    func testPlaybackReferenceAllowsAcousticallyIndependentInterruptionWithoutGaze() {
+    func testPlaybackReferenceStillNeedsConfirmedContactForInterruption() {
         var matcher = LiveVoiceEchoReferenceMatcher()
         matcher.appendReference(
             deterministicAudio(count: 24_000, seed: 0xA11CE),
@@ -1938,13 +1932,12 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertEqual(assessment.relationship, .acousticallyIndependent)
         XCTAssertLessThan(assessment.maximumCorrelation, 0.2)
         XCTAssertTrue(assessment.permitsBargeIn)
-        XCTAssertTrue(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+        XCTAssertFalse(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
             trackedFaceVisible: true,
             independentSpeakerEvidence: true,
             speechEvidenceQualified: true,
             directContactConfirmed: false,
-            speakerAttributionRejected: false,
-            requiresDirectGaze: false
+            speakerAttributionRejected: false
         ))
     }
 
@@ -2040,12 +2033,11 @@ final class EventImportanceTests: XCTestCase {
             independentSpeakerEvidence: contradicted.speakerEvidenceObserved,
             speechEvidenceQualified: contradicted.speechEvidence.qualified,
             directContactConfirmed: false,
-            speakerAttributionRejected: contradicted.hardSpeakerRejection,
-            requiresDirectGaze: false
+            speakerAttributionRejected: contradicted.hardSpeakerRejection
         ))
     }
 
-    func testGazeOptionalDuplexDoesNotTreatContactTimeoutAsSpeakerRejection() {
+    func testContactTimeoutCannotReleasePlaybackCapture() {
         var episode = LiveVoiceSpeakerEpisodeGate(maximumResolutionMilliseconds: 300)
         let evidence = AudioVisualSpeakerEvidence(
             faceVisible: true,
@@ -2072,13 +2064,12 @@ final class EventImportanceTests: XCTestCase {
 
         XCTAssertEqual(timedOut.state, .rejected)
         XCTAssertFalse(timedOut.hardSpeakerRejection)
-        XCTAssertTrue(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
+        XCTAssertFalse(LiveVoiceDuplexSpeakerPolicy.verifiesParticipant(
             trackedFaceVisible: true,
             independentSpeakerEvidence: timedOut.speakerEvidenceObserved,
             speechEvidenceQualified: timedOut.speechEvidence.qualified,
             directContactConfirmed: false,
-            speakerAttributionRejected: timedOut.hardSpeakerRejection,
-            requiresDirectGaze: false
+            speakerAttributionRejected: timedOut.hardSpeakerRejection
         ))
     }
 
@@ -2380,64 +2371,6 @@ final class EventImportanceTests: XCTestCase {
         XCTAssertFalse(gate.beginLaunch(at: start + 6_000_000_000))
         gate.observeEnded()
         XCTAssertTrue(gate.beginLaunch(at: start + 6_000_000_000))
-    }
-
-    func testInitialTurnValidationRevokesOnlyUnconfirmedParticipantOpenings() {
-        var validation = LiveVoiceInitialTurnValidation(transcriptTimeoutMilliseconds: 3_500)
-        validation.begin(origin: .participantContact)
-        XCTAssertTrue(validation.shouldCloseWhenContactIsRevoked)
-        XCTAssertFalse(validation.permitsAssistantResponse)
-        XCTAssertEqual(
-            validation.observeTransportActive(at: 1_000_000_000),
-            4_500_000_000
-        )
-        XCTAssertFalse(validation.shouldCloseForMissingTranscript(at: 4_499_999_999))
-        XCTAssertTrue(validation.shouldCloseForMissingTranscript(at: 4_500_000_000))
-        validation.confirmParticipantInput()
-        XCTAssertFalse(validation.shouldCloseWhenContactIsRevoked)
-        XCTAssertTrue(validation.permitsAssistantResponse)
-        XCTAssertNil(validation.transcriptDeadlineNS)
-        XCTAssertFalse(validation.shouldCloseForMissingTranscript(at: UInt64.max))
-
-        validation.begin(origin: .proactive)
-        XCTAssertFalse(validation.shouldCloseWhenContactIsRevoked)
-        XCTAssertTrue(validation.permitsAssistantResponse)
-        XCTAssertNil(validation.observeTransportActive(at: 10_000_000_000))
-        validation.reset()
-        XCTAssertNil(validation.origin)
-    }
-
-    func testInitialTurnValidationRequiresRemoteSpeechEvidence() {
-        var validation = LiveVoiceInitialTurnValidation(transcriptTimeoutMilliseconds: 3_500)
-        validation.begin(origin: .participantContact)
-        _ = validation.observeTransportActive(at: 1_000_000_000)
-
-        validation.observeInitialAudioSubmitted()
-        XCTAssertFalse(validation.permitsAssistantResponse)
-        XCTAssertNotNil(validation.transcriptDeadlineNS)
-
-        validation.observeInitialAudioTransportProgress()
-        XCTAssertFalse(validation.permitsAssistantResponse)
-        XCTAssertNotNil(validation.transcriptDeadlineNS)
-
-        validation.observeServerSpeechDetected()
-        XCTAssertTrue(validation.permitsAssistantResponse)
-        XCTAssertTrue(validation.serverSpeechDetected)
-        XCTAssertNil(validation.transcriptDeadlineNS)
-        XCTAssertFalse(validation.shouldCloseWhenContactIsRevoked)
-
-        validation.begin(origin: .participantContact)
-        validation.observeInitialAudioTransportProgress()
-        XCTAssertFalse(validation.permitsAssistantResponse)
-        validation.observeInitialAudioSubmitted()
-        XCTAssertFalse(validation.permitsAssistantResponse)
-
-        validation.begin(origin: .proactive)
-        validation.observeInitialAudioSubmitted()
-        validation.observeInitialAudioTransportProgress()
-        XCTAssertFalse(validation.initialAudioSubmitted)
-        XCTAssertFalse(validation.initialAudioTransportConfirmed)
-        XCTAssertTrue(validation.permitsAssistantResponse)
     }
 
     private func decision(

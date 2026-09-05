@@ -27,6 +27,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
     public let title: String
     public let objective: String
     public let workingDirectory: String
+    public let workClass: HermesDelegatedWorkClass?
+    public let acceptanceCriteria: String?
     public let status: HermesAgentTaskStatus
     public let hermesStoredSessionID: String?
     public let result: String?
@@ -45,6 +47,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
         title: String,
         objective: String,
         workingDirectory: String,
+        workClass: HermesDelegatedWorkClass? = nil,
+        acceptanceCriteria: String? = nil,
         status: HermesAgentTaskStatus = .queued,
         hermesStoredSessionID: String? = nil,
         result: String? = nil,
@@ -62,6 +66,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
         self.title = Self.bounded(title, limit: 160)
         self.objective = Self.bounded(objective, limit: 24_000)
         self.workingDirectory = Self.bounded(workingDirectory, limit: 1_024)
+        self.workClass = workClass
+        self.acceptanceCriteria = acceptanceCriteria.map { Self.bounded($0, limit: 4_000) }
         self.status = status
         self.hermesStoredSessionID = hermesStoredSessionID.map { Self.bounded($0, limit: 160) }
         self.result = result.map { Self.bounded($0, limit: 96_000) }
@@ -92,6 +98,8 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
             title: title,
             objective: objective,
             workingDirectory: workingDirectory,
+            workClass: workClass,
+            acceptanceCriteria: acceptanceCriteria,
             status: status ?? self.status,
             hermesStoredSessionID: hermesStoredSessionID ?? self.hermesStoredSessionID,
             result: result ?? self.result,
@@ -107,6 +115,22 @@ public struct HermesAgentTask: Codable, Equatable, Identifiable, Sendable {
 
     private static func bounded(_ value: String, limit: Int) -> String {
         String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
+    }
+
+    public var workerPrompt: String? {
+        guard let workClass,
+              let acceptanceCriteria,
+              !objective.isEmpty,
+              !acceptanceCriteria.isEmpty else { return nil }
+        return """
+        Work class: \(workClass.rawValue)
+
+        Objective:
+        \(objective)
+
+        Acceptance criteria:
+        \(acceptanceCriteria)
+        """
     }
 }
 
@@ -128,6 +152,8 @@ public struct HermesAgentTaskIPCRequest: Codable, Equatable, Sendable {
     public let title: String?
     public let objective: String?
     public let workingDirectory: String?
+    public let workClass: HermesDelegatedWorkClass?
+    public let acceptanceCriteria: String?
     public let statuses: [HermesAgentTaskStatus]?
     public let wantsReport: Bool?
 
@@ -138,6 +164,8 @@ public struct HermesAgentTaskIPCRequest: Codable, Equatable, Sendable {
         title: String? = nil,
         objective: String? = nil,
         workingDirectory: String? = nil,
+        workClass: HermesDelegatedWorkClass? = nil,
+        acceptanceCriteria: String? = nil,
         statuses: [HermesAgentTaskStatus]? = nil,
         wantsReport: Bool? = nil
     ) {
@@ -147,6 +175,8 @@ public struct HermesAgentTaskIPCRequest: Codable, Equatable, Sendable {
         self.title = title.map { String($0.prefix(160)) }
         self.objective = objective.map { String($0.prefix(24_000)) }
         self.workingDirectory = workingDirectory.map { String($0.prefix(1_024)) }
+        self.workClass = workClass
+        self.acceptanceCriteria = acceptanceCriteria.map { String($0.prefix(4_000)) }
         self.statuses = statuses.map { Array($0.prefix(HermesAgentTaskStatus.allCases.count)) }
         self.wantsReport = wantsReport
     }

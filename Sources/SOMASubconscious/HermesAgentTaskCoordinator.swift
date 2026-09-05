@@ -74,6 +74,9 @@ private enum HermesAgentProtocolRunner {
         onHandle: @escaping @Sendable (HermesAgentProcessHandle) -> Void,
         onSessionOpened: @escaping @Sendable (_ storedSessionID: String) -> Void
     ) async throws -> HermesAgentRunResult {
+        guard let workerPrompt = task.workerPrompt else {
+            throw HermesAgentRunnerError.rpc("task_contract_missing")
+        }
         let runtime = try discoverRuntime()
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let temporaryDirectory = FileManager.default.temporaryDirectory
@@ -135,7 +138,7 @@ private enum HermesAgentProtocolRunner {
             method: "prompt.submit",
             params: [
                 "session_id": session.runtimeID,
-                "text": task.objective,
+                "text": workerPrompt,
             ]
         )
 
@@ -333,12 +336,22 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
         self.onHealth = onHealth
         let now = Date()
         tasks = try store.load().map { task in
-            guard task.status == .running else { return task }
-            return task.updating(
-                status: .queued,
-                error: .some("resuming_after_runtime_restart"),
-                at: now
-            )
+            let recovered = task.status == .running
+                ? task.updating(
+                    status: .queued,
+                    error: .some("resuming_after_runtime_restart"),
+                    at: now
+                )
+                : task
+            guard recovered.status != .queued || recovered.workerPrompt != nil else {
+                return recovered.updating(
+                    status: .failed,
+                    error: .some("hermes_task_contract_missing"),
+                    completedAt: .some(now),
+                    at: now
+                )
+            }
+            return recovered
         }
         try store.save(tasks)
         onHealth(
@@ -356,8 +369,18 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
                 case .submit:
                     guard let goalEpisodeID = request.goalEpisodeID,
                           let objective = normalized(request.objective, limit: 24_000),
-                          let title = normalized(request.title, limit: 160) else {
+                          let title = normalized(request.title, limit: 160),
+                          let workClass = request.workClass,
+                          let acceptanceCriteria = normalized(request.acceptanceCriteria, limit: 4_000) else {
                         throw HermesAgentCoordinatorError(message: "hermes_task_request_invalid")
+                    }
+                    if let error = L2TaskRoutingPolicy.hermesDelegationValidationError(
+                        workClass: workClass,
+                        objective: objective,
+                        acceptanceCriteria: acceptanceCriteria,
+                        workingDirectory: request.workingDirectory
+                    ) {
+                        throw HermesAgentCoordinatorError(message: error)
                     }
                     if let existing = HermesAgentTaskDeduplication.rootTask(
                         for: goalEpisodeID,
@@ -370,7 +393,9 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
                         goalEpisodeID: goalEpisodeID,
                         title: title,
                         objective: objective,
-                        workingDirectory: directory
+                        workingDirectory: directory,
+                        workClass: workClass,
+                        acceptanceCriteria: acceptanceCriteria
                     )
                     tasks.append(task)
                     try persist()
@@ -381,8 +406,18 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
                           let parent = tasks.first(where: { $0.id == parentID }),
                           (parent.status.isTerminal || parent.status == .waitingForInput),
                           parent.hermesStoredSessionID != nil,
+                          let workClass = parent.workClass,
+                          let acceptanceCriteria = normalized(parent.acceptanceCriteria, limit: 4_000),
                           let objective = normalized(request.objective, limit: 24_000) else {
                         throw HermesAgentCoordinatorError(message: "hermes_task_continuation_invalid")
+                    }
+                    if let error = L2TaskRoutingPolicy.hermesDelegationValidationError(
+                        workClass: workClass,
+                        objective: objective,
+                        acceptanceCriteria: acceptanceCriteria,
+                        workingDirectory: parent.workingDirectory
+                    ) {
+                        throw HermesAgentCoordinatorError(message: error)
                     }
                     let goal = request.goalEpisodeID ?? parent.goalEpisodeID
                     if let existing = tasks.last(where: {
@@ -396,6 +431,8 @@ final class HermesAgentTaskCoordinator: @unchecked Sendable {
                         title: normalized(request.title, limit: 160) ?? parent.title,
                         objective: objective,
                         workingDirectory: parent.workingDirectory,
+                        workClass: workClass,
+                        acceptanceCriteria: acceptanceCriteria,
                         hermesStoredSessionID: parent.hermesStoredSessionID
                     )
                     tasks.append(task)
@@ -597,7 +634,9 @@ func testHermesAgentProtocolBridge() async throws -> String {
         goalEpisodeID: UUID(),
         title: "SOMA Hermes bridge smoke test",
         objective: "Return exactly SOMA_HERMES_BRIDGE_OK and do not call tools.",
-        workingDirectory: FileManager.default.currentDirectoryPath
+        workingDirectory: FileManager.default.currentDirectoryPath,
+        workClass: .processSupervision,
+        acceptanceCriteria: "The worker returns exactly SOMA_HERMES_BRIDGE_OK without calling tools."
     )
     final class HandleBox: @unchecked Sendable {
         private let lock = NSLock()
